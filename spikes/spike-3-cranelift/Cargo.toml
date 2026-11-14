@@ -1,0 +1,24 @@
+[package]
+name = "spike-3-cranelift"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "spike_3_cranelift"
+path = "src/lib.rs"
+
+[[bin]]
+name = "trapprobe3"
+path = "src/bin/trapprobe.rs"
+
+[dependencies]
+spike-1-gc-scheduler = { path = "../spike-1-gc-scheduler" }
+cranelift-codegen = "0.137"
+cranelift-jit = "0.137"
+cranelift-module = "0.137"
+cranelift-frontend = "0.137"
+cranelift-native = "0.137"
+
+[dev-dependencies]
+libc = "0.2"
