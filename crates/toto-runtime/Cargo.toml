@@ -1,0 +1,8 @@
+[package]
+name = "toto-runtime"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+name = "toto_runtime"
+path = "src/lib.rs"

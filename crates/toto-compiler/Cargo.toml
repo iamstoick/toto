@@ -1,0 +1,8 @@
+[package]
+name = "toto-compiler"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+name = "toto_compiler"
+path = "src/lib.rs"
