@@ -18,6 +18,22 @@ pub struct GcRef {
     generation: u32,
 }
 
+impl GcRef {
+    /// Field accessors for generated-code interop (Spike 3 encodes
+    /// handles as u64 across the JIT boundary). Additive only.
+    pub fn index(self) -> u32 {
+        self.index
+    }
+
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
+
+    pub fn from_parts(index: u32, generation: u32) -> Self {
+        Self { index, generation }
+    }
+}
+
 /// How a descriptor identifies reference fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefMap {
@@ -223,6 +239,29 @@ impl Heap {
             },
             _ => None,
         }
+    }
+
+    /// Overwrite pair field `idx` (0 or 1). The descriptor must allow
+    /// a reference in that slot. Added for Spike 3 (generated-code
+    /// field writes go through a runtime entry point); additive only.
+    pub fn set_pair_field(&mut self, r: GcRef, idx: usize, v: GcRef) -> bool {
+        let Some(entry) = self.entries.get_mut(r.index() as usize) else {
+            return false;
+        };
+        let Some(e) = entry.as_mut() else {
+            return false;
+        };
+        if e.generation != r.generation() {
+            return false;
+        }
+        let Payload::Slots(s) = &mut e.payload else {
+            return false;
+        };
+        let Some(slot) = s.get_mut(idx) else {
+            return false;
+        };
+        *slot = Slot::Ref(v);
+        true
     }
 
     pub fn get_array_len(&self, r: GcRef) -> Option<usize> {

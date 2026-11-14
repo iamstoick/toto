@@ -90,6 +90,15 @@ impl ShadowStack {
         self.roots.truncate(base);
     }
 
+    /// Truncate roots to `len`. Used by generated code epilogues and
+    /// test harnesses that manage root lifetimes manually. Caller
+    /// guarantees all frames opened after this length was read are
+    /// closed (balanced by construction). Additive for Spike 3.
+    pub fn truncate(&mut self, len: usize) {
+        debug_assert!(len <= self.roots.len());
+        self.roots.truncate(len);
+    }
+
     pub fn frames_len(&self) -> usize {
         self.frames.len()
     }
