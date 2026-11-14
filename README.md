@@ -17,6 +17,9 @@
 - `spikes/spike-2-hot-reload/` — **isolated prototype** for Spike 2
   (drain-and-restart reload mechanics on the Spike 1/1b runtime).
   Same throwaway status.
+- `spikes/spike-3-cranelift/` — **isolated prototype** for Spike 3
+  (Cranelift JIT from toy IR against the Spike 1 heap).
+  Same throwaway status.
 - `docs/decisions/` — ADRs (D1–D8 as ratified).
 - `docs/spikes/` — spike reports.
 - `scripts/check.sh` — runs `cargo fmt --check`, `cargo clippy`, `cargo test`.
