@@ -3,8 +3,8 @@
 > Phase 2 (type checker + shared typed IR) complete: `toto run` checks
 > first (exit 2, never executes on type errors); HIR + MIR with a MIR
 > interpreter verified by a differential harness over a 97-program corpus;
-> D8 frozen. See [Implementation Roadmap v2.3](docs/) and
-> `docs/decisions/`.
+> D8 frozen. Phase 3 (runtime + concurrency) in progress.
+> See [Implementation Roadmap v2.3](docs/) and `docs/decisions/`.
 
 ## Layout
 
