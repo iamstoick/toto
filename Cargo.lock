@@ -53,6 +53,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spike-2-hot-reload"
+version = "0.0.0"
+dependencies = [
+ "spike-1-gc-scheduler",
+ "spike-1b-stack-switching",
+]
+
+[[package]]
 name = "toto-cli"
 version = "0.0.0"
 

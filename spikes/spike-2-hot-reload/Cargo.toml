@@ -1,0 +1,13 @@
+[package]
+name = "spike-2-hot-reload"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "spike_2_hot_reload"
+path = "src/lib.rs"
+
+[dependencies]
+spike-1-gc-scheduler = { path = "../spike-1-gc-scheduler" }
+spike-1b-stack-switching = { path = "../spike-1b-stack-switching" }
