@@ -1,11 +1,11 @@
 # Toto Language Specification (v1 core — Phase 1 draft)
 
-Status: **draft for review**. This spec defines the v1 core subset that the
-Phase 1 interpreter executes, plus reserved syntax specified now and
-implemented in later phases. Nothing outside this document may be assumed.
-Decisions the PDF did not fix are marked **[Proposal]**; each is also listed
-in Appendix A for review. The STOP gate applies: no lexer/parser/interpreter
-code is written until this spec is approved.
+Status: **APPROVED with amendments (review 2026-11-14)**. This spec
+defines the v1 core subset that the Phase 1 interpreter executes, plus
+reserved syntax specified now and implemented in later phases. Nothing
+outside this document may be assumed. Decisions the PDF did not fix were
+marked **[Proposal]**; each is listed in Appendix A with the review verdict.
+The Stage 1 STOP gate is discharged: implementation may proceed.
 
 Sources: Toto Implementation Roadmap v2.3 (authoritative; Part 1 governs
 sequencing, Part 2 governs technical defaults D1–D8). Where this spec and the
@@ -30,8 +30,8 @@ Core subset (implemented by the Phase 1 interpreter):
 
 - `let` / `mut` bindings with optional type annotations (parsed, stored,
   **not checked** in Phase 1; §5.6).
-- Values: 64-bit integers, 64-bit floats, strings, booleans, arrays,
-  structs, ranges, first-class functions and closures.
+- Values: 64-bit integers, 64-bit floats, strings, booleans, the unit
+  value `()`, arrays, structs, ranges, first-class functions and closures.
 - Operators: arithmetic `+ - * / %`, unary `-` and `!`, comparison
   `== != < <= > >=`, short-circuit logical `&& ||`, call, index, field
   access, assignment `=`.
@@ -75,7 +75,7 @@ literals and to terminate `//` comments. Statements are terminated by `;`
 fn let mut if else while for in return break continue struct
 true false go chan select defer close unsafe extern match
 import mod use pub trait impl const static as loop self
-int float string bool Array Map Range Result Option
+int float string bool unit Array Map Range Result Option
 Some None Ok Err
 ```
 
@@ -180,9 +180,9 @@ postfix_expr:= primary_expr (call_suffix | field_suffix | index_suffix)* ;
 call_suffix := "(" (expr ("," expr)* ","?)? ")" ;
 field_suffix:= "." IDENT ;
 index_suffix:= "[" expr "]" ;
-primary_expr:= INT | FLOAT | STRING | "true" | "false"
+primary_expr:= INT | FLOAT | STRING | "true" | "false" | "(" ")"
              | IDENT | "(" expr ")"
-             | "if" expr block ("else" ("if" expr block)* block)?
+             | "if" expr block ("else" ("if" expr block | block))?   (* else-less if: statement only, §5.5 *)
              | "fn" "(" params? ")" "->" type block     (* anonymous closure *)
              | IDENT "{" field_init ("," field_init)* ","? "}"   (* struct literal *)
              | "[" (expr ("," expr)* ","?)? "]"          (* array literal *)
@@ -194,24 +194,37 @@ type        := IDENT ("<" type ("," type)* ">")? ("[" "]")? ;
 
 Notes and proposals:
 
-- **[Proposal]** Every function declares an explicit return type; there is
-  no inference of return types and no `void`/`unit` type ("no type inference
-  beyond literals" per the roadmap). The entry point is exactly
-  `fn main() -> int` with zero parameters; the process exit code is main's
-  return value (§10). A function body is a block: `return expr;` returns
-  early, and a trailing expression without `;` is the implicit return.
-  Falling off the end of a non-`main` function without returning is a
-  runtime panic (`E0204`). Rationale: return types are the Phase 2 checker's
-  anchor points; making `main` return the exit code removes the need for a
-  unit type in v1. Reopen if: Phase 2 wants `main` to return `Result`.
-- **[Proposal]** `if`/`else` is an **expression** (both branches evaluate to
-  a value; `else if` chains allowed); `while`/`for` are **statements** (they
-  evaluate to an internal "no value" that cannot be named in source).
+- **[Proposal, amended per review: unit type added]** Every function
+  declares an explicit return type; there is no inference of return types
+  ("no type inference beyond literals" per the roadmap). The unit type is
+  named `unit` and its only value is the literal `()`. Functions that
+  return nothing declare `-> unit` and never need a dummy return value:
+  ```gzv
+  fn greet(name: string) -> unit {
+      println(name);
+  }
+  ```
+  The entry point is exactly `fn main() -> int` with zero parameters; the
+  process exit code is main's return value (§10). A function body is a
+  block: `return expr;` returns early, and a trailing expression without
+  `;` is the implicit return. Falling off the end of a `-> unit` function
+  returns `()`; falling off the end of any other function without returning
+  is a runtime panic (`E0212`). Rationale: return types are the Phase 2
+  checker's anchor points; explicit `unit` keeps procedures honest without
+  dummy values. Reopen if: Phase 2 wants `main` to return `Result`.
+- **[Proposal, amended per review: else-required rule added]** `if` with
+  `else` is an **expression** (both branches evaluate to a value; `else if`
+  chains allowed); `if` **without** `else` is a **statement only** — it may
+  not appear in expression position (operands, call arguments, `let`
+  initializers, `return` values, array/struct literals, block tails), where
+  the parser rejects it (`E0107`). `while`/`for` are **statements**; loops
+  and else-less `if` evaluate to the unit value `()`, which is only
+  observable if explicitly returned from a `-> unit` function.
   Rationale: matches the roadmap ("loops are statements"), keeps
-  conditional values ergonomic. Reopen if: checker scoping prefers
-  statement-only `if`.
+  conditional values ergonomic, and an else-less expression would have no
+  defined value. Reopen if: checker scoping prefers statement-only `if`.
 - **[Proposal]** Blocks are expressions: `{ stmts...; tail }` evaluates to
-  `tail`, a block of only statements evaluates to the internal no-value.
+  `tail`; a block of only statements evaluates to the unit value `()`.
   Assignment (`=`) is a **statement**, not an expression, so `=` vs `==`
   confusion cannot hide inside larger expressions. Reopen if: Phase 2 wants
   `let x = (y = 1);` rejected at parse rather than by grammar shape.
@@ -241,7 +254,7 @@ static error).
 and `continue`. Blocks, `if`/`while`/`for`, function and struct declarations
 take no trailing `;`. A missing `;` is a parse error pointing at the next
 token ("expected `;`"). A block's trailing expression **omits** `;`
-(`{ …; tail }` returns `tail`; `{ …; tail; }` returns no-value).
+(`{ …; tail }` returns `tail`; `{ …; tail; }` returns `()`).
 
 ### 3.3 Out-of-subset rejections
 
@@ -263,6 +276,10 @@ name. Minimum required rejections (negative corpus, §9.4):
   at runtime with "… is a Phase 2 value" (`E0206`); the interpreter
   special-cases these four names so the error names Phase 2 instead of
   reporting a plain undefined function.
+- `x.y(…)` (method-call syntax) is rejected by the parser: Toto v1 has
+  **functions only, no methods and no method-call syntax** — call a function
+  with the value as an argument instead (`E0158`). Plain field access
+  `x.y` remains core.
 
 ## 4. Types (Phase 1 reading)
 
@@ -278,7 +295,7 @@ Runtime values carry tags; static types are documentation until Phase 2.
 | struct types | named fields, declaration order | reference semantics, §5.3 |
 | `Range` | `{ start: int, end: int }` | from `..`, iterated by `for` |
 | function/closure | code + captured environment | identity equality only |
-| (internal no-value) | not nameable in source | loops, discarded statements |
+| `unit` | the single value `()` | procedures' return type; what statements evaluate to |
 
 `Map<K,V>`, `Result<T,E>`, `Option<T>`, `chan<T>` parse as types; no values
 of these types can be produced in Phase 1.
@@ -344,8 +361,9 @@ wants deep immutability for `let`.
   (`to_float` / `to_int`). Rationale: silent cross-type `false` hides bugs;
   Phase 2 will flag these statically, and the interpreter must not bless
   them now. Reopen if: dogfooding wants total cross-type equality.
-- Same-type rules: `int`/`bool` by value; `float` by IEEE 754, so
-  `nan == nan` is `false` and `0.0 == -0.0` is `true` (use `is_nan` to test);
+- Same-type rules: `int`/`bool`/`unit` by value (`() == ()` is `true`);
+  `float` by IEEE 754, so `nan == nan` is `false` and `0.0 == -0.0` is
+  `true` (use `is_nan` to test);
   `string` by contents; `Range` by endpoints; `Array`/struct **structural
   (deep)** equality with cycle detection — cyclic structures fall back to
   identity comparison rather than recursing forever; functions/closures by
@@ -353,6 +371,9 @@ wants deep immutability for `let`.
 - Ordering `< <= > >=`: `int`, `float` (NaN comparisons are `false`, per
   IEEE), and `string` (lexicographic byte order). Other types are a runtime
   panic.
+- Note: Phase 2 will reject cross-type `==` statically, so the runtime
+  panic above becomes unreachable in checked programs; it exists in Phase 1
+  because the interpreter runs unchecked code.
 
 ### 5.5 Conditions, truthiness, and control flow
 
@@ -383,7 +404,18 @@ in-scope binding is read when the closure value is created and stored with
 the closure. Scalars are copied; arrays/structs are shared by reference
 (consistent with §5.3). Later rebinding of the outer variable does not
 affect the closure; mutation of a captured array/struct through the closure
-is visible outside (same object). Named `fn` declarations do not capture —
+is visible outside (same object). Concretely: capture copies the binding's
+value, and for arrays and structs that value *is* the shared reference, so
+a closure created before a mutation observes that mutation:
+```gzv
+let a = [1];
+let f = fn() -> int { return a[0]; };
+a[0] = 9;
+f()   // 9: f shares the same array object
+```
+Rebinding after creation, by contrast, is not observed: after
+`let x = 1; let g = fn() -> int { return x; }; x = 2;`, `g()` still
+returns 1. Named `fn` declarations do not capture —
 they resolve names in the top-level scope at call time, which makes direct
 recursion (`fact` calling `fact`) work. Parameters may be declared `mut`
 (local rebinding only; no effect on the caller — all argument passing is by
@@ -407,11 +439,13 @@ Rust panic on a user program is a bug.
 
 ### 5.9 Recursion depth
 
-**[Proposal]** The interpreter limits the Toto call stack to 8,192 frames;
-exceeding it panics cleanly (`E0211`, "stack overflow", with span) instead
-of overflowing the host stack. Rationale: "never a Rust crash" requires a
-defined limit; 8,192 fits real programs and keeps debug-build stacks safe.
-Reopen if: measurement shows real programs need more.
+**[Proposal]** The **interpreter** limits the Toto call stack to 8,192
+frames; exceeding it panics cleanly (`E0211`, "stack overflow", with span)
+instead of overflowing the host stack. This limit is INTERPRETER-ONLY:
+compiled code has its own stack limits (ratified 64 KiB stacks, Phase 3).
+Rationale: "never a Rust crash" requires a defined limit; 8,192 fits real
+programs and keeps debug-build stacks safe. Reopen if: measurement shows
+real programs need more.
 
 ## 6. Panic contract
 
@@ -473,16 +507,22 @@ write_file(path: string, contents: string) -> int  bytes written; panic on error
 file_exists(path: string) -> bool
 ```
 
-**[Proposal]** `len` on strings counts Unicode scalar values (chars), not
-bytes, so `len("héllo") == 5`. Rationale: byte counts surprise CLI authors;
-chars match user intent for a v1 builtin. Reopen if: a byte-length builtin
-is needed for IO framing (add `byte_len` then).
+This catalog is FROZEN as of spec approval (review 2026-11-14). No builtin
+may be added, removed, or re-specified during Phase 1; any change needs a
+stop-and-ask with a spec amendment.
+
+**[Proposal, decided per review: chars]** `len` on strings counts Unicode
+scalar values (chars), not bytes, so `len("héllo") == 5`. Rationale: byte
+counts surprise CLI authors; chars match user intent for a v1 builtin.
+Reopen if: a byte-length builtin is needed for IO framing (add `byte_len`
+then).
 
 **[Proposal]** `print`/`println` accept any value and format it with the
 `Display` rules: ints decimal; floats shortest round-trip (`1.0` prints as
 `1.0`, not `1`); bools `true`/`false`; strings raw (no quotes); arrays
 `[1, 2]`; structs `Point { x: 1 }`; ranges `0..10`; functions/closures
-`<closure>` / `<fn name>`. Rationale: dogfooding needs `print(anything)`;
+`<closure>` / `<fn name>`; unit prints as `()`. Rationale: dogfooding
+needs `print(anything)`;
 typed `print(string)` would force `to_string` everywhere. Reopen if: Phase 2
 wants `print` restricted to strings.
 
@@ -547,7 +587,9 @@ stderr from the test harness itself) as a test failure.
   diagnostic), execute from `main`. Exit code: main's return value (must be
   0–255, else panic exit 1); runtime panic exits 1 with the §6 format;
   static diagnostics exit 2; missing/unreadable file or bad CLI usage
-  exits 3 (`toto: couldn't read <file>: <os error>`).
+  exits 3 (`toto: couldn't read <file>: <os error>`). A normal `main`
+  return of 1 is indistinguishable from the panic exit code 1; this
+  collision is accepted as standard practice, not an error.
 - `toto --help` — usage text, exit 0. `toto --version` — `toto 0.1.0`,
   exit 0. **[Proposal]** Initial version `0.1.0` for the CLI crate.
 - Single-file programs only; any `import` is a Phase 2 diagnostic (§3.3).
@@ -590,9 +632,11 @@ Every **[Proposal]** above is a judgment call the PDF did not fix. For the
 reviewer, the load-bearing ones:
 
 1. `fn` keyword; `fn main() -> int` entry returning the exit code; all
-   functions require explicit return types; no unit type (§3, §3.1).
-2. `if` is an expression; loops/assignment are statements; blocks evaluate
-   to their trailing expression (§3).
+   functions require explicit return types; unit type `unit` with literal
+   `()` for procedures (review amendment; §3, §3.1).
+2. `if` with `else` is an expression; else-less `if`, loops, and assignment
+   are statements; blocks evaluate to their trailing expression or `()`
+   (§3).
 3. Left-to-right evaluation order everywhere, short-circuit `&&`/`||`
    (§5.1).
 4. Cross-type `==` panics (except the int/float hint); NaN ≠ NaN; deep
@@ -609,13 +653,24 @@ reviewer, the load-bearing ones:
 12. Float `/` by zero is IEEE (inf/NaN), only int div/mod-by-zero panics.
 13. Int/float arithmetic never mixes implicitly; explicit `to_int`/`to_float`.
 14. CLI version `0.1.0`.
+15. Toto v1 has functions only: no method-call syntax (`x.y(…)` rejected
+    with `E0158`); plain field access stays core (review gap-close; §3.3).
+16. Statement termination is explicit `;` per §3.2 (confirmed present in
+    review; no change needed).
+
+Review record (2026-11-14): all items APPROVED — item 1 amended (unit type
+added), item 2 amended (else-required rule), items 15–16 added by the
+review. All other items approved as proposed. The 25-function builtin
+catalog (§7) is FROZEN.
 
 Reopen triggers: any decision reopens on (a) contradiction with a Phase 2
 checker requirement, (b) dogfooding evidence it rejects ordinary programs,
 or (c) differential-testing friction in Phase 4. Reopening needs a spec
 amendment recorded here — never silent drift.
 
-## Appendix B. Open questions for the reviewer
+## Appendix B. Review questions and answers (2026-11-14 review)
+
+All eight questions ANSWERED; answers are binding on Phase 1 implementation.
 
 - Q1. Is `fn main() -> int` (exit code as return) acceptable, or should
   `main` return nothing with a separate exit mechanism?
@@ -630,3 +685,12 @@ amendment recorded here — never silent drift.
 - Q6. Should `len` count chars or bytes?
 - Q7. Is banning `1.` (trailing-dot float) and `..=` acceptable v1 minimalism?
 - Q8. Any objection to the exit-code split (1 panic / 2 static / 3 CLI)?
+
+Answers: A1 APPROVED main-as-exit-code. A2 APPROVED strict `==` with the
+int/float hint (Phase 2 rejects cross-type `==` statically, §5.4 note). A3
+APPROVED expression-`if` with the else-required rule (§3). A4 APPROVED
+capture-by-value with the shared-reference clarification (§5.7). A5 The
+25-function catalog stands and is FROZEN — no growth in Phase 1 without
+stop-and-ask. A6 `len` counts CHARS. A7 APPROVED minimalism (`1.` is not a
+float; no `..=`, no hex floats). A8 APPROVED the exit-code split with the
+return-1 collision documented as accepted (§10).
