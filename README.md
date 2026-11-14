@@ -14,6 +14,9 @@
 - `spikes/spike-1b-stack-switching/` — **isolated prototype** for
   Spike 1b (real stackful switching via corosensei on the Spike 1 GC
   contract). Same throwaway status.
+- `spikes/spike-2-hot-reload/` — **isolated prototype** for Spike 2
+  (drain-and-restart reload mechanics on the Spike 1/1b runtime).
+  Same throwaway status.
 - `docs/decisions/` — ADRs (D1–D8 as ratified).
 - `docs/spikes/` — spike reports.
 - `scripts/check.sh` — runs `cargo fmt --check`, `cargo clippy`, `cargo test`.
