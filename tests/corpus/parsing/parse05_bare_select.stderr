@@ -1,0 +1,5 @@
+error[E0101]: expected `{`, found `;`
+ --> parse05_bare_select.gzv:2:11
+  |
+2 |     select;
+  |           ^

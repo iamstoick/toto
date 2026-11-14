@@ -1,0 +1,70 @@
+fn pick(a: chan<int>, b: chan<int>) -> int {
+  // %0: chan<int> (a (param))
+  // %1: chan<int> (b (param))
+  // %2: int (x)
+  // %3: int (y)
+  // %4: int (select)
+  // %5: int (const case index)
+  // %6: bool (case 0 chosen)
+  // %7: int (const case index)
+  // %8: bool (case 1 chosen)
+  // %9: int (const int)
+  bb0:
+    safepoint entry
+    safepoint park
+    %4 = select [recv %0 -> %2, recv %1 -> %3] else default
+    %5 = const 0:int
+    %6 = eq %4, %5
+    br %6 bb2 bb3
+  bb1:
+    falloff
+  bb2:
+    ret %2
+  bb3:
+    %7 = const 1:int
+    %8 = eq %4, %7
+    br %8 bb4 bb5
+  bb4:
+    ret %3
+  bb5:
+    %9 = const 0:int
+    ret %9
+}
+
+fn main() -> int {
+  // %0: int (const int)
+  // %1: chan<int> (chan)
+  // %2: chan<int> (a)
+  // %3: int (const int)
+  // %4: chan<int> (chan)
+  // %5: chan<int> (b)
+  // %6: int (const int)
+  // %7: unit (send)
+  // %8: unit (unit)
+  // %9: fn(chan<int>, chan<int>) -> int (fn pick)
+  // %10: int (call)
+  // %11: int (println())
+  // %12: int (const int)
+  bb0:
+    safepoint entry
+    %0 = const 1:int
+    safepoint alloc
+    %1 = channew int cap %0
+    %2 = copy %1
+    %3 = const 1:int
+    safepoint alloc
+    %4 = channew int cap %3
+    %5 = copy %4
+    %6 = const 3:int
+    safepoint park
+    send %2 <- %6
+    %8 = const ():unit
+    %7 = copy %8
+    %9 = funcref 0
+    safepoint call
+    %10 = call %9(%2, %5)
+    safepoint call
+    %11 = builtin println(%10)
+    %12 = const 0:int
+    ret %12
+}

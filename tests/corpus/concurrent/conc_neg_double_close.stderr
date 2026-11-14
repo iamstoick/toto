@@ -1,0 +1,7 @@
+panic[E0213]: close of a closed channel
+ --> conc_neg_double_close.gzv:4:5
+  |
+4 |     close(ch);
+  |     ^^^^^^^^^
+stack trace:
+  in main at conc_neg_double_close.gzv:1:4

@@ -1,0 +1,10 @@
+fn main() -> int {
+    let ch = chan<int>();
+    go {
+        let v = <-ch;
+        println(v)
+    }
+    let x = 1 / 0;
+    println(x);
+    return 0;
+}

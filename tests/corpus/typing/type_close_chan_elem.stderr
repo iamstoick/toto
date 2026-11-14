@@ -1,0 +1,5 @@
+error[E0315]: cannot close `chan<chan<int>>`: element type has no zero value
+ --> type_close_chan_elem.gzv:5:5
+  |
+5 |     close(outer);
+  |     ^^^^^^^^^^^^ help: recv on a closed channel must yield the zero value; `chan` and `fn` elements have none

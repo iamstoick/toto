@@ -1,0 +1,8 @@
+struct Box { v: int }
+fn main() -> int {
+    let ch = chan<Box>(1);
+    let b = Box { v: 1 };
+    ch <- b;
+    println(b.v);
+    return 0;
+}

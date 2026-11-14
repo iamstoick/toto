@@ -1,0 +1,10 @@
+fn main() -> int {
+    let ch = chan<int>(1);
+    go {
+        ch <- 7;
+        return ();
+        ch <- 8
+    }
+    println(<-ch);
+    return 0;
+}

@@ -11,6 +11,13 @@
 //!   `safepoint alloc`;
 //! - every entry block opens with `safepoint entry`.
 //!
+//! Phase 3 extension (channels, same frozen rules): every blocking op
+//! (`send`, `recv`, `select`) is guarded by an immediately preceding
+//! `safepoint park`; every channel creation and every `spawn` is guarded
+//! by an immediately preceding `safepoint alloc`; every spawned task
+//! body opens with `safepoint entry`. Checks cover nested bodies
+//! (`spawn` targets), not just top-level functions.
+//!
 //! Tier 2 (representation-level: layouts, root publication at runtime,
 //! entry-point signatures, context-switch contract, trap behavior) needs
 //! Cranelift and runs in Phase 3; see ADR-008.
@@ -95,6 +102,37 @@ fn each_instr(prog: &MProgram, mut f: impl FnMut(&str, &[(String, Ty)], &MBlock,
 
 fn is_divcheck_for(instr: &MInstr, divisor: usize) -> bool {
     matches!(instr, MInstr::DivCheck { value, .. } if *value == divisor)
+}
+
+/// Every nested code body in the program: `spawn` targets and closure
+/// bodies, recursively (bodies nest: a `go` body can spawn or close over
+/// further bodies).
+fn nested_bodies(prog: &MProgram) -> Vec<std::sync::Arc<toto_compiler::mir::MirBody>> {
+    use std::sync::Arc;
+    let mut out = Vec::new();
+    let mut stack: Vec<Arc<toto_compiler::mir::MirBody>> = Vec::new();
+    let push_instrs = |instrs: &[MInstr], stack: &mut Vec<Arc<toto_compiler::mir::MirBody>>| {
+        for instr in instrs {
+            match instr {
+                MInstr::Spawn { body, .. } | MInstr::MakeClosure { body, .. } => {
+                    stack.push(body.clone())
+                }
+                _ => {}
+            }
+        }
+    };
+    for func in &prog.fns {
+        for block in &func.blocks {
+            push_instrs(&block.instrs, &mut stack);
+        }
+    }
+    while let Some(body) = stack.pop() {
+        for block in &body.blocks {
+            push_instrs(&block.instrs, &mut stack);
+        }
+        out.push(body);
+    }
+    out
 }
 
 fn is_safepoint(instr: &MInstr, kind: SpKind) -> bool {
@@ -246,9 +284,72 @@ fn abi_conformance_tier1() {
                         i > 0 && guarded(SpKind::Alloc),
                     );
                 }
+                // Phase 3: blocking ops park (roots published before
+                // the suspension); creation ops allocate.
+                MInstr::Send { .. } | MInstr::Recv { .. } | MInstr::Select { .. } => {
+                    check(
+                        &format!("{name} bb{}: blocking op lacks safepoint park", block.id),
+                        i > 0 && guarded(SpKind::Park),
+                    );
+                }
+                MInstr::ChanNew { .. } | MInstr::Spawn { .. } => {
+                    check(
+                        &format!("{name} bb{}: channel/spawn lacks safepoint alloc", block.id),
+                        i > 0 && guarded(SpKind::Alloc),
+                    );
+                }
                 _ => {}
             }
         });
+        // Nested task bodies (spawn targets): entry opens with
+        // `safepoint entry`, and their blocks obey the same guards.
+        for body in nested_bodies(&prog) {
+            let entry = body.blocks.iter().find(|b| b.id == body.entry);
+            check(
+                "spawned body: entry block lacks safepoint entry",
+                matches!(
+                    entry.and_then(|b| b.instrs.first()),
+                    Some(MInstr::Safepoint {
+                        kind: SpKind::Entry
+                    })
+                ),
+            );
+            for block in &body.blocks {
+                for (i, instr) in block.instrs.iter().enumerate() {
+                    let prev = block.instrs.get(i.wrapping_sub(1));
+                    let guarded = |kind: SpKind| prev.is_some_and(|p| is_safepoint(p, kind));
+                    match instr {
+                        MInstr::Bin {
+                            op: MBinOp::Div | MBinOp::Mod,
+                            ..
+                        } => {
+                            // Div/mod guards are checked with locals in
+                            // `each_instr`; nested bodies repeat only the
+                            // park/alloc/entry discipline here.
+                        }
+                        MInstr::Send { .. } | MInstr::Recv { .. } | MInstr::Select { .. } => {
+                            check(
+                                &format!(
+                                    "spawned body bb{}: blocking op lacks safepoint park",
+                                    block.id
+                                ),
+                                i > 0 && guarded(SpKind::Park),
+                            );
+                        }
+                        MInstr::ChanNew { .. } | MInstr::Spawn { .. } => {
+                            check(
+                                &format!(
+                                    "spawned body bb{}: channel/spawn lacks safepoint alloc",
+                                    block.id
+                                ),
+                                i > 0 && guarded(SpKind::Alloc),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
     assert!(
         failures.is_empty(),

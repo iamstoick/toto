@@ -517,6 +517,7 @@ name = "toto-cli"
 version = "0.1.0"
 dependencies = [
  "toto-compiler",
+ "toto-runtime",
 ]
 
 [[package]]
@@ -526,6 +527,11 @@ version = "0.1.0"
 [[package]]
 name = "toto-runtime"
 version = "0.1.0"
+dependencies = [
+ "corosensei",
+ "libc",
+ "toto-compiler",
+]
 
 [[package]]
 name = "unicode-ident"

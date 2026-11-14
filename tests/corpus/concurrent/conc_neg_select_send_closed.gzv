@@ -1,0 +1,10 @@
+fn main() -> int {
+    let ch = chan<int>(1);
+    close(ch);
+    select {
+        ch <- 9 {
+            println(1)
+        }
+    }
+    return 0;
+}

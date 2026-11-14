@@ -1,0 +1,6 @@
+fn main() -> int {
+    let ch = chan<int>();
+    close(ch);
+    ch <- 1;
+    return 0;
+}

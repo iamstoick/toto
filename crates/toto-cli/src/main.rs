@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use toto_compiler::{Outcome, render_errors, render_panic, run_source};
+use toto_compiler::{Outcome, parse_and_check, render_errors, render_panic, run_source};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -54,6 +54,30 @@ fn run_file(path: &str) -> ExitCode {
     };
     // Diagnostic paths show the path as given on the command line.
     let filename = path;
+    // Route concurrent programs to the runtime executor (spec §13);
+    // sequential programs stay on the tree-walking interpreter.
+    let (program, checked) = match parse_and_check(&src) {
+        Ok(parsed) => parsed,
+        Err(diags) => {
+            eprint!("{}", render_errors(&diags, &src, filename));
+            return ExitCode::from(2);
+        }
+    };
+    if checked.uses_concurrency {
+        let outcome =
+            toto_runtime::run_checked(&program, &checked, toto_runtime::RuntimeConfig::default());
+        return match outcome.result {
+            Ok(code) => {
+                let _ = std::io::stdout().write_all(&outcome.stdout);
+                ExitCode::from(code as u8)
+            }
+            Err((diag, trace)) => {
+                let _ = std::io::stdout().write_all(&outcome.stdout);
+                eprint!("{}", render_panic(&diag, &trace, &src, filename));
+                ExitCode::from(1)
+            }
+        };
+    }
     match run_source(&src, filename) {
         Outcome::Success { code, stdout } => {
             let _ = std::io::stdout().write_all(&stdout);

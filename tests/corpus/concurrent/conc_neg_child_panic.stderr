@@ -1,0 +1,8 @@
+panic[E0202]: division by zero
+ --> conc_neg_child_panic.gzv:2:13
+  |
+2 |     let x = 1 / 0;
+  |             ^^^^^
+stack trace:
+  in boom at conc_neg_child_panic.gzv:8:17
+  in go at conc_neg_child_panic.gzv:7:5

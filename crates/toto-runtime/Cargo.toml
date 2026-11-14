@@ -7,3 +7,8 @@ license = "MIT OR Apache-2.0"
 [lib]
 name = "toto_runtime"
 path = "src/lib.rs"
+
+[dependencies]
+toto-compiler = { path = "../toto-compiler" }
+corosensei = "0.3"
+libc = "0.2"

@@ -1,0 +1,6 @@
+fn main() -> int {
+    go {
+        return 1;
+    }
+    return 0;
+}

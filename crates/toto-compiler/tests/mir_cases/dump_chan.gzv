@@ -1,0 +1,11 @@
+fn main() -> int {
+    let ch = chan<int>(2);
+    go {
+        ch <- 1
+    }
+    let v = <-ch;
+    close(ch);
+    println(v);
+    println(closed(ch));
+    return 0;
+}

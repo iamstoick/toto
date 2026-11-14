@@ -1,0 +1,11 @@
+fn main() -> int {
+    let inner = chan<int>(1);
+    let outer = chan<chan<int>>(1);
+    outer <- inner;
+    let got = <-outer;
+    got <- 7;
+    println(<-got);
+    close(got);
+    println(closed(got));
+    return 0;
+}

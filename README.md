@@ -1,14 +1,17 @@
 # Toto (.gzv) — language implementation in Rust
 
-> Phase 2 (type checker + shared typed IR) complete: `toto run` checks
-> first (exit 2, never executes on type errors); HIR + MIR with a MIR
-> interpreter verified by a differential harness over a 97-program corpus;
-> D8 frozen. Phase 3 (runtime + concurrency) in progress.
-> See [Implementation Roadmap v2.3](docs/) and `docs/decisions/`.
+> Phase 3 Stage 1 (single-threaded production runtime) complete:
+> green threads + channels + GC heap + forced collection,
+> deterministic, gate green (76 tests). `toto run` routes concurrent
+> programs through the MIR executor on 64 KiB coroutine stacks.
+> Stage 2 (M:N) and Stage 3 (ABI gates) carry forward.
+> See [Phase 3 report](docs/phases/phase-3-runtime.md).
 
 ## Layout
 
-- `crates/toto-runtime/` — production runtime scaffold (empty until Phase 3).
+- `crates/toto-runtime/` — production runtime (GC heap, corosensei
+  scheduler, channels/select/scopes, MIR executor, deterministic
+  mode). No `Rc`/`RefCell`; all cross-task state is `Arc`+`Mutex`.
 - `crates/toto-compiler/` — lexer, parser, diagnostics, tree-walking
   interpreter, plus the Phase 2 checker, shared `ops`, HIR, MIR, and MIR
   interpreter (differential-tested against the tree-walker).

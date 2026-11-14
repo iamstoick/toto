@@ -1,0 +1,11 @@
+error[E0308]: `?` on a `Result` needs an enclosing function returning `Result`
+ --> type_question_in_go.gzv:6:17
+  |
+6 |         let x = f()?;
+  |                 ^^^^
+
+error[E0301]: undefined variable `x`
+ --> type_question_in_go.gzv:7:17
+  |
+7 |         println(x)
+  |                 ^

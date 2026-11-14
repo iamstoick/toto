@@ -1,0 +1,12 @@
+fn main() -> int {
+    let ch = chan<int>();
+    select {
+        let v = <-ch {
+            println(v)
+        }
+        default {
+            println(0)
+        }
+    }
+    return 0;
+}

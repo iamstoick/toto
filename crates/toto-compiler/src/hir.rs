@@ -21,6 +21,8 @@ pub enum Ty {
     Map(Box<Ty>, Box<Ty>),
     Result(Box<Ty>, Box<Ty>),
     Option(Box<Ty>),
+    /// `chan<T>`: channel carrying values of type `T`.
+    Chan(Box<Ty>),
     Struct(String),
     /// Function types. Spelling `fn(T1, T2) -> R` is PROVISIONAL (Phase 2
     /// report): the core subset has first-class functions (spec §4,
@@ -49,6 +51,7 @@ impl fmt::Display for Ty {
             Ty::Map(k, v) => write!(f, "Map<{k}, {v}>"),
             Ty::Result(t, e) => write!(f, "Result<{t}, {e}>"),
             Ty::Option(t) => write!(f, "Option<{t}>"),
+            Ty::Chan(t) => write!(f, "chan<{t}>"),
             Ty::Struct(name) => write!(f, "{name}"),
             Ty::Fn(params, ret) => {
                 write!(f, "fn(")?;
@@ -152,6 +155,35 @@ pub enum HStmtKind {
         iter: HExpr,
         body: Box<HBlock>,
     },
+    /// `go <block>`: spawn a child task. Completion is observed through
+    /// scopes and channels; the statement yields `unit`.
+    Go {
+        body: Box<HBlock>,
+        /// Names bound outside the `go` body that it uses (immutable only;
+        /// `mut` captures are rejected by the checker).
+        captured: Vec<(String, Ty)>,
+    },
+    /// `select` with guarded cases and an optional trailing `default`.
+    Select {
+        cases: Vec<HSelectCase>,
+        default: Option<Box<HBlock>>,
+    },
+}
+
+/// One checked `select` case.
+#[derive(Clone, Debug)]
+pub enum HSelectCase {
+    Recv {
+        /// `let v = <-ch` binding, or `None` for a discarding `<-ch`.
+        name: Option<(String, Span)>,
+        chan: HExpr,
+        body: Box<HBlock>,
+    },
+    Send {
+        chan: HExpr,
+        value: HExpr,
+        body: Box<HBlock>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +259,20 @@ pub enum HExprKind {
     Err(Box<HExpr>),
     Some(Box<HExpr>),
     None,
+    /// `ch <- v`: send (an expression yielding `unit`).
+    Send {
+        chan: Box<HExpr>,
+        value: Box<HExpr>,
+    },
+    /// `<-ch`: receive.
+    Recv {
+        chan: Box<HExpr>,
+    },
+    /// `chan<T>()` / `chan<T>(n)`: channel construction.
+    ChanNew {
+        elem_ty: Ty,
+        cap: Option<Box<HExpr>>,
+    },
     /// `operand?` with resolved types: `inner` is the unwrapped type,
     /// `fn_ret` the enclosing function's return type (conversion target).
     Question {
@@ -250,4 +296,8 @@ pub struct CheckedProgram {
     pub program: HProgram,
     pub fns: Vec<FnSig>,
     pub structs: HashMap<String, HStructDecl>,
+    /// True when the program uses concurrency (`go`, channels, `select`).
+    /// The CLI routes such programs to the runtime executor; sequential
+    /// programs keep running on the tree-walking interpreter.
+    pub uses_concurrency: bool,
 }
