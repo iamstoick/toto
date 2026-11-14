@@ -1,0 +1,15 @@
+[package]
+name = "ffi-smoke-test"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "ffi_smoke_test"
+path = "src/lib.rs"
+
+[dependencies]
+spike-1-gc-scheduler = { path = "../spike-1-gc-scheduler" }
+
+[build-dependencies]
+cc = "1"
