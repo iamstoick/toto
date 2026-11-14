@@ -1,9 +1,12 @@
 [package]
 name = "toto-cli"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "toto"
 path = "src/main.rs"
+
+[dependencies]
+toto-compiler = { path = "../toto-compiler" }
