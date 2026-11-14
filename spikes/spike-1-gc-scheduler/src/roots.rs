@@ -27,10 +27,10 @@ impl ShadowStack {
     }
 
     /// Open a frame, returning its base cookie. Pair with `close`.
-    /// `Cx::with_frame` is the task-facing wrapper; this exists so the
-    /// scheduler side and unit tests can manage frames without borrow
-    /// gymnastics.
-    pub(crate) fn open(&mut self) -> usize {
+    /// `Cx::with_frame` is the task-facing wrapper. Public (since
+    /// Spike 1b) so other prototype schedulers sharing this module can
+    /// manage frames without borrow gymnastics.
+    pub fn open(&mut self) -> usize {
         let base = self.roots.len();
         self.frames.push(base);
         base
@@ -38,7 +38,7 @@ impl ShadowStack {
 
     /// Close the frame opened by `open`, popping its roots. Frames must
     /// close in LIFO order (debug-asserted).
-    pub(crate) fn close(&mut self, base: usize, frames_len: usize) {
+    pub fn close(&mut self, base: usize, frames_len: usize) {
         debug_assert_eq!(self.frames.len(), frames_len);
         debug_assert_eq!(self.frames.pop(), Some(base));
         self.pop_to(base);
@@ -90,7 +90,7 @@ impl ShadowStack {
         self.roots.truncate(base);
     }
 
-    pub(crate) fn frames_len(&self) -> usize {
+    pub fn frames_len(&self) -> usize {
         self.frames.len()
     }
 }

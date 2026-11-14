@@ -1,0 +1,22 @@
+[package]
+name = "spike-1b-stack-switching"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "spike_1b_stack_switching"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demo1b"
+path = "src/bin/demo1b.rs"
+
+[[bin]]
+name = "overflow1b"
+path = "src/bin/overflow.rs"
+
+[dependencies]
+spike-1-gc-scheduler = { path = "../spike-1-gc-scheduler" }
+corosensei = "0.3"
+libc = "0.2"

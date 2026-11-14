@@ -11,6 +11,9 @@
 - `spikes/spike-1-gc-scheduler/` — **isolated prototype** for Spike 1
   (single-threaded cooperative scheduler + stop-the-world tracing GC).
   Throwaway code: it may be deleted, and it is NOT the production runtime.
+- `spikes/spike-1b-stack-switching/` — **isolated prototype** for
+  Spike 1b (real stackful switching via corosensei on the Spike 1 GC
+  contract). Same throwaway status.
 - `docs/decisions/` — ADRs (D1–D8 as ratified).
 - `docs/spikes/` — spike reports.
 - `scripts/check.sh` — runs `cargo fmt --check`, `cargo clippy`, `cargo test`.

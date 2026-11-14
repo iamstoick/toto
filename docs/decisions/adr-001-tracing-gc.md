@@ -66,3 +66,14 @@ If generated-code root scanning or pause times prove unworkable in
 Phase 3 (real codegen, real heaps), fall back to ARC with weak
 references and documented cycle leaks. Do not drift into
 ownership/borrowing without a separate RFC.
+
+## Safepoint-protocol note from Spike 1b (appended; decision unchanged)
+
+Spike 1b extended the protocol to allocation + switch/yield
+boundary (`docs/spikes/spike-1b-stack-switching.md`). The native
+stack is never scanned; each task's shadow stack lives in
+scheduler-owned memory so no shadow-pointer save/restore crosses a
+switch. `send` enforces publish-before-switch with a runtime assert
+at the suspend site; the yield side rests on construction plus a
+missed-root control test. Forced GCs while tasks are suspended
+mid-computation stay exact. No change to the collector design.
