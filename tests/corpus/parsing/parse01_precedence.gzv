@@ -1,0 +1,11 @@
+fn main() -> int {
+    println(1 + 2 * 3);
+    println((1 + 2) * 3);
+    println(10 - 4 - 3);
+    println(2 * 3 % 4);
+    println(1 < 2 == true);
+    println(true || false && false);
+    println(!false && true);
+    println(0..2 + 1);
+    return 0;
+}

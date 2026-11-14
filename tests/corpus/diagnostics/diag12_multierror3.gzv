@@ -1,0 +1,4 @@
+fn bad() -> int {
+    let y = if x = 1 { 1 } else { 2 };
+    let = 3;
+    return y;

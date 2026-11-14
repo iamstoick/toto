@@ -1,0 +1,11 @@
+fn tag(s: string) -> string {
+    print(s);
+    return s;
+}
+
+fn main() -> int {
+    println(tag("a") + tag("b") + tag("c"));
+    let arr = [tag("x")];
+    push(arr, tag("y"));
+    return 0;
+}

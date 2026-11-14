@@ -1,0 +1,5 @@
+error[E0107]: `if` used as an expression requires an `else` branch
+ --> diag06_bare_if.gzv:2:13
+  |
+2 |     let x = if true { 1 };
+  |             ^^^^^^^^^^^^^ help: add an `else` branch, or use `if` as a statement

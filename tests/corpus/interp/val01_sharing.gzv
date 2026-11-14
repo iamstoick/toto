@@ -1,0 +1,19 @@
+struct Pt { x: int }
+
+fn bump(p: Pt) -> unit {
+    p.x = p.x + 1;
+}
+
+fn main() -> int {
+    let a = [1, 2];
+    let b = a;
+    push(b, 3);
+    println(a);
+    let p = Pt { x: 1 };
+    bump(p);
+    println(p.x);
+    let v = 10;
+    let v = v + 1;
+    println(v);
+    return 0;
+}

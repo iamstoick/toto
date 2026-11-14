@@ -1,0 +1,7 @@
+panic[E0205]: missing field `y` in `Point` literal
+ --> struct02_shape.gzv:4:13
+  |
+4 |     let p = Point { x: 1 };
+  |             ^^^^^^^^^^^^^^
+stack trace:
+  in main at struct02_shape.gzv:3:4

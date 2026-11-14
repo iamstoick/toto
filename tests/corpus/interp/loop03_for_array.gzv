@@ -1,0 +1,12 @@
+fn main() -> int {
+    let words = ["a", "bb", "ccc"];
+    for w in words {
+        println(w);
+    }
+    let mut total = 0;
+    for v in [1, 2, 3] {
+        total = total + v;
+    }
+    println(total);
+    return 0;
+}

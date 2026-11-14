@@ -1,0 +1,5 @@
+error[E0104]: invalid assignment target
+ --> diag05_bad_assign.gzv:2:5
+  |
+2 |     1 = 2;
+  |     ^ help: assign to a variable, field, or index

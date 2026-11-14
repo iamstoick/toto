@@ -1,0 +1,6 @@
+fn main() -> int {
+    if true & false {
+        println("x");
+    }
+    return 0;
+}

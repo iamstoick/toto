@@ -1,0 +1,7 @@
+panic[E0207]: if condition must be bool, got int
+ --> diag08_cond_type.gzv:2:8
+  |
+2 |     if 42 {
+  |        ^^
+stack trace:
+  in main at diag08_cond_type.gzv:1:4

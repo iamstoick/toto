@@ -1,0 +1,7 @@
+panic[E0204]: wrong number of arguments: `add` takes 2, got 1
+ --> fn01_arity.gzv:6:13
+  |
+6 |     println(add(1));
+  |             ^^^^^^
+stack trace:
+  in main at fn01_arity.gzv:5:4

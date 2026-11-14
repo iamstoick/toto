@@ -1,0 +1,17 @@
+error[E0102]: expected `;` after `let` statement, found identifier
+ --> parse02_multierror.gzv:3:5
+  |
+3 |     println(x));
+  |     ^^^^^^^ help: add `;` at the end of the statement
+
+error[E0101]: expected binding name, found `=`
+ --> parse02_multierror.gzv:4:9
+  |
+4 |     let = 5;
+  |         ^
+
+error[E0104]: invalid assignment target
+ --> parse02_multierror.gzv:5:5
+  |
+5 |     1 = 2;
+  |     ^ help: assign to a variable, field, or index

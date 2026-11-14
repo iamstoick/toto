@@ -1,0 +1,7 @@
+panic[E0209]: index 5 out of bounds for array of length 2
+ --> arr01_oob.gzv:3:13
+  |
+3 |     println(a[5]);
+  |             ^^^^
+stack trace:
+  in main at arr01_oob.gzv:1:4

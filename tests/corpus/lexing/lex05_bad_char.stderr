@@ -1,0 +1,5 @@
+error[E0001]: unexpected character `$`
+ --> lex05_bad_char.gzv:2:13
+  |
+2 |     println($);
+  |             ^

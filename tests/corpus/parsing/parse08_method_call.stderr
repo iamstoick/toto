@@ -1,0 +1,5 @@
+error[E0158]: method-call syntax is not in v1
+ --> parse08_method_call.gzv:3:13
+  |
+3 |     println(a.len());
+  |             ^^^^^ help: Toto v1 has functions only; call a function with the value as an argument

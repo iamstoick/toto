@@ -1,0 +1,7 @@
+panic[E0202]: division by zero
+ --> int03_divzero.gzv:2:13
+  |
+2 |     println(1 / 0);
+  |             ^^^^^
+stack trace:
+  in main at int03_divzero.gzv:1:4

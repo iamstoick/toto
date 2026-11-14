@@ -1,0 +1,8 @@
+fn main() -> int {
+    let x = 1;
+    if x = 1 {
+        println("one");
+    }
+    println("done";
+    return 0;
+}

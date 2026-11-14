@@ -1,0 +1,18 @@
+fn main() -> int {
+    let text = read_file("cli01_input.txt");
+    let lines = split(text, "\n");
+    println(len(lines));
+    let mut total = 0;
+    for line in lines {
+        let t = trim(line);
+        if t == "" {
+            continue;
+        }
+        total = total + parse_int(t);
+    }
+    println(total);
+    println(file_exists("cli01_input.txt"));
+    write_file("cli01_tmp.txt", to_string(total));
+    println(read_file("cli01_tmp.txt"));
+    return 0;
+}

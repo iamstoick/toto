@@ -1,0 +1,5 @@
+error[E0001]: unexpected character `&`
+ --> diag03_and_suggest.gzv:2:13
+  |
+2 |     if true & false {
+  |             ^ help: did you mean `&&`?

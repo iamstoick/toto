@@ -1,0 +1,11 @@
+error[E0154]: user-defined generics are not supported in v1 (generic functions)
+ --> parse06_reject_generics_extern.gzv:1:6
+  |
+1 | fn id<T>(x: T) -> T {
+  |      ^ help: remove the type parameters
+
+error[E0155]: `unsafe` FFI blocks execute in Phase 5
+ --> parse06_reject_generics_extern.gzv:6:5
+  |
+6 |     unsafe {
+  |     ^^^^^^

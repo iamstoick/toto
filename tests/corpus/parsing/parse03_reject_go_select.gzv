@@ -1,0 +1,7 @@
+fn main() -> int {
+    go {
+        println("bg");
+    }
+    select;
+    return 0;
+}

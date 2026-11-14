@@ -1,0 +1,5 @@
+error[E0102]: expected `;` after `let` statement, found identifier
+ --> diag04_missing_semi.gzv:3:5
+  |
+3 |     println(x);
+  |     ^^^^^^^ help: add `;` at the end of the statement

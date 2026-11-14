@@ -1,0 +1,12 @@
+fn main() -> int {
+    println(1 == 1);
+    println(1 != 2);
+    println(1 < 2);
+    println(2 <= 2);
+    println(3 > 4);
+    println(true == true);
+    println(false != true);
+    println("a" < "b");
+    println("abc" == "abc");
+    return 0;
+}

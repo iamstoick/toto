@@ -514,15 +514,18 @@ checksum = "8c447be3a2abfa84b2d91680c56600bd6b2873866de27b36ec911be705e291da"
 
 [[package]]
 name = "toto-cli"
-version = "0.0.0"
+version = "0.1.0"
+dependencies = [
+ "toto-compiler",
+]
 
 [[package]]
 name = "toto-compiler"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "toto-runtime"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"

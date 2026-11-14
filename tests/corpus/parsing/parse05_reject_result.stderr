@@ -1,0 +1,5 @@
+error[E0153]: `?` error propagation is specified now and executes in Phase 2
+ --> parse05_reject_result.gzv:6:16
+  |
+6 |     let x = f()?;
+  |                ^

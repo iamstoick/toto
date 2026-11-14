@@ -1,0 +1,14 @@
+struct Point { x: int, y: int }
+
+fn origin() -> Point {
+    return Point { x: 0, y: 0 };
+}
+
+fn main() -> int {
+    let p = Point { y: 2, x: 1 };
+    println(p.x + p.y);
+    p.x = 10;
+    println(p);
+    println(origin());
+    return 0;
+}

@@ -1,0 +1,10 @@
+fn noop() -> unit {
+}
+
+fn main() -> int {
+    println("héllo" == "héllo");
+    println("a" + "b" == "ab");
+    println(noop() == ());
+    println(noop());
+    return 0;
+}
