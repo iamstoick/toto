@@ -20,6 +20,9 @@
 - `spikes/spike-3-cranelift/` — **isolated prototype** for Spike 3
   (Cranelift JIT from toy IR against the Spike 1 heap).
   Same throwaway status.
+- `spikes/ffi-smoke-test/` — **isolated prototype** for the D6 FFI
+  smoke test (one C file through `extern "C"` declarations).
+  Same throwaway status.
 - `docs/decisions/` — ADRs (D1–D8 as ratified).
 - `docs/spikes/` — spike reports.
 - `scripts/check.sh` — runs `cargo fmt --check`, `cargo clippy`, `cargo test`.
