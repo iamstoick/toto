@@ -627,7 +627,7 @@ impl Parser<'_> {
                     None
                 };
                 self.expect(|k| matches!(k, TokenKind::Eq), "`=`")?;
-                let value = self.parse_expr(true, false)?;
+                let value = self.parse_expr(false, false)?;
                 self.expect_semi("after `let` statement")?;
                 Ok(StmtOut::Stmt(Sp::new(
                     StmtKind::Let {
@@ -642,7 +642,7 @@ impl Parser<'_> {
             }
             TokenKind::Return => {
                 self.bump();
-                let value = self.parse_expr(true, false)?;
+                let value = self.parse_expr(false, false)?;
                 self.expect_semi("after `return`")?;
                 Ok(StmtOut::Stmt(Sp::new(
                     StmtKind::Return(value),
@@ -815,7 +815,7 @@ impl Parser<'_> {
                 let expr = self.parse_expr(true, true)?;
                 if matches!(self.peek().kind, TokenKind::Eq) {
                     self.bump();
-                    let value = self.parse_expr(true, false)?;
+                    let value = self.parse_expr(false, false)?;
                     self.expect_semi("after assignment")?;
                     let target = match expr.node {
                         ExprKind::Var(name) => AssignTarget::Var(name, expr.span),
@@ -852,17 +852,36 @@ impl Parser<'_> {
                         StmtKind::Expr(expr),
                         start.merge(self.prev_span()),
                     )))
-                } else if matches!(expr.node, ExprKind::If { .. })
-                    && !matches!(self.peek().kind, TokenKind::RBrace)
-                {
-                    // Statement-position `if` needs no `;`.
-                    Ok(StmtOut::Stmt(Sp::new(
-                        StmtKind::Expr(expr),
-                        start.merge(self.prev_span()),
-                    )))
                 } else {
-                    // No `;`: this is a block tail expression candidate.
-                    Ok(StmtOut::Tail(expr))
+                    // No `;`: sort statement-`if` from tails from errors.
+                    let is_if = matches!(&expr.node, ExprKind::If { .. });
+                    let is_bare_if =
+                        matches!(&expr.node, ExprKind::If { else_b: None, .. });
+                    let at_rbrace = matches!(self.peek().kind, TokenKind::RBrace);
+                    if is_bare_if && at_rbrace {
+                        // A block tail is expression position (spec §3).
+                        self.error(
+                            "E0107",
+                            "`if` used as an expression requires an `else` branch"
+                                .to_string(),
+                            expr.span,
+                            Some(
+                                "add an `else` branch, or use `if` as a statement"
+                                    .to_string(),
+                            ),
+                        );
+                        return Err(());
+                    }
+                    if is_if {
+                        // Statement-position `if` needs no `;`.
+                        Ok(StmtOut::Stmt(Sp::new(
+                            StmtKind::Expr(expr),
+                            start.merge(self.prev_span()),
+                        )))
+                    } else {
+                        // Tail candidate; parse_block requires `}` next.
+                        Ok(StmtOut::Tail(expr))
+                    }
                 }
             }
         }
@@ -1134,7 +1153,7 @@ impl Parser<'_> {
                     let close = self.bump();
                     return Ok(Sp::new(ExprKind::Unit, start.merge(close.span)));
                 }
-                let inner = self.parse_expr(true, false)?;
+                let inner = self.parse_expr(false, false)?;
                 self.expect_close(start, &TokenKind::RParen, "(")?;
                 let span = start.merge(self.prev_span());
                 Ok(Sp::new(inner.node, span))
