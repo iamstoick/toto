@@ -1,0 +1,11 @@
+error[E0303]: if branches must agree in type: then is int, else is string
+ --> type12_if_branch_mismatch.gzv:2:13
+  |
+2 |     let x = if true { 1 } else { "s" };
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0301]: undefined variable `x`
+ --> type12_if_branch_mismatch.gzv:3:13
+  |
+3 |     println(x);
+  |             ^

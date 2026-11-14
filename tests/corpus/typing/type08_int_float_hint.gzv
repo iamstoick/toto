@@ -1,0 +1,4 @@
+fn main() -> int {
+    println(1 + 1.5);
+    return 0;
+}

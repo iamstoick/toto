@@ -1,0 +1,5 @@
+error[E0303]: cannot add int and float
+ --> type08_int_float_hint.gzv:2:13
+  |
+2 |     println(1 + 1.5);
+  |             ^^^^^^^ help: int and float do not mix implicitly; convert explicitly with to_int or to_float

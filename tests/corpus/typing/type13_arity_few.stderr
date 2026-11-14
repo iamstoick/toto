@@ -1,0 +1,5 @@
+error[E0304]: wrong number of arguments: takes 3, got 2
+ --> type13_arity_few.gzv:6:13
+  |
+6 |     println(f(1, 2));
+  |             ^^^^^^^

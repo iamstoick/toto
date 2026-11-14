@@ -1,0 +1,20 @@
+fn main() -> int {
+    let mut total = 0;
+    for i in 0..5 {
+        total = total + i;
+    }
+    let mut k = 0;
+    while k < 3 {
+        k = k + 1;
+        if k == 2 {
+            continue;
+        }
+        total = total + k;
+    }
+    let xs = [7, 8];
+    for x in xs {
+        total = total + x;
+    }
+    println(total);
+    return 0;
+}

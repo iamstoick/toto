@@ -1,0 +1,4 @@
+fn main() -> int {
+    println(1 == true);
+    return 0;
+}

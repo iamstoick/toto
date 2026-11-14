@@ -1,0 +1,116 @@
+fn main() -> int {
+  // %0: int (const int)
+  // %1: int (total)
+  // %2: int (const int)
+  // %3: int (const int)
+  // %4: int (i i)
+  // %5: bool (i cond)
+  // %6: int (i)
+  // %7: int (bin)
+  // %8: int (i next)
+  // %9: bool (i done)
+  // %10: int (const int)
+  // %11: int (k)
+  // %12: int (const int)
+  // %13: bool (bin)
+  // %14: int (const int)
+  // %15: int (bin)
+  // %16: int (const int)
+  // %17: bool (bin)
+  // %18: unit (if)
+  // %19: unit (unit)
+  // %20: int (bin)
+  // %21: int (const int)
+  // %22: int (const int)
+  // %23: Array<int> (array)
+  // %24: Array<int> (xs)
+  // %25: Array<int> (x snap)
+  // %26: int (x len)
+  // %27: int (x i)
+  // %28: int (const 0)
+  // %29: bool (x cond)
+  // %30: int (x)
+  // %31: int (bin)
+  // %32: int (const 1)
+  // %33: int (x next)
+  // %34: int (println())
+  // %35: int (const int)
+  bb0:
+    safepoint entry
+    %0 = const 0:int
+    %1 = copy %0
+    %2 = const 0:int
+    %3 = const 5:int
+    %4 = copy %2
+    jump bb1
+  bb1:
+    safepoint loop
+    %5 = lt %4, %3
+    br %5 bb2 bb4
+  bb2:
+    %6 = copy %4
+    %7 = add %1, %6
+    %1 = copy %7
+    jump bb3
+  bb3:
+    %8 = satincr %4
+    %9 = eq %8, %3
+    %4 = copy %8
+    br %9 bb4 bb1
+  bb4:
+    %10 = const 0:int
+    %11 = copy %10
+    jump bb5
+  bb5:
+    safepoint loop
+    %12 = const 3:int
+    %13 = lt %11, %12
+    br %13 bb6 bb7
+  bb6:
+    %14 = const 1:int
+    %15 = add %11, %14
+    %11 = copy %15
+    %16 = const 2:int
+    %17 = eq %11, %16
+    br %17 bb8 bb9
+  bb7:
+    %21 = const 7:int
+    %22 = const 8:int
+    safepoint alloc
+    %23 = array [%21, %22]
+    %24 = copy %23
+    %25 = snapshot %24
+    %26 = len %25
+    %28 = const 0:int
+    %27 = copy %28
+    jump bb11
+  bb8:
+    jump bb5
+  bb9:
+    %19 = const ():unit
+    %18 = copy %19
+    jump bb10
+  bb10:
+    %20 = add %1, %11
+    %1 = copy %20
+    jump bb5
+  bb11:
+    safepoint loop
+    %29 = lt %27, %26
+    br %29 bb12 bb14
+  bb12:
+    %30 = index %25[%27]
+    %31 = add %1, %30
+    %1 = copy %31
+    jump bb13
+  bb13:
+    %32 = const 1:int
+    %33 = add %27, %32
+    %27 = copy %33
+    jump bb11
+  bb14:
+    safepoint call
+    %34 = builtin println(%1)
+    %35 = const 0:int
+    ret %35
+}

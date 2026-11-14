@@ -1,0 +1,5 @@
+error[E0303]: mismatched types: expected int, found bool
+ --> type33_cross_eq_bool.gzv:2:18
+  |
+2 |     println(1 == true);
+  |                  ^^^^

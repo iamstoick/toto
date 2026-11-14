@@ -34,11 +34,12 @@ fn method_call_rejected_with_phase_hint() {
 #[test]
 fn out_of_subset_names_its_phase() {
     assert!(codes("fn main() -> int {\n go { }\n return 0;\n}\n").contains(&"E0151"));
+    // `?` is no longer out of subset: it parses since Phase 2 (spec §11).
     assert!(
         codes(
             "fn main() -> int {\n let x = f()?;\n return 0;\n}\nfn f() -> int {\n return 1;\n}\n"
         )
-        .contains(&"E0153")
+        .is_empty()
     );
     assert!(
         codes("fn id<T>(x: T) -> T {\n return x;\n}\nfn main() -> int {\n return 0;\n}\n")

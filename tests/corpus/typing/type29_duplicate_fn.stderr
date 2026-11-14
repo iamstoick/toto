@@ -1,0 +1,5 @@
+error[E0311]: duplicate definition of function `dup`
+ --> type29_duplicate_fn.gzv:5:4
+  |
+5 | fn dup() -> int {
+  |    ^^^

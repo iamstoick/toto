@@ -1,0 +1,5 @@
+error[E0303]: mismatched types: expected int, found string
+ --> type06_arg_mismatch.gzv:6:20
+  |
+6 |     println(add(1, "s"));
+  |                    ^^^

@@ -1,0 +1,5 @@
+error[E0303]: mismatched types: expected int, found string
+ --> type35_push_mismatch.gzv:3:21
+  |
+3 |     println(push(a, "s"));
+  |                     ^^^

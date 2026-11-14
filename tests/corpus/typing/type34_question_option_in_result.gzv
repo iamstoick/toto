@@ -1,0 +1,13 @@
+fn f() -> Option<int> {
+    return Some(1);
+}
+
+fn g() -> Result<int, string> {
+    let x = f()?;
+    return Ok(x);
+}
+
+fn main() -> int {
+    println(g());
+    return 0;
+}

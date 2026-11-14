@@ -1,0 +1,5 @@
+error[E0312]: program has no `fn main() -> int`
+ --> type36_no_main.gzv:1:1
+  |
+1 | fn helper() -> int {
+  | ^

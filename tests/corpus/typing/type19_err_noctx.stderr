@@ -1,0 +1,11 @@
+error[E0309]: cannot infer the error type of `Err`
+ --> type19_err_noctx.gzv:2:13
+  |
+2 |     let e = Err("x");
+  |             ^^^^^^^^ help: add an annotation, e.g. `let x: Result<int, string> = Err(…)`
+
+error[E0301]: undefined variable `e`
+ --> type19_err_noctx.gzv:3:13
+  |
+3 |     println(e);
+  |             ^

@@ -4,9 +4,14 @@
 
 pub mod ast;
 pub mod builtins;
+pub mod check;
 pub mod diag;
+pub mod hir;
 pub mod interp;
 pub mod lexer;
+pub mod mir;
+pub mod mir_interp;
+pub mod ops;
 pub mod parser;
 pub mod span;
 pub mod token;
@@ -44,6 +49,13 @@ pub fn run_source(src: &str, _filename: &str) -> Outcome {
     if !parse_errors.is_empty() {
         return Outcome::Static(parse_errors);
     }
+    // Phase 2: check before interpreting. A program with type errors
+    // never executes (spec §9.1: exit code 2 for static diagnostics).
+    let (checked, check_errors) = check::check(&program);
+    if !check_errors.is_empty() {
+        return Outcome::Static(check_errors);
+    }
+    let _ = checked;
     // The tree-walking interpreter recurses on the host stack (one Rust
     // call chain per Toto call level). The 8,192-frame semantic limit
     // (spec §5.9) needs more host stack than the default 8 MiB in debug

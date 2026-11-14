@@ -1,0 +1,14 @@
+fn f() -> Option<int> {
+    return None;
+}
+
+fn g() -> Option<int> {
+    let v = f()?;
+    return Some(v + 1);
+}
+
+fn main() -> int {
+    let o: Option<int> = g();
+    println(o);
+    return 0;
+}

@@ -1,0 +1,19 @@
+fn f() -> Result<int, string> {
+    return Err("root-cause");
+}
+
+fn g() -> Result<int, string> {
+    let v = f()?;
+    return Ok(v);
+}
+
+fn h() -> Result<int, string> {
+    let w = g()?;
+    return Ok(w + 1);
+}
+
+fn main() -> int {
+    let r: Result<int, string> = h();
+    println(r);
+    return 0;
+}

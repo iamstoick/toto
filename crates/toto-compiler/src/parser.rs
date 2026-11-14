@@ -507,6 +507,36 @@ impl Parser<'_> {
 
     fn parse_type(&mut self) -> PResult<Type> {
         let start = self.peek().span;
+        // Provisional function-type syntax `fn(T1, T2) -> R` (spec §4 note).
+        if matches!(self.peek().kind, TokenKind::Fn) {
+            self.bump();
+            let open = self.expect(|k| matches!(k, TokenKind::LParen), "`(`")?.span;
+            let mut params = Vec::new();
+            if !matches!(self.peek().kind, TokenKind::RParen) {
+                loop {
+                    params.push(self.parse_type()?);
+                    if matches!(self.peek().kind, TokenKind::Comma) {
+                        self.bump();
+                        if matches!(self.peek().kind, TokenKind::RParen) {
+                            break;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+            }
+            self.expect_close(open, &TokenKind::RParen, "(")?;
+            self.expect(|k| matches!(k, TokenKind::Arrow), "`->`")?;
+            let ret = self.parse_type()?;
+            let span = start.merge(ret.span);
+            return Ok(Type {
+                kind: TypeKind::Fn {
+                    params,
+                    ret: Box::new(ret),
+                },
+                span,
+            });
+        }
         let name = match self.peek().kind.clone() {
             TokenKind::Ident(n) => {
                 self.bump();
@@ -559,8 +589,7 @@ impl Parser<'_> {
             self.bump();
         }
         Ok(Type {
-            name,
-            args,
+            kind: TypeKind::Named { name, args },
             span: start.merge(self.prev_span()),
         })
     }
@@ -1120,15 +1149,9 @@ impl Parser<'_> {
                     );
                 }
                 TokenKind::Question => {
-                    let span = self.bump().span;
-                    self.error(
-                        "E0153",
-                        "`?` error propagation is specified now and executes in Phase 2"
-                            .to_string(),
-                        span,
-                        None,
-                    );
-                    return Err(());
+                    self.bump();
+                    let span = expr.span.merge(self.prev_span());
+                    expr = Sp::new(ExprKind::Question(Box::new(expr)), span);
                 }
                 _ => break,
             }
@@ -1211,12 +1234,29 @@ impl Parser<'_> {
             }
             TokenKind::If => self.parse_if(allow_bare_if, no_struct),
             TokenKind::Fn => self.parse_closure(),
-            // Phase 2 value constructors: parse as ordinary calls so the
-            // interpreter can reject them with E0206 (spec §3.3).
-            TokenKind::Ok | TokenKind::Err | TokenKind::Some | TokenKind::None => {
+            // `Result`/`Option` constructors (checked and executed since
+            // Phase 2): `Ok(e)`, `Err(e)`, `Some(e)` take exactly one
+            // argument; `None` stands alone.
+            TokenKind::Ok | TokenKind::Err | TokenKind::Some => {
                 let t = self.bump();
-                let name = t.kind.name().trim_matches('`').to_string();
-                Ok(Sp::new(ExprKind::Var(name), t.span))
+                let is_ok = matches!(t.kind, TokenKind::Ok);
+                let is_err = matches!(t.kind, TokenKind::Err);
+                let open = self.expect(|k| matches!(k, TokenKind::LParen), "`(`")?.span;
+                let inner = self.parse_expr(false, false, false)?;
+                self.expect_close(open, &TokenKind::RParen, "(")?;
+                let span = t.span.merge(self.prev_span());
+                let kind = if is_ok {
+                    ExprKind::Ok(Box::new(inner))
+                } else if is_err {
+                    ExprKind::Err(Box::new(inner))
+                } else {
+                    ExprKind::Some(Box::new(inner))
+                };
+                Ok(Sp::new(kind, span))
+            }
+            TokenKind::None => {
+                let t = self.bump();
+                Ok(Sp::new(ExprKind::None, t.span))
             }
             TokenKind::Ident(name) => {
                 self.bump();

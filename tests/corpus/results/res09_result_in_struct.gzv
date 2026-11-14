@@ -1,0 +1,9 @@
+struct Outcome { code: int, detail: Result<int, string> }
+
+fn main() -> int {
+    let ok: Result<int, string> = Ok(1);
+    let o = Outcome { code: 0, detail: ok };
+    println(o.code);
+    println(o.detail);
+    return 0;
+}

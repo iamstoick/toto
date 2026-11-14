@@ -1,0 +1,11 @@
+error[E0308]: `?` on a `Result` needs an enclosing function returning `Result`
+ --> type21_question_wrong_fn.gzv:6:13
+  |
+6 |     let x = f()?;
+  |             ^^^^
+
+error[E0301]: undefined variable `x`
+ --> type21_question_wrong_fn.gzv:7:12
+  |
+7 |     return x;
+  |            ^

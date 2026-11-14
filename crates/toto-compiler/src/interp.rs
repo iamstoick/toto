@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::ast::TypeKind;
 use crate::ast::*;
 use crate::diag::Diag;
 use crate::span::Span;
@@ -28,6 +29,10 @@ pub enum Value {
     Range(i64, i64),
     Closure(Rc<ClosureVal>),
     Func(usize),
+    Ok(Box<Value>),
+    Err(Box<Value>),
+    Some(Box<Value>),
+    None,
 }
 
 #[derive(Clone, Debug)]
@@ -38,10 +43,25 @@ pub struct StructVal {
 
 #[derive(Clone, Debug)]
 pub struct ClosureVal {
-    pub params: Vec<Param>,
-    pub ret: Type,
-    pub body: Box<Block>,
+    pub code: ClosureCode,
     pub captured: Vec<(String, Value)>,
+}
+
+/// Where a closure's code lives. The tree-walking interpreter creates
+/// `Ast`; the MIR interpreter (Phase 2) creates `Mir`. Each interpreter
+/// only ever executes its own variant: a value never crosses between them.
+#[derive(Clone, Debug)]
+pub enum ClosureCode {
+    Ast {
+        params: Vec<Param>,
+        ret: Type,
+        body: Box<Block>,
+    },
+    Mir {
+        params: Vec<(String, crate::hir::Ty)>,
+        ret: crate::hir::Ty,
+        body: std::sync::Arc<crate::mir::MirBody>,
+    },
 }
 
 impl Value {
@@ -57,6 +77,8 @@ impl Value {
             Value::Struct(_) => "struct",
             Value::Range(_, _) => "Range",
             Value::Closure(_) | Value::Func(_) => "function",
+            Value::Ok(_) | Value::Err(_) => "Result",
+            Value::Some(_) | Value::None => "Option",
         }
     }
 }
@@ -88,6 +110,22 @@ fn fmt_val(
         Value::Str(s) => out.push_str(s),
         Value::Range(a, b) => out.push_str(&format!("{a}..{b}")),
         Value::Closure(_) => out.push_str("<closure>"),
+        Value::Ok(v) => {
+            out.push_str("Ok(");
+            fmt_val(v, fns, out, visiting, depth + 1);
+            out.push(')');
+        }
+        Value::Err(v) => {
+            out.push_str("Err(");
+            fmt_val(v, fns, out, visiting, depth + 1);
+            out.push(')');
+        }
+        Value::Some(v) => {
+            out.push_str("Some(");
+            fmt_val(v, fns, out, visiting, depth + 1);
+            out.push(')');
+        }
+        Value::None => out.push_str("None"),
         Value::Func(idx) => {
             let name = fns.get(*idx).map(|f| f.name.as_str()).unwrap_or("?");
             out.push_str(&format!("<fn {name}>"));
@@ -139,6 +177,27 @@ pub struct TraceFrame {
     pub span: Span,
 }
 
+/// Enclosing-function return shape (for `?`). The checker guarantees the
+/// error types line up, so `?` propagation here is identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetKind {
+    Result,
+    Option,
+    Other,
+}
+
+fn ret_kind(ty: &Type) -> RetKind {
+    match &ty.kind {
+        TypeKind::Named { name, .. } if name == "Result" => RetKind::Result,
+        TypeKind::Named { name, .. } if name == "Option" => RetKind::Option,
+        _ => RetKind::Other,
+    }
+}
+
+fn is_unit_ret(ty: &Type) -> bool {
+    matches!(&ty.kind, TypeKind::Named { name, .. } if name == "unit")
+}
+
 #[derive(Clone, Debug)]
 struct Slot {
     value: Value,
@@ -167,6 +226,8 @@ pub struct Interp {
     trace: Vec<TraceFrame>,
     call_depth: usize,
     pub output: Vec<u8>,
+    /// Enclosing function return kinds (for `?`); pushed per call.
+    ret_stack: Vec<RetKind>,
 }
 
 impl Interp {
@@ -193,6 +254,7 @@ impl Interp {
             trace: Vec::new(),
             call_depth: 0,
             output: Vec::new(),
+            ret_stack: Vec::new(),
         }
     }
 
@@ -294,6 +356,7 @@ impl Interp {
             name: decl.name.clone(),
             span,
         });
+        self.ret_stack.push(ret_kind(&decl.ret));
         let mut frame = HashMap::new();
         for (param, arg) in decl.params.iter().zip(args) {
             frame.insert(
@@ -307,9 +370,10 @@ impl Interp {
         let mut scopes = vec![frame];
         let result = self.eval_block_value(&decl.body, &mut scopes);
         self.call_depth -= 1;
+        self.ret_stack.pop();
         match result {
             Ok(v) => {
-                if decl.ret.name == "unit" {
+                if is_unit_ret(&decl.ret) {
                     self.trace.pop();
                     Ok(Value::Unit)
                 } else if decl.body.tail.is_none() {
@@ -359,13 +423,26 @@ impl Interp {
         span: Span,
         display: &str,
     ) -> Result<Value, (Diag, Vec<TraceFrame>)> {
-        if args.len() != closure.params.len() {
+        let ClosureCode::Ast { params, ret, body } = &closure.code else {
+            // Unreachable: the tree-walker only creates Ast closures, and
+            // values never cross to the MIR interpreter.
+            return Err((
+                Diag::new(
+                    "E0204",
+                    "internal error: MIR closure called by tree-walking interpreter".to_string(),
+                    span,
+                    None,
+                ),
+                std::mem::take(&mut self.trace),
+            ));
+        };
+        if args.len() != params.len() {
             return Err((
                 Diag::new(
                     "E0204",
                     format!(
                         "wrong number of arguments: closure takes {}, got {}",
-                        closure.params.len(),
+                        params.len(),
                         args.len()
                     ),
                     span,
@@ -392,6 +469,7 @@ impl Interp {
             name: display.to_string(),
             span,
         });
+        self.ret_stack.push(ret_kind(ret));
         let mut frame = HashMap::new();
         for (name, value) in &closure.captured {
             frame.insert(
@@ -402,7 +480,7 @@ impl Interp {
                 },
             );
         }
-        for (param, arg) in closure.params.iter().zip(args) {
+        for (param, arg) in params.iter().zip(args) {
             frame.insert(
                 param.name.clone(),
                 Slot {
@@ -412,20 +490,21 @@ impl Interp {
             );
         }
         let mut scopes = vec![frame];
-        let result = self.eval_block_value(&closure.body, &mut scopes);
+        let result = self.eval_block_value(body, &mut scopes);
         self.call_depth -= 1;
+        self.ret_stack.pop();
         match result {
             Ok(v) => {
-                if closure.ret.name == "unit" {
+                if is_unit_ret(ret) {
                     self.trace.pop();
                     Ok(Value::Unit)
-                } else if closure.body.tail.is_none() {
+                } else if body.tail.is_none() {
                     // Fell off the end: keep this frame for the trace.
                     Err((
                         Diag::new(
                             "E0212",
                             "closure exited without returning a value".to_string(),
-                            closure.body.span,
+                            body.span,
                             None,
                         ),
                         std::mem::take(&mut self.trace),
@@ -651,63 +730,14 @@ impl Interp {
             }
             AssignTarget::Field(base, field_name, field_span) => {
                 let b = self.eval_expr(base, scopes)?;
-                match b {
-                    Value::Struct(cell) => {
-                        let mut s = cell.borrow_mut();
-                        match s.fields.iter_mut().find(|(n, _)| n == field_name) {
-                            Some((_, slot)) => {
-                                *slot = value;
-                                Ok(())
-                            }
-                            None => Err(panic(
-                                "E0209",
-                                format!("struct {} has no field `{field_name}`", s.name),
-                                *field_span,
-                                None,
-                            )),
-                        }
-                    }
-                    other => Err(panic(
-                        "E0209",
-                        format!("cannot assign field on {}", other.type_name()),
-                        *field_span,
-                        None,
-                    )),
-                }
+                crate::ops::field_write(b, field_name, value, *field_span)
+                    .map_err(|(d, t)| Signal::Panic(d, t))
             }
             AssignTarget::Index(base, index, _) => {
                 let b = self.eval_expr(base, scopes)?;
                 let i = self.eval_expr(index, scopes)?;
-                match (b, i) {
-                    (Value::Array(cell), Value::Int(n)) => {
-                        let mut arr = cell.borrow_mut();
-                        if n < 0 || (n as usize) >= arr.len() {
-                            return Err(panic(
-                                "E0209",
-                                format!(
-                                    "index {n} out of bounds for array of length {}",
-                                    arr.len()
-                                ),
-                                span,
-                                None,
-                            ));
-                        }
-                        arr[n as usize] = value;
-                        Ok(())
-                    }
-                    (Value::Array(_), other) => Err(panic(
-                        "E0209",
-                        format!("array index must be int, got {}", other.type_name()),
-                        index.span,
-                        None,
-                    )),
-                    (other, _) => Err(panic(
-                        "E0209",
-                        format!("cannot index {}", other.type_name()),
-                        span,
-                        None,
-                    )),
-                }
+                crate::ops::index_write(b, i, value, span, index.span)
+                    .map_err(|(d, t)| Signal::Panic(d, t))
             }
         }
     }
@@ -721,27 +751,42 @@ impl Interp {
             ExprKind::Str(s) => Ok(Value::Str(Rc::new(s.clone()))),
             ExprKind::Bool(b) => Ok(Value::Bool(*b)),
             ExprKind::Unit => Ok(Value::Unit),
+            ExprKind::Ok(inner) => Ok(Value::Ok(Box::new(self.eval_expr(inner, scopes)?))),
+            ExprKind::Err(inner) => Ok(Value::Err(Box::new(self.eval_expr(inner, scopes)?))),
+            ExprKind::Some(inner) => Ok(Value::Some(Box::new(self.eval_expr(inner, scopes)?))),
+            ExprKind::None => Ok(Value::None),
+            ExprKind::Question(inner) => {
+                let v = self.eval_expr(inner, scopes)?;
+                let enclosing = match self.ret_stack.last().copied().unwrap_or(RetKind::Other) {
+                    RetKind::Result => crate::ops::FnRetKind::Result,
+                    RetKind::Option => crate::ops::FnRetKind::Option,
+                    RetKind::Other => crate::ops::FnRetKind::Other,
+                };
+                // The checker guarantees the error type matches the
+                // enclosing return type, so propagation is identity and
+                // the original error value is preserved as the cause.
+                match crate::ops::propagate(v, enclosing, expr.span) {
+                    Ok(unwrapped) => Ok(unwrapped),
+                    Err(crate::ops::Propagate::Return(e)) => Err(Signal::Return(e)),
+                    Err(crate::ops::Propagate::Bug(span)) => Err(panic(
+                        "E0204",
+                        "`?` outside a matching Result/Option function (unreachable in checked programs)".to_string(),
+                        span,
+                        None,
+                    )),
+                }
+            }
             ExprKind::Var(name) => match self.lookup(scopes, name) {
                 Some(v) => Ok(v),
                 // Named functions are first-class values.
                 None => match self.fn_index.get(name) {
                     Some(&idx) => Ok(Value::Func(idx)),
-                    None => match name.as_str() {
-                        "Ok" | "Err" | "Some" | "None" => Err(panic(
-                            "E0206",
-                            format!(
-                                "`{name}` is a Phase 2 value (Result/Option execution arrives in Phase 2)"
-                            ),
-                            expr.span,
-                            None,
-                        )),
-                        _ => Err(panic(
-                            "E0208",
-                            format!("undefined variable `{name}`"),
-                            expr.span,
-                            None,
-                        )),
-                    },
+                    None => Err(panic(
+                        "E0208",
+                        format!("undefined variable `{name}`"),
+                        expr.span,
+                        None,
+                    )),
                 },
             },
             ExprKind::If {
@@ -779,9 +824,11 @@ impl Interp {
                     }
                 }
                 Ok(Value::Closure(Rc::new(ClosureVal {
-                    params: params.clone(),
-                    ret: ret.clone(),
-                    body: body.clone(),
+                    code: ClosureCode::Ast {
+                        params: params.clone(),
+                        ret: ret.clone(),
+                        body: body.clone(),
+                    },
                     captured,
                 })))
             }
@@ -876,59 +923,13 @@ impl Interp {
             ExprKind::Call { callee, args } => self.eval_call(callee, args, expr.span, scopes),
             ExprKind::Field { base, name } => {
                 let b = self.eval_expr(base, scopes)?;
-                match b {
-                    Value::Struct(cell) => {
-                        let s = cell.borrow();
-                        match s.fields.iter().find(|(n, _)| n == name) {
-                            Some((_, v)) => Ok(v.clone()),
-                            None => Err(panic(
-                                "E0209",
-                                format!("struct {} has no field `{name}`", s.name),
-                                expr.span,
-                                None,
-                            )),
-                        }
-                    }
-                    other => Err(panic(
-                        "E0209",
-                        format!("cannot access field of {}", other.type_name()),
-                        expr.span,
-                        None,
-                    )),
-                }
+                crate::ops::field_read(b, name, expr.span).map_err(|(d, t)| Signal::Panic(d, t))
             }
             ExprKind::Index { base, index } => {
                 let b = self.eval_expr(base, scopes)?;
                 let i = self.eval_expr(index, scopes)?;
-                match (b, i) {
-                    (Value::Array(cell), Value::Int(n)) => {
-                        let arr = cell.borrow();
-                        if n < 0 || (n as usize) >= arr.len() {
-                            return Err(panic(
-                                "E0209",
-                                format!(
-                                    "index {n} out of bounds for array of length {}",
-                                    arr.len()
-                                ),
-                                expr.span,
-                                None,
-                            ));
-                        }
-                        Ok(arr[n as usize].clone())
-                    }
-                    (Value::Array(_), other) => Err(panic(
-                        "E0209",
-                        format!("array index must be int, got {}", other.type_name()),
-                        index.span,
-                        None,
-                    )),
-                    (other, _) => Err(panic(
-                        "E0209",
-                        format!("cannot index {}", other.type_name()),
-                        expr.span,
-                        None,
-                    )),
-                }
+                crate::ops::index_read(b, i, expr.span, index.span)
+                    .map_err(|(d, t)| Signal::Panic(d, t))
             }
         }
     }
@@ -1032,22 +1033,12 @@ impl Interp {
                 }
                 return result;
             }
-            return match name.as_str() {
-                "Ok" | "Err" | "Some" | "None" => Err(panic(
-                    "E0206",
-                    format!(
-                        "`{name}` is a Phase 2 value (Result/Option execution arrives in Phase 2)"
-                    ),
-                    callee.span,
-                    None,
-                )),
-                _ => Err(panic(
-                    "E0208",
-                    format!("undefined variable `{name}`"),
-                    callee.span,
-                    None,
-                )),
-            };
+            return Err(panic(
+                "E0208",
+                format!("undefined variable `{name}`"),
+                callee.span,
+                None,
+            ));
         }
         let target = self.eval_expr(callee, scopes)?;
         self.call_value(&target, values, span, "<value>")
@@ -1079,75 +1070,30 @@ impl Interp {
         }
     }
 
-    fn eval_unary(&mut self, op: UnOp, v: Value, inner_span: Span, span: Span) -> Exec<Value> {
+    fn eval_unary(&self, op: UnOp, v: Value, inner_span: Span, span: Span) -> Exec<Value> {
+        let wrap = |r: crate::ops::OpResult<Value>| r.map_err(|(d, t)| Signal::Panic(d, t));
         match op {
-            UnOp::Neg => match v {
-                Value::Int(i) => match i.checked_neg() {
-                    Some(n) => Ok(Value::Int(n)),
-                    None => Err(panic("E0201", "integer overflow".to_string(), span, None)),
-                },
-                Value::Float(f) => Ok(Value::Float(-f)),
-                other => Err(panic(
-                    "E0203",
-                    format!("cannot negate {}", other.type_name()),
-                    inner_span,
-                    None,
-                )),
-            },
-            UnOp::Not => match v {
-                Value::Bool(b) => Ok(Value::Bool(!b)),
-                other => Err(panic(
-                    "E0203",
-                    format!("`!` needs a bool, got {}", other.type_name()),
-                    inner_span,
-                    None,
-                )),
-            },
+            UnOp::Neg => wrap(crate::ops::neg_value(v, inner_span, span)),
+            UnOp::Not => wrap(crate::ops::not_value(v, inner_span)),
         }
     }
 
     fn eval_binary(&mut self, op: BinOp, l: Value, r: Value, span: Span) -> Exec<Value> {
+        // Value semantics live in `crate::ops`, shared with the MIR
+        // interpreter; fallible ops convert to `Signal::Panic` here.
+        let wrap = |r: crate::ops::OpResult<Value>| r.map_err(|(d, t)| Signal::Panic(d, t));
         match op {
-            BinOp::Add => self.arith(l, r, span, "add", |a, b| a.checked_add(b)),
-            BinOp::Sub => self.arith(l, r, span, "subtract", |a, b| a.checked_sub(b)),
-            BinOp::Mul => self.arith(l, r, span, "multiply", |a, b| a.checked_mul(b)),
-            BinOp::Div => match (l, r) {
-                (Value::Int(a), Value::Int(b)) => {
-                    if b == 0 {
-                        return Err(panic("E0202", "division by zero".to_string(), span, None));
-                    }
-                    match a.checked_div(b) {
-                        Some(n) => Ok(Value::Int(n)),
-                        None => Err(panic("E0201", "integer overflow".to_string(), span, None)),
-                    }
-                }
-                (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
-                (a, b) => Err(panic(
-                    "E0203",
-                    format!("cannot divide {} by {}", a.type_name(), b.type_name()),
-                    span,
-                    self.int_float_hint(&a, &b),
-                )),
-            },
-            BinOp::Mod => match (l, r) {
-                (Value::Int(a), Value::Int(b)) => {
-                    if b == 0 {
-                        return Err(panic("E0202", "modulo by zero".to_string(), span, None));
-                    }
-                    // i64::MIN % -1 is the only overflow; its value is 0.
-                    Ok(Value::Int(a.wrapping_rem(b)))
-                }
-                (a, b) => Err(panic(
-                    "E0203",
-                    format!(
-                        "cannot take modulo of {} and {}",
-                        a.type_name(),
-                        b.type_name()
-                    ),
-                    span,
-                    self.int_float_hint(&a, &b),
-                )),
-            },
+            BinOp::Add => wrap(crate::ops::arith(l, r, span, "add", |a, b| {
+                a.checked_add(b)
+            })),
+            BinOp::Sub => wrap(crate::ops::arith(l, r, span, "subtract", |a, b| {
+                a.checked_sub(b)
+            })),
+            BinOp::Mul => wrap(crate::ops::arith(l, r, span, "multiply", |a, b| {
+                a.checked_mul(b)
+            })),
+            BinOp::Div => wrap(crate::ops::div_values(l, r, span)),
+            BinOp::Mod => wrap(crate::ops::mod_values(l, r, span)),
             BinOp::Range => match (l, r) {
                 (Value::Int(a), Value::Int(b)) => Ok(Value::Range(a, b)),
                 (a, b) => Err(panic(
@@ -1161,158 +1107,12 @@ impl Interp {
                     None,
                 )),
             },
-            BinOp::Eq => self.equality(l, r, span, true),
-            BinOp::NotEq => self.equality(l, r, span, false),
-            BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => self.ordering(op, l, r, span),
+            BinOp::Eq => wrap(crate::ops::equality(l, r, span, true)),
+            BinOp::NotEq => wrap(crate::ops::equality(l, r, span, false)),
+            BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
+                wrap(crate::ops::ordering(op, l, r, span))
+            }
             BinOp::And | BinOp::Or => unreachable!("short-circuit handled in eval_expr"),
         }
-    }
-
-    fn int_float_hint(&self, a: &Value, b: &Value) -> Option<String> {
-        if matches!(
-            (a, b),
-            (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_))
-        ) {
-            Some(
-                "int and float do not mix implicitly; convert explicitly with to_int or to_float"
-                    .to_string(),
-            )
-        } else {
-            None
-        }
-    }
-
-    fn arith(
-        &mut self,
-        l: Value,
-        r: Value,
-        span: Span,
-        verb: &str,
-        op: fn(i64, i64) -> Option<i64>,
-    ) -> Exec<Value> {
-        match (l, r) {
-            (Value::Int(a), Value::Int(b)) => match op(a, b) {
-                Some(n) => Ok(Value::Int(n)),
-                None => Err(panic("E0201", "integer overflow".to_string(), span, None)),
-            },
-            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(match verb {
-                "add" => a + b,
-                "subtract" => a - b,
-                _ => a * b,
-            })),
-            (Value::Str(a), Value::Str(b)) if verb == "add" => {
-                let mut s = a.as_ref().clone();
-                s.push_str(b.as_ref());
-                Ok(Value::Str(Rc::new(s)))
-            }
-            (a, b) => Err(panic(
-                "E0203",
-                format!("cannot {verb} {} and {}", a.type_name(), b.type_name()),
-                span,
-                self.int_float_hint(&a, &b),
-            )),
-        }
-    }
-
-    fn equality(&mut self, l: Value, r: Value, span: Span, want_eq: bool) -> Exec<Value> {
-        let same_type = std::mem::discriminant(&l) == std::mem::discriminant(&r)
-            && !(matches!(&l, Value::Struct(_))
-                && matches!(&r, Value::Struct(_))
-                && struct_name(&l) != struct_name(&r))
-            && !(matches!(&l, Value::Closure(_)) && matches!(&r, Value::Func(_)))
-            && !(matches!(&l, Value::Func(_)) && matches!(&r, Value::Closure(_)));
-        if !same_type {
-            return Err(panic(
-                "E0203",
-                format!("cannot compare {} with {}", l.type_name(), r.type_name()),
-                span,
-                self.int_float_hint(&l, &r),
-            ));
-        }
-        let eq = self.values_equal(&l, &r, 0);
-        Ok(Value::Bool(if want_eq { eq } else { !eq }))
-    }
-
-    fn values_equal(&self, a: &Value, b: &Value, depth: usize) -> bool {
-        if depth > 100 {
-            // Cycle guard (spec §5.4): fall back to identity.
-            return match (a, b) {
-                (Value::Array(x), Value::Array(y)) => Rc::ptr_eq(x, y),
-                (Value::Struct(x), Value::Struct(y)) => Rc::ptr_eq(x, y),
-                _ => false,
-            };
-        }
-        match (a, b) {
-            (Value::Int(x), Value::Int(y)) => x == y,
-            (Value::Float(x), Value::Float(y)) => x == y,
-            (Value::Bool(x), Value::Bool(y)) => x == y,
-            (Value::Unit, Value::Unit) => true,
-            (Value::Str(x), Value::Str(y)) => x == y,
-            (Value::Range(a, b), Value::Range(c, d)) => a == c && b == d,
-            (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),
-            (Value::Func(x), Value::Func(y)) => x == y,
-            (Value::Array(x), Value::Array(y)) => {
-                if Rc::ptr_eq(x, y) {
-                    return true;
-                }
-                let x = x.borrow();
-                let y = y.borrow();
-                x.len() == y.len()
-                    && x.iter()
-                        .zip(y.iter())
-                        .all(|(e, f)| self.values_equal(e, f, depth + 1))
-            }
-            (Value::Struct(x), Value::Struct(y)) => {
-                if Rc::ptr_eq(x, y) {
-                    return true;
-                }
-                let x = x.borrow();
-                let y = y.borrow();
-                x.name == y.name
-                    && x.fields.len() == y.fields.len()
-                    && x.fields
-                        .iter()
-                        .zip(y.fields.iter())
-                        .all(|((n, e), (m, f))| n == m && self.values_equal(e, f, depth + 1))
-            }
-            _ => false,
-        }
-    }
-
-    fn ordering(&mut self, op: BinOp, l: Value, r: Value, span: Span) -> Exec<Value> {
-        let ord = match (&l, &r) {
-            (Value::Int(a), Value::Int(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => {
-                // NaN comparisons are false (IEEE).
-                match a.partial_cmp(b) {
-                    Some(o) => o,
-                    None => return Ok(Value::Bool(false)),
-                }
-            }
-            (Value::Str(a), Value::Str(b)) => a.cmp(b),
-            _ => {
-                return Err(panic(
-                    "E0203",
-                    format!("cannot order {} and {}", l.type_name(), r.type_name()),
-                    span,
-                    self.int_float_hint(&l, &r),
-                ));
-            }
-        };
-        let result = match op {
-            BinOp::Lt => ord == std::cmp::Ordering::Less,
-            BinOp::LtEq => ord != std::cmp::Ordering::Greater,
-            BinOp::Gt => ord == std::cmp::Ordering::Greater,
-            BinOp::GtEq => ord != std::cmp::Ordering::Less,
-            _ => unreachable!(),
-        };
-        Ok(Value::Bool(result))
-    }
-}
-
-fn struct_name(v: &Value) -> String {
-    match v {
-        Value::Struct(cell) => cell.borrow().name.clone(),
-        _ => String::new(),
     }
 }

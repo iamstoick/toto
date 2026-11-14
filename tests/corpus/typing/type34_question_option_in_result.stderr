@@ -1,0 +1,11 @@
+error[E0308]: `?` on an `Option` needs an enclosing function returning `Option`
+ --> type34_question_option_in_result.gzv:6:13
+  |
+6 |     let x = f()?;
+  |             ^^^^
+
+error[E0301]: undefined variable `x`
+ --> type34_question_option_in_result.gzv:7:15
+  |
+7 |     return Ok(x);
+  |               ^

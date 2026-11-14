@@ -1,0 +1,11 @@
+error[E0302]: type `Array` takes 1 argument, got 0
+ --> type03_array_arity.gzv:2:12
+  |
+2 |     let x: Array = [1];
+  |            ^^^^^
+
+error[E0301]: undefined variable `x`
+ --> type03_array_arity.gzv:3:13
+  |
+3 |     println(x);
+  |             ^

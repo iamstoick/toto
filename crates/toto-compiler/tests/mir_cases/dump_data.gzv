@@ -1,0 +1,12 @@
+struct Pair { x: int, y: int }
+
+fn main() -> int {
+    let p = Pair { x: 1, y: 2 };
+    p.x = 10;
+    let a = [1, 2, 3];
+    a[0] = 9;
+    let r = 1..4;
+    println(p.x);
+    println(a[0]);
+    return 0;
+}

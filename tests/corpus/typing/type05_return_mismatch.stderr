@@ -1,0 +1,5 @@
+error[E0303]: mismatched types: expected int, found string
+ --> type05_return_mismatch.gzv:2:12
+  |
+2 |     return "s";
+  |            ^^^

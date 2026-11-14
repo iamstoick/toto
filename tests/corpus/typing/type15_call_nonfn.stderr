@@ -1,0 +1,5 @@
+error[E0305]: call of non-function value (int)
+ --> type15_call_nonfn.gzv:3:13
+  |
+3 |     println(f());
+  |             ^

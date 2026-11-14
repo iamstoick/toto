@@ -1,0 +1,11 @@
+error[E0308]: `?` needs a `Result` or `Option`, found int
+ --> type20_question_plain.gzv:6:13
+  |
+6 |     let x = f()?;
+  |             ^^^^
+
+error[E0301]: undefined variable `x`
+ --> type20_question_plain.gzv:7:13
+  |
+7 |     println(x);
+  |             ^

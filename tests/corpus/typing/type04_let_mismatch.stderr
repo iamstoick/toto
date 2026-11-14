@@ -1,0 +1,11 @@
+error[E0303]: mismatched types: expected int, found string
+ --> type04_let_mismatch.gzv:2:18
+  |
+2 |     let x: int = "s";
+  |                  ^^^
+
+error[E0301]: undefined variable `x`
+ --> type04_let_mismatch.gzv:3:13
+  |
+3 |     println(x);
+  |             ^

@@ -1,0 +1,5 @@
+error[E0313]: cannot assign to function `foo`
+ --> type31_assign_fn.gzv:6:5
+  |
+6 |     foo = 2;
+  |     ^^^

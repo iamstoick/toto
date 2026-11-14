@@ -1,0 +1,5 @@
+error[E0310]: cannot index string
+ --> type28_index_string.gzv:3:13
+  |
+3 |     println(s[0]);
+  |             ^^^^

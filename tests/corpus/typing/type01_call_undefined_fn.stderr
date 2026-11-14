@@ -1,0 +1,5 @@
+error[E0301]: undefined variable `nosuchfn`
+ --> type01_call_undefined_fn.gzv:2:13
+  |
+2 |     println(nosuchfn(1));
+  |             ^^^^^^^^

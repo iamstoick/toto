@@ -1,0 +1,8 @@
+fn f() -> Result<int, string> {
+    return Ok(1);
+}
+
+fn main() -> int {
+    f();
+    return 0;
+}

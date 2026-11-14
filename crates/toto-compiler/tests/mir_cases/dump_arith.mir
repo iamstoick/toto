@@ -1,0 +1,53 @@
+fn main() -> int {
+  // %0: int (const int)
+  // %1: int (const int)
+  // %2: int (const int)
+  // %3: int (bin)
+  // %4: int (bin)
+  // %5: int (a)
+  // %6: int (const int)
+  // %7: int (bin)
+  // %8: int (b)
+  // %9: int (const int)
+  // %10: int (bin)
+  // %11: int (c)
+  // %12: float (const float)
+  // %13: float (const float)
+  // %14: float (bin)
+  // %15: float (d)
+  // %16: int (println())
+  // %17: int (println())
+  // %18: int (println())
+  // %19: int (println())
+  // %20: int (const int)
+  bb0:
+    safepoint entry
+    %0 = const 10:int
+    %1 = const 20:int
+    %2 = const 2:int
+    %3 = mul %1, %2
+    %4 = add %0, %3
+    %5 = copy %4
+    %6 = const 3:int
+    divcheck %6
+    %7 = div %5, %6
+    %8 = copy %7
+    %9 = const 3:int
+    divcheck %9
+    %10 = mod %5, %9
+    %11 = copy %10
+    %12 = const 1.5:float
+    %13 = const 2.5:float
+    %14 = add %12, %13
+    %15 = copy %14
+    safepoint call
+    %16 = builtin println(%5)
+    safepoint call
+    %17 = builtin println(%8)
+    safepoint call
+    %18 = builtin println(%11)
+    safepoint call
+    %19 = builtin println(%15)
+    %20 = const 0:int
+    ret %20
+}

@@ -1,0 +1,11 @@
+error[E0308]: cannot convert error type string to int with `?`; handle the error explicitly
+ --> type22_question_err_mismatch.gzv:6:13
+  |
+6 |     let x = f()?;
+  |             ^^^^
+
+error[E0301]: undefined variable `x`
+ --> type22_question_err_mismatch.gzv:7:15
+  |
+7 |     return Ok(x);
+  |               ^

@@ -1,0 +1,5 @@
+error[E0303]: mismatched types: expected bool, found int
+ --> type10_not_int.gzv:2:14
+  |
+2 |     println(!1);
+  |              ^

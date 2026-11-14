@@ -1,0 +1,8 @@
+fn foo() -> int {
+    return 1;
+}
+
+fn main() -> int {
+    foo = 2;
+    return 0;
+}

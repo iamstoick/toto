@@ -1,0 +1,7 @@
+fn main() -> int {
+    let e: Result<int, string> = Ok(5);
+    let a = [e];
+    println(len(a));
+    println(a[0]);
+    return 0;
+}

@@ -1,0 +1,8 @@
+fn f() -> int {
+    return "s";
+}
+
+fn main() -> int {
+    println(f());
+    return 0;
+}

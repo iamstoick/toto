@@ -1,0 +1,5 @@
+error[E0304]: wrong number of arguments: `len` takes 1, got 2
+ --> type14_arity_builtin.gzv:2:13
+  |
+2 |     println(len("a", "b"));
+  |             ^^^^^^^^^^^^^

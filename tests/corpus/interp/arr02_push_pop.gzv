@@ -1,5 +1,5 @@
 fn main() -> int {
-    let a = [];
+    let a: Array<string> = [];
     println(len(a));
     println(push(a, "x"));
     println(push(a, "y"));

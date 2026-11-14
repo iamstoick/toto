@@ -1,0 +1,6 @@
+fn main() -> int {
+    for i in 5 {
+        println(i);
+    }
+    return 0;
+}

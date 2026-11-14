@@ -1,7 +1,0 @@
-panic[E0206]: `Ok` is a Phase 2 value (Result/Option execution arrives in Phase 2)
- --> diag09_phase2_ok.gzv:2:13
-  |
-2 |     println(Ok(1));
-  |             ^^
-stack trace:
-  in main at diag09_phase2_ok.gzv:1:4

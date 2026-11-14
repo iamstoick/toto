@@ -1,0 +1,8 @@
+fn f() -> Option<int> {
+    return Some(1);
+}
+
+fn main() -> int {
+    f();
+    return 0;
+}

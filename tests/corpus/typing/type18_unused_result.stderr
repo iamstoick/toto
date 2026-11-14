@@ -1,0 +1,5 @@
+error[E0307]: unused `Result<int, string>` value
+ --> type18_unused_result.gzv:6:5
+  |
+6 |     f();
+  |     ^^^ help: bind it with `let`, propagate it with `?`, or return it

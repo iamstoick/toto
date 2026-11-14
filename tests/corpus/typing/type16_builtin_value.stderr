@@ -1,0 +1,11 @@
+error[E0305]: builtin `print` is not a first-class value (call it directly)
+ --> type16_builtin_value.gzv:2:13
+  |
+2 |     let p = print;
+  |             ^^^^^
+
+error[E0301]: undefined variable `p`
+ --> type16_builtin_value.gzv:3:13
+  |
+3 |     println(p);
+  |             ^

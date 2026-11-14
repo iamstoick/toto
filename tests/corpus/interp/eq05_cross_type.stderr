@@ -1,7 +1,5 @@
-panic[E0203]: cannot compare int with string
- --> eq05_cross_type.gzv:2:13
+error[E0303]: mismatched types: expected int, found string
+ --> eq05_cross_type.gzv:2:18
   |
 2 |     println(1 == "1");
-  |             ^^^^^^^^
-stack trace:
-  in main at eq05_cross_type.gzv:1:4
+  |                  ^^^

@@ -1,0 +1,14 @@
+fn pick(flag: bool) -> Option<int> {
+    if flag {
+        return Some(1);
+    }
+    return None;
+}
+
+fn main() -> int {
+    let a: Option<int> = pick(true);
+    println(a);
+    let b: Option<int> = pick(false);
+    println(b);
+    return 0;
+}

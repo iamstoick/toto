@@ -1,0 +1,11 @@
+error[E0309]: cannot infer the type of `None`
+ --> type24_none_noctx.gzv:2:13
+  |
+2 |     let x = None;
+  |             ^^^^ help: add an annotation, e.g. `let x: Option<int> = None`
+
+error[E0301]: undefined variable `x`
+ --> type24_none_noctx.gzv:3:13
+  |
+3 |     println(x);
+  |             ^
