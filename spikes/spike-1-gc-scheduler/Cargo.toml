@@ -1,0 +1,13 @@
+[package]
+name = "spike-1-gc-scheduler"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "spike_1_gc_scheduler"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spike1-demo"
+path = "src/main.rs"
