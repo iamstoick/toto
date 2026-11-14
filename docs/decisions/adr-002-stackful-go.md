@@ -46,3 +46,16 @@ state machine, which would split the stdlib into two colors.
 If no suitable context-switching approach works with
 Cranelift-generated code and FFI, revisit. Do not mix models in v1:
 no `async fn` alongside `go`.
+
+## Spike 1b findings (appended; decision unchanged)
+
+Spike 1b (`docs/spikes/spike-1b-stack-switching.md`) validated the
+mechanism this ADR defers: real stackful switching on one OS thread
+via **corosensei 0.3.4** (fixed 64 KiB mmap stacks, PROT_NONE guard
+page, ~115–145 ns/resume debug). Tasks yield from nested calls with
+locals intact; shadow-stack roots survive real switches exactly;
+guard-page overflow is a defined SIGSEGV trap (child-process test).
+Measured high-water on spike workloads is 2–3 KiB — the 64 KiB
+default is sufficient for spikes but stays provisional until
+generated code re-measures it. No amendment to the decision; the
+revisit trigger stands.
