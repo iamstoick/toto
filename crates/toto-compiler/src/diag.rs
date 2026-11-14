@@ -13,12 +13,7 @@ pub struct Diag {
 }
 
 impl Diag {
-    pub fn new(
-        code: &'static str,
-        message: String,
-        span: Span,
-        help: Option<String>,
-    ) -> Self {
+    pub fn new(code: &'static str, message: String, span: Span, help: Option<String>) -> Self {
         Self {
             code,
             message,
@@ -75,10 +70,7 @@ impl Diag {
 fn span_char_len(span: Span, src: &str, line_start: usize) -> usize {
     let end = (span.end as usize).min(src.len());
     let from = (span.start as usize).max(line_start).min(end);
-    src[from..end]
-        .chars()
-        .take_while(|&c| c != '\n')
-        .count()
+    src[from..end].chars().take_while(|&c| c != '\n').count()
 }
 
 /// Render several diagnostics separated by blank lines.

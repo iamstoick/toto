@@ -1,0 +1,6 @@
+fn main() -> int {
+    if 42 {
+        println("x");
+    }
+    return 0;
+}

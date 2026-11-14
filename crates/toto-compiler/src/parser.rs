@@ -207,6 +207,17 @@ impl Parser<'_> {
             annotations.push(self.parse_annotation()?);
         }
         match self.peek().kind.clone() {
+            TokenKind::Import | TokenKind::Mod | TokenKind::Use | TokenKind::Pub => {
+                let t = self.bump();
+                self.error(
+                    "E0157",
+                    format!("{} modules and imports arrive in Phase 2", t.kind.name()),
+                    start.merge(t.span),
+                    None,
+                );
+                self.sync_item();
+                Err(())
+            }
             TokenKind::Fn => {
                 let mut decl = self.parse_fn()?;
                 decl.annotations = annotations;
@@ -256,7 +267,10 @@ impl Parser<'_> {
                 let span = self.peek().span;
                 self.error(
                     "E0101",
-                    format!("expected annotation name, found {}", self.peek().kind.name()),
+                    format!(
+                        "expected annotation name, found {}",
+                        self.peek().kind.name()
+                    ),
                     span,
                     None,
                 );
@@ -451,10 +465,7 @@ impl Parser<'_> {
         let body = self.parse_block()?;
         let span = start.merge(body.span);
         let body = Box::new(body);
-        Ok(Sp::new(
-            ExprKind::Closure { params, ret, body },
-            span,
-        ))
+        Ok(Sp::new(ExprKind::Closure { params, ret, body }, span))
     }
 
     fn parse_struct(&mut self) -> PResult<StructDecl> {
@@ -583,10 +594,7 @@ impl Parser<'_> {
                         let span = self.peek().span;
                         self.error(
                             "E0102",
-                            format!(
-                                "expected `;` or `}}`, found {}",
-                                self.peek().kind.name()
-                            ),
+                            format!("expected `;` or `}}`, found {}", self.peek().kind.name()),
                             span,
                             Some("add `;` to make this a statement".to_string()),
                         );
@@ -627,7 +635,7 @@ impl Parser<'_> {
                     None
                 };
                 self.expect(|k| matches!(k, TokenKind::Eq), "`=`")?;
-                let value = self.parse_expr(false, false)?;
+                let value = self.parse_expr(false, false, false)?;
                 self.expect_semi("after `let` statement")?;
                 Ok(StmtOut::Stmt(Sp::new(
                     StmtKind::Let {
@@ -642,7 +650,7 @@ impl Parser<'_> {
             }
             TokenKind::Return => {
                 self.bump();
-                let value = self.parse_expr(false, false)?;
+                let value = self.parse_expr(false, false, false)?;
                 self.expect_semi("after `return`")?;
                 Ok(StmtOut::Stmt(Sp::new(
                     StmtKind::Return(value),
@@ -685,7 +693,7 @@ impl Parser<'_> {
             }
             TokenKind::While => {
                 self.bump();
-                let cond = self.parse_expr(false, false)?;
+                let cond = self.parse_expr(false, false, true)?;
                 self.loop_depth += 1;
                 let body = self.parse_block();
                 self.loop_depth -= 1;
@@ -697,7 +705,7 @@ impl Parser<'_> {
                 self.bump();
                 let (name, name_span) = self.parse_ident("loop variable")?;
                 self.expect(|k| matches!(k, TokenKind::In), "`in`")?;
-                let iter = self.parse_expr(false, false)?;
+                let iter = self.parse_expr(false, false, true)?;
                 self.loop_depth += 1;
                 let body = self.parse_block();
                 self.loop_depth -= 1;
@@ -724,6 +732,13 @@ impl Parser<'_> {
                 if matches!(self.peek().kind, TokenKind::LBrace) {
                     self.bump();
                     self.skip_balanced();
+                    // The construct is fully consumed; continue parsing so
+                    // later errors in this block are still reported. The
+                    // dummy never executes (static errors abort before run).
+                    return Ok(StmtOut::Stmt(Sp::new(
+                        StmtKind::Expr(Sp::new(ExprKind::Unit, start)),
+                        start.merge(self.prev_span()),
+                    )));
                 }
                 Err(())
             }
@@ -735,12 +750,29 @@ impl Parser<'_> {
                     start.merge(self.prev_span()),
                     None,
                 );
-                if matches!(self.peek().kind, TokenKind::LBrace) {
+                // Skip the scrutinee, then the body block if present.
+                let mut found_body = false;
+                while !self.at_eof() {
+                    match self.peek().kind {
+                        TokenKind::LBrace => {
+                            found_body = true;
+                            break;
+                        }
+                        TokenKind::Semi | TokenKind::RBrace => break,
+                        _ => {
+                            self.bump();
+                        }
+                    }
+                }
+                if found_body {
                     self.bump();
                     self.skip_balanced();
-                } else {
-                    self.sync_stmt();
+                    return Ok(StmtOut::Stmt(Sp::new(
+                        StmtKind::Expr(Sp::new(ExprKind::Unit, start)),
+                        start.merge(self.prev_span()),
+                    )));
                 }
+                self.sync_stmt();
                 Err(())
             }
             TokenKind::Import | TokenKind::Mod | TokenKind::Use | TokenKind::Pub => {
@@ -812,10 +844,10 @@ impl Parser<'_> {
             _ => {
                 // Expression statement or assignment. Parse an expression,
                 // stopping before a top-level `=`.
-                let expr = self.parse_expr(true, true)?;
+                let expr = self.parse_expr(true, true, false)?;
                 if matches!(self.peek().kind, TokenKind::Eq) {
                     self.bump();
-                    let value = self.parse_expr(false, false)?;
+                    let value = self.parse_expr(false, false, false)?;
                     self.expect_semi("after assignment")?;
                     let target = match expr.node {
                         ExprKind::Var(name) => AssignTarget::Var(name, expr.span),
@@ -832,18 +864,13 @@ impl Parser<'_> {
                                 "E0104",
                                 "invalid assignment target".to_string(),
                                 expr.span,
-                                Some(
-                                    "assign to a variable, field, or index".to_string(),
-                                ),
+                                Some("assign to a variable, field, or index".to_string()),
                             );
                             return Err(());
                         }
                     };
                     Ok(StmtOut::Stmt(Sp::new(
-                        StmtKind::Assign {
-                            target,
-                            value,
-                        },
+                        StmtKind::Assign { target, value },
                         start.merge(self.prev_span()),
                     )))
                 } else if matches!(self.peek().kind, TokenKind::Semi) {
@@ -855,20 +882,15 @@ impl Parser<'_> {
                 } else {
                     // No `;`: sort statement-`if` from tails from errors.
                     let is_if = matches!(&expr.node, ExprKind::If { .. });
-                    let is_bare_if =
-                        matches!(&expr.node, ExprKind::If { else_b: None, .. });
+                    let is_bare_if = matches!(&expr.node, ExprKind::If { else_b: None, .. });
                     let at_rbrace = matches!(self.peek().kind, TokenKind::RBrace);
                     if is_bare_if && at_rbrace {
                         // A block tail is expression position (spec §3).
                         self.error(
                             "E0107",
-                            "`if` used as an expression requires an `else` branch"
-                                .to_string(),
+                            "`if` used as an expression requires an `else` branch".to_string(),
                             expr.span,
-                            Some(
-                                "add an `else` branch, or use `if` as a statement"
-                                    .to_string(),
-                            ),
+                            Some("add an `else` branch, or use `if` as a statement".to_string()),
                         );
                         return Err(());
                     }
@@ -892,7 +914,12 @@ impl Parser<'_> {
     /// Parse an expression. `allow_bare_if` permits `if` without `else`
     /// (statement position only, spec §3). `stmt_level` stops before a
     /// top-level `=` so the statement parser can treat it as assignment.
-    fn parse_expr(&mut self, allow_bare_if: bool, stmt_level: bool) -> PResult<Expr> {
+    fn parse_expr(
+        &mut self,
+        allow_bare_if: bool,
+        stmt_level: bool,
+        no_struct: bool,
+    ) -> PResult<Expr> {
         if self.depth >= MAX_DEPTH {
             self.error(
                 "E0108",
@@ -903,7 +930,7 @@ impl Parser<'_> {
             return Err(());
         }
         self.depth += 1;
-        let result = self.parse_prec(allow_bare_if, stmt_level, 0);
+        let result = self.parse_prec(allow_bare_if, stmt_level, no_struct, 0);
         self.depth -= 1;
         result
     }
@@ -912,9 +939,10 @@ impl Parser<'_> {
         &mut self,
         allow_bare_if: bool,
         stmt_level: bool,
+        no_struct: bool,
         min_prec: u8,
     ) -> PResult<Expr> {
-        let mut left = self.parse_unary(allow_bare_if)?;
+        let mut left = self.parse_unary(allow_bare_if, no_struct)?;
         loop {
             let (op, prec) = match self.peek().kind.clone() {
                 TokenKind::OrOr => (BinOp::Or, 10),
@@ -941,7 +969,7 @@ impl Parser<'_> {
                         None,
                     );
                     // Recover: parse a right-hand side, drop the construct.
-                    let _ = self.parse_unary(false);
+                    let _ = self.parse_unary(false, no_struct);
                     return Err(());
                 }
                 TokenKind::Eq => {
@@ -958,7 +986,7 @@ impl Parser<'_> {
                         ),
                     );
                     // Recover as `==` so parsing can continue.
-                    let right = self.parse_prec(false, false, 31)?;
+                    let right = self.parse_prec(false, false, no_struct, 31)?;
                     let span = left.span.merge(right.span);
                     left = Sp::new(
                         ExprKind::Binary {
@@ -976,7 +1004,7 @@ impl Parser<'_> {
                 break;
             }
             self.bump();
-            let right = self.parse_prec(false, false, prec + 1)?;
+            let right = self.parse_prec(false, false, no_struct, prec + 1)?;
             let span = left.span.merge(right.span);
             left = Sp::new(
                 ExprKind::Binary {
@@ -990,12 +1018,12 @@ impl Parser<'_> {
         Ok(left)
     }
 
-    fn parse_unary(&mut self, allow_bare_if: bool) -> PResult<Expr> {
+    fn parse_unary(&mut self, allow_bare_if: bool, no_struct: bool) -> PResult<Expr> {
         let start = self.peek().span;
         match self.peek().kind.clone() {
             TokenKind::Minus => {
                 self.bump();
-                let expr = self.parse_unary(false)?;
+                let expr = self.parse_unary(false, no_struct)?;
                 let span = start.merge(expr.span);
                 Ok(Sp::new(
                     ExprKind::Unary {
@@ -1007,7 +1035,7 @@ impl Parser<'_> {
             }
             TokenKind::Bang => {
                 self.bump();
-                let expr = self.parse_unary(false)?;
+                let expr = self.parse_unary(false, no_struct)?;
                 let span = start.merge(expr.span);
                 Ok(Sp::new(
                     ExprKind::Unary {
@@ -1017,12 +1045,12 @@ impl Parser<'_> {
                     span,
                 ))
             }
-            _ => self.parse_postfix(allow_bare_if),
+            _ => self.parse_postfix(allow_bare_if, no_struct),
         }
     }
 
-    fn parse_postfix(&mut self, allow_bare_if: bool) -> PResult<Expr> {
-        let mut expr = self.parse_primary(allow_bare_if)?;
+    fn parse_postfix(&mut self, allow_bare_if: bool, no_struct: bool) -> PResult<Expr> {
+        let mut expr = self.parse_primary(allow_bare_if, no_struct)?;
         loop {
             match self.peek().kind.clone() {
                 TokenKind::LParen => {
@@ -1030,7 +1058,7 @@ impl Parser<'_> {
                     let mut args = Vec::new();
                     if !matches!(self.peek().kind, TokenKind::RParen) {
                         loop {
-                            args.push(self.parse_expr(false, false)?);
+                            args.push(self.parse_expr(false, false, false)?);
                             if matches!(self.peek().kind, TokenKind::Comma) {
                                 self.bump();
                                 if matches!(self.peek().kind, TokenKind::RParen) {
@@ -1057,6 +1085,7 @@ impl Parser<'_> {
                     if matches!(self.peek().kind, TokenKind::LParen) {
                         // Method-call syntax is not v1 (spec §3.3, E0158).
                         // Recover: consume the balanced argument list.
+                        self.bump(); // consume `(`
                         self.skip_call_args();
                         self.error(
                             "E0158",
@@ -1079,7 +1108,7 @@ impl Parser<'_> {
                 }
                 TokenKind::LBracket => {
                     let open = self.bump().span;
-                    let index = self.parse_expr(false, false)?;
+                    let index = self.parse_expr(false, false, false)?;
                     self.expect_close(open, &TokenKind::RBracket, "[")?;
                     let span = expr.span.merge(self.prev_span());
                     expr = Sp::new(
@@ -1124,7 +1153,7 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_primary(&mut self, allow_bare_if: bool) -> PResult<Expr> {
+    fn parse_primary(&mut self, allow_bare_if: bool, no_struct: bool) -> PResult<Expr> {
         let start = self.peek().span;
         match self.peek().kind.clone() {
             TokenKind::Int(v) => {
@@ -1153,7 +1182,7 @@ impl Parser<'_> {
                     let close = self.bump();
                     return Ok(Sp::new(ExprKind::Unit, start.merge(close.span)));
                 }
-                let inner = self.parse_expr(false, false)?;
+                let inner = self.parse_expr(false, false, false)?;
                 self.expect_close(start, &TokenKind::RParen, "(")?;
                 let span = start.merge(self.prev_span());
                 Ok(Sp::new(inner.node, span))
@@ -1163,7 +1192,7 @@ impl Parser<'_> {
                 let mut elems = Vec::new();
                 if !matches!(self.peek().kind, TokenKind::RBracket) {
                     loop {
-                        elems.push(self.parse_expr(false, false)?);
+                        elems.push(self.parse_expr(false, false, false)?);
                         if matches!(self.peek().kind, TokenKind::Comma) {
                             self.bump();
                             if matches!(self.peek().kind, TokenKind::RBracket) {
@@ -1180,11 +1209,24 @@ impl Parser<'_> {
                     open.merge(self.prev_span()),
                 ))
             }
-            TokenKind::If => self.parse_if(allow_bare_if),
+            TokenKind::If => self.parse_if(allow_bare_if, no_struct),
             TokenKind::Fn => self.parse_closure(),
+            // Phase 2 value constructors: parse as ordinary calls so the
+            // interpreter can reject them with E0206 (spec §3.3).
+            TokenKind::Ok | TokenKind::Err | TokenKind::Some | TokenKind::None => {
+                let t = self.bump();
+                let name = t.kind.name().trim_matches('`').to_string();
+                Ok(Sp::new(ExprKind::Var(name), t.span))
+            }
             TokenKind::Ident(name) => {
                 self.bump();
-                if matches!(self.peek().kind, TokenKind::LBrace) {
+                // `Name {` is a struct literal when the brace holds
+                // `field :` pairs (lookahead), or when it is an empty `{}` in
+                // a full expression position (`let p = Point {}`). Otherwise
+                // the brace opens a control-flow body (`for i in lines {`).
+                if matches!(self.peek().kind, TokenKind::LBrace)
+                    && (self.brace_starts_struct_lit() || (!no_struct && self.brace_is_empty()))
+                {
                     return self.parse_struct_lit(name, start);
                 }
                 Ok(Sp::new(ExprKind::Var(name), start))
@@ -1271,6 +1313,33 @@ impl Parser<'_> {
         }
     }
 
+    /// Lookahead for `Ident {`: true when the brace opens a struct literal
+    /// (`{ Ident :` or `{}`-with-fields shape), false when it opens a
+    /// control-flow body. Called with the parser positioned ON the `{`.
+    /// A struct literal must start with `field :` (or be non-empty with a
+    /// leading field name); anything else leaves the brace to the caller.
+    /// True when the token after the `{` under the cursor is `}`.
+    fn brace_is_empty(&self) -> bool {
+        matches!(
+            self.toks.get(self.pos + 1),
+            Some(t) if matches!(t.kind, TokenKind::RBrace)
+        )
+    }
+
+    fn brace_starts_struct_lit(&self) -> bool {
+        let mut it = self.toks.iter().skip(self.pos + 1);
+        match it.next() {
+            // `{}`: ambiguous; the caller (a condition/iterable) owns the
+            // brace as a body block. Struct literals use this path only
+            // from full expression positions, which pass no_struct=false.
+            Some(t) if matches!(t.kind, TokenKind::RBrace) => false,
+            Some(t) if matches!(t.kind, TokenKind::Ident(_)) => {
+                matches!(it.next(), Some(t2) if matches!(t2.kind, TokenKind::Colon))
+            }
+            _ => false,
+        }
+    }
+
     fn parse_struct_lit(&mut self, name: String, start: Span) -> PResult<Expr> {
         let open = self.bump().span; // {
         let mut fields = Vec::new();
@@ -1278,7 +1347,7 @@ impl Parser<'_> {
             loop {
                 let (fname, fspan) = self.parse_ident("field name")?;
                 self.expect(|k| matches!(k, TokenKind::Colon), "`:`")?;
-                let value = self.parse_expr(false, false)?;
+                let value = self.parse_expr(false, false, false)?;
                 fields.push((fname, value, fspan));
                 if matches!(self.peek().kind, TokenKind::Comma) {
                     self.bump();
@@ -1292,21 +1361,18 @@ impl Parser<'_> {
         }
         self.expect_close(open, &TokenKind::RBrace, "{")?;
         let span = start.merge(self.prev_span());
-        Ok(Sp::new(
-            ExprKind::StructLit { name, fields },
-            span,
-        ))
+        Ok(Sp::new(ExprKind::StructLit { name, fields }, span))
     }
 
-    fn parse_if(&mut self, allow_bare_if: bool) -> PResult<Expr> {
+    fn parse_if(&mut self, allow_bare_if: bool, no_struct: bool) -> PResult<Expr> {
         let start = self.bump().span; // if
-        let cond = self.parse_expr(false, false)?;
+        let cond = self.parse_expr(false, false, no_struct)?;
         let then_b = Box::new(self.parse_block()?);
         let mut else_b: Option<Box<Block>> = None;
         if matches!(self.peek().kind, TokenKind::Else) {
             self.bump();
             if matches!(self.peek().kind, TokenKind::If) {
-                let nested = self.parse_if(true)?;
+                let nested = self.parse_if(true, false)?;
                 // An `else if` chain is an else containing one if-expr;
                 // model it as a block with that if as its tail.
                 let span = nested.span;
@@ -1348,9 +1414,7 @@ fn has_final_else(else_b: &Option<Box<Block>>) -> bool {
         None => false,
         Some(block) => match &block.tail {
             Some(tail) => match &tail.node {
-                ExprKind::If {
-                    else_b: inner, ..
-                } => has_final_else(inner),
+                ExprKind::If { else_b: inner, .. } => has_final_else(inner),
                 _ => true,
             },
             None => true,

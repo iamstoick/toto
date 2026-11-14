@@ -1,0 +1,15 @@
+struct Pair { x: int, y: int }
+
+fn main() -> int {
+    println([1, [2, 3]] == [1, [2, 3]]);
+    println([1] == [1, 2]);
+    println(Pair { x: 1, y: 2 } == Pair { x: 1, y: 2 });
+    println(Pair { x: 1, y: 2 } == Pair { x: 1, y: 3 });
+    let a = [];
+    let b = [];
+    push(a, a);
+    push(b, b);
+    println(a == b);
+    println(a == a);
+    return 0;
+}

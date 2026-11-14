@@ -1,0 +1,29 @@
+panic[E0211]: stack overflow: Toto call stack exceeded 8,192 frames (interpreter limit)
+ --> diag10_recursion_limit.gzv:5:12
+  |
+5 |     return down(n - 1);
+  |            ^^^^^^^^^^^
+stack trace:
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  in down at diag10_recursion_limit.gzv:5:12
+  ... (8170 frames omitted) ...
+  in main at diag10_recursion_limit.gzv:8:4
+  in down at diag10_recursion_limit.gzv:9:12

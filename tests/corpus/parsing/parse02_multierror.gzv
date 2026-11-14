@@ -1,0 +1,7 @@
+fn main() -> int {
+    let x = 1
+    println(x));
+    let = 5;
+    1 = 2;
+    return 0;
+}

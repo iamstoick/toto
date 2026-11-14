@@ -1,0 +1,9 @@
+fn main() -> int {
+    let a = [1];
+    let f = fn() -> int { return a[0]; };
+    a[0] = 9;
+    println(f());
+    push(a, 2);
+    println(a);
+    return 0;
+}

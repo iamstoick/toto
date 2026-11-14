@@ -1,0 +1,4 @@
+fn main() -> int {
+    # not a comment
+    return 0;
+}

@@ -1,0 +1,5 @@
+error[E0001]: unexpected character `#`
+ --> diag02_hash_comment.gzv:2:5
+  |
+2 |     # not a comment
+  |     ^ help: comments start with `//`

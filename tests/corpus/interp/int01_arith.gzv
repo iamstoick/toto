@@ -1,0 +1,13 @@
+fn main() -> int {
+    println(7 + 8 * 2 - 30 / 4);
+    println(0 - 10);
+    println(abs(0 - 42));
+    println(min(3, 9) + max(3, 9));
+    println(sqrt(2.0));
+    println(floor(2.9));
+    println(ceil(0.0 - 2.1));
+    println(to_int(3.99));
+    println(to_float(3));
+    println(parse_int("  -12 "));
+    return 0;
+}

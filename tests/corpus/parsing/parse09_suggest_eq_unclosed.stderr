@@ -1,0 +1,11 @@
+error[E0106]: unexpected `=` in expression
+ --> parse09_suggest_eq_unclosed.gzv:3:10
+  |
+3 |     if x = 1 {
+  |          ^ help: did you mean `==`? assignment is a statement and cannot appear inside an expression
+
+error[E0103]: unclosed `(` opened at 6:12
+ --> parse09_suggest_eq_unclosed.gzv:6:19
+  |
+6 |     println("done";
+  |                   ^ help: add the closing `)`

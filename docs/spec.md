@@ -470,6 +470,10 @@ stack trace:
 - Then the span snippet (` --> file:line:col`, source line, caret span).
 - Then `stack trace:` with one `in <fn> at <file>:<line>:<col>` per live
   Toto frame, innermost first. Builtin frames appear as `in <builtin>`.
+  Traces longer than 22 frames are truncated to the innermost 20 plus the
+  outermost 2, with a `... (N frames omitted) ...` line between them
+  (implementation amendment, Phase 1: full 8,192-frame traces are unreadable
+  and untestable as goldens; the omission count keeps them exact).
 - Exit code 1. (Static diagnostics exit 2; CLI/file errors exit 3; §10.)
 
 ## 7. Minimal builtins (the only stdlib in Phase 1)

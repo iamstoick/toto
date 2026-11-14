@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use toto_compiler::{render_errors, render_panic, run_source, Outcome};
+use toto_compiler::{Outcome, render_errors, render_panic, run_source};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 

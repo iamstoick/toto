@@ -254,12 +254,7 @@ impl<'a> Lexer<'a> {
                 _ => {
                     let ch = self.src[start..].chars().next().unwrap_or('\u{fffd}');
                     self.bump();
-                    self.fail(
-                        start,
-                        "E0001",
-                        format!("unexpected character `{ch}`"),
-                        None,
-                    );
+                    self.fail(start, "E0001", format!("unexpected character `{ch}`"), None);
                 }
             }
         }
@@ -285,8 +280,8 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_number(&mut self, start: usize) {
-        let hex = self.bytes[start] == b'0'
-            && (self.peek2() == Some(b'x') || self.peek2() == Some(b'X'));
+        let hex =
+            self.bytes[start] == b'0' && (self.peek2() == Some(b'x') || self.peek2() == Some(b'X'));
         if hex {
             self.bump();
             self.bump();
@@ -308,7 +303,10 @@ impl<'a> Lexer<'a> {
                     self.fail(
                         start,
                         "E0004",
-                        format!("integer literal `{}` out of range", &self.src[start..self.pos]),
+                        format!(
+                            "integer literal `{}` out of range",
+                            &self.src[start..self.pos]
+                        ),
                         None,
                     );
                     self.emit(start, TokenKind::Int(0));
@@ -326,9 +324,7 @@ impl<'a> Lexer<'a> {
         // Fraction only when `.` is followed by a digit (spec §2.4: `1.` is
         // not a float, so `0..10` lexes cleanly).
         let mut is_float = false;
-        if self.peek() == Some(b'.')
-            && matches!(self.bytes.get(self.pos + 1), Some(b'0'..=b'9'))
-        {
+        if self.peek() == Some(b'.') && matches!(self.bytes.get(self.pos + 1), Some(b'0'..=b'9')) {
             is_float = true;
             self.bump();
             while let Some(c) = self.peek() {

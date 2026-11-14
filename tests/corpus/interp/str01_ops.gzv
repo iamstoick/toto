@@ -1,0 +1,12 @@
+fn main() -> int {
+    let s = "  Hello, World!  ";
+    println(trim(s));
+    println(upper("abc"));
+    println(lower("AbC"));
+    println(contains(s, "World"));
+    println(split("a,b,c", ","));
+    println(split("xyz", ""));
+    println(to_string(true));
+    println("n=" + to_string(42));
+    return 0;
+}

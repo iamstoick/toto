@@ -1,0 +1,22 @@
+struct Point { x: int, y: int }
+
+@note("demo")
+fn show(p: Point) -> unit {
+    println(p.x);
+}
+
+fn main() -> int {
+    let mut i = 0;
+    while true {
+        i = i + 1;
+        if i == 3 {
+            break;
+        }
+        if i == 1 {
+            continue;
+        }
+        println(i);
+    }
+    show(Point { x: 7, y: 8 });
+    return 0;
+}

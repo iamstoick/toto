@@ -1,0 +1,7 @@
+panic[E0201]: integer overflow
+ --> int02_overflow.gzv:3:13
+  |
+3 |     println(big + 1);
+  |             ^^^^^^^
+stack trace:
+  in main at int02_overflow.gzv:1:4

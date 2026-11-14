@@ -1,0 +1,17 @@
+error[E0106]: unexpected `=` in expression
+ --> diag12_multierror3.gzv:2:18
+  |
+2 |     let y = if x = 1 { 1 } else { 2 };
+  |                  ^ help: did you mean `==`? assignment is a statement and cannot appear inside an expression
+
+error[E0101]: expected binding name, found `=`
+ --> diag12_multierror3.gzv:3:9
+  |
+3 |     let = 3;
+  |         ^
+
+error[E0103]: unclosed `{` opened at 1:17
+ --> diag12_multierror3.gzv:5:1
+  |
+5 | 
+  | ^ help: add the closing `}`

@@ -1,0 +1,7 @@
+panic[E0208]: undefined variable `nosuchvar`
+ --> diag07_undefined_var.gzv:2:13
+  |
+2 |     println(nosuchvar);
+  |             ^^^^^^^^^
+stack trace:
+  in main at diag07_undefined_var.gzv:1:4

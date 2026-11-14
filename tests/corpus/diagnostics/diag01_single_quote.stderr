@@ -1,0 +1,11 @@
+error[E0001]: unexpected character `'`
+ --> diag01_single_quote.gzv:2:13
+  |
+2 |     println('hi');
+  |             ^ help: strings use double quotes: `"x"`
+
+error[E0001]: unexpected character `'`
+ --> diag01_single_quote.gzv:2:16
+  |
+2 |     println('hi');
+  |                ^ help: strings use double quotes: `"x"`

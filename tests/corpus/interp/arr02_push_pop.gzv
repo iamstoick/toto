@@ -1,0 +1,10 @@
+fn main() -> int {
+    let a = [];
+    println(len(a));
+    println(push(a, "x"));
+    println(push(a, "y"));
+    println(pop(a));
+    println(a);
+    println(len(a));
+    return 0;
+}

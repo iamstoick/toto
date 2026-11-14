@@ -1,0 +1,9 @@
+// leading comment exercises comment skipping
+fn main() -> int {
+    println("tab\there"); // trailing comment
+    println("quote\"q\"");
+    println("back\\slash");
+    println(len("héllo🦎"));
+    println("line1\nline2");
+    return 0;
+}

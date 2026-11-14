@@ -15,6 +15,7 @@ use diag::{Diag, render_all};
 use interp::{Interp, TraceFrame};
 
 /// What running a source file produces.
+#[derive(Debug)]
 pub enum Outcome {
     /// `main` returned an exit code, with captured stdout.
     Success { code: i32, stdout: Vec<u8> },
@@ -43,25 +44,60 @@ pub fn run_source(src: &str, _filename: &str) -> Outcome {
     if !parse_errors.is_empty() {
         return Outcome::Static(parse_errors);
     }
-    let mut interp = Interp::new(&program);
-    match interp.run() {
+    // The tree-walking interpreter recurses on the host stack (one Rust
+    // call chain per Toto call level). The 8,192-frame semantic limit
+    // (spec §5.9) needs more host stack than the default 8 MiB in debug
+    // builds, so interpretation runs on a dedicated large-stack thread.
+    // A host panic here is an interpreter bug, never a user error: let it
+    // propagate so tests fail loudly instead of hiding it.
+    let (run_result, output) = std::thread::Builder::new()
+        .name("toto-interp".to_string())
+        .stack_size(256 << 20)
+        .spawn(move || {
+            let mut interp = Interp::new(&program);
+            let result = interp.run();
+            (result, interp.output)
+        })
+        .expect("failed to spawn interpreter thread")
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e));
+    match run_result {
         Ok(code) => Outcome::Success {
             code,
-            stdout: std::mem::take(&mut interp.output),
+            stdout: output,
         },
         Err((diag, trace)) => Outcome::RuntimePanic {
             diag,
             trace,
-            stdout: std::mem::take(&mut interp.output),
+            stdout: output,
         },
     }
 }
 
-/// Format a runtime panic per the spec §6 contract.
+/// Frames shown per side when truncating a deep trace (spec §6).
+const TRACE_HEAD: usize = 20;
+const TRACE_TAIL: usize = 2;
+
+/// Format a runtime panic per the spec §6 contract. Traces longer than
+/// `TRACE_HEAD + TRACE_TAIL` frames are truncated to the innermost
+/// `TRACE_HEAD` plus the outermost `TRACE_TAIL`, with an omission count.
 pub fn render_panic(diag: &Diag, trace: &[TraceFrame], src: &str, filename: &str) -> String {
     let mut out = diag.render(src, filename, true);
     out.push_str("stack trace:\n");
-    for frame in trace.iter().rev() {
+    let frames: Vec<&TraceFrame> = if trace.len() <= TRACE_HEAD + TRACE_TAIL {
+        trace.iter().rev().collect()
+    } else {
+        let mut v: Vec<&TraceFrame> = trace.iter().rev().take(TRACE_HEAD).collect();
+        v.extend(trace.iter().take(TRACE_TAIL));
+        v
+    };
+    for (i, frame) in frames.iter().enumerate() {
+        if trace.len() > TRACE_HEAD + TRACE_TAIL && i == TRACE_HEAD {
+            out.push_str(&format!(
+                "  ... ({} frames omitted) ...\n",
+                trace.len() - TRACE_HEAD - TRACE_TAIL
+            ));
+        }
         let (line, col) = frame.span.line_col(src);
         out.push_str(&format!("  in {} at {filename}:{line}:{col}\n", frame.name));
     }

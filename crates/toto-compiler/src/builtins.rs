@@ -45,19 +45,32 @@ fn fail(code: &'static str, message: String, span: Span) -> (Diag, Vec<TraceFram
     (Diag::new(code, message, span, None), Vec::new())
 }
 
-fn arity(name: &str, args: &[Value], want: usize, span: Span) -> Result<(), (Diag, Vec<TraceFrame>)> {
+fn arity(
+    name: &str,
+    args: &[Value],
+    want: usize,
+    span: Span,
+) -> Result<(), (Diag, Vec<TraceFrame>)> {
     if args.len() == want {
         Ok(())
     } else {
         Err(fail(
             "E0204",
-            format!("wrong number of arguments: `{name}` takes {want}, got {}", args.len()),
+            format!(
+                "wrong number of arguments: `{name}` takes {want}, got {}",
+                args.len()
+            ),
             span,
         ))
     }
 }
 
-fn as_str<'v>(v: &'v Value, span: Span, name: &str, pos: usize) -> Result<&'v str, (Diag, Vec<TraceFrame>)> {
+fn as_str<'v>(
+    v: &'v Value,
+    span: Span,
+    name: &str,
+    pos: usize,
+) -> Result<&'v str, (Diag, Vec<TraceFrame>)> {
     match v {
         Value::Str(s) => Ok(s),
         other => Err(fail(
@@ -173,7 +186,10 @@ pub fn call_builtin(name: &str, args: Vec<Value>, span: Span, interp: &mut Inter
                 Value::Bool(b) => Ok(Value::Str(Rc::new(b.to_string()))),
                 other => Err(fail(
                     "E0210",
-                    format!("`to_string` needs int, float, or bool, got {}", other.type_name()),
+                    format!(
+                        "`to_string` needs int, float, or bool, got {}",
+                        other.type_name()
+                    ),
                     span,
                 )),
             }
@@ -203,7 +219,11 @@ pub fn call_builtin(name: &str, args: Vec<Value>, span: Span, interp: &mut Inter
         "to_int" => {
             arity(name, &args, 1, span)?;
             let f = as_float(&args[0], span, name, 0)?;
-            if f.is_nan() || f.is_infinite() || !(f >= -9223372036854775808.0 && f < 9223372036854775808.0) {
+            // i64 range as f64 bounds (both exactly representable).
+            if f.is_nan()
+                || f.is_infinite()
+                || !(-9223372036854775808.0..9223372036854775808.0).contains(&f)
+            {
                 return Err(fail(
                     "E0210",
                     "`to_int` cannot convert NaN, infinity, or out-of-range float".to_string(),
@@ -233,11 +253,15 @@ pub fn call_builtin(name: &str, args: Vec<Value>, span: Span, interp: &mut Inter
         }
         "min" => {
             arity(name, &args, 2, span)?;
-            Ok(Value::Int(as_int(&args[0], span, name, 0)?.min(as_int(&args[1], span, name, 1)?)))
+            Ok(Value::Int(
+                as_int(&args[0], span, name, 0)?.min(as_int(&args[1], span, name, 1)?),
+            ))
         }
         "max" => {
             arity(name, &args, 2, span)?;
-            Ok(Value::Int(as_int(&args[0], span, name, 0)?.max(as_int(&args[1], span, name, 1)?)))
+            Ok(Value::Int(
+                as_int(&args[0], span, name, 0)?.max(as_int(&args[1], span, name, 1)?),
+            ))
         }
         "sqrt" => {
             arity(name, &args, 1, span)?;
@@ -310,10 +334,6 @@ pub fn call_builtin(name: &str, args: Vec<Value>, span: Span, interp: &mut Inter
             let path = as_str(&args[0], span, name, 0)?;
             Ok(Value::Bool(std::path::Path::new(path).exists()))
         }
-        _ => Err(fail(
-            "E0208",
-            format!("undefined variable `{name}`"),
-            span,
-        )),
+        _ => Err(fail("E0208", format!("undefined variable `{name}`"), span)),
     }
 }

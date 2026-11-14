@@ -69,7 +69,13 @@ pub fn format_value(v: &Value, fns: &[FnDecl]) -> String {
     out
 }
 
-fn fmt_val(v: &Value, fns: &[FnDecl], out: &mut String, visiting: &mut Vec<*const ()>, depth: usize) {
+fn fmt_val(
+    v: &Value,
+    fns: &[FnDecl],
+    out: &mut String,
+    visiting: &mut Vec<*const ()>,
+    depth: usize,
+) {
     if depth > 100 {
         out.push_str("<...>");
         return;
@@ -151,10 +157,7 @@ pub enum Signal {
 pub type Exec<T> = Result<T, Signal>;
 
 fn panic(code: &'static str, message: String, span: Span, help: Option<String>) -> Signal {
-    Signal::Panic(
-        Diag::new(code, message, span, help),
-        Vec::new(),
-    )
+    Signal::Panic(Diag::new(code, message, span, help), Vec::new())
 }
 
 pub struct Interp {
@@ -250,7 +253,12 @@ impl Interp {
         }
     }
 
-    fn call_fn(&mut self, idx: usize, args: Vec<Value>, span: Span) -> Result<Value, (Diag, Vec<TraceFrame>)> {
+    fn call_fn(
+        &mut self,
+        idx: usize,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, (Diag, Vec<TraceFrame>)> {
         let decl = self.fns[idx].clone();
         if args.len() != decl.params.len() {
             return Err((
@@ -298,31 +306,40 @@ impl Interp {
         }
         let mut scopes = vec![frame];
         let result = self.eval_block_value(&decl.body, &mut scopes);
-        self.trace.pop();
         self.call_depth -= 1;
         match result {
             Ok(v) => {
                 if decl.ret.name == "unit" {
+                    self.trace.pop();
                     Ok(Value::Unit)
                 } else if decl.body.tail.is_none() {
+                    // Fell off the end: keep this frame for the trace.
                     Err((
                         Diag::new(
                             "E0212",
-                            format!(
-                                "function `{}` exited without returning a value",
-                                decl.name
-                            ),
+                            format!("function `{}` exited without returning a value", decl.name),
                             decl.body.span,
                             None,
                         ),
                         std::mem::take(&mut self.trace),
                     ))
                 } else {
+                    self.trace.pop();
                     Ok(v)
                 }
             }
-            Err(Signal::Return(v)) => Ok(v),
-            Err(Signal::Panic(diag, _)) => Err((diag, std::mem::take(&mut self.trace))),
+            Err(Signal::Return(v)) => {
+                self.trace.pop();
+                Ok(v)
+            }
+            Err(Signal::Panic(diag, carried)) => {
+                // Merge: outer frames still live here plus any trace
+                // carried from deeper (at most one side is non-empty,
+                // since panics unwind without pushing new frames).
+                let mut trace = std::mem::take(&mut self.trace);
+                trace.extend(carried);
+                Err((diag, trace))
+            }
             Err(Signal::Break) | Err(Signal::Continue) => Err((
                 Diag::new(
                     "E0204",
@@ -396,13 +413,14 @@ impl Interp {
         }
         let mut scopes = vec![frame];
         let result = self.eval_block_value(&closure.body, &mut scopes);
-        self.trace.pop();
         self.call_depth -= 1;
         match result {
             Ok(v) => {
                 if closure.ret.name == "unit" {
+                    self.trace.pop();
                     Ok(Value::Unit)
                 } else if closure.body.tail.is_none() {
+                    // Fell off the end: keep this frame for the trace.
                     Err((
                         Diag::new(
                             "E0212",
@@ -413,11 +431,22 @@ impl Interp {
                         std::mem::take(&mut self.trace),
                     ))
                 } else {
+                    self.trace.pop();
                     Ok(v)
                 }
             }
-            Err(Signal::Return(v)) => Ok(v),
-            Err(Signal::Panic(diag, _)) => Err((diag, std::mem::take(&mut self.trace))),
+            Err(Signal::Return(v)) => {
+                self.trace.pop();
+                Ok(v)
+            }
+            Err(Signal::Panic(diag, carried)) => {
+                // Merge: outer frames still live here plus any trace
+                // carried from deeper (at most one side is non-empty,
+                // since panics unwind without pushing new frames).
+                let mut trace = std::mem::take(&mut self.trace);
+                trace.extend(carried);
+                Err((diag, trace))
+            }
             Err(Signal::Break) | Err(Signal::Continue) => Err((
                 Diag::new(
                     "E0204",
@@ -463,11 +492,7 @@ impl Interp {
         result
     }
 
-    fn exec_stmt(
-        &mut self,
-        stmt: &Stmt,
-        scopes: &mut Vec<HashMap<String, Slot>>,
-    ) -> Exec<()> {
+    fn exec_stmt(&mut self, stmt: &Stmt, scopes: &mut Vec<HashMap<String, Slot>>) -> Exec<()> {
         match &stmt.node {
             StmtKind::Let {
                 name,
@@ -510,10 +535,7 @@ impl Interp {
                         other => {
                             return Err(panic(
                                 "E0207",
-                                format!(
-                                    "while condition must be bool, got {}",
-                                    other.type_name()
-                                ),
+                                format!("while condition must be bool, got {}", other.type_name()),
                                 cond.span,
                                 None,
                             ));
@@ -611,9 +633,7 @@ impl Interp {
                         if !slot.mutable {
                             return Err(panic(
                                 "E0204",
-                                format!(
-                                    "cannot reassign immutable binding `{name}`"
-                                ),
+                                format!("cannot reassign immutable binding `{name}`"),
                                 *name_span,
                                 Some("declare it with `let mut` to reassign".to_string()),
                             ));
@@ -641,10 +661,7 @@ impl Interp {
                             }
                             None => Err(panic(
                                 "E0209",
-                                format!(
-                                    "struct {} has no field `{field_name}`",
-                                    s.name
-                                ),
+                                format!("struct {} has no field `{field_name}`", s.name),
                                 *field_span,
                                 None,
                             )),
@@ -697,11 +714,7 @@ impl Interp {
 }
 
 impl Interp {
-    fn eval_expr(
-        &mut self,
-        expr: &Expr,
-        scopes: &mut Vec<HashMap<String, Slot>>,
-    ) -> Exec<Value> {
+    fn eval_expr(&mut self, expr: &Expr, scopes: &mut Vec<HashMap<String, Slot>>) -> Exec<Value> {
         match &expr.node {
             ExprKind::Int(v) => Ok(Value::Int(*v)),
             ExprKind::Float(v) => Ok(Value::Float(*v)),
@@ -716,7 +729,9 @@ impl Interp {
                     None => match name.as_str() {
                         "Ok" | "Err" | "Some" | "None" => Err(panic(
                             "E0206",
-                            format!("`{name}` is a Phase 2 value (Result/Option execution arrives in Phase 2)"),
+                            format!(
+                                "`{name}` is a Phase 2 value (Result/Option execution arrives in Phase 2)"
+                            ),
                             expr.span,
                             None,
                         )),
@@ -752,8 +767,11 @@ impl Interp {
             ExprKind::Closure { params, ret, body } => {
                 // Capture by value at creation (spec §5.7): copy every
                 // visible binding. Scalars copy; arrays/structs share.
+                // Innermost scope first so shadowed names resolve to the
+                // innermost binding deterministically (HashMap order is
+                // randomized per process and must not be observable).
                 let mut captured = Vec::new();
-                for scope in scopes.iter() {
+                for scope in scopes.iter().rev() {
                     for (name, slot) in scope {
                         if !captured.iter().any(|(n, _)| n == name) {
                             captured.push((name.clone(), slot.value.clone()));
@@ -767,7 +785,9 @@ impl Interp {
                     captured,
                 })))
             }
-            ExprKind::StructLit { name, fields } => self.eval_struct_lit(name, fields, expr.span, scopes),
+            ExprKind::StructLit { name, fields } => {
+                self.eval_struct_lit(name, fields, expr.span, scopes)
+            }
             ExprKind::Array(elems) => {
                 let mut values = Vec::with_capacity(elems.len());
                 for e in elems {
@@ -807,10 +827,7 @@ impl Interp {
                                 Value::Bool(b) => Ok(Value::Bool(b)),
                                 other => Err(panic(
                                     "E0203",
-                                    format!(
-                                        "`&&` needs bools, got bool and {}",
-                                        other.type_name()
-                                    ),
+                                    format!("`&&` needs bools, got bool and {}", other.type_name()),
                                     right.span,
                                     None,
                                 )),
@@ -836,10 +853,7 @@ impl Interp {
                                 Value::Bool(b) => Ok(Value::Bool(b)),
                                 other => Err(panic(
                                     "E0203",
-                                    format!(
-                                        "`||` needs bools, got bool and {}",
-                                        other.type_name()
-                                    ),
+                                    format!("`||` needs bools, got bool and {}", other.type_name()),
                                     right.span,
                                     None,
                                 )),
@@ -1007,13 +1021,23 @@ impl Interp {
                 return self.call_value(&target, values, span, name);
             }
             if crate::builtins::is_builtin(name) {
-                return crate::builtins::call_builtin(name, values, span, self)
+                self.trace.push(TraceFrame {
+                    name: format!("{name} (builtin)"),
+                    span,
+                });
+                let result = crate::builtins::call_builtin(name, values, span, self)
                     .map_err(|(d, t)| Signal::Panic(d, t));
+                if result.is_ok() {
+                    self.trace.pop();
+                }
+                return result;
             }
             return match name.as_str() {
                 "Ok" | "Err" | "Some" | "None" => Err(panic(
                     "E0206",
-                    format!("`{name}` is a Phase 2 value (Result/Option execution arrives in Phase 2)"),
+                    format!(
+                        "`{name}` is a Phase 2 value (Result/Option execution arrives in Phase 2)"
+                    ),
                     callee.span,
                     None,
                 )),
@@ -1090,12 +1114,7 @@ impl Interp {
             BinOp::Div => match (l, r) {
                 (Value::Int(a), Value::Int(b)) => {
                     if b == 0 {
-                        return Err(panic(
-                            "E0202",
-                            "division by zero".to_string(),
-                            span,
-                            None,
-                        ));
+                        return Err(panic("E0202", "division by zero".to_string(), span, None));
                     }
                     match a.checked_div(b) {
                         Some(n) => Ok(Value::Int(n)),
@@ -1113,19 +1132,18 @@ impl Interp {
             BinOp::Mod => match (l, r) {
                 (Value::Int(a), Value::Int(b)) => {
                     if b == 0 {
-                        return Err(panic(
-                            "E0202",
-                            "modulo by zero".to_string(),
-                            span,
-                            None,
-                        ));
+                        return Err(panic("E0202", "modulo by zero".to_string(), span, None));
                     }
                     // i64::MIN % -1 is the only overflow; its value is 0.
                     Ok(Value::Int(a.wrapping_rem(b)))
                 }
                 (a, b) => Err(panic(
                     "E0203",
-                    format!("cannot take modulo of {} and {}", a.type_name(), b.type_name()),
+                    format!(
+                        "cannot take modulo of {} and {}",
+                        a.type_name(),
+                        b.type_name()
+                    ),
                     span,
                     self.int_float_hint(&a, &b),
                 )),
@@ -1155,7 +1173,10 @@ impl Interp {
             (a, b),
             (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_))
         ) {
-            Some("int and float do not mix implicitly; convert explicitly with to_int or to_float".to_string())
+            Some(
+                "int and float do not mix implicitly; convert explicitly with to_int or to_float"
+                    .to_string(),
+            )
         } else {
             None
         }
@@ -1195,18 +1216,15 @@ impl Interp {
 
     fn equality(&mut self, l: Value, r: Value, span: Span, want_eq: bool) -> Exec<Value> {
         let same_type = std::mem::discriminant(&l) == std::mem::discriminant(&r)
-            && !(matches!(&l, Value::Struct(_)) && matches!(&r, Value::Struct(_))
+            && !(matches!(&l, Value::Struct(_))
+                && matches!(&r, Value::Struct(_))
                 && struct_name(&l) != struct_name(&r))
             && !(matches!(&l, Value::Closure(_)) && matches!(&r, Value::Func(_)))
             && !(matches!(&l, Value::Func(_)) && matches!(&r, Value::Closure(_)));
         if !same_type {
             return Err(panic(
                 "E0203",
-                format!(
-                    "cannot compare {} with {}",
-                    l.type_name(),
-                    r.type_name()
-                ),
+                format!("cannot compare {} with {}", l.type_name(), r.type_name()),
                 span,
                 self.int_float_hint(&l, &r),
             ));
@@ -1252,9 +1270,10 @@ impl Interp {
                 let y = y.borrow();
                 x.name == y.name
                     && x.fields.len() == y.fields.len()
-                    && x.fields.iter().zip(y.fields.iter()).all(|((n, e), (m, f))| {
-                        n == m && self.values_equal(e, f, depth + 1)
-                    })
+                    && x.fields
+                        .iter()
+                        .zip(y.fields.iter())
+                        .all(|((n, e), (m, f))| n == m && self.values_equal(e, f, depth + 1))
             }
             _ => false,
         }
@@ -1274,11 +1293,7 @@ impl Interp {
             _ => {
                 return Err(panic(
                     "E0203",
-                    format!(
-                        "cannot order {} and {}",
-                        l.type_name(),
-                        r.type_name()
-                    ),
+                    format!("cannot order {} and {}", l.type_name(), r.type_name()),
                     span,
                     self.int_float_hint(&l, &r),
                 ));
