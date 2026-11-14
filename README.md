@@ -40,10 +40,11 @@
 ./scripts/check.sh
 ```
 
-Repo host is not known yet, so there is no CI config; `scripts/check.sh`
-is the gate (fmt check + clippy + test). This assumption is recorded in
-the Spike 1 report.
+CI runs the same gate on Linux x86_64 via
+[ci.yml](/home/gerald/Apps/toto/.github/workflows/ci.yml) (push and pull
+request): `scripts/check.sh` (fmt check + clippy + test).
 
 ## License
 
-TODO: license not chosen. Ask the project owner before publishing anything.
+Dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE).
+See `license = "MIT OR Apache-2.0"` in each crate manifest.
