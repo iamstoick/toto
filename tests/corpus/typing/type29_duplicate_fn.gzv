@@ -1,0 +1,12 @@
+fn dup() -> int {
+    return 1;
+}
+
+fn dup() -> int {
+    return 2;
+}
+
+fn main() -> int {
+    println(dup());
+    return 0;
+}

@@ -1,0 +1,5 @@
+error[E0303]: cannot order string and int
+ --> type09_order_mismatch.gzv:2:13
+  |
+2 |     println("a" < 1);
+  |             ^^^^^^^

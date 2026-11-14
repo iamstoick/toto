@@ -1,0 +1,97 @@
+fn f(ok: bool) -> Result<int, string> {
+  // %0: bool (ok (param))
+  // %1: unit (if)
+  // %2: int (const int)
+  // %3: Result<int, string> (ok)
+  // %4: unit (unit)
+  // %5: string (const string)
+  // %6: Result<int, string> (err)
+  bb0:
+    safepoint entry
+    br %0 bb1 bb2
+  bb1:
+    %2 = const 1:int
+    safepoint alloc
+    %3 = wrap_ok %2
+    ret %3
+  bb2:
+    %4 = const ():unit
+    %1 = copy %4
+    jump bb3
+  bb3:
+    %5 = const "no":string
+    safepoint alloc
+    %6 = wrap_err %5
+    ret %6
+}
+
+fn g() -> Result<int, string> {
+  // %0: fn(bool) -> Result<int, string> (fn f)
+  // %1: bool (const bool)
+  // %2: Result<int, string> (call)
+  // %3: int (question)
+  // %4: int (v)
+  // %5: int (const int)
+  // %6: int (bin)
+  // %7: Result<int, string> (ok)
+  bb0:
+    safepoint entry
+    %0 = funcref 0
+    %1 = const true:bool
+    safepoint call
+    %2 = call %0(%1)
+    %3 = propagate %2
+    %4 = copy %3
+    %5 = const 1:int
+    %6 = add %4, %5
+    safepoint alloc
+    %7 = wrap_ok %6
+    ret %7
+}
+
+fn main() -> int {
+  // %0: int (const int)
+  // %1: int (base)
+  // %2: fn(int) -> int (closure)
+  // %3: fn(int) -> int (addb)
+  // %4: fn() -> Result<int, string> (fn g)
+  // %5: Result<int, string> (call)
+  // %6: Result<int, string> (r)
+  // %7: int (println())
+  // %8: int (const int)
+  // %9: int (call)
+  // %10: int (println())
+  // %11: fn(bool) -> Result<int, string> (fn f)
+  // %12: bool (const bool)
+  // %13: Result<int, string> (call)
+  // %14: Result<int, string> (e)
+  // %15: int (println())
+  // %16: int (const int)
+  bb0:
+    safepoint entry
+    %0 = const 100:int
+    %1 = copy %0
+    safepoint alloc
+    %2 = make_closure [%1]
+    %3 = copy %2
+    %4 = funcref 1
+    safepoint call
+    %5 = call %4()
+    %6 = copy %5
+    safepoint call
+    %7 = builtin println(%6)
+    %8 = const 5:int
+    safepoint call
+    %9 = call %3(%8)
+    safepoint call
+    %10 = builtin println(%9)
+    %11 = funcref 0
+    %12 = const false:bool
+    safepoint call
+    %13 = call %11(%12)
+    %14 = copy %13
+    safepoint call
+    %15 = builtin println(%14)
+    %16 = const 0:int
+    ret %16
+}

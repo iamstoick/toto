@@ -1,0 +1,14 @@
+fn read_port() -> Result<int, string> {
+    return Err("port: not a number");
+}
+
+fn config() -> Result<int, string> {
+    let p = read_port()?;
+    return Ok(p + 1000);
+}
+
+fn main() -> int {
+    let r: Result<int, string> = config();
+    println(r);
+    return 0;
+}

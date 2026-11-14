@@ -1,0 +1,22 @@
+fn f(ok: bool) -> Result<int, string> {
+    if ok {
+        return Ok(1);
+    }
+    return Err("no");
+}
+
+fn g() -> Result<int, string> {
+    let v = f(true)?;
+    return Ok(v + 1);
+}
+
+fn main() -> int {
+    let base = 100;
+    let addb = fn(x: int) -> int { return x + base; };
+    let r: Result<int, string> = g();
+    println(r);
+    println(addb(5));
+    let e: Result<int, string> = f(false);
+    println(e);
+    return 0;
+}

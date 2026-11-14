@@ -1,0 +1,11 @@
+error[E0309]: cannot infer the element type of an empty array
+ --> type23_empty_array.gzv:2:13
+  |
+2 |     let a = [];
+  |             ^^ help: add an annotation, e.g. `let a: Array<int> = []`
+
+error[E0301]: undefined variable `a`
+ --> type23_empty_array.gzv:3:13
+  |
+3 |     println(a);
+  |             ^

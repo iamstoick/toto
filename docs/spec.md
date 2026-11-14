@@ -263,8 +263,8 @@ name. Minimum required rejections (negative corpus, §9.4):
 
 - `go <block>` and any use of `<-` → "channels and `go` blocks execute in
   Phase 3" (code `E0151` / `E0152`).
-- Postfix `?` (`expr?`) → "`?` error propagation is specified now and
-  executes in Phase 2" (`E0153`).
+- Postfix `?` (`expr?`) → **retired in Phase 2**: `?` now parses and
+  executes (§11, §12); the `E0153` rejection no longer exists.
 - `fn name<T>(…)` or `struct Name<T> …` (user generics) → "user-defined
   generics are not supported in v1" (`E0154`).
 - `unsafe` blocks / `extern` blocks or declarations → "FFI executes in
@@ -272,10 +272,9 @@ name. Minimum required rejections (negative corpus, §9.4):
 - `match` → "pattern matching is a Phase 2 concern" (`E0156`).
 - `import` / `mod` / `use` / `pub` → "modules and imports arrive in
   Phase 2" (`E0157`).
-- `Ok(…)`, `Err(…)`, `Some(…)`, `None(…)` parse as ordinary calls and fail
-  at runtime with "… is a Phase 2 value" (`E0206`); the interpreter
-  special-cases these four names so the error names Phase 2 instead of
-  reporting a plain undefined function.
+- `Ok(…)`, `Err(…)`, `Some(…)`, `None(…)` → **retired in Phase 2**: these
+  are value constructors that parse, check, and execute (§11, §12); the
+  `E0206` runtime rejection no longer exists.
 - `x.y(…)` (method-call syntax) is rejected by the parser: Toto v1 has
   **functions only, no methods and no method-call syntax** — call a function
   with the value as an argument instead (`E0158`). Plain field access
@@ -552,7 +551,8 @@ error[E0102]: expected `;` after let statement
 Every diagnostic carries: stable code, `error`/`panic` kind, message,
 `file:line:col` span, source snippet with caret span, and optional
 `help:` suggestion. Codes: `E00xx` lexer, `E01xx` parser, `E02xx` runtime
-(panics). The code list lives with the implementation and is appended to
+(panics), `E03xx` static type errors (Phase 2, §12). The code list lives
+with the implementation and is appended to
 this spec when new codes are added (spec amendment, not silent drift).
 
 ### 9.2 Multi-error recovery
@@ -587,8 +587,9 @@ stderr from the test harness itself) as a test failure.
 
 ## 10. CLI
 
-- `toto run <file.gzv>` — lex, parse (multi-error: exit 2 on any static
-  diagnostic), execute from `main`. Exit code: main's return value (must be
+- `toto run <file.gzv>` — lex, parse, **check** (§12), then execute from
+  `main`. Any static diagnostic (lex, parse, or type error) exits 2 and
+  nothing executes. Exit code: main's return value (must be
   0–255, else panic exit 1); runtime panic exits 1 with the §6 format;
   static diagnostics exit 2; missing/unreadable file or bad CLI usage
   exits 3 (`toto: couldn't read <file>: <os error>`). A normal `main`
@@ -615,8 +616,96 @@ forms. Semantics (binding on Phase 2):
   interpreter rule).
 - `panic` is only for bugs; a panic in a child task fails its structured
   scope by default (Phase 3 failure policy).
+- Implemented in Phase 2: checking and execution per §12. The §11
+  `E0153`/`E0206` rejections are retired: `?`, `Ok`, `Err`, `Some`, `None`
+  now parse, check, and execute.
 
-## 12. Reserved for later phases (syntax acknowledgment)
+## 12. Static typing (Phase 2)
+
+Pipeline: lex → parse → **check** → interpret. `toto run` checks first;
+a program with any `E03xx` diagnostic never executes (exit 2, §10). The
+tree-walking interpreter still runs unchecked code in the sense that it
+performs its own runtime tag checks, but every program it runs has passed
+the checker, so the `E0203` cross-type `==` panic (§5.4) is unreachable in
+checked programs and survives only as a backstop. No checked program can
+reach it: `==`/`!=` with mismatched static types is `E0303`.
+
+### 13.1 What the checker enforces
+
+- Function boundaries are explicit: every parameter and the return type
+  carry an annotation (§5.6). There is no inference across function
+  boundaries and no Hindley-Milner anywhere.
+- `let` types come from initializers; an annotation, when present, must
+  match. Rebinding a `let` (non-`mut`) binding is `E0313`; shadowing by a
+  later `let` is allowed (§5.6).
+- Struct literals supply every declared field exactly once, each with the
+  declared type; unknown or duplicate fields are errors. Field and index
+  targets resolve against the struct declarations and array element types.
+- Conditions are strictly `bool`; expression-`if` branches must agree in
+  type; `return` must match the declared return type; `for` iterates
+  `Range`/`Array` only. Arithmetic, ordering, and equality follow the
+  §5.2/§5.4 matrices exactly; cross-type `==` is rejected statically.
+- Calls check arity and argument types. The frozen 25 builtins (§7) check
+  by fixed signatures; the catalog does not grow. Builtins are callable by
+  name only — a bare builtin in value position is `E0305`, as is calling a
+  non-function value.
+- Duplicates (functions, structs, parameters, struct fields) are `E0311`;
+  the entry point must be exactly `fn main() -> int` (`E0312`).
+- D4: an unused `Result` value in statement position is `E0307`. (An
+  unused `Option` is legal: it is not a result.)
+- `?` unwraps `Result<T, E>` to `T` (or `Option<T>` to `T`) and
+  early-returns the error/None from the enclosing function. The enclosing
+  function must return a matching `Result`/`Option`. The v1 error
+  conversion (§11, D4) is defined only for **identical** error types —
+  identity propagation, which preserves the original error as cause
+  trivially. `?` across differing error types is `E0308`: handle the
+  error explicitly. There is no `Error` supertype and no other conversion
+  in v1.
+- Constructors need context, never guessing: `Ok`/`Err` require an
+  enclosing `Result<T, E>` annotation (parameter, return, `let`, or
+  another `Result`-typed position); `None` requires `Option<T>` context;
+  an empty array `[]` requires an `Array<T>` annotation. Context does not
+  flow inward through array literals: `[Ok(1)]` is still `E0309` — bind
+  the element first. (If this proves unergonomic, it reopens here, not in
+  the checker alone.)
+- Types: `int float string bool unit Range Array<T> Map<K,V> Result<T,E>
+  Option<T>`, struct types, and function types spelled `fn(T1, T2) -> R`.
+  The `fn(…) -> …` spelling is **provisional**: the core subset has
+  first-class functions but no annotatable function-type syntax, so a
+  minimal spelling was chosen to keep higher-order functions checkable
+  (e.g. the `apply` corpus program). Confirm or rename — the spelling is
+  isolated to the type parser. `Map<K,V>` checks as a type but no values
+  exist yet (constructors are a later phase). A struct cannot reference
+  itself, directly or through another struct: field types must resolve
+  against already-declared structs, so recursive types are rejected with
+  `E0302`. Closures capture per §5.7; the checker records each closure's
+  capture list (names bound outside the closure that its body uses) in
+  HIR for MIR closure conversion. Named `fn` declarations do not capture.
+
+### 13.2 Type-error codes (E03xx)
+
+All `E03xx` diagnostics use the §9.1 format with `error` kind and name
+expected vs found types. Multi-error recovery is preserved: checking
+continues after an error where the scope structure allows, so one run can
+report several independent type errors (at most 16 per file, as in §9.2).
+
+| Code | Meaning |
+|---|---|
+| `E0301` | undefined variable (no binding, function, or builtin in scope) |
+| `E0302` | unknown or misapplied type (bad arity, recursive struct) |
+| `E0303` | type mismatch (expected vs found, incl. cross-type `==`) |
+| `E0304` | wrong number of arguments |
+| `E0305` | bad call (non-function callee; bare builtin value) |
+| `E0306` | cannot iterate (`for` over non-`Range`/`Array`) |
+| `E0307` | unused `Result` value |
+| `E0308` | bad `?` (non-`Result`/`Option` operand, wrong enclosing return, error-type mismatch) |
+| `E0309` | cannot infer (empty array, `None`, `Ok`/`Err` without context) |
+| `E0310` | bad struct/array target (missing/unknown/duplicate field, field of non-struct, index of non-array) |
+| `E0311` | duplicate definition (function, struct, parameter, field) |
+| `E0312` | bad or missing `main` |
+| `E0313` | illegal rebinding (`let` reassigned, function assigned) |
+
+## 13. Reserved for later phases (syntax acknowledgment)
 
 - Concurrency: `go <block>`, `chan<T>`, `ch <- v`, `<-ch`, `select`
   (Phase 3). The `<-` lexical rule (§2.3) and the rejection diagnostics

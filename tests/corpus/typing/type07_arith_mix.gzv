@@ -1,0 +1,4 @@
+fn main() -> int {
+    println(1 + "s");
+    return 0;
+}

@@ -1,0 +1,59 @@
+fn fact(n: int) -> int {
+  // %0: int (n (param))
+  // %1: int (const int)
+  // %2: bool (bin)
+  // %3: unit (if)
+  // %4: int (const int)
+  // %5: unit (unit)
+  // %6: fn(int) -> int (fn fact)
+  // %7: int (const int)
+  // %8: int (bin)
+  // %9: int (call)
+  // %10: int (bin)
+  bb0:
+    safepoint entry
+    %1 = const 1:int
+    %2 = le %0, %1
+    br %2 bb1 bb2
+  bb1:
+    %4 = const 1:int
+    ret %4
+  bb2:
+    %5 = const ():unit
+    %3 = copy %5
+    jump bb3
+  bb3:
+    %6 = funcref 0
+    %7 = const 1:int
+    %8 = sub %0, %7
+    safepoint call
+    %9 = call %6(%8)
+    %10 = mul %0, %9
+    ret %10
+}
+
+fn main() -> int {
+  // %0: fn(int) -> int (fn fact)
+  // %1: int (const int)
+  // %2: int (call)
+  // %3: int (println())
+  // %4: string (const string)
+  // %5: int (len())
+  // %6: int (println())
+  // %7: int (const int)
+  bb0:
+    safepoint entry
+    %0 = funcref 0
+    %1 = const 5:int
+    safepoint call
+    %2 = call %0(%1)
+    safepoint call
+    %3 = builtin println(%2)
+    %4 = const "hey":string
+    safepoint call
+    %5 = builtin len(%4)
+    safepoint call
+    %6 = builtin println(%5)
+    %7 = const 0:int
+    ret %7
+}

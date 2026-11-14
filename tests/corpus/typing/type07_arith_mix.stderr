@@ -1,0 +1,5 @@
+error[E0303]: cannot add int and string
+ --> type07_arith_mix.gzv:2:13
+  |
+2 |     println(1 + "s");
+  |             ^^^^^^^

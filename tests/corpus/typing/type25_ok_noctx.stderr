@@ -1,0 +1,5 @@
+error[E0309]: cannot infer the error type of `Ok`
+ --> type25_ok_noctx.gzv:2:13
+  |
+2 |     println(Ok(1));
+  |             ^^^^^ help: add an annotation, e.g. `let x: Result<int, string> = Ok(…)`

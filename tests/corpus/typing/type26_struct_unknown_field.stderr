@@ -1,0 +1,11 @@
+error[E0310]: unknown field `z` for struct `Point`
+ --> type26_struct_unknown_field.gzv:4:33
+  |
+4 |     let p = Point { x: 1, y: 2, z: 3 };
+  |                                 ^
+
+error[E0301]: undefined variable `p`
+ --> type26_struct_unknown_field.gzv:5:13
+  |
+5 |     println(p);
+  |             ^

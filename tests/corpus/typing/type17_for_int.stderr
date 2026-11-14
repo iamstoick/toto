@@ -1,0 +1,5 @@
+error[E0306]: cannot iterate over int
+ --> type17_for_int.gzv:2:14
+  |
+2 |     for i in 5 {
+  |              ^ help: for iterates ranges (`0..n`) and arrays only

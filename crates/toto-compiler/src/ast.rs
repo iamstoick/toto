@@ -77,9 +77,21 @@ pub struct StructField {
 
 #[derive(Clone, Debug)]
 pub struct Type {
-    pub name: String,
-    pub args: Vec<Type>,
+    pub kind: TypeKind,
     pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum TypeKind {
+    Named {
+        name: String,
+        args: Vec<Type>,
+    },
+    /// Function types, provisional spelling `fn(T1, T2) -> R` (see `hir::Ty`).
+    Fn {
+        params: Vec<Type>,
+        ret: Box<Type>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +176,11 @@ pub enum ExprKind {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    Ok(Box<Expr>),
+    Err(Box<Expr>),
+    Some(Box<Expr>),
+    None,
+    Question(Box<Expr>),
     Field {
         base: Box<Expr>,
         name: String,

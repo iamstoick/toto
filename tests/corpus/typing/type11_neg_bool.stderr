@@ -1,0 +1,5 @@
+error[E0303]: cannot negate bool
+ --> type11_neg_bool.gzv:2:14
+  |
+2 |     println(-true);
+  |              ^^^^

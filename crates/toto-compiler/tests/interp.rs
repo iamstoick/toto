@@ -71,11 +71,21 @@ fn closure_sees_innermost_shadowed_binding() {
 
 #[test]
 fn cyclic_display_terminates() {
-    match run("fn main() -> int {\n let a = [];\n push(a, a);\n println(a);\n return 0;\n}\n") {
-        Outcome::Success { stdout, .. } => {
-            assert_eq!(stdout, b"[<cycle>]\n");
+    // Checked programs cannot build cycles (`push(a, a)` is untypable), so
+    // the cycle guard is a runtime backstop exercised below the checker.
+    use toto_compiler::interp::Interp;
+    use toto_compiler::{lexer, parser};
+    let src = "fn main() -> int {\n let a = [];\n push(a, a);\n println(a);\n return 0;\n}\n";
+    let (tokens, lex_errors) = lexer::lex(src);
+    assert!(lex_errors.is_empty());
+    let (program, parse_errors) = parser::parse(tokens, src);
+    assert!(parse_errors.is_empty());
+    let mut interp = Interp::new(&program);
+    match interp.run() {
+        Ok(_) => {
+            assert_eq!(interp.output, b"[<cycle>]\n");
         }
-        other => panic!("expected success, got {other:?}"),
+        Err((diag, _)) => panic!("unexpected panic: {diag:?}"),
     }
 }
 

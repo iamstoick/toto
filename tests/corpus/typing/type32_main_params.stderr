@@ -1,0 +1,5 @@
+error[E0312]: `main` takes no parameters
+ --> type32_main_params.gzv:1:4
+  |
+1 | fn main(x: int) -> int {
+  |    ^^^^

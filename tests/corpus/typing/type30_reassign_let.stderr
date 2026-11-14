@@ -1,0 +1,5 @@
+error[E0313]: cannot reassign immutable binding `x`
+ --> type30_reassign_let.gzv:3:5
+  |
+3 |     x = 2;
+  |     ^ help: declare it with `let mut` to reassign

@@ -1,0 +1,14 @@
+fn f() -> Result<int, string> {
+    return Ok(40);
+}
+
+fn g() -> Result<int, string> {
+    let v = f()?;
+    return Ok(v + 2);
+}
+
+fn main() -> int {
+    let r: Result<int, string> = g();
+    println(r);
+    return 0;
+}

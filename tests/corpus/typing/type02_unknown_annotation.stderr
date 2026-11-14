@@ -1,0 +1,11 @@
+error[E0302]: unknown type `Nope`
+ --> type02_unknown_annotation.gzv:2:12
+  |
+2 |     let x: Nope = 1;
+  |            ^^^^ help: declare a `struct` with this name, or fix the spelling
+
+error[E0301]: undefined variable `x`
+ --> type02_unknown_annotation.gzv:3:13
+  |
+3 |     println(x);
+  |             ^
