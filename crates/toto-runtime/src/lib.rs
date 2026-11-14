@@ -41,6 +41,15 @@ pub struct RuntimeConfig {
     /// `gc_collect_for_test` equivalent for the production runtime).
     /// Never set in shipped code paths; the CLI leaves it false.
     pub collect_at_every_safepoint_for_test: bool,
+    /// Worker threads for the M:N scheduler (Stage 2). `1` is the
+    /// deterministic single-threaded mode: one FIFO queue, fixed-seed
+    /// RNG, exact goldens. Higher values enable work-stealing across
+    /// OS threads (genuinely nondeterministic interleavings: use
+    /// invariant assertions, not exact goldens).
+    pub workers: usize,
+    /// Dedicated blocking-pool threads for file-system builtins
+    /// (Stage 2 policy: no worker ever stalls on IO).
+    pub blocking_pool_threads: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -50,6 +59,8 @@ impl Default for RuntimeConfig {
             rng_seed: 0x9E37_79B9_7F4A_7C15,
             stack_bytes: 64 * 1024,
             collect_at_every_safepoint_for_test: false,
+            workers: 1,
+            blocking_pool_threads: 2,
         }
     }
 }
@@ -104,6 +115,7 @@ pub fn run_checked(
                 stats: RunStats {
                     tasks_spawned: 0,
                     switches: 0,
+                    steals: 0,
                     high_water_max: 0,
                     collections: 0,
                     allocated: 0,
@@ -123,12 +135,14 @@ pub fn run_checked(
         .name("toto-runtime".to_string())
         .stack_size(256 << 20)
         .spawn(move || {
-            let mut sched = Scheduler::new(
+            let sched = Scheduler::new(
                 code,
                 config.gc_threshold_bytes,
                 config.rng_seed,
                 config.stack_bytes,
                 config.collect_at_every_safepoint_for_test,
+                config.workers,
+                config.blocking_pool_threads,
             );
             sched.spawn_main(main_idx, main_span);
             sched.run()

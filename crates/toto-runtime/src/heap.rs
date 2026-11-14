@@ -23,6 +23,18 @@ impl GcRef {
     pub fn from_parts(index: u32, generation: u32) -> Self {
         Self { index, generation }
     }
+
+    /// Slot index (low 32 bits of the ADR-008 handle codec).
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
+    /// Generation at allocation (high 32 bits of the codec). A copy
+    /// whose generation no longer owns the slot is stale and resolves
+    /// to `None` — never to a stranger's object (ADR-008).
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
 }
 
 /// Type descriptor in the object header: tells the tracer which

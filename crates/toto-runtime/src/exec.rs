@@ -35,7 +35,7 @@ use toto_compiler::span::Span;
 use crate::channel::{ChannelId, TaskId};
 use crate::conv;
 use crate::heap::{Heap, Payload};
-use crate::sched::{ExecCode, ScopeId, Shared, ToSched, ToTask, gather_roots};
+use crate::sched::{ExecCode, ScopeId, Shared, ToSched, ToTask};
 use crate::value::{RtClosure, RtVal};
 
 /// How a task finished.
@@ -534,14 +534,22 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Publish roots and collect when the allocation threshold is
-    /// reached (allocation + switch safepoints, frozen ADR-008).
+    /// Publish roots and rendezvous for a stop-the-world collection
+    /// when the allocation threshold is reached (allocation + switch
+    /// safepoints, frozen ADR-008). With one worker the rendezvous
+    /// completes inline, exactly like the old direct collect; with M:N
+    /// every worker joins at its next opportunity while this task's
+    /// roots stay published.
     fn maybe_collect(&self) {
         self.publish_roots();
-        let mut st = self.shared.state.lock().expect("shared state lock");
-        if self.shared.force_collect_for_test || st.heap.bytes_since_gc() >= self.shared.threshold {
-            let roots = gather_roots(&st);
-            st.heap.collect(&roots);
+        let need = self.shared.force_collect_for_test
+            || {
+                let st = self.shared.state.lock().expect("shared state lock");
+                st.heap.bytes_since_gc() >= self.shared.threshold
+            }
+            || { self.shared.gc.lock().expect("gc lock").requested };
+        if need {
+            self.shared.rendezvous_collect();
         }
     }
 
@@ -1254,6 +1262,9 @@ impl<'a> Executor<'a> {
             "len" => return self.builtin_len(dst, args, span),
             "push" => return self.builtin_push(dst, args, span),
             "pop" => return self.builtin_pop(dst, args, span),
+            "read_file" | "write_file" | "file_exists" => {
+                return self.builtin_blocking(dst, name, args, span);
+            }
             _ => {}
         }
         // Shared builtins via conversion (parity by construction; one
@@ -1284,6 +1295,103 @@ impl<'a> Executor<'a> {
             Err((diag, _carried)) => return Err(ExecErr::Toto(diag)),
         }
         Ok(())
+    }
+
+    /// Read a string argument straight off the heap (no interpreter
+    /// conversion: blocking requests carry owned plain data so no
+    /// `Rc`-bearing `Value` is alive at the park — see the `Send`
+    /// audit in `sched.rs`).
+    fn blocking_str(&self, local: usize, name: &str, span: Span) -> Result<String, ExecErr> {
+        let top = self.frames.len() - 1;
+        let st = self.shared.state.lock().expect("shared state lock");
+        match &self.frames[top].locals[local] {
+            RtVal::Heap(r) => match st.heap.get(*r) {
+                Some(Payload::Str(s)) => Ok(s.clone()),
+                _ => {
+                    let tn = self.frames[top].locals[local].type_name(&st.heap);
+                    Err(self.internal(
+                        &format!("`{name}` argument must be a string, got {tn}"),
+                        span,
+                    ))
+                }
+            },
+            other => {
+                let tn = other.type_name(&st.heap);
+                Err(self.internal(
+                    &format!("`{name}` argument must be a string, got {tn}"),
+                    span,
+                ))
+            }
+        }
+    }
+
+    /// File-system builtins via the dedicated blocking pool (Stage 2
+    /// policy): arguments convert to owned plain data, the job runs on
+    /// a pool thread, and the task parks until the completion arrives.
+    /// Results mirror the inline builtins exactly (same values, same
+    /// E0210 messages — the pool formats those).
+    fn builtin_blocking(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
+        use crate::sched::BlockingOp;
+        let op = match name {
+            "read_file" => {
+                self.arity(name, args.len(), 1, span)?;
+                BlockingOp::ReadFile {
+                    path: self.blocking_str(args[0], name, span)?,
+                }
+            }
+            "write_file" => {
+                self.arity(name, args.len(), 2, span)?;
+                BlockingOp::WriteFile {
+                    path: self.blocking_str(args[0], name, span)?,
+                    contents: self.blocking_str(args[1], name, span)?.into_bytes(),
+                }
+            }
+            "file_exists" => {
+                self.arity(name, args.len(), 1, span)?;
+                BlockingOp::FileExists {
+                    path: self.blocking_str(args[0], name, span)?,
+                }
+            }
+            _ => return Err(self.internal("non-blocking builtin", span)),
+        };
+        // Fail-fast in a failed scope, like `park`.
+        if self.scope_failed() {
+            return Err(self.cancelled("blocking", span));
+        }
+        self.maybe_collect();
+        // Push the builtin frame BEFORE parking so a pool-reported
+        // failure carries the same trace as the inline builtins (the
+        // frame stays on panic, like `exec_builtin`). The frame holds
+        // no heap references, so parking with it pushed is root-safe.
+        self.trace.push(TraceFrame {
+            name: format!("{name} (builtin)"),
+            span,
+        });
+        match self.y.suspend(crate::sched::ToSched::Blocking { op, span }) {
+            ToTask::Value(v) => {
+                self.trace.pop();
+                if let Some(d) = dst {
+                    let top = self.frames.len() - 1;
+                    self.frames[top].locals[d] = v;
+                }
+                Ok(())
+            }
+            ToTask::OpPanic { diag } => Err(ExecErr::Toto(diag)),
+            ToTask::Cancelled { op } => {
+                self.trace.pop();
+                Err(self.cancelled(op, span))
+            }
+            other => {
+                let _ = other;
+                Err(self.internal("blocking response", span))
+            }
+        }
     }
 
     fn arity(&self, name: &str, got: usize, want: usize, span: Span) -> Result<(), ExecErr> {

@@ -30,6 +30,9 @@ fn pressure_config() -> RuntimeConfig {
         rng_seed: 0x9E37_79B9_7F4A_7C15,
         stack_bytes: 64 * 1024,
         collect_at_every_safepoint_for_test: true,
+        // Deterministic single-worker mode: exact goldens.
+        workers: 1,
+        blocking_pool_threads: 2,
     }
 }
 

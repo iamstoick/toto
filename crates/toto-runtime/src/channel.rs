@@ -107,4 +107,19 @@ impl ChannelTable {
     pub fn parked_count(&self) -> usize {
         self.channels.iter().map(Channel::parked_count).sum()
     }
+
+    /// Drop every waiter entry belonging to `released` (scope-failure
+    /// release sweep): stale entries would keep send values rooted
+    /// forever and could consume channel values for dead waits.
+    /// Returns the number of entries removed.
+    pub fn sweep_released(&mut self, released: &std::collections::HashSet<usize>) -> usize {
+        let mut removed = 0;
+        for ch in &mut self.channels {
+            let before = ch.send_waiters.len() + ch.recv_waiters.len();
+            ch.send_waiters.retain(|w| !released.contains(&w.task.0));
+            ch.recv_waiters.retain(|w| !released.contains(&w.task.0));
+            removed += before - (ch.send_waiters.len() + ch.recv_waiters.len());
+        }
+        removed
+    }
 }

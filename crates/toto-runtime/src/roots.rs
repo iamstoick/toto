@@ -30,6 +30,21 @@ impl ShadowStack {
         self.roots = roots;
     }
 
+    /// Push one root (codegen-emitted publication, ADR-008: the
+    /// backend publishes each live handle around safepoints; the MIR
+    /// executor keeps its rebuild-scan `publish` discipline).
+    pub fn push(&mut self, root: GcRef) {
+        self.roots.push(root);
+    }
+
+    /// Release roots pushed after `len` (generated epilogues). Never
+    /// panics: truncating past the end is a no-op, so a codegen bug
+    /// here leaks roots instead of corrupting state (tests assert
+    /// exact depths, so leaks surface immediately).
+    pub fn pop_to(&mut self, len: usize) {
+        self.roots.truncate(len);
+    }
+
     pub fn clear(&mut self) {
         self.roots.clear();
     }
