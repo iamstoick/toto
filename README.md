@@ -1,13 +1,15 @@
 # Toto (.gzv) — language implementation in Rust
 
-> Phase 0 (foundations + de-risking spikes) work in progress.
-> See [Implementation Roadmap v2.2](docs/) and `docs/decisions/`.
+> Phase 1 (vertical slice, runnable core) complete: `toto run` executes
+> the core subset via a tree-walking interpreter with a 50-program corpus.
+> See [Implementation Roadmap v2.3](docs/) and `docs/decisions/`.
 
 ## Layout
 
 - `crates/toto-runtime/` — production runtime scaffold (empty until Phase 3).
-- `crates/toto-compiler/` — production compiler scaffold (empty until Phase 1/2).
-- `crates/toto-cli/` — `toto` CLI scaffold (empty until Phase 1/4).
+- `crates/toto-compiler/` — lexer, parser, diagnostics, tree-walking
+  interpreter (Phase 1 core subset; checker + IR arrive in Phase 2).
+- `crates/toto-cli/` — `toto run` + `--help`/`--version` (Phase 1).
 - `spikes/spike-1-gc-scheduler/` — **isolated prototype** for Spike 1
   (single-threaded cooperative scheduler + stop-the-world tracing GC).
   Throwaway code: it may be deleted, and it is NOT the production runtime.
