@@ -58,6 +58,13 @@ impl<'a> TaskRt<'a> {
         self.with_world(|w| w.shadows[self.task].push(r));
     }
 
+    /// Release one occurrence of a root (scope exit, callable
+    /// release). Added for Spike 2, which manages version-token and
+    /// callable lifetimes from task code; additive only.
+    pub fn remove_one_root(&self, r: GcRef) -> bool {
+        self.with_world(|w| w.shadows[self.task].remove_one(r))
+    }
+
     pub fn shadow_len(&self) -> usize {
         self.world.borrow().shadows[self.task].len()
     }
