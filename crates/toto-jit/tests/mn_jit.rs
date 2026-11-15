@@ -88,7 +88,7 @@ fn run_compiled(
 
 fn run_case(name: &str, config: RuntimeConfig) -> CaseOut {
     let (src, program, checked, session) = load(name);
-    run_compiled(&src, &program, &checked, &session, config, name)
+    run_compiled(name, &src, &program, &checked, &session, config)
 }
 
 fn golden(name: &str, ext: &str) -> Vec<u8> {
@@ -281,8 +281,7 @@ fn check_legal(name: &str, out: &CaseOut, failures: &mut Vec<String>) {
             failures.push(format!("{name}: race-free golden mismatch"));
         }
     } else if name == "conc03_select_two" {
-        if out.status != "0"
-            || !(out.stdout == b"10\n".to_vec() || out.stdout == b"20\n".to_vec())
+        if out.status != "0" || !(out.stdout == b"10\n".to_vec() || out.stdout == b"20\n".to_vec())
         {
             failures.push(format!("{name}: illegal tie-break {:?}", out.stdout));
         }
@@ -327,7 +326,7 @@ fn mn_jit_hammer_1620() {
                     workers,
                     ..mn_config()
                 };
-                let out = run_compiled(&src, &program, &checked, &session, cfg, name);
+                let out = run_compiled(name, &src, &program, &checked, &session, cfg);
                 runs += 1;
                 check_legal(name, &out, &mut failures);
             }

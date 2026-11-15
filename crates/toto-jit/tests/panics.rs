@@ -178,7 +178,9 @@ fn panics_match_interpreter() {
         let want_head = want.split("stack trace:\n").next().unwrap_or("");
         let got_head = got.split("stack trace:\n").next().unwrap_or("");
         if want_head != got_head {
-            failures.push(format!("{name}: stderr head differs:\n got:\n{got_head}\n want:\n{want_head}"));
+            failures.push(format!(
+                "{name}: stderr head differs:\n got:\n{got_head}\n want:\n{want_head}"
+            ));
             continue;
         }
         if !got.contains("stack trace:\n") || !got.contains("in main") {

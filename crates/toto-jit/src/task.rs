@@ -91,7 +91,7 @@ pub struct JitTaskCtx {
     pub chan_types: Arc<Vec<toto_compiler::hir::Ty>>,
 }
 
-fn tctx(ctx: *mut JitTaskCtx) -> &mut JitTaskCtx {
+fn tctx<'a>(ctx: *mut JitTaskCtx) -> &'a mut JitTaskCtx {
     // SAFETY: only the running task touches its context (see the
     // struct docs), the pointer is the live box the spawner built,
     // and no helper re-enters while another borrow is alive.
@@ -155,9 +155,7 @@ fn maybe_collect(ctx: &JitTaskCtx) {
             let st = ctx.shared.state.lock().expect("shared state lock");
             st.heap.bytes_since_gc() >= ctx.shared.threshold
         }
-        || {
-            ctx.shared.gc.lock().expect("gc lock").requested
-        };
+        || { ctx.shared.gc.lock().expect("gc lock").requested };
     if need {
         ctx.shared.rendezvous_collect();
     }
@@ -198,7 +196,14 @@ fn decode_inner(
         }
     };
     if let RtVal::Heap(r) = v {
-        let live = ctx.shared.state.lock().expect("shared state lock").heap.get(r).is_some();
+        let live = ctx
+            .shared
+            .state
+            .lock()
+            .expect("shared state lock")
+            .heap
+            .get(r)
+            .is_some();
         if !live {
             internal(
                 ctx,
@@ -416,8 +421,7 @@ pub unsafe extern "C" fn task_alloc_closure(
     let ctx = tctx(ctx);
     let span = Span::new(start as u32, end as u32);
     let n = ncaps as usize;
-    let words =
-        unsafe { std::slice::from_raw_parts(caps_ptr as *const u64, n.saturating_mul(2)) };
+    let words = unsafe { std::slice::from_raw_parts(caps_ptr as *const u64, n.saturating_mul(2)) };
     let mut captures = Vec::with_capacity(n);
     for i in 0..n {
         match decode_inner(ctx, "alloc_closure", words[2 * i], words[2 * i + 1], span) {
@@ -496,7 +500,11 @@ pub unsafe extern "C" fn task_index_read(
         Some(v) => match encode_val(&v) {
             Some(w) => w,
             None => {
-                internal(ctx, String::from("index value is not JIT-trafficable"), span);
+                internal(
+                    ctx,
+                    String::from("index value is not JIT-trafficable"),
+                    span,
+                );
                 0
             }
         },
@@ -629,10 +637,7 @@ enum StructMiss {
 }
 
 /// Owned struct-shape snapshot (see the gate's `struct_snapshot`).
-fn struct_snapshot(
-    heap: &Heap,
-    obj: u64,
-) -> Result<(String, Vec<(String, RtVal)>), StructMiss> {
+fn struct_snapshot(heap: &Heap, obj: u64) -> Result<(String, Vec<(String, RtVal)>), StructMiss> {
     match heap.get(decode(obj)) {
         Some(Payload::Struct { name, fields }) => Ok((name.clone(), fields.clone())),
         Some(_) => Err(StructMiss::Other),
@@ -750,7 +755,11 @@ pub unsafe extern "C" fn task_struct_get(
         Some(v) => match encode_val(&v) {
             Some(w) => w,
             None => {
-                internal(ctx, String::from("struct_get value is not JIT-trafficable"), span);
+                internal(
+                    ctx,
+                    String::from("struct_get value is not JIT-trafficable"),
+                    span,
+                );
                 0
             }
         },
@@ -879,7 +888,13 @@ pub unsafe extern "C" fn task_len(
             TAG_FUNC => "function",
             _ => "unknown",
         };
-        record(ctx, "E0209", format!("`len` needs an array, got {tn}"), span, None);
+        record(
+            ctx,
+            "E0209",
+            format!("`len` needs an array, got {tn}"),
+            span,
+            None,
+        );
         return 0;
     }
     let shape: Option<Option<usize>> = {
@@ -897,7 +912,13 @@ pub unsafe extern "C" fn task_len(
                 let st = ctx.shared.state.lock().expect("shared state lock");
                 RtVal::Heap(decode(obj)).type_name(&st.heap)
             };
-            record(ctx, "E0209", format!("`len` needs an array, got {tn}"), span, None);
+            record(
+                ctx,
+                "E0209",
+                format!("`len` needs an array, got {tn}"),
+                span,
+                None,
+            );
             0
         }
         None => {
@@ -1081,7 +1102,11 @@ pub unsafe extern "C" fn task_wrap_inner(
     match encode_val(&inner) {
         Some(w) => w,
         None => {
-            internal(ctx, String::from("wrap_inner value is not JIT-trafficable"), span);
+            internal(
+                ctx,
+                String::from("wrap_inner value is not JIT-trafficable"),
+                span,
+            );
             0
         }
     }
@@ -1136,19 +1161,17 @@ pub unsafe extern "C" fn task_closure_cap(
         payload_owned(&st.heap, obj)
     };
     let cap = match snap {
-        Some(Payload::Closure { captures, .. }) => {
-            match captures.get(idx as usize).cloned() {
-                Some(v) => v,
-                None => {
-                    internal(
-                        ctx,
-                        format!("closure capture index {idx} out of range"),
-                        span,
-                    );
-                    return 0;
-                }
+        Some(Payload::Closure { captures, .. }) => match captures.get(idx as usize).cloned() {
+            Some(v) => v,
+            None => {
+                internal(
+                    ctx,
+                    format!("closure capture index {idx} out of range"),
+                    span,
+                );
+                return 0;
             }
-        }
+        },
         Some(_) => {
             internal(ctx, String::from("closure_cap on a non-closure"), span);
             return 0;
@@ -1165,7 +1188,11 @@ pub unsafe extern "C" fn task_closure_cap(
     match encode_val(&cap) {
         Some(w) => w,
         None => {
-            internal(ctx, String::from("closure_cap value is not JIT-trafficable"), span);
+            internal(
+                ctx,
+                String::from("closure_cap value is not JIT-trafficable"),
+                span,
+            );
             0
         }
     }
@@ -1394,9 +1421,7 @@ fn jit_values_equal(ctx: &JitTaskCtx, a: &EqOperand, b: &EqOperand, depth: usize
     };
     match (a.kind, b.kind) {
         (EqKind::Int, EqKind::Int) => a.word as i64 == b.word as i64,
-        (EqKind::Float, EqKind::Float) => {
-            f64::from_bits(a.word) == f64::from_bits(b.word)
-        }
+        (EqKind::Float, EqKind::Float) => f64::from_bits(a.word) == f64::from_bits(b.word),
         (EqKind::Bool, EqKind::Bool) => (a.word != 0) == (b.word != 0),
         (EqKind::Unit, EqKind::Unit) => true,
         (EqKind::Str, EqKind::Str) => match payloads(a.word, b.word) {
@@ -1404,34 +1429,25 @@ fn jit_values_equal(ctx: &JitTaskCtx, a: &EqOperand, b: &EqOperand, depth: usize
             _ => false,
         },
         (EqKind::Range, EqKind::Range) => match payloads(a.word, b.word) {
-            (
-                Some(Payload::Range { lo: a0, hi: a1 }),
-                Some(Payload::Range { lo: b0, hi: b1 }),
-            ) => a0 == b0 && a1 == b1,
+            (Some(Payload::Range { lo: a0, hi: a1 }), Some(Payload::Range { lo: b0, hi: b1 })) => {
+                a0 == b0 && a1 == b1
+            }
             _ => false,
         },
         (EqKind::Closure, EqKind::Closure) => a.word == b.word,
         (EqKind::Func, EqKind::Func) => a.word == b.word,
         (EqKind::Chan, EqKind::Chan) => true,
-        (EqKind::Ok, EqKind::Ok) | (EqKind::Err, EqKind::Err) => {
-            match payloads(a.word, b.word) {
-                (
-                    Some(Payload::Result { inner: x, .. }),
-                    Some(Payload::Result { inner: y, .. }),
-                ) => {
-                    let xo = operand_of_rtval(ctx, &x);
-                    let yo = operand_of_rtval(ctx, &y);
-                    jit_values_equal(ctx, &xo, &yo, depth + 1)
-                }
-                _ => false,
+        (EqKind::Ok, EqKind::Ok) | (EqKind::Err, EqKind::Err) => match payloads(a.word, b.word) {
+            (Some(Payload::Result { inner: x, .. }), Some(Payload::Result { inner: y, .. })) => {
+                let xo = operand_of_rtval(ctx, &x);
+                let yo = operand_of_rtval(ctx, &y);
+                jit_values_equal(ctx, &xo, &yo, depth + 1)
             }
-        }
+            _ => false,
+        },
         (EqKind::Ok, EqKind::Err) | (EqKind::Err, EqKind::Ok) => false,
         (EqKind::Some, EqKind::Some) => match payloads(a.word, b.word) {
-            (
-                Some(Payload::Option { inner: x }),
-                Some(Payload::Option { inner: y }),
-            ) => {
+            (Some(Payload::Option { inner: x }), Some(Payload::Option { inner: y })) => {
                 let xo = operand_of_rtval(ctx, &x);
                 let yo = operand_of_rtval(ctx, &y);
                 jit_values_equal(ctx, &xo, &yo, depth + 1)
@@ -1515,7 +1531,11 @@ pub unsafe extern "C" fn task_values_eq(
         record(
             ctx,
             "E0203",
-            format!("cannot compare {} with {}", eq_name(oa.kind), eq_name(ob.kind)),
+            format!(
+                "cannot compare {} with {}",
+                eq_name(oa.kind),
+                eq_name(ob.kind)
+            ),
             span,
             eq_hint(&oa, &ob),
         );
@@ -1551,12 +1571,10 @@ pub unsafe extern "C" fn task_values_order(
     };
     let ord = match (oa.kind, ob.kind) {
         (EqKind::Int, EqKind::Int) => (a as i64).cmp(&(b as i64)),
-        (EqKind::Float, EqKind::Float) => {
-            match f64::from_bits(a).partial_cmp(&f64::from_bits(b)) {
-                Some(o) => o,
-                None => return 0,
-            }
-        }
+        (EqKind::Float, EqKind::Float) => match f64::from_bits(a).partial_cmp(&f64::from_bits(b)) {
+            Some(o) => o,
+            None => return 0,
+        },
         (EqKind::Str, EqKind::Str) => {
             let pair = {
                 let st = ctx.shared.state.lock().expect("shared state lock");
@@ -1585,7 +1603,11 @@ pub unsafe extern "C" fn task_values_order(
         2 => ord == std::cmp::Ordering::Greater,
         3 => ord != std::cmp::Ordering::Less,
         _ => {
-            internal(ctx, format!("values_order with unknown operator {op}"), span);
+            internal(
+                ctx,
+                format!("values_order with unknown operator {op}"),
+                span,
+            );
             return 0;
         }
     };
@@ -1593,7 +1615,9 @@ pub unsafe extern "C" fn task_values_order(
 }
 
 fn task_builtin_name(id: u64) -> Option<&'static str> {
-    toto_compiler::builtins::BUILTIN_NAMES.get(id as usize).copied()
+    toto_compiler::builtins::BUILTIN_NAMES
+        .get(id as usize)
+        .copied()
 }
 
 fn builtin_arity(ctx: &mut JitTaskCtx, name: &str, got: usize, want: usize, span: Span) {
@@ -1728,7 +1752,13 @@ fn builtin_pop(ctx: &mut JitTaskCtx, decoded: &[RtVal], span: Span) -> u64 {
             }
         },
         Out::Empty => {
-            record(ctx, "E0210", String::from("pop from empty array"), span, None);
+            record(
+                ctx,
+                "E0210",
+                String::from("pop from empty array"),
+                span,
+                None,
+            );
             0
         }
         Out::NotArray => {
@@ -1852,7 +1882,11 @@ fn builtin_blocking(
     let yielder = match ctx.yielder {
         Some(y) => y,
         None => {
-            internal(ctx, String::from("blocking suspend with no yielder installed"), span);
+            internal(
+                ctx,
+                String::from("blocking suspend with no yielder installed"),
+                span,
+            );
             return 0;
         }
     };
@@ -1863,7 +1897,11 @@ fn builtin_blocking(
         ToTask::Value(v) => match encode_val(&v) {
             Some(w) => w,
             None => {
-                internal(ctx, String::from("blocking result is not JIT-trafficable"), span);
+                internal(
+                    ctx,
+                    String::from("blocking result is not JIT-trafficable"),
+                    span,
+                );
                 0
             }
         },
@@ -1890,12 +1928,7 @@ fn builtin_blocking(
 }
 
 /// Shared-implementation builtins (see the gate's `builtin_conv`).
-fn builtin_conv(
-    ctx: &mut JitTaskCtx,
-    name: &'static str,
-    decoded: Vec<RtVal>,
-    span: Span,
-) -> u64 {
+fn builtin_conv(ctx: &mut JitTaskCtx, name: &'static str, decoded: Vec<RtVal>, span: Span) -> u64 {
     use std::collections::HashMap;
     let mut memo = HashMap::new();
     let mut args = Vec::with_capacity(decoded.len());
@@ -1939,11 +1972,7 @@ fn builtin_conv(
                     }
                 },
                 Err(_) => {
-                    internal(
-                        ctx,
-                        String::from("function from builtin"),
-                        span,
-                    );
+                    internal(ctx, String::from("function from builtin"), span);
                     0
                 }
             }
@@ -1985,8 +2014,7 @@ pub unsafe extern "C" fn task_builtin(
         return 0;
     }
     let n = nargs as usize;
-    let words =
-        unsafe { std::slice::from_raw_parts(args_ptr as *const u64, n.saturating_mul(2)) };
+    let words = unsafe { std::slice::from_raw_parts(args_ptr as *const u64, n.saturating_mul(2)) };
     let mut decoded = Vec::with_capacity(n);
     for i in 0..n {
         match decode_inner(ctx, "builtin", words[2 * i], words[2 * i + 1], span) {
@@ -2093,7 +2121,11 @@ fn response_value(ctx: &mut JitTaskCtx, v: RtVal, span: Span) -> Option<u64> {
     match encode_val(&n) {
         Some(w) => Some(w),
         None => {
-            internal(ctx, String::from("response value is not JIT-trafficable"), span);
+            internal(
+                ctx,
+                String::from("response value is not JIT-trafficable"),
+                span,
+            );
             None
         }
     }
@@ -2175,7 +2207,11 @@ pub unsafe extern "C" fn task_chan_make(
     let elem = match elem {
         Some(t) => t,
         None => {
-            internal(ctx, format!("channel element type id {elem_ty} out of range"), span);
+            internal(
+                ctx,
+                format!("channel element type id {elem_ty} out of range"),
+                span,
+            );
             return 0;
         }
     };
@@ -2239,8 +2275,7 @@ pub unsafe extern "C" fn task_spawn(
         }
     };
     let n = ncaps as usize;
-    let words =
-        unsafe { std::slice::from_raw_parts(caps_ptr as *const u64, n.saturating_mul(2)) };
+    let words = unsafe { std::slice::from_raw_parts(caps_ptr as *const u64, n.saturating_mul(2)) };
     let mut captures = Vec::with_capacity(n);
     for i in 0..n {
         let (tag, word) = (words[2 * i], words[2 * i + 1]);
@@ -2399,13 +2434,16 @@ fn yield_select(
     // (kind, chan, vtag, vword, cstart, cend). Kind 0 receives, kind
     // 1 sends; the received value (when any) lands in `out_ptr`.
     let n = ncases as usize;
-    let words =
-        unsafe { std::slice::from_raw_parts(cases_ptr as *const u64, n.saturating_mul(6)) };
+    let words = unsafe { std::slice::from_raw_parts(cases_ptr as *const u64, n.saturating_mul(6)) };
     let mut cases = Vec::with_capacity(n);
     for i in 0..n {
         let base = 6 * i;
-        let (kind, chan_w, vtag, vword) =
-            (words[base], words[base + 1], words[base + 2], words[base + 3]);
+        let (kind, chan_w, vtag, vword) = (
+            words[base],
+            words[base + 1],
+            words[base + 2],
+            words[base + 3],
+        );
         let cspan = Span::new(words[base + 4] as u32, words[base + 5] as u32);
         match kind {
             0 => cases.push(SelReq::Recv {
@@ -2509,7 +2547,11 @@ fn yield_closed(ctx: &mut JitTaskCtx, chan_w: u64, span: Span) -> u64 {
         Some(ToTask::Value(v)) => match encode_val(&v) {
             Some(w) => w,
             None => {
-                internal(ctx, String::from("closed result is not JIT-trafficable"), span);
+                internal(
+                    ctx,
+                    String::from("closed result is not JIT-trafficable"),
+                    span,
+                );
                 0
             }
         },
@@ -2540,7 +2582,7 @@ pub unsafe extern "C" fn task_yield(
     a1: u64,
     a2: u64,
     a3: u64,
-    a4: u64,
+    _a4: u64,
     start: u64,
     end: u64,
 ) -> u64 {
@@ -2597,7 +2639,11 @@ pub unsafe extern "C" fn task_func_entry(
     match entry {
         Some(e) => e as u64,
         None => {
-            internal(ctx, format!("function `{name}` has no compiled entry"), span);
+            internal(
+                ctx,
+                format!("function `{name}` has no compiled entry"),
+                span,
+            );
             0
         }
     }
@@ -2672,6 +2718,7 @@ pub fn jit_task_entry(
                     "E0204",
                     String::from("internal error: failed without a recorded diag (unreachable)"),
                     Span::new(0, 0),
+                    None,
                 )
             });
             let mut trace = Vec::with_capacity(ctxr.trace.len());
@@ -2754,6 +2801,7 @@ impl JitRun {
 /// returns the live handle immediately. `Err` carries an immediate
 /// outcome when no run starts (missing main/entry — unreachable in
 /// checked programs). The blocking `run_jit` is spawn-plus-join.
+#[allow(clippy::result_large_err)]
 pub fn spawn_jit_run(
     program: &Program,
     checked: &CheckedProgram,

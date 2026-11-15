@@ -52,12 +52,14 @@ fn differential_task_concurrent() {
             .trim()
             .to_string();
         let want_out = read_or_empty(&case.with_extension("stdout"));
-        let want_err = String::from_utf8_lossy(&read_or_empty(&case.with_extension("stderr")))
-            .into_owned();
+        let want_err =
+            String::from_utf8_lossy(&read_or_empty(&case.with_extension("stderr"))).into_owned();
         let (program, checked) = match parse_and_check(&src) {
             Ok(v) => v,
             Err(diags) => {
-                failures.push(format!("{name}: concurrent case failed to check: {diags:?}"));
+                failures.push(format!(
+                    "{name}: concurrent case failed to check: {diags:?}"
+                ));
                 continue;
             }
         };
@@ -105,8 +107,14 @@ fn differential_task_concurrent() {
         }
         if first.stats.tasks_spawned < 1 || first.stats.collections < 1 {
             failures.push(format!(
-                "{name}: invariant stats failed: {:?}",
-                first.stats
+                "{name}: invariant stats failed: tasks_spawned={} switches={} steals={} high_water_max={} collections={} allocated={} reclaimed={}",
+                first.stats.tasks_spawned,
+                first.stats.switches,
+                first.stats.steals,
+                first.stats.high_water_max,
+                first.stats.collections,
+                first.stats.allocated,
+                first.stats.reclaimed
             ));
             continue;
         }

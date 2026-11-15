@@ -41,7 +41,11 @@ fn yield_from_live_jit_frames() {
     // `5` crosses the channel to the spawned task; `60` proves main's
     // array survived forced collections while main was parked.
     assert_eq!(outcome.stdout, b"5\n60\n".to_vec());
-    assert!(matches!(outcome.result, Ok(0)), "result: {:?}", outcome.result);
+    assert!(
+        matches!(outcome.result, Ok(0)),
+        "result: {:?}",
+        outcome.result
+    );
     assert!(
         outcome.stats.tasks_spawned >= 2,
         "tasks: {}",

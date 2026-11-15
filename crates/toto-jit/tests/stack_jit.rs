@@ -54,8 +54,7 @@ fn jit_stack_high_water_under_budget() {
     for (area, name) in PROGRAMS {
         let case = root.join(area).join(format!("{name}.gzv"));
         let src = std::fs::read_to_string(&case).expect("read case");
-        let (program, checked) =
-            parse_and_check(&src).expect("stack program checks");
+        let (program, checked) = parse_and_check(&src).expect("stack program checks");
         let mut jit = Jit::new_task().expect("session");
         let prog = toto_compiler::mir::lower(&checked);
         let session = jit.compile_task(&prog).expect("stack program compiles");

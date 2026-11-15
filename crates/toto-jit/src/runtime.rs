@@ -620,8 +620,7 @@ pub unsafe extern "C" fn toto_alloc_closure(
 ) -> u64 {
     let rt = rt(ctx);
     let n = ncaps as usize;
-    let words =
-        unsafe { std::slice::from_raw_parts(caps_ptr as *const u64, n.saturating_mul(2)) };
+    let words = unsafe { std::slice::from_raw_parts(caps_ptr as *const u64, n.saturating_mul(2)) };
     let mut captures = Vec::with_capacity(n);
     for i in 0..n {
         captures.push(decode_inner(
@@ -660,10 +659,7 @@ enum StructMiss {
 
 /// Owned struct-shape snapshot (see `Shape`): declaration name plus a
 /// field clone, so callers never diverge holding a heap borrow.
-fn struct_snapshot(
-    heap: &Heap,
-    obj: u64,
-) -> Result<(String, Vec<(String, RtVal)>), StructMiss> {
+fn struct_snapshot(heap: &Heap, obj: u64) -> Result<(String, Vec<(String, RtVal)>), StructMiss> {
     match heap.get(decode(obj)) {
         Some(Payload::Struct { name, fields }) => Ok((name.clone(), fields.clone())),
         Some(_) => Err(StructMiss::Other),
@@ -765,7 +761,9 @@ pub unsafe extern "C" fn toto_struct_get(
             E_INTERNAL,
             start,
             end,
-            String::from("struct_get value is not JIT-trafficable (unreachable in JIT-built heaps)"),
+            String::from(
+                "struct_get value is not JIT-trafficable (unreachable in JIT-built heaps)",
+            ),
         ),
     }
 }
@@ -929,12 +927,7 @@ pub unsafe extern "C" fn toto_range_hi(ctx: *mut JitRt, obj: u64, start: u64, en
 /// `1` for `Ok`, `0` for `Err`. Stale objects diverge `E0204`;
 /// anything else is an unreachable backstop (statically a `Result`).
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn toto_result_is_ok(
-    ctx: *mut JitRt,
-    obj: u64,
-    start: u64,
-    end: u64,
-) -> u64 {
+pub unsafe extern "C" fn toto_result_is_ok(ctx: *mut JitRt, obj: u64, start: u64, end: u64) -> u64 {
     let rt = rt(ctx);
     match payload_owned(&rt.heap, obj) {
         Some(Payload::Result { is_ok, .. }) => u64::from(is_ok),
@@ -984,7 +977,9 @@ pub unsafe extern "C" fn toto_wrap_inner(ctx: *mut JitRt, obj: u64, start: u64, 
             E_INTERNAL,
             start,
             end,
-            String::from("wrap_inner value is not JIT-trafficable (unreachable in JIT-built heaps)"),
+            String::from(
+                "wrap_inner value is not JIT-trafficable (unreachable in JIT-built heaps)",
+            ),
         ),
     }
 }
@@ -1026,18 +1021,16 @@ pub unsafe extern "C" fn toto_closure_cap(
 ) -> u64 {
     let rt = rt(ctx);
     let cap = match payload_owned(&rt.heap, obj) {
-        Some(Payload::Closure { captures, .. }) => {
-            match captures.get(idx as usize).cloned() {
-                Some(v) => v,
-                None => do_panic(
-                    rt,
-                    E_INTERNAL,
-                    start,
-                    end,
-                    format!("closure capture index {idx} out of range (unreachable: checked code)"),
-                ),
-            }
-        }
+        Some(Payload::Closure { captures, .. }) => match captures.get(idx as usize).cloned() {
+            Some(v) => v,
+            None => do_panic(
+                rt,
+                E_INTERNAL,
+                start,
+                end,
+                format!("closure capture index {idx} out of range (unreachable: checked code)"),
+            ),
+        },
         Some(_) => do_panic(
             rt,
             E_INTERNAL,
@@ -1060,7 +1053,9 @@ pub unsafe extern "C" fn toto_closure_cap(
             E_INTERNAL,
             start,
             end,
-            String::from("closure_cap value is not JIT-trafficable (unreachable in JIT-built heaps)"),
+            String::from(
+                "closure_cap value is not JIT-trafficable (unreachable in JIT-built heaps)",
+            ),
         ),
     }
 }
@@ -1266,9 +1261,7 @@ fn jit_values_equal(heap: &Heap, a: &EqOperand, b: &EqOperand, depth: usize) -> 
     }
     match (a.kind, b.kind) {
         (EqKind::Int, EqKind::Int) => a.word as i64 == b.word as i64,
-        (EqKind::Float, EqKind::Float) => {
-            f64::from_bits(a.word) == f64::from_bits(b.word)
-        }
+        (EqKind::Float, EqKind::Float) => f64::from_bits(a.word) == f64::from_bits(b.word),
         (EqKind::Bool, EqKind::Bool) => (a.word != 0) == (b.word != 0),
         (EqKind::Unit, EqKind::Unit) => true,
         (EqKind::Str, EqKind::Str) => {
@@ -1305,10 +1298,7 @@ fn jit_values_equal(heap: &Heap, a: &EqOperand, b: &EqOperand, depth: usize) -> 
         (EqKind::Ok, EqKind::Err) | (EqKind::Err, EqKind::Ok) => false,
         (EqKind::Some, EqKind::Some) => {
             match (payload_owned(heap, a.word), payload_owned(heap, b.word)) {
-                (
-                    Some(Payload::Option { inner: x }),
-                    Some(Payload::Option { inner: y }),
-                ) => {
+                (Some(Payload::Option { inner: x }), Some(Payload::Option { inner: y })) => {
                     let xo = operand_of_rtval(heap, &x);
                     let yo = operand_of_rtval(heap, &y);
                     jit_values_equal(heap, &xo, &yo, depth + 1)
@@ -1391,7 +1381,11 @@ pub unsafe extern "C" fn toto_values_eq(
             E_MISMATCH,
             start,
             end,
-            format!("cannot compare {} with {}", eq_name(oa.kind), eq_name(ob.kind)),
+            format!(
+                "cannot compare {} with {}",
+                eq_name(oa.kind),
+                eq_name(ob.kind)
+            ),
         );
     }
     let eq = jit_values_equal(&rt.heap, &oa, &ob, 0);
@@ -1419,12 +1413,10 @@ pub unsafe extern "C" fn toto_values_order(
     let ob = eq_snapshot(rt, "values_order", tag_b, b, start, end);
     let ord = match (oa.kind, ob.kind) {
         (EqKind::Int, EqKind::Int) => (a as i64).cmp(&(b as i64)),
-        (EqKind::Float, EqKind::Float) => {
-            match f64::from_bits(a).partial_cmp(&f64::from_bits(b)) {
-                Some(o) => o,
-                None => return 0,
-            }
-        }
+        (EqKind::Float, EqKind::Float) => match f64::from_bits(a).partial_cmp(&f64::from_bits(b)) {
+            Some(o) => o,
+            None => return 0,
+        },
         (EqKind::Str, EqKind::Str) => {
             match (payload_owned(&rt.heap, a), payload_owned(&rt.heap, b)) {
                 (Some(Payload::Str(x)), Some(Payload::Str(y))) => x.cmp(&y),
@@ -1706,8 +1698,7 @@ pub unsafe extern "C" fn toto_builtin(
         );
     }
     let n = nargs as usize;
-    let words =
-        unsafe { std::slice::from_raw_parts(args_ptr as *const u64, n.saturating_mul(2)) };
+    let words = unsafe { std::slice::from_raw_parts(args_ptr as *const u64, n.saturating_mul(2)) };
     // Decode to owned values first (ends all borrows): pair `i` is
     // `(tag, word)`, 1-based in messages.
     let mut decoded = Vec::with_capacity(n);
@@ -1889,7 +1880,13 @@ pub unsafe extern "C" fn toto_index_read(
                 ),
                 Some(None) => {
                     let tn = index_operand_name(rt, btag, obj);
-                    do_panic(rt, E_OUT_OF_BOUNDS, start, end, format!("cannot index {tn}"))
+                    do_panic(
+                        rt,
+                        E_OUT_OF_BOUNDS,
+                        start,
+                        end,
+                        format!("cannot index {tn}"),
+                    )
                 }
                 None => do_panic(
                     rt,
@@ -1981,7 +1978,13 @@ pub unsafe extern "C" fn toto_index_write(
         ),
         WriteOut::NotArray => {
             let tn = index_operand_name(rt, btag, obj);
-            do_panic(rt, E_OUT_OF_BOUNDS, start, end, format!("cannot index {tn}"))
+            do_panic(
+                rt,
+                E_OUT_OF_BOUNDS,
+                start,
+                end,
+                format!("cannot index {tn}"),
+            )
         }
         WriteOut::Stale => do_panic(
             rt,
@@ -1998,12 +2001,7 @@ pub unsafe extern "C" fn toto_index_write(
 /// `E0204` (unreachable: indices come from live `FuncRef`s, all
 /// in-range for the compiled program).
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn toto_func_entry(
-    ctx: *mut JitRt,
-    idx: u64,
-    start: u64,
-    end: u64,
-) -> u64 {
+pub unsafe extern "C" fn toto_func_entry(ctx: *mut JitRt, idx: u64, start: u64, end: u64) -> u64 {
     let rt = rt(ctx);
     let name = rt.func_names.get(idx as usize).cloned();
     let name = match name {
@@ -2033,12 +2031,7 @@ pub unsafe extern "C" fn toto_func_entry(
 /// through closure values). Unknown ids diverge `E0204`
 /// (unreachable: ids come from live `MakeClosure`s).
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn toto_body_entry(
-    ctx: *mut JitRt,
-    body: u64,
-    start: u64,
-    end: u64,
-) -> u64 {
+pub unsafe extern "C" fn toto_body_entry(ctx: *mut JitRt, body: u64, start: u64, end: u64) -> u64 {
     let rt = rt(ctx);
     let entry = rt.bodies.get(&(body as u32)).copied();
     match entry {

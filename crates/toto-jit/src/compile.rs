@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, InstBuilder, MemFlags, Signature, StackSlotData, StackSlotKind,
+    AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind,
     types::*,
 };
 use cranelift_codegen::isa::CallConv;
@@ -505,7 +505,7 @@ impl Jit {
         // malformed input such as use-before-def; checked MIR cannot
         // produce it, but the compiler stays total regardless.
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+            let mut b = FunctionBuilder::new(&mut ctx.func, fctx);
             FnCx::lower(self, &mut b, prog, shape)?;
             let frontend_config = self.module.isa().frontend_config();
             b.finalize(frontend_config);
@@ -599,7 +599,6 @@ struct FnCx<'a> {
     /// `FuncRef` resolutions seen so far: MIR local → program fn index.
     funcrefs: HashMap<usize, usize>,
     body_span: Span,
-    kind: BodyKind,
 }
 
 type CVal = cranelift_codegen::ir::Value;
@@ -617,7 +616,6 @@ impl<'a> FnCx<'a> {
             base: None,
             funcrefs: HashMap::new(),
             body_span: shape.body_span,
-            kind: shape.kind,
         }
     }
 
@@ -649,8 +647,13 @@ impl<'a> FnCx<'a> {
     fn trafficable(ty: &Ty) -> Result<bool, String> {
         match ty {
             Ty::Int | Ty::Float | Ty::Bool | Ty::Unit | Ty::Chan(_) => Ok(false),
-            Ty::String | Ty::Array(_) | Ty::Struct(_) | Ty::Range | Ty::Result(..)
-            | Ty::Option(_) | Ty::Fn(..) => Ok(true),
+            Ty::String
+            | Ty::Array(_)
+            | Ty::Struct(_)
+            | Ty::Range
+            | Ty::Result(..)
+            | Ty::Option(_)
+            | Ty::Fn(..) => Ok(true),
             Ty::Map(..) => Err(format!("type {ty:?} has no runtime values")),
         }
     }
@@ -723,11 +726,7 @@ impl<'a> FnCx<'a> {
     /// variable here is always defined: undefined-on-a-path locals
     /// publish the null word, which the collector skips (it never
     /// resolves).
-    fn publish_all(
-        &self,
-        jit: &mut Jit,
-        b: &mut FunctionBuilder<'_>,
-    ) -> Result<(), SubsetError> {
+    fn publish_all(&self, jit: &mut Jit, b: &mut FunctionBuilder<'_>) -> Result<(), SubsetError> {
         let mut ids: Vec<usize> = self.handle_locals.keys().copied().collect();
         ids.sort();
         for id in ids {
@@ -782,10 +781,10 @@ impl<'a> FnCx<'a> {
             let cb = b.create_block();
             cx.blocks.insert(blk.id, cb);
         }
-        // Declare one variable per local.
-        for i in 0..shape.locals.len() {
-            let var = Variable::new(i as u32);
-            b.declare_var(var, I64);
+        // Declare one variable per local (index order = declaration
+        // order, matching `cx.vars`).
+        for _ in 0..shape.locals.len() {
+            let var = b.declare_var(I64);
             cx.vars.push(var);
         }
         // Mark handle-typed locals for publication.
@@ -934,7 +933,9 @@ impl<'a> FnCx<'a> {
             MInstr::SplitRange { range, .. } => vec![*range],
             MInstr::Index { base, index, .. } => vec![*base, *index],
             MInstr::StoreField { base, value, .. } => vec![*base, *value],
-            MInstr::StoreIndex { base, index, value, .. } => vec![*base, *index, *value],
+            MInstr::StoreIndex {
+                base, index, value, ..
+            } => vec![*base, *index, *value],
             MInstr::Call { func, args, .. } => {
                 let mut out = vec![*func];
                 out.extend(args.iter().copied());
@@ -985,7 +986,7 @@ impl<'a> FnCx<'a> {
     ) -> Result<(), SubsetError> {
         let zero = Self::iconst(b, 0);
         for id in self.handle_locals.keys() {
-            b.ins().def_var(self.vars[*id], zero);
+            b.def_var(self.vars[*id], zero);
         }
         let want = match shape.kind {
             BodyKind::TopLevel => shape.params.len() + 1,
@@ -1041,7 +1042,12 @@ impl<'a> FnCx<'a> {
         let i = Self::iconst(b, idx as i64);
         let start = Self::iconst(b, span.start as i64);
         let end = Self::iconst(b, span.end as i64);
-        self.call_value(jit, b, "toto_closure_cap", &[self.ctx, handle, i, start, end])
+        self.call_value(
+            jit,
+            b,
+            "toto_closure_cap",
+            &[self.ctx, handle, i, start, end],
+        )
     }
 
     /// Fetch one go-body capture word (task context slots).
@@ -1100,10 +1106,9 @@ impl<'a> FnCx<'a> {
                     Ok(())
                 } else {
                     let msg = match shape.kind {
-                        BodyKind::TopLevel => format!(
-                            "function `{}` exited without returning a value",
-                            shape.name
-                        ),
+                        BodyKind::TopLevel => {
+                            format!("function `{}` exited without returning a value", shape.name)
+                        }
                         BodyKind::Closure => {
                             String::from("closure exited without returning a value")
                         }
@@ -1123,28 +1128,45 @@ impl<'a> FnCx<'a> {
                 }
             }
             MTerm::Jump(target) => {
-                let cb = self.blocks.get(target).copied().ok_or_else(|| SubsetError {
-                    func: self.func.clone(),
-                    message: format!("jump to missing block {target}"),
-                })?;
+                let cb = self
+                    .blocks
+                    .get(target)
+                    .copied()
+                    .ok_or_else(|| SubsetError {
+                        func: self.func.clone(),
+                        message: format!("jump to missing block {target}"),
+                    })?;
                 b.ins().jump(cb, &[]);
                 Ok(())
             }
-            MTerm::Branch { cond, then_b, else_b, .. } => {
+            MTerm::Branch {
+                cond,
+                then_b,
+                else_b,
+                ..
+            } => {
                 let c = self.operand(b, *cond)?;
                 // Boolean words are 0/1 by construction (all producers
                 // emit them; checked code never branches on anything
                 // else), so no `E0207` backstop is emitted.
                 let zero = Self::iconst(b, 0);
                 let t = b.ins().icmp(IntCC::NotEqual, c, zero);
-                let then_c = self.blocks.get(then_b).copied().ok_or_else(|| SubsetError {
-                    func: self.func.clone(),
-                    message: format!("branch to missing block {then_b}"),
-                })?;
-                let else_c = self.blocks.get(else_b).copied().ok_or_else(|| SubsetError {
-                    func: self.func.clone(),
-                    message: format!("branch to missing block {else_b}"),
-                })?;
+                let then_c = self
+                    .blocks
+                    .get(then_b)
+                    .copied()
+                    .ok_or_else(|| SubsetError {
+                        func: self.func.clone(),
+                        message: format!("branch to missing block {then_b}"),
+                    })?;
+                let else_c = self
+                    .blocks
+                    .get(else_b)
+                    .copied()
+                    .ok_or_else(|| SubsetError {
+                        func: self.func.clone(),
+                        message: format!("branch to missing block {else_b}"),
+                    })?;
                 b.ins().brif(t, then_c, &[], else_c, &[]);
                 Ok(())
             }
@@ -1386,8 +1408,7 @@ impl<'a> FnCx<'a> {
         b.seal_block(func_b);
         let fstart = Self::iconst(b, span.start as i64);
         let fend = Self::iconst(b, span.end as i64);
-        let entry =
-            self.call_value(jit, b, "toto_func_entry", &[self.ctx, fv, fstart, fend])?;
+        let entry = self.call_value(jit, b, "toto_func_entry", &[self.ctx, fv, fstart, fend])?;
         self.check_silent(jit, b, *span)?;
         let fsig = sig_arity(argvals.len() as u32, true);
         let fsig = b.func.import_signature(fsig);
@@ -1402,8 +1423,7 @@ impl<'a> FnCx<'a> {
         b.seal_block(clo_b);
         let cstart = Self::iconst(b, span.start as i64);
         let cend = Self::iconst(b, span.end as i64);
-        let body =
-            self.call_value(jit, b, "toto_closure_body", &[self.ctx, fv, cstart, cend])?;
+        let body = self.call_value(jit, b, "toto_closure_body", &[self.ctx, fv, cstart, cend])?;
         self.check_silent(jit, b, *span)?;
         let centry = self.call_value(jit, b, "toto_body_entry", &[self.ctx, body, cstart, cend])?;
         self.check_silent(jit, b, *span)?;
@@ -1447,10 +1467,11 @@ impl<'a> FnCx<'a> {
         name: &'static str,
         args: &[CVal],
     ) -> Result<CVal, SubsetError> {
-        self.call_import(jit, b, name, args)?.ok_or_else(|| SubsetError {
-            func: self.func.clone(),
-            message: format!("import `{name}` returned no value (unreachable)"),
-        })
+        self.call_import(jit, b, name, args)?
+            .ok_or_else(|| SubsetError {
+                func: self.func.clone(),
+                message: format!("import `{name}` returned no value (unreachable)"),
+            })
     }
 
     /// A tagged operand pair (static tag iconst + word) for helpers.
@@ -1471,22 +1492,21 @@ impl<'a> FnCx<'a> {
     /// Allocate a writable stack slot of `bytes` (8-byte aligned),
     /// returning its address.
     fn stack_slot(b: &mut FunctionBuilder<'_>, bytes: u32) -> CVal {
-        let slot = b.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            bytes,
-            3,
-        ));
+        let slot =
+            b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, bytes, 3));
         b.ins().stack_addr(I64, slot, 0)
     }
 
     /// Store `v` at `base + idx * 8`.
     fn stack_store(b: &mut FunctionBuilder<'_>, base: CVal, idx: usize, v: CVal) {
-        b.ins().store(MemFlags::new(), v, base, (idx * 8) as i32);
+        b.ins()
+            .store(MemFlagsData::trusted(), v, base, (idx * 8) as i32);
     }
 
     /// Load the word at `base + idx * 8`.
     fn stack_load(b: &mut FunctionBuilder<'_>, base: CVal, idx: usize) -> CVal {
-        b.ins().load(I64, MemFlags::new(), base, (idx * 8) as i32)
+        b.ins()
+            .load(I64, MemFlagsData::trusted(), base, (idx * 8) as i32)
     }
 
     fn operand(&self, b: &mut FunctionBuilder<'_>, local: usize) -> Result<CVal, SubsetError> {
@@ -1494,7 +1514,7 @@ impl<'a> FnCx<'a> {
             func: self.func.clone(),
             message: format!("local {local} out of range"),
         })?;
-        Ok(b.ins().use_var(var))
+        Ok(b.use_var(var))
     }
 
     fn define(
@@ -1507,7 +1527,7 @@ impl<'a> FnCx<'a> {
             func: self.func.clone(),
             message: format!("local {local} out of range"),
         })?;
-        b.ins().def_var(var, v);
+        b.def_var(var, v);
         Ok(())
     }
 
@@ -1560,10 +1580,6 @@ impl<'a> FnCx<'a> {
         divcheck_span: (u64, u64),
     ) -> Result<CVal, SubsetError> {
         use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-        let fail_op = |op: MBinOp, lty: &Ty, rty: &Ty| SubsetError {
-            func: self.func.clone(),
-            message: format!("{op:?} on {lty:?} and {rty:?} cannot appear in checked code"),
-        };
         match (op, lty, rty) {
             (MBinOp::Add, Ty::Int, Ty::Int) => {
                 let r = b.ins().iadd(a, c);
@@ -1772,12 +1788,8 @@ impl<'a> FnCx<'a> {
             (MBinOp::Add, Ty::String, Ty::String) => {
                 let start_v = Self::iconst(b, span.0 as i64);
                 let end_v = Self::iconst(b, span.1 as i64);
-                let v = self.call_value(
-                    jit,
-                    b,
-                    "toto_str_concat",
-                    &[self.ctx, a, c, start_v, end_v],
-                )?;
+                let v =
+                    self.call_value(jit, b, "toto_str_concat", &[self.ctx, a, c, start_v, end_v])?;
                 self.check_silent(jit, b, Span::new(span.0 as u32, span.1 as u32))?;
                 Ok(v)
             }
@@ -1794,7 +1806,6 @@ impl<'a> FnCx<'a> {
             (MBinOp::Add | MBinOp::Sub | MBinOp::Mul | MBinOp::Div | MBinOp::Mod, _, _) => {
                 self.lower_arith_mismatch(jit, b, op, lty, rty, span)
             }
-            _ => Err(fail_op(op, lty, rty)),
         }
     }
 
@@ -1938,7 +1949,11 @@ impl<'a> FnCx<'a> {
             Ty::Int => Ok(TAG_INT),
             Ty::Float => Ok(TAG_FLOAT),
             Ty::Bool => Ok(TAG_BOOL),
-            Ty::String | Ty::Array(_) | Ty::Struct(_) | Ty::Range | Ty::Result(..)
+            Ty::String
+            | Ty::Array(_)
+            | Ty::Struct(_)
+            | Ty::Range
+            | Ty::Result(..)
             | Ty::Option(_) => Ok(TAG_HANDLE),
             Ty::Unit => Ok(TAG_UNIT),
             Ty::Chan(_) => Ok(TAG_CHAN),
@@ -2075,8 +2090,7 @@ impl<'a> FnCx<'a> {
                         // Statically impossible (the checker rejects
                         // negation of non-numbers), panicking
                         // faithfully if ever reached.
-                        let msg =
-                            format!("cannot negate {}", Self::static_type_name(&other));
+                        let msg = format!("cannot negate {}", Self::static_type_name(&other));
                         self.emit_dead_panic(
                             jit,
                             b,
@@ -2101,10 +2115,8 @@ impl<'a> FnCx<'a> {
                         // Statically impossible (the checker rejects
                         // `!` on non-bools); the body span stands in
                         // for the missing operand span.
-                        let msg = format!(
-                            "`!` needs a bool, got {}",
-                            Self::static_type_name(&other)
-                        );
+                        let msg =
+                            format!("`!` needs a bool, got {}", Self::static_type_name(&other));
                         let r = self.emit_dead_panic(
                             jit,
                             b,
@@ -2136,9 +2148,7 @@ impl<'a> FnCx<'a> {
                 }
                 self.publish_all(jit, b)?;
                 let ret = match self.funcrefs.get(func).copied() {
-                    Some(target) => {
-                        self.lower_direct_call(jit, b, prog, target, &argvals, span)?
-                    }
+                    Some(target) => self.lower_direct_call(jit, b, prog, target, &argvals, span)?,
                     None => self.lower_indirect_call(jit, b, *func, &argvals, span, display)?,
                 };
                 if let Some(d) = dst {
@@ -2210,12 +2220,8 @@ impl<'a> FnCx<'a> {
                 let alen = Self::iconst(b, elems.len() as i64);
                 let astart = Self::iconst(b, span.start as i64);
                 let aend = Self::iconst(b, span.end as i64);
-                let arr = self.call_value(
-                    jit,
-                    b,
-                    "toto_alloc_array",
-                    &[self.ctx, alen, astart, aend],
-                )?;
+                let arr =
+                    self.call_value(jit, b, "toto_alloc_array", &[self.ctx, alen, astart, aend])?;
                 self.check_silent(jit, b, *span)?;
                 for (i, e) in elems.iter().enumerate() {
                     let v = self.operand(b, *e)?;
@@ -2235,8 +2241,7 @@ impl<'a> FnCx<'a> {
                         b,
                         "toto_index_write",
                         &[
-                            self.ctx, arr, btag, itag, idx, vtag, v, astart, aend, astart,
-                            aend,
+                            self.ctx, arr, btag, itag, idx, vtag, v, astart, aend, astart, aend,
                         ],
                     )?;
                     self.check_silent(jit, b, *span)?;
@@ -2293,12 +2298,8 @@ impl<'a> FnCx<'a> {
                 let ltag = Self::iconst(b, tag as i64);
                 let lstart = Self::iconst(b, span.start as i64);
                 let lend = Self::iconst(b, span.end as i64);
-                let v = self.call_value(
-                    jit,
-                    b,
-                    "toto_len",
-                    &[self.ctx, lbase, ltag, lstart, lend],
-                )?;
+                let v =
+                    self.call_value(jit, b, "toto_len", &[self.ctx, lbase, ltag, lstart, lend])?;
                 self.check_silent(jit, b, *span)?;
                 self.define(b, *dst, v)?;
             }
@@ -2310,9 +2311,7 @@ impl<'a> FnCx<'a> {
                 // allocation and suspension safepoints collect inside
                 // their helpers instead). Gate mode collects in
                 // allocation helpers only.
-                if self.mode == CodegenMode::Task
-                    && matches!(kind, K::Loop | K::Call | K::Entry)
-                {
+                if self.mode == CodegenMode::Task && matches!(kind, K::Loop | K::Call | K::Entry) {
                     self.call_import(jit, b, "toto_gc_collect", &[self.ctx])?;
                 }
             }
@@ -2365,12 +2364,8 @@ impl<'a> FnCx<'a> {
                 let btag = Self::iconst(b, TAG_HANDLE as i64);
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
-                let len = self.call_value(
-                    jit,
-                    b,
-                    "toto_len",
-                    &[self.ctx, bobj, btag, start_v, end_v],
-                )?;
+                let len =
+                    self.call_value(jit, b, "toto_len", &[self.ctx, bobj, btag, start_v, end_v])?;
                 self.check_silent(jit, b, *span)?;
                 let ety = match self.local_ty(*base)?.clone() {
                     Ty::Array(t) => *t,
@@ -2385,12 +2380,8 @@ impl<'a> FnCx<'a> {
                     message: format!("snapshot element: {e}"),
                 })?;
                 self.publish_all(jit, b)?;
-                let arr = self.call_value(
-                    jit,
-                    b,
-                    "toto_alloc_array",
-                    &[self.ctx, len, start_v, end_v],
-                )?;
+                let arr =
+                    self.call_value(jit, b, "toto_alloc_array", &[self.ctx, len, start_v, end_v])?;
                 self.check_silent(jit, b, *span)?;
                 let zero = Self::iconst(b, 0);
                 let one = Self::iconst(b, 1);
@@ -2421,8 +2412,7 @@ impl<'a> FnCx<'a> {
                     b,
                     "toto_index_write",
                     &[
-                        self.ctx, arr, btag, itag, i, vtag_v, v, start_v, end_v, start_v,
-                        end_v,
+                        self.ctx, arr, btag, itag, i, vtag_v, v, start_v, end_v, start_v, end_v,
                     ],
                 )?;
                 self.check_silent(jit, b, *span)?;
@@ -2437,12 +2427,16 @@ impl<'a> FnCx<'a> {
                 let lo_v = self.operand(b, *lo)?;
                 let hi_v = self.operand(b, *hi)?;
                 self.publish_all(jit, b)?;
-                let v =
-                    self.call_value(jit, b, "toto_alloc_range", &[self.ctx, lo_v, hi_v])?;
+                let v = self.call_value(jit, b, "toto_alloc_range", &[self.ctx, lo_v, hi_v])?;
                 self.check_silent(jit, b, *span)?;
                 self.define(b, *dst, v)?;
             }
-            MInstr::SplitRange { lo, hi, range, span } => {
+            MInstr::SplitRange {
+                lo,
+                hi,
+                range,
+                span,
+            } => {
                 let r = self.operand(b, *range)?;
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
@@ -2575,7 +2569,12 @@ impl<'a> FnCx<'a> {
                     }
                 }
             }
-            MInstr::Field { dst, base, name, span } => {
+            MInstr::Field {
+                dst,
+                base,
+                name,
+                span,
+            } => {
                 let bobj = self.operand(b, *base)?;
                 let (ptr, len) = jit.intern(name);
                 let nptr = Self::iconst(b, ptr as i64);
@@ -2591,7 +2590,12 @@ impl<'a> FnCx<'a> {
                 self.check_silent(jit, b, *span)?;
                 self.define(b, *dst, v)?;
             }
-            MInstr::StoreField { base, name, value, span } => {
+            MInstr::StoreField {
+                base,
+                name,
+                value,
+                span,
+            } => {
                 let bobj = self.operand(b, *base)?;
                 let (vtag, vword) = self.tagged_operand(b, *value)?;
                 let (ptr, len) = jit.intern(name);
@@ -2607,7 +2611,13 @@ impl<'a> FnCx<'a> {
                 )?;
                 self.check_silent(jit, b, *span)?;
             }
-            MInstr::StoreIndex { base, index, value, span, index_span } => {
+            MInstr::StoreIndex {
+                base,
+                index,
+                value,
+                span,
+                index_span,
+            } => {
                 let bobj = self.operand(b, *base)?;
                 let bty = self.local_ty(*base)?.clone();
                 let ity = self.local_ty(*index)?.clone();
@@ -2632,8 +2642,8 @@ impl<'a> FnCx<'a> {
                     b,
                     "toto_index_write",
                     &[
-                        self.ctx, bobj, btag_v, itag_v, idx, vtag, vword, start_v, end_v,
-                        istart, iend,
+                        self.ctx, bobj, btag_v, itag_v, idx, vtag, vword, start_v, end_v, istart,
+                        iend,
                     ],
                 )?;
                 self.check_silent(jit, b, *span)?;
@@ -2653,7 +2663,12 @@ impl<'a> FnCx<'a> {
                 );
                 self.define(b, *dst, r)?;
             }
-            MInstr::MakeClosure { dst, body, captures, span } => {
+            MInstr::MakeClosure {
+                dst,
+                body,
+                captures,
+                span,
+            } => {
                 // Assign a body id and collect the body for later
                 // compilation (both modes lower closures).
                 let id = jit.next_body;
@@ -2679,7 +2694,12 @@ impl<'a> FnCx<'a> {
                 self.check_silent(jit, b, *span)?;
                 self.define(b, *dst, v)?;
             }
-            MInstr::ChanNew { dst, elem, cap, span } => {
+            MInstr::ChanNew {
+                dst,
+                elem,
+                cap,
+                span,
+            } => {
                 let v = self.chan_new_emit(jit, b, elem, *cap, span)?;
                 self.define(b, *dst, v)?;
             }
@@ -2757,7 +2777,12 @@ impl<'a> FnCx<'a> {
                 )?;
                 self.check_silent(jit, b, *span)?;
             }
-            MInstr::Select { dst, cases, has_default, span } => {
+            MInstr::Select {
+                dst,
+                cases,
+                has_default,
+                span,
+            } => {
                 if self.mode == CodegenMode::Gate {
                     return self.fail(String::from(
                         "select needs a task session (concurrency is task-only)",
@@ -2768,7 +2793,9 @@ impl<'a> FnCx<'a> {
                 for (i, case) in cases.iter().enumerate() {
                     let base = 6 * i;
                     match case {
-                        MSelectCase::Recv { chan, span: cspan, .. } => {
+                        MSelectCase::Recv {
+                            chan, span: cspan, ..
+                        } => {
                             let chan_w = self.operand(b, *chan)?;
                             let z = Self::iconst(b, 0);
                             let cs = Self::iconst(b, cspan.start as i64);
@@ -2780,7 +2807,11 @@ impl<'a> FnCx<'a> {
                             Self::stack_store(b, slot, base + 4, cs);
                             Self::stack_store(b, slot, base + 5, ce);
                         }
-                        MSelectCase::Send { chan, value, span: cspan } => {
+                        MSelectCase::Send {
+                            chan,
+                            value,
+                            span: cspan,
+                        } => {
                             let chan_w = self.operand(b, *chan)?;
                             let (vtag, vword) = self.tagged_operand(b, *value)?;
                             let kind_v = Self::iconst(b, 1);

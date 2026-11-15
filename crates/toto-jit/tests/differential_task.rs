@@ -52,7 +52,13 @@ fn compare(
     failures: &mut Vec<String>,
 ) {
     match (interp, &jit.result) {
-        (Outcome::Success { code: a, stdout: oa }, Ok(b)) => {
+        (
+            Outcome::Success {
+                code: a,
+                stdout: oa,
+            },
+            Ok(b),
+        ) => {
             if a != b {
                 failures.push(format!("{name}{tag}: exit {b} vs interpreter {a}"));
             } else if oa != &jit.stdout {
@@ -124,10 +130,7 @@ fn differential_task_sequential() {
             let saved_cwd = std::env::current_dir().expect("cwd");
             std::env::set_current_dir(&dir).expect("set case cwd");
             let parsed = parse_and_check(&src);
-            let interp = parsed
-                .as_ref()
-                .ok()
-                .map(|_| run_source(&src, &name));
+            let interp = parsed.as_ref().ok().map(|_| run_source(&src, &name));
             std::env::set_current_dir(&saved_cwd).expect("restore cwd");
             match parsed {
                 Err(_) => {

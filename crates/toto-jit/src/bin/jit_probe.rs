@@ -110,7 +110,7 @@ fn main() {
     });
     let n = out as i64;
     if (0..=255).contains(&n) {
-        std::process::exit(n as u8);
+        std::process::exit((n as u8).into());
     }
     // Mirror the interpreter's main-range panic exactly.
     let diag = Diag::new(
