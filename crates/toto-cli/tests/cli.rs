@@ -15,7 +15,7 @@ fn help_and_version() {
     assert!(
         String::from_utf8(out.stdout)
             .unwrap()
-            .contains("toto run <file.gzv>")
+            .contains("toto run [--workers N] <file.gzv>")
     );
     let out = toto().arg("--version").output().expect("runs");
     assert_eq!(out.status.code(), Some(0));
@@ -41,4 +41,42 @@ fn missing_file_is_exit_3() {
 fn bad_usage_is_exit_3() {
     let out = toto().arg("bogus").output().expect("runs");
     assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn workers_flag_runs_concurrent() {
+    // `--workers N` routes through the M:N scheduler end to end.
+    let prog = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("corpus")
+        .join("concurrent")
+        .join("conc01_pingpong.gzv");
+    let out = toto()
+        .arg("run")
+        .arg("--workers")
+        .arg("4")
+        .arg(&prog)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "42\n");
+}
+
+#[test]
+fn workers_flag_rejects_zero() {
+    let out = toto()
+        .arg("run")
+        .arg("--workers")
+        .arg("0")
+        .arg("no-such-file.gzv")
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(3));
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("needs a positive number")
+    );
 }

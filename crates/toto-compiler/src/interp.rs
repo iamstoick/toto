@@ -263,6 +263,17 @@ impl Interp {
         &self.fns
     }
 
+    /// Dispatch a builtin call with this interpreter's function table,
+    /// capturing printed output into its buffer.
+    pub fn dispatch_builtin(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, (Diag, Vec<TraceFrame>)> {
+        crate::builtins::call_builtin(name, args, span, &self.fns, &mut self.output)
+    }
+
     pub fn run(&mut self) -> Result<i32, (Diag, Vec<TraceFrame>)> {
         let main = match self.fn_index.get("main") {
             Some(&i) => i,
@@ -695,6 +706,16 @@ impl Interp {
                     )),
                 }
             }
+            // Concurrent constructs never reach the sequential tree-walker
+            // in production: `toto run` routes `uses_concurrency` programs
+            // to the runtime executor. This arm is a routing tripwire.
+            StmtKind::Go { .. } | StmtKind::Select { .. } => Err(panic(
+                "E0215",
+                "concurrent construct reached the sequential interpreter (internal routing error)"
+                    .to_string(),
+                stmt.span,
+                Some("concurrent programs run on the runtime executor".to_string()),
+            )),
         }
     }
 
@@ -755,6 +776,15 @@ impl Interp {
             ExprKind::Err(inner) => Ok(Value::Err(Box::new(self.eval_expr(inner, scopes)?))),
             ExprKind::Some(inner) => Ok(Value::Some(Box::new(self.eval_expr(inner, scopes)?))),
             ExprKind::None => Ok(Value::None),
+            // Routing tripwire, as in `exec_stmt`: the sequential
+            // tree-walker cannot execute channels.
+            ExprKind::Send { .. } | ExprKind::Recv { .. } | ExprKind::ChanNew { .. } => Err(panic(
+                "E0215",
+                "concurrent construct reached the sequential interpreter (internal routing error)"
+                    .to_string(),
+                expr.span,
+                Some("concurrent programs run on the runtime executor".to_string()),
+            )),
             ExprKind::Question(inner) => {
                 let v = self.eval_expr(inner, scopes)?;
                 let enclosing = match self.ret_stack.last().copied().unwrap_or(RetKind::Other) {
@@ -1026,7 +1056,8 @@ impl Interp {
                     name: format!("{name} (builtin)"),
                     span,
                 });
-                let result = crate::builtins::call_builtin(name, values, span, self)
+                let result = self
+                    .dispatch_builtin(name, values, span)
                     .map_err(|(d, t)| Signal::Panic(d, t));
                 if result.is_ok() {
                     self.trace.pop();

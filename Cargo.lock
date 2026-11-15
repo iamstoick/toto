@@ -517,6 +517,7 @@ name = "toto-cli"
 version = "0.1.0"
 dependencies = [
  "toto-compiler",
+ "toto-runtime",
 ]
 
 [[package]]
@@ -524,8 +525,27 @@ name = "toto-compiler"
 version = "0.1.0"
 
 [[package]]
+name = "toto-jit"
+version = "0.1.0"
+dependencies = [
+ "corosensei",
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-jit",
+ "cranelift-module",
+ "cranelift-native",
+ "toto-compiler",
+ "toto-runtime",
+]
+
+[[package]]
 name = "toto-runtime"
 version = "0.1.0"
+dependencies = [
+ "corosensei",
+ "libc",
+ "toto-compiler",
+]
 
 [[package]]
 name = "unicode-ident"

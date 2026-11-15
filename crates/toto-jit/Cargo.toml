@@ -1,0 +1,23 @@
+[package]
+name = "toto-jit"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "toto_jit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "panic_probe"
+path = "src/bin/panic_probe.rs"
+
+[dependencies]
+toto-compiler = { path = "../toto-compiler" }
+toto-runtime = { path = "../toto-runtime" }
+corosensei = "0.3"
+cranelift-codegen = "0.137"
+cranelift-jit = "0.137"
+cranelift-module = "0.137"
+cranelift-frontend = "0.137"
+cranelift-native = "0.137"

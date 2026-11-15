@@ -1,0 +1,8 @@
+struct Box { vs: Array<int> }
+fn main() -> int {
+    let ch = chan<Array<int>>(1);
+    let mut b = Box { vs: [1] };
+    ch <- b.vs;
+    println(b.vs);
+    return 0;
+}

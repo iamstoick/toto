@@ -1,0 +1,13 @@
+fn boom() -> int {
+    let x = 1 / 0;
+    return x;
+}
+fn main() -> int {
+    let ch = chan<int>(1);
+    go {
+        let v = boom();
+        ch <- v
+    }
+    println(<-ch);
+    return 0;
+}

@@ -1,0 +1,20 @@
+fn main() -> int {
+    let ch = chan<int>(3);
+    go {
+        ch <- 1
+    }
+    go {
+        ch <- 2
+    }
+    go {
+        ch <- 3
+    }
+    let mut total = 0;
+    let mut n = 0;
+    while n < 3 {
+        total = total + <-ch;
+        n = n + 1;
+    }
+    println(total);
+    return 0;
+}

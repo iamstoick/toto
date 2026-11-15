@@ -1,0 +1,5 @@
+error[E0314]: use of moved value `b` (moved into a channel send)
+ --> type_send_moved_use.gzv:6:13
+  |
+6 |     println(b.v);
+  |             ^

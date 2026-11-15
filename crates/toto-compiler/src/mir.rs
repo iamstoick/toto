@@ -216,9 +216,64 @@ pub enum MInstr {
         captures: Vec<Local>,
         span: Span,
     },
+    /// Create a channel. `elem` is the element type `T`; `cap` is `None`
+    /// for unbuffered (`chan<T>()`) or a local holding the capacity
+    /// (`chan<T>(n)`).
+    ChanNew {
+        dst: Local,
+        elem: Ty,
+        cap: Option<Local>,
+        span: Span,
+    },
+    /// Rendezvous send. May park the task; always a safepoint.
+    Send {
+        chan: Local,
+        value: Local,
+        span: Span,
+    },
+    /// Blocking receive. May park the task; always a safepoint.
+    Recv {
+        dst: Local,
+        chan: Local,
+        span: Span,
+    },
+    /// Spawn a task running `body` (a parameterless unit body, lowered
+    /// like a closure) with `captures` as its capture values.
+    Spawn {
+        body: Arc<MirBody>,
+        /// Enclosing locals feeding the body's capture slots, in order.
+        captures: Vec<Local>,
+        span: Span,
+    },
+    /// Multi-way rendezvous. The executor evaluates readiness, performs
+    /// exactly one transfer, and writes the chosen case index into
+    /// `dst` (`cases.len()` for `default`). Recv cases write the
+    /// received value into `bind` when present. Always a safepoint.
+    Select {
+        dst: Local,
+        cases: Vec<MSelectCase>,
+        has_default: bool,
+        span: Span,
+    },
     /// No runtime effect; marks GC safepoints for Phase 3 codegen.
     Safepoint {
         kind: SpKind,
+    },
+}
+
+/// One `select` guard, lowered: channel/value locals plus the bind slot
+/// for receive-and-bind cases.
+#[derive(Clone, Debug)]
+pub enum MSelectCase {
+    Recv {
+        chan: Local,
+        bind: Option<Local>,
+        span: Span,
+    },
+    Send {
+        chan: Local,
+        value: Local,
+        span: Span,
     },
 }
 
@@ -261,6 +316,9 @@ pub enum SpKind {
     Loop,
     Call,
     Alloc,
+    /// A suspension point: send, receive, select, or spawn. Live
+    /// references are published to the shadow stack before parking.
+    Park,
 }
 
 #[derive(Clone, Debug)]
@@ -525,6 +583,193 @@ impl<'a> FnBuilder<'a> {
                 name, iter, body, ..
             } => {
                 self.lower_for(name, iter, body, ret, stmt.span);
+            }
+            HStmtKind::Go { body, captured } => self.lower_go(body, captured, stmt.span),
+            HStmtKind::Select { cases, default } => {
+                self.lower_select(cases, default.as_deref(), ret, stmt.span)
+            }
+        }
+    }
+
+    /// Lower `go <block>`: capture values are read at creation (spec
+    /// §5.7/§13.2), the body runs as a parameterless unit body on the
+    /// spawned task. A tail expression runs for effects and is discarded;
+    /// `return` inside exits the task.
+    fn lower_go(&mut self, body: &HBlock, captured: &[(String, Ty)], span: Span) {
+        let mut srcs = Vec::with_capacity(captured.len());
+        for (name, _) in captured {
+            srcs.push(self.resolve(name));
+        }
+        let mut sub = FnBuilder::new(self.checked);
+        for (name, ty) in captured {
+            let l = sub.fresh(format!("{name} (capture)"), ty.clone());
+            sub.scopes
+                .last_mut()
+                .expect("scope underflow")
+                .insert(name.clone(), l);
+        }
+        sub.entry_safepoint();
+        sub.lower_stmts(&body.stmts, &Ty::Unit);
+        if !sub.sealed
+            && let Some(t) = &body.tail
+        {
+            let _ = sub.lower_expr(t, &Ty::Unit);
+        }
+        if !sub.sealed {
+            let u = sub.materialize_unit();
+            sub.close(MTerm::Return(Some(u)));
+        }
+        sub.blocks.sort_by_key(|b| b.id);
+        let mir_body = Arc::new(MirBody {
+            params: Vec::new(),
+            ret: Ty::Unit,
+            captures: captured.to_vec(),
+            locals: sub.locals,
+            blocks: sub.blocks,
+            entry: 0,
+            body_span: body.span,
+        });
+        self.emit(MInstr::Safepoint {
+            kind: SpKind::Alloc,
+        });
+        self.emit(MInstr::Spawn {
+            body: mir_body,
+            captures: srcs,
+            span,
+        });
+    }
+
+    /// Lower `select`: guards evaluate left-to-right, then one
+    /// `Select` rendezvous picks the case index; a branch chain runs
+    /// the chosen body. An empty guard list with no default never
+    /// unblocks (the task parks forever; the deadlock detector fires).
+    fn lower_select(
+        &mut self,
+        cases: &[crate::hir::HSelectCase],
+        default: Option<&HBlock>,
+        ret: &Ty,
+        span: Span,
+    ) {
+        use crate::hir::HSelectCase;
+        let mut mcases = Vec::with_capacity(cases.len());
+        // Bind slots for receive-and-bind cases: created with the guards
+        // (so the `Select` rendezvous can write them), installed into
+        // scope only while lowering their own case body.
+        let mut binds: Vec<Option<(String, Local)>> = Vec::with_capacity(cases.len());
+        for case in cases {
+            match case {
+                HSelectCase::Recv { name, chan, .. } => {
+                    let c = self.lower_expr(chan, ret);
+                    let bind = match name {
+                        Some((n, _)) => {
+                            let elem = match &self.locals[c].1 {
+                                Ty::Chan(t) => (**t).clone(),
+                                other => {
+                                    debug_assert!(
+                                        false,
+                                        "checker guarantees channels here, found {other}"
+                                    );
+                                    Ty::Unit
+                                }
+                            };
+                            let b = self.fresh(n.clone(), elem);
+                            binds.push(Some((n.clone(), b)));
+                            Some(b)
+                        }
+                        None => {
+                            binds.push(None);
+                            None
+                        }
+                    };
+                    mcases.push(MSelectCase::Recv {
+                        chan: c,
+                        bind,
+                        span: chan.span,
+                    });
+                }
+                HSelectCase::Send { chan, value, .. } => {
+                    let c = self.lower_expr(chan, ret);
+                    let v = self.lower_expr(value, ret);
+                    binds.push(None);
+                    mcases.push(MSelectCase::Send {
+                        chan: c,
+                        value: v,
+                        span: chan.span,
+                    });
+                }
+            }
+        }
+        let dst = self.fresh("select".to_string(), Ty::Int);
+        self.emit(MInstr::Safepoint { kind: SpKind::Park });
+        self.emit(MInstr::Select {
+            dst,
+            cases: mcases,
+            has_default: default.is_some(),
+            span,
+        });
+        let join_id = self.fresh_block();
+        for (i, case) in cases.iter().enumerate() {
+            let body_id = self.fresh_block();
+            let next_id = self.fresh_block();
+            let idx = self.const_local(MConst::Int(i as i64), Ty::Int, "case index");
+            let c = self.fresh(format!("case {i} chosen"), Ty::Bool);
+            self.emit(MInstr::Bin {
+                dst: c,
+                op: MBinOp::Eq,
+                l: dst,
+                r: idx,
+                span,
+            });
+            self.close(MTerm::Branch {
+                cond: c,
+                then_b: body_id,
+                else_b: next_id,
+                span,
+                while_cond: false,
+            });
+            self.open(body_id);
+            // The recv-bind local (created with the guards) is visible
+            // only in its own case body.
+            self.scopes.push(HashMap::new());
+            if let Some((n, b)) = &binds[i] {
+                self.scopes
+                    .last_mut()
+                    .expect("scope underflow")
+                    .insert(n.clone(), *b);
+            }
+            let hbody = match case {
+                HSelectCase::Recv { body, .. } | HSelectCase::Send { body, .. } => body,
+            };
+            self.lower_stmts(&hbody.stmts, ret);
+            if !self.sealed
+                && let Some(t) = &hbody.tail
+            {
+                let _ = self.lower_expr(t, ret);
+            }
+            self.scopes.pop();
+            if !self.sealed {
+                self.close(MTerm::Jump(join_id));
+            }
+            self.open(next_id);
+        }
+        match default {
+            Some(b) => {
+                self.scopes.push(HashMap::new());
+                self.lower_stmts(&b.stmts, ret);
+                if !self.sealed
+                    && let Some(t) = &b.tail
+                {
+                    let _ = self.lower_expr(t, ret);
+                }
+                self.scopes.pop();
+                if !self.sealed {
+                    self.close(MTerm::Jump(join_id));
+                }
+                self.open(join_id);
+            }
+            None => {
+                self.close(MTerm::Jump(join_id));
+                self.open(join_id);
             }
         }
     }
@@ -856,6 +1101,54 @@ impl<'a> FnBuilder<'a> {
                         span: expr.span,
                     }),
                 }
+                dst
+            }
+            HExprKind::Send { chan, value } => {
+                let c = self.lower_expr(chan, ret);
+                let v = self.lower_expr(value, ret);
+                let dst = self.fresh("send".to_string(), Ty::Unit);
+                self.emit(MInstr::Safepoint { kind: SpKind::Park });
+                self.emit(MInstr::Send {
+                    chan: c,
+                    value: v,
+                    span: expr.span,
+                });
+                // A send statement discards the unit; keep the slot
+                // well-formed for expression positions.
+                let u = self.materialize_unit();
+                self.emit(MInstr::Copy { dst, src: u });
+                dst
+            }
+            HExprKind::Recv { chan } => {
+                let c = self.lower_expr(chan, ret);
+                let dst = self.fresh("recv".to_string(), expr.ty.clone());
+                self.emit(MInstr::Safepoint { kind: SpKind::Park });
+                self.emit(MInstr::Recv {
+                    dst,
+                    chan: c,
+                    span: expr.span,
+                });
+                dst
+            }
+            HExprKind::ChanNew { cap, .. } => {
+                let hcap = cap.as_ref().map(|c| self.lower_expr(c, ret));
+                let elem = match &expr.ty {
+                    Ty::Chan(t) => (**t).clone(),
+                    other => {
+                        debug_assert!(false, "checker guarantees chan types here, found {other}");
+                        Ty::Unit
+                    }
+                };
+                let dst = self.fresh("chan".to_string(), expr.ty.clone());
+                self.emit(MInstr::Safepoint {
+                    kind: SpKind::Alloc,
+                });
+                self.emit(MInstr::ChanNew {
+                    dst,
+                    elem,
+                    cap: hcap,
+                    span: expr.span,
+                });
                 dst
             }
             HExprKind::Call { callee, args } => {
@@ -1446,6 +1739,54 @@ impl fmt::Display for MInstr {
                 }
                 write!(f, "]")
             }
+            MInstr::ChanNew { dst, elem, cap, .. } => match cap {
+                Some(c) => write!(f, "{} = channew {} cap {}", local(*dst), elem, local(*c)),
+                None => write!(f, "{} = channew {}", local(*dst), elem),
+            },
+            MInstr::Send { chan, value, .. } => {
+                write!(f, "send {} <- {}", local(*chan), local(*value))
+            }
+            MInstr::Recv { dst, chan, .. } => {
+                write!(f, "{} = recv {}", local(*dst), local(*chan))
+            }
+            MInstr::Spawn { captures, .. } => {
+                write!(f, "spawn [")?;
+                for (i, c) in captures.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", local(*c))?;
+                }
+                write!(f, "]")
+            }
+            MInstr::Select {
+                dst,
+                cases,
+                has_default,
+                ..
+            } => {
+                write!(f, "{} = select [", local(*dst))?;
+                for (i, c) in cases.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    match c {
+                        MSelectCase::Recv { chan, bind, .. } => match bind {
+                            Some(b) => write!(f, "recv {} -> {}", local(*chan), local(*b))?,
+                            None => write!(f, "recv {}", local(*chan))?,
+                        },
+                        MSelectCase::Send { chan, value, .. } => {
+                            write!(f, "send {} <- {}", local(*chan), local(*value))?
+                        }
+                    }
+                    let _ = i;
+                }
+                write!(f, "]")?;
+                if *has_default {
+                    write!(f, " else default")?;
+                }
+                Ok(())
+            }
             MInstr::Safepoint { kind } => write!(f, "safepoint {kind}"),
         }
     }
@@ -1496,6 +1837,7 @@ impl fmt::Display for SpKind {
             SpKind::Loop => "loop",
             SpKind::Call => "call",
             SpKind::Alloc => "alloc",
+            SpKind::Park => "park",
         };
         write!(f, "{s}")
     }

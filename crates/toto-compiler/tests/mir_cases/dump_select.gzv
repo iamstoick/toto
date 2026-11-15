@@ -1,0 +1,20 @@
+fn pick(a: chan<int>, b: chan<int>) -> int {
+    select {
+        let x = <-a {
+            return x;
+        }
+        let y = <-b {
+            return y;
+        }
+        default {
+            return 0;
+        }
+    }
+}
+fn main() -> int {
+    let a = chan<int>(1);
+    let b = chan<int>(1);
+    a <- 3;
+    println(pick(a, b));
+    return 0;
+}

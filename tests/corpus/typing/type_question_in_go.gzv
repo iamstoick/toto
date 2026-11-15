@@ -1,0 +1,10 @@
+fn f() -> Result<int, string> {
+    return Ok(1);
+}
+fn main() -> int {
+    go {
+        let x = f()?;
+        println(x)
+    }
+    return 0;
+}

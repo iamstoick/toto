@@ -1,0 +1,5 @@
+error[E0314]: cannot send shared mutable state from a field or index; only deeply immutable field values can be sent
+ --> type_send_field.gzv:5:11
+  |
+5 |     ch <- b.vs;
+  |           ^^^^

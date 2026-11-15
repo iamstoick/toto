@@ -12,7 +12,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::builtins;
 use crate::diag::Diag;
 use crate::hir::{CheckedProgram, Ty};
 use crate::interp::{ClosureCode, ClosureVal, Interp, MAX_FRAMES, StructVal, TraceFrame, Value};
@@ -451,7 +450,7 @@ impl<'a> MirInterp<'a> {
                     name: format!("{name} (builtin)"),
                     span: *span,
                 });
-                let result = builtins::call_builtin(name, vs, *span, &mut self.inner);
+                let result = self.inner.dispatch_builtin(name, vs, *span);
                 match result {
                     Ok(v) => {
                         self.trace.pop();
@@ -635,6 +634,24 @@ impl<'a> MirInterp<'a> {
             MInstr::Safepoint { .. } => {
                 // No-op in the MIR interpreter: single-threaded, no GC in
                 // Phase 2. Phase 3 codegen uses these markers.
+            }
+            // Routing tripwire: the sequential MIR interpreter cannot
+            // execute channels. Concurrent programs run on the runtime
+            // executor; reaching one of these here is a routing bug.
+            MInstr::ChanNew { span, .. }
+            | MInstr::Send { span, .. }
+            | MInstr::Recv { span, .. }
+            | MInstr::Spawn { span, .. }
+            | MInstr::Select { span, .. } => {
+                return Err((
+                    Diag::new(
+                        "E0215",
+                        "concurrent construct reached the sequential interpreter (internal routing error)".to_string(),
+                        *span,
+                        Some("concurrent programs run on the runtime executor".to_string()),
+                    ),
+                    Vec::new(),
+                ));
             }
         }
         Ok(Flow::Continue)

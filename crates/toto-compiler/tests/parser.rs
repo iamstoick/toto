@@ -33,7 +33,10 @@ fn method_call_rejected_with_phase_hint() {
 
 #[test]
 fn out_of_subset_names_its_phase() {
-    assert!(codes("fn main() -> int {\n go { }\n return 0;\n}\n").contains(&"E0151"));
+    // `go` is a Phase 3 statement: statement position parses, expression
+    // position is E0101 (expected expression).
+    assert!(codes("fn main() -> int {\n go { }\n return 0;\n}\n").is_empty());
+    assert!(codes("fn main() -> int {\n let x = go { };\n return 0;\n}\n").contains(&"E0101"));
     // `?` is no longer out of subset: it parses since Phase 2 (spec §11).
     assert!(
         codes(

@@ -1,0 +1,11 @@
+error[E0305]: cannot receive from int
+ --> type_recv_nonchan.gzv:3:15
+  |
+3 |     let x = <-ch;
+  |               ^^ help: receive targets a `chan<T>`
+
+error[E0301]: undefined variable `x`
+ --> type_recv_nonchan.gzv:4:13
+  |
+4 |     println(x);
+  |             ^

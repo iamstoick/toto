@@ -1,0 +1,5 @@
+error[E0314]: `go` blocks cannot capture `mut` binding `x` by reference
+ --> type_go_mut_capture.gzv:4:17
+  |
+4 |         println(x)
+  |                 ^ help: send the value over a channel, or bind it immutably outside

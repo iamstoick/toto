@@ -1,0 +1,7 @@
+panic[E0213]: send on a closed channel
+ --> conc_neg_send_closed.gzv:4:5
+  |
+4 |     ch <- 1;
+  |     ^^^^^^^
+stack trace:
+  in main at conc_neg_send_closed.gzv:1:4

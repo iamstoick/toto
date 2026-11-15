@@ -70,9 +70,10 @@ fn differential_tree_vs_mir() {
         let dir = case.parent().expect("parent dir").to_path_buf();
         let src = std::fs::read_to_string(case).expect("read case");
         std::env::set_current_dir(&dir).expect("set case cwd");
-        // Tree-walker via the real `toto run` pipeline (lex+parse+check+run).
-        let tree = run_source(&src, "case.gzv");
-        // MIR via lex+parse+check+lower+run.
+        // Lex+parse+check first: concurrent programs never reach the
+        // sequential interpreters (routing tripwire E0215) and are
+        // covered exactly by the runtime executor's deterministic
+        // goldens instead.
         let (tokens, lex_errors) = lexer::lex(&src);
         assert!(lex_errors.is_empty(), "{}: lex errors", case.display());
         let (program, parse_errors) = parser::parse(tokens, &src);
@@ -84,6 +85,12 @@ fn differential_tree_vs_mir() {
             case.display()
         );
         let checked = checked.expect("checked program");
+        if checked.uses_concurrency {
+            continue;
+        }
+        // Tree-walker via the real `toto run` pipeline (lex+parse+check+run).
+        let tree = run_source(&src, "case.gzv");
+        // MIR via lex+parse+check+lower+run.
         let (mir_result, mir_out) = mir_interp::run_mir(&program, &checked);
         // Compare as rendered text: exit code, stdout, panic rendering.
         let (tree_render, mir_render) = match tree {

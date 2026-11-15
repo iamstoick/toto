@@ -128,6 +128,33 @@ pub enum StmtKind {
         iter: Expr,
         body: Box<Block>,
     },
+    /// `go <block>`: spawn a child task in the enclosing scope (Phase 3).
+    /// Yields `unit`; completion is observed through scopes and channels.
+    Go {
+        body: Box<Block>,
+    },
+    /// `select` with guarded cases and an optional trailing `default`.
+    Select {
+        cases: Vec<SelectCase>,
+        default: Option<Box<Block>>,
+    },
+}
+
+/// One `select` case. Recv guards bind with `let` or discard; send
+/// guards commit a value. Bodies run when the case is selected.
+#[derive(Clone, Debug)]
+pub enum SelectCase {
+    Recv {
+        /// `let v = <-ch` binding, or `None` for a discarding `<-ch`.
+        name: Option<(String, Span)>,
+        chan: Expr,
+        body: Box<Block>,
+    },
+    Send {
+        chan: Expr,
+        value: Expr,
+        body: Box<Block>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +207,21 @@ pub enum ExprKind {
     Err(Box<Expr>),
     Some(Box<Expr>),
     None,
+    /// `ch <- v`: send (an expression yielding `unit` so it also fits
+    /// select guards; normally used as a statement).
+    Send {
+        chan: Box<Expr>,
+        value: Box<Expr>,
+    },
+    /// `<-ch`: receive, yielding the element value.
+    Recv {
+        chan: Box<Expr>,
+    },
+    /// `chan<T>()` / `chan<T>(n)`: channel construction.
+    ChanNew {
+        elem: Box<Type>,
+        cap: Option<Box<Expr>>,
+    },
     Question(Box<Expr>),
     Field {
         base: Box<Expr>,

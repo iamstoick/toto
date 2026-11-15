@@ -1,0 +1,6 @@
+panic[E0216]: deadlock: no runnable tasks remain (1 blocked with no one left to wake them); task0 `main` blocked in `send` (bytes 49..56)
+ --> conc_neg_deadlock.gzv:3:5
+  |
+3 |     ch <- 1;
+  |     ^^^^^^^
+stack trace:

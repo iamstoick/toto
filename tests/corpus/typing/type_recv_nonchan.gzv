@@ -1,6 +1,6 @@
 fn main() -> int {
     let ch = 0;
-    ch <- 1;
     let x = <-ch;
+    println(x);
     return 0;
 }

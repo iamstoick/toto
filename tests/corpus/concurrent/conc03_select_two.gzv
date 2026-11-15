@@ -1,0 +1,15 @@
+fn main() -> int {
+    let a = chan<int>(1);
+    let b = chan<int>(1);
+    a <- 10;
+    b <- 20;
+    select {
+        let x = <-a {
+            println(x)
+        }
+        let y = <-b {
+            println(y)
+        }
+    }
+    return 0;
+}

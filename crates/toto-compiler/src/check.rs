@@ -8,7 +8,7 @@ use crate::ast::{BinOp, Block, Expr, Program, Stmt, Type, TypeKind, UnOp};
 use crate::diag::Diag;
 use crate::hir::{
     CheckedProgram, FnSig, HAssignTarget, HBlock, HExpr, HExprKind, HFn, HItem, HItemKind,
-    HProgram, HStmt, HStmtKind, HStructDecl, Ty, VarRef,
+    HProgram, HSelectCase, HStmt, HStmtKind, HStructDecl, Ty, VarRef,
 };
 use crate::span::Span;
 
@@ -20,6 +20,9 @@ struct Binding {
     ty: Ty,
     mutable: bool,
     depth: u32,
+    /// Set when the binding was moved into a channel send (spec §13.1):
+    /// any later use is E0314.
+    moved: bool,
 }
 
 pub struct Checker {
@@ -29,6 +32,12 @@ pub struct Checker {
     scopes: Vec<HashMap<String, Binding>>,
     depth: u32,
     errors: Vec<Diag>,
+    /// Creation depths of enclosing `go` bodies (spec §13.2). Any use of
+    /// an outer `mut` binding at or outside the innermost depth is E0314.
+    go_stack: Vec<u32>,
+    /// Set when the program uses concurrency; copied to CheckedProgram
+    /// so the CLI can route it to the runtime executor.
+    uses_concurrency: bool,
 }
 
 impl Checker {
@@ -40,6 +49,8 @@ impl Checker {
             scopes: Vec::new(),
             depth: 0,
             errors: Vec::new(),
+            go_stack: Vec::new(),
+            uses_concurrency: false,
         }
     }
 
@@ -132,6 +143,18 @@ impl Checker {
                         }
                         Ok(Ty::Option(Box::new(self.resolve_ty(&args[0])?)))
                     }
+                    "chan" => {
+                        if arity != 1 {
+                            self.error(
+                                "E0302",
+                                format!("type `chan` takes 1 argument, got {arity}"),
+                                ty.span,
+                                None,
+                            );
+                            return Err(());
+                        }
+                        Ok(Ty::Chan(Box::new(self.resolve_ty(&args[0])?)))
+                    }
                     _ => {
                         if !args.is_empty() {
                             self.error(
@@ -173,6 +196,96 @@ impl Checker {
                 None,
             );
             Err(())
+        }
+    }
+
+    /// Whether the innermost binding of `name` was moved into a channel.
+    fn is_moved(&self, name: &str) -> bool {
+        for scope in self.scopes.iter().rev() {
+            if let Some(b) = scope.get(name) {
+                return b.moved;
+            }
+        }
+        false
+    }
+
+    /// Mark the innermost binding of `name` as moved (spec §13.1).
+    fn mark_moved(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(b) = scope.get_mut(name) {
+                b.moved = true;
+                return;
+            }
+        }
+    }
+
+    /// D3 (spec §13.1): values that are deeply immutable (scalars,
+    /// strings, ranges, `None`-style empties, and containers thereof, plus
+    /// channel handles, which the scheduler synchronizes) may be shared
+    /// across tasks. Anything else must move on send.
+    /// Deeply immutable = no in-place mutation path, so sharing across
+    /// tasks cannot race. Scalars, strings (no string-mutation builtin),
+    /// ranges, and channel handles (the intended sharing mechanism) qualify.
+    /// `Array` NEVER qualifies — `push`/`pop`/index-store mutate in place —
+    /// even `Array<int>`. `Option`/`Result` qualify iff their payloads do
+    /// (wrappers have no mutation API). Structs have field stores.
+    fn deeply_immutable(ty: &Ty) -> bool {
+        match ty {
+            Ty::Int | Ty::Float | Ty::String | Ty::Bool | Ty::Unit | Ty::Range => true,
+            Ty::Chan(_) => true,
+            Ty::Array(_) => false,
+            Ty::Option(t) => Self::deeply_immutable(t),
+            Ty::Result(t, e) => Self::deeply_immutable(t) && Self::deeply_immutable(e),
+            Ty::Struct(_) | Ty::Fn(_, _) | Ty::Map(_, _) => false,
+        }
+    }
+
+    /// Enforce move-on-send (spec §13.1): a send of a value that is not
+    /// deeply immutable moves a whole binding (`ch <- x`); any other
+    /// place (`a[i]`, `p.x`) holding such a value is rejected, since the
+    /// sender would retain access. Fresh values (calls, literals,
+    /// constructors) transfer ownership with nothing to mark.
+    fn check_send_move(&mut self, hvalue: &HExpr, span: Span) -> CResult<()> {
+        if Self::deeply_immutable(&hvalue.ty) {
+            return Ok(());
+        }
+        match &hvalue.kind {
+            HExprKind::Var(name, VarRef::Local { .. }) => {
+                self.mark_moved(name);
+                Ok(())
+            }
+            HExprKind::Var(_, VarRef::GlobalFn { .. }) => {
+                // Named functions are immutable code: safe to share.
+                Ok(())
+            }
+            HExprKind::Call { .. }
+            | HExprKind::CallBuiltin { .. }
+            | HExprKind::StructLit { .. }
+            | HExprKind::Array(_)
+            | HExprKind::Range(..)
+            | HExprKind::Ok(_)
+            | HExprKind::Err(_)
+            | HExprKind::Some(_)
+            | HExprKind::None
+            | HExprKind::ChanNew { .. }
+            | HExprKind::Int(_)
+            | HExprKind::Float(_)
+            | HExprKind::Str(_)
+            | HExprKind::Bool(_)
+            | HExprKind::Unit => Ok(()),
+            _ => {
+                // Field/index reads alias the container (shared by
+                // reference, spec §5.7), so sending a non-deeply-immutable
+                // one would share mutable state the sender keeps. Only
+                // deeply immutable field values can be sent.
+                self.error(
+                    "E0314",
+                    "cannot send shared mutable state from a field or index; only deeply immutable field values can be sent".to_string(),
+                    span,
+                    None,
+                );
+                Err(())
+            }
         }
     }
 
@@ -274,6 +387,16 @@ fn captured_vars(body: &HBlock, creation_depth: u32) -> Vec<(String, Ty)> {
                     self.walk_expr(v);
                 }
                 HExprKind::Question { operand, .. } => self.walk_expr(operand),
+                HExprKind::Send { chan, value } => {
+                    self.walk_expr(chan);
+                    self.walk_expr(value);
+                }
+                HExprKind::Recv { chan } => self.walk_expr(chan),
+                HExprKind::ChanNew { cap, .. } => {
+                    if let Some(c) = cap {
+                        self.walk_expr(c);
+                    }
+                }
                 HExprKind::Int(_)
                 | HExprKind::Float(_)
                 | HExprKind::Str(_)
@@ -309,6 +432,28 @@ fn captured_vars(body: &HBlock, creation_depth: u32) -> Vec<(String, Ty)> {
                     HStmtKind::For { iter, body, .. } => {
                         self.walk_expr(iter);
                         self.walk_block(body);
+                    }
+                    // A nested `go` body shares the outer creation site:
+                    // names it uses that are bound outside flow through
+                    // the outer capture list, like nested closures.
+                    HStmtKind::Go { body, .. } => self.walk_block(body),
+                    HStmtKind::Select { cases, default } => {
+                        for case in cases {
+                            match case {
+                                HSelectCase::Recv { chan, body, .. } => {
+                                    self.walk_expr(chan);
+                                    self.walk_block(body);
+                                }
+                                HSelectCase::Send { chan, value, body } => {
+                                    self.walk_expr(chan);
+                                    self.walk_expr(value);
+                                    self.walk_block(body);
+                                }
+                            }
+                        }
+                        if let Some(b) = default {
+                            self.walk_block(b);
+                        }
                     }
                     HStmtKind::Break | HStmtKind::Continue => {}
                 }
@@ -489,6 +634,7 @@ pub fn check(program: &Program) -> (Option<CheckedProgram>, Vec<Diag>) {
             program: HProgram { items: hitems },
             fns: c.fns,
             structs: c.structs,
+            uses_concurrency: c.uses_concurrency,
         };
         (Some(checked), Vec::new())
     } else {
@@ -519,6 +665,7 @@ impl Checker {
                     ty: ty.clone(),
                     mutable: *is_mut,
                     depth: 0,
+                    moved: false,
                 },
             );
         }
@@ -586,6 +733,7 @@ impl Checker {
                         ty: h.ty.clone(),
                         mutable: *is_mut,
                         depth: self.depth,
+                        moved: false,
                     },
                 );
                 HStmtKind::Let {
@@ -632,6 +780,96 @@ impl Checker {
                     body: Box::new(self.check_block(body, ret)?),
                 }
             }
+            StmtKind::Go { body } => {
+                self.uses_concurrency = true;
+                let creation_depth = self.depth;
+                self.go_stack.push(creation_depth);
+                // A `go` body is its own task (spec §13.2: a statement
+                // yielding `unit`). `return` inside exits the task and
+                // `?` must target the task's own `unit` return — which
+                // the `Question` arm always rejects with E0308 — so the
+                // body is checked against `unit`, never the enclosing
+                // function's return type (checking against the enclosing
+                // `ret` would let a task "return" a foreign value).
+                let hbody = self.check_block(body, &Ty::Unit);
+                self.go_stack.pop();
+                let hbody = hbody?;
+                let captured = captured_vars(&hbody, creation_depth);
+                HStmtKind::Go {
+                    body: Box::new(hbody),
+                    captured,
+                }
+            }
+            StmtKind::Select { cases, default } => {
+                self.uses_concurrency = true;
+                let mut hcases = Vec::with_capacity(cases.len());
+                for case in cases {
+                    match case {
+                        crate::ast::SelectCase::Recv { name, chan, body } => {
+                            let hchan = self.check_expr(chan, None, ret)?;
+                            let Ty::Chan(elem) = &hchan.ty else {
+                                self.error(
+                                    "E0305",
+                                    format!("cannot receive from {}", hchan.ty),
+                                    chan.span,
+                                    Some("receive targets a `chan<T>`".to_string()),
+                                );
+                                return Err(());
+                            };
+                            let elem = (**elem).clone();
+                            self.push_scope();
+                            if let Some((n, _)) = name {
+                                self.scopes.last_mut().expect("scope underflow").insert(
+                                    n.clone(),
+                                    Binding {
+                                        ty: elem,
+                                        mutable: false,
+                                        depth: self.depth,
+                                        moved: false,
+                                    },
+                                );
+                            }
+                            let hbody = self.check_block(body, ret);
+                            self.pop_scope();
+                            hcases.push(HSelectCase::Recv {
+                                name: name.clone(),
+                                chan: hchan,
+                                body: Box::new(hbody?),
+                            });
+                        }
+                        crate::ast::SelectCase::Send { chan, value, body } => {
+                            let hchan = self.check_expr(chan, None, ret)?;
+                            let Ty::Chan(elem) = &hchan.ty else {
+                                self.error(
+                                    "E0305",
+                                    format!("cannot send on {}", hchan.ty),
+                                    chan.span,
+                                    Some("send targets a `chan<T>`".to_string()),
+                                );
+                                return Err(());
+                            };
+                            let elem = (**elem).clone();
+                            let hvalue = self.check_expr(value, Some(&elem), ret)?;
+                            self.expect_ty(&hvalue.ty, &elem, value.span)?;
+                            self.check_send_move(&hvalue, value.span)?;
+                            let hbody = self.check_block(body, ret)?;
+                            hcases.push(HSelectCase::Send {
+                                chan: hchan,
+                                value: hvalue,
+                                body: Box::new(hbody),
+                            });
+                        }
+                    }
+                }
+                let hdefault = match default {
+                    Some(b) => Some(Box::new(self.check_block(b, ret)?)),
+                    None => None,
+                };
+                HStmtKind::Select {
+                    cases: hcases,
+                    default: hdefault,
+                }
+            }
             StmtKind::For {
                 name, iter, body, ..
             } => {
@@ -656,6 +894,7 @@ impl Checker {
                         ty: var_ty.clone(),
                         mutable: false,
                         depth: self.depth,
+                        moved: false,
                     },
                 );
                 let hbody = self.check_block(body, ret);
@@ -684,6 +923,14 @@ impl Checker {
         match target {
             AssignTarget::Var(name, span) => {
                 let (ty, varref) = self.resolve_place(name, *span)?;
+                // Rebinding gives the binding a fresh value: a moved
+                // binding becomes usable again.
+                for scope in self.scopes.iter_mut().rev() {
+                    if let Some(b) = scope.get_mut(name) {
+                        b.moved = false;
+                        break;
+                    }
+                }
                 let h = self.check_expr(value, Some(&ty), ret)?;
                 self.expect_ty(&h.ty, &ty, value.span)?;
                 Ok((HAssignTarget::Var(name.clone(), varref, *span), h))
@@ -754,6 +1001,34 @@ impl Checker {
             ExprKind::Unit => (HExprKind::Unit, Ty::Unit),
             ExprKind::Var(name) => {
                 let (ty, varref) = self.resolve_use(name, span)?;
+                if let VarRef::Local { mutable, depth, .. } = &varref {
+                    // D3 (spec §13.1/§13.2): a `go` body may not use an
+                    // outer `mut` binding — no capture by reference.
+                    if *mutable && self.go_stack.last().is_some_and(|g| depth <= g) {
+                        self.error(
+                            "E0314",
+                            format!(
+                                "`go` blocks cannot capture `mut` binding `{name}` by reference"
+                            ),
+                            span,
+                            Some(
+                                "send the value over a channel, or bind it immutably outside"
+                                    .to_string(),
+                            ),
+                        );
+                        return Err(());
+                    }
+                    // A binding moved into a channel send is gone.
+                    if self.is_moved(name) {
+                        self.error(
+                            "E0314",
+                            format!("use of moved value `{name}` (moved into a channel send)"),
+                            span,
+                            None,
+                        );
+                        return Err(());
+                    }
+                }
                 (HExprKind::Var(name.clone(), varref), ty)
             }
             ExprKind::If {
@@ -819,6 +1094,7 @@ impl Checker {
                             ty: ty.clone(),
                             mutable: *is_mut,
                             depth: self.depth,
+                            moved: false,
                         },
                     );
                 }
@@ -971,6 +1247,69 @@ impl Checker {
             ExprKind::Call { callee, args } => {
                 let (h, ty) = self.check_call(callee, args, span, ret)?;
                 (h, ty)
+            }
+            ExprKind::Send { chan, value } => {
+                self.uses_concurrency = true;
+                let hchan = self.check_expr(chan, None, ret)?;
+                let Ty::Chan(elem) = &hchan.ty else {
+                    self.error(
+                        "E0305",
+                        format!("cannot send on {}", hchan.ty),
+                        chan.span,
+                        Some("send targets a `chan<T>`".to_string()),
+                    );
+                    return Err(());
+                };
+                let elem = (**elem).clone();
+                let hvalue = self.check_expr(value, Some(&elem), ret)?;
+                self.expect_ty(&hvalue.ty, &elem, value.span)?;
+                self.check_send_move(&hvalue, value.span)?;
+                (
+                    HExprKind::Send {
+                        chan: Box::new(hchan),
+                        value: Box::new(hvalue),
+                    },
+                    Ty::Unit,
+                )
+            }
+            ExprKind::Recv { chan } => {
+                self.uses_concurrency = true;
+                let hchan = self.check_expr(chan, None, ret)?;
+                let Ty::Chan(elem) = &hchan.ty else {
+                    self.error(
+                        "E0305",
+                        format!("cannot receive from {}", hchan.ty),
+                        chan.span,
+                        Some("receive targets a `chan<T>`".to_string()),
+                    );
+                    return Err(());
+                };
+                let ty = (**elem).clone();
+                (
+                    HExprKind::Recv {
+                        chan: Box::new(hchan),
+                    },
+                    ty,
+                )
+            }
+            ExprKind::ChanNew { elem, cap } => {
+                self.uses_concurrency = true;
+                let elem_ty = self.resolve_ty(elem)?;
+                let hcap = match cap {
+                    Some(c) => {
+                        let h = self.check_expr(c, Some(&Ty::Int), ret)?;
+                        self.expect_ty(&h.ty, &Ty::Int, c.span)?;
+                        Some(Box::new(h))
+                    }
+                    None => None,
+                };
+                (
+                    HExprKind::ChanNew {
+                        elem_ty: elem_ty.clone(),
+                        cap: hcap,
+                    },
+                    Ty::Chan(Box::new(elem_ty)),
+                )
             }
             ExprKind::Field { base, name } => {
                 let hbase = self.check_expr(base, None, ret)?;
@@ -1555,6 +1894,59 @@ impl Checker {
                 self.builtin_arity(name, nargs, 1, span)?;
                 self.expect_arg(name, &args[0], 0, &Ty::String)?;
                 Ok(Ty::Bool)
+            }
+            "close" => {
+                self.uses_concurrency = true;
+                self.builtin_arity(name, nargs, 1, span)?;
+                match &args[0].ty {
+                    Ty::Chan(elem) => {
+                        // Recv-on-closed yields the element zero value; spec
+                        // §13.1 rows `chan`/`fn` elements to E0315 (they
+                        // have no zero value). All other element types —
+                        // incl. [Proposal] TBD rows — stay allowed: only
+                        // what the spec bans is banned.
+                        if matches!(elem.as_ref(), Ty::Chan(_) | Ty::Fn(..)) {
+                            self.error(
+                                "E0315",
+                                format!(
+                                    "cannot close `chan<{}>`: element type has no zero value",
+                                    elem
+                                ),
+                                span,
+                                Some(
+                                    "recv on a closed channel must yield the zero value; `chan` and `fn` elements have none".to_string(),
+                                ),
+                            );
+                            return Err(());
+                        }
+                        Ok(Ty::Unit)
+                    }
+                    other => {
+                        self.error(
+                            "E0303",
+                            format!("`close` needs a channel, found {other}"),
+                            span,
+                            None,
+                        );
+                        Err(())
+                    }
+                }
+            }
+            "closed" => {
+                self.uses_concurrency = true;
+                self.builtin_arity(name, nargs, 1, span)?;
+                match &args[0].ty {
+                    Ty::Chan(_) => Ok(Ty::Bool),
+                    other => {
+                        self.error(
+                            "E0303",
+                            format!("`closed` needs a channel, found {other}"),
+                            span,
+                            None,
+                        );
+                        Err(())
+                    }
+                }
             }
             _ => {
                 self.error("E0301", format!("undefined variable `{name}`"), span, None);

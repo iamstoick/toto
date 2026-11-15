@@ -1,18 +1,23 @@
 # Toto (.gzv) — language implementation in Rust
 
-> Phase 2 (type checker + shared typed IR) complete: `toto run` checks
-> first (exit 2, never executes on type errors); HIR + MIR with a MIR
-> interpreter verified by a differential harness over a 97-program corpus;
-> D8 frozen. Phase 3 (runtime + concurrency) in progress.
-> See [Implementation Roadmap v2.3](docs/) and `docs/decisions/`.
+> Phase 3 (runtime + concurrency) complete: single-threaded
+> milestone, M:N work-stealing scheduler with dedicated blocking
+> pool, and the Tier-2 Cranelift ABI gate (real MIR → production
+> heap, JIT-on-coroutine-stacks proof). Gate green (95 tests).
+> `toto run [--workers N]` routes concurrent programs through the
+> MIR executor on 64 KiB coroutine stacks (default 1, deterministic).
+> See [Phase 3 report](docs/phases/phase-3-runtime.md).
 
 ## Layout
 
-- `crates/toto-runtime/` — production runtime scaffold (empty until Phase 3).
+- `crates/toto-runtime/` — production runtime (GC heap, corosensei
+  scheduler, channels/select/scopes, MIR executor, deterministic
+  mode). No `Rc`/`RefCell`; all cross-task state is `Arc`+`Mutex`.
 - `crates/toto-compiler/` — lexer, parser, diagnostics, tree-walking
   interpreter, plus the Phase 2 checker, shared `ops`, HIR, MIR, and MIR
   interpreter (differential-tested against the tree-walker).
-- `crates/toto-cli/` — `toto run` + `--help`/`--version` (Phase 1).
+- `crates/toto-cli/` — `toto run [--workers N]` + `--help`/`--version` (Phase 1, workers flag Phase 3).
+- `crates/toto-jit/` — Tier-2 ABI gate (Phase 3): real-MIR subset → Cranelift → production heap. Conformance gate, not the Phase 4 backend.
 - `spikes/spike-1-gc-scheduler/` — **isolated prototype** for Spike 1
   (single-threaded cooperative scheduler + stop-the-world tracing GC).
   Throwaway code: it may be deleted, and it is NOT the production runtime.

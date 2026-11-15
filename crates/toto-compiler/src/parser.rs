@@ -555,6 +555,12 @@ impl Parser<'_> {
                 let t = self.bump();
                 t.kind.name().trim_matches('`').to_string()
             }
+            // Channel types nest (`chan<chan<int>>`): same shape as the
+            // `chan<T>()` value form, one type argument (spec §13.1).
+            TokenKind::Chan => {
+                self.bump();
+                "chan".to_string()
+            }
             _ => {
                 self.error(
                     "E0101",
@@ -640,6 +646,121 @@ impl Parser<'_> {
                 Err(()) => self.sync_stmt(),
             }
         }
+    }
+
+    /// Parse a `select` body after the `select` keyword: guarded cases
+    /// and an optional trailing `default`. Each guard is followed by a
+    /// braced block (spec §13.3).
+    fn parse_select(&mut self) -> PResult<(Vec<SelectCase>, Option<Box<Block>>)> {
+        self.expect(|k| matches!(k, TokenKind::LBrace), "`{`")?;
+        let mut cases = Vec::new();
+        let mut default: Option<Box<Block>> = None;
+        loop {
+            // `default` lexes as an identifier (not a keyword token).
+            if matches!(self.peek().kind, TokenKind::Ident(ref s) if s == "default") {
+                self.bump();
+                if default.is_some() {
+                    self.error(
+                        "E0159",
+                        "duplicate `default` in `select`".to_string(),
+                        self.prev_span(),
+                        None,
+                    );
+                    return Err(());
+                }
+                let body = Box::new(self.parse_block()?);
+                default = Some(body);
+                // Anything after `default` except `}` is an error.
+                if !matches!(self.peek().kind, TokenKind::RBrace) {
+                    self.error(
+                        "E0159",
+                        "`default` must be the last case in `select`".to_string(),
+                        self.peek().span,
+                        None,
+                    );
+                    return Err(());
+                }
+            } else if matches!(self.peek().kind, TokenKind::RBrace) {
+                self.bump();
+                break;
+            } else {
+                if default.is_some() {
+                    self.error(
+                        "E0159",
+                        "`default` must be the last case in `select`".to_string(),
+                        self.peek().span,
+                        None,
+                    );
+                    return Err(());
+                }
+                cases.push(self.parse_select_case()?);
+            }
+            if self.at_eof() {
+                self.error(
+                    "E0103",
+                    "unclosed `select`".to_string(),
+                    self.peek().span,
+                    Some("add the closing `}`".to_string()),
+                );
+                return Err(());
+            }
+        }
+        Ok((cases, default))
+    }
+
+    /// Parse one `select` guard plus its body block.
+    fn parse_select_case(&mut self) -> PResult<SelectCase> {
+        // `let v = <-ch { ... }`: receive with binding.
+        if matches!(self.peek().kind, TokenKind::Let) {
+            self.bump();
+            let (name, name_span) = self.parse_ident("binding name")?;
+            self.expect(|k| matches!(k, TokenKind::Eq), "`=`")?;
+            if !matches!(self.peek().kind, TokenKind::LtMinus) {
+                self.error(
+                    "E0159",
+                    "expected `<-ch` after `let v =` in `select` guard".to_string(),
+                    self.peek().span,
+                    None,
+                );
+                return Err(());
+            }
+            self.bump();
+            let chan = self.parse_expr(false, false, false)?;
+            let body = Box::new(self.parse_block()?);
+            return Ok(SelectCase::Recv {
+                name: Some((name, name_span)),
+                chan,
+                body,
+            });
+        }
+        // `<-ch { ... }`: receive and discard.
+        if matches!(self.peek().kind, TokenKind::LtMinus) {
+            self.bump();
+            let chan = self.parse_expr(false, false, false)?;
+            let body = Box::new(self.parse_block()?);
+            return Ok(SelectCase::Recv {
+                name: None,
+                chan,
+                body,
+            });
+        }
+        // `ch <- v { ... }`: send. Parse the channel operand, then look
+        // for `<-`. (No `default` token exists; `default` lexes as an
+        // identifier and is handled by the caller.)
+        let chan = self.parse_prec(false, false, false, 6)?;
+        if !matches!(self.peek().kind, TokenKind::LtMinus) {
+            self.error(
+                "E0159",
+                "expected a `select` guard (`<-ch`, `let v = <-ch`, or `ch <- v`)".to_string(),
+                self.peek().span,
+                None,
+            );
+            return Err(());
+        }
+        self.bump();
+        let value = self.parse_expr(false, false, false)?;
+        let body = Box::new(self.parse_block()?);
+        Ok(SelectCase::Send { chan, value, body })
     }
 
     /// Parse one statement: a full statement, or a block tail expression.
@@ -752,24 +873,20 @@ impl Parser<'_> {
             }
             TokenKind::Go => {
                 self.bump();
-                self.error(
-                    "E0151",
-                    "`go` blocks execute in Phase 3".to_string(),
-                    start.merge(self.prev_span()),
-                    None,
-                );
-                if matches!(self.peek().kind, TokenKind::LBrace) {
-                    self.bump();
-                    self.skip_balanced();
-                    // The construct is fully consumed; continue parsing so
-                    // later errors in this block are still reported. The
-                    // dummy never executes (static errors abort before run).
-                    return Ok(StmtOut::Stmt(Sp::new(
-                        StmtKind::Expr(Sp::new(ExprKind::Unit, start)),
-                        start.merge(self.prev_span()),
-                    )));
-                }
-                Err(())
+                let body = Box::new(self.parse_block().map_err(|_| {
+                    self.sync_stmt();
+                })?);
+                let span = start.merge(body.span);
+                Ok(StmtOut::Stmt(Sp::new(StmtKind::Go { body }, span)))
+            }
+            TokenKind::Select => {
+                self.bump();
+                let (cases, default) = self.parse_select()?;
+                let span = start.merge(self.prev_span());
+                Ok(StmtOut::Stmt(Sp::new(
+                    StmtKind::Select { cases, default },
+                    span,
+                )))
             }
             TokenKind::Match => {
                 self.bump();
@@ -837,9 +954,7 @@ impl Parser<'_> {
             | TokenKind::Static
             | TokenKind::As
             | TokenKind::SelfKw
-            | TokenKind::Defer
-            | TokenKind::Close
-            | TokenKind::Select => {
+            | TokenKind::Defer => {
                 let t = self.bump();
                 self.error(
                     "E0159",
@@ -988,18 +1103,22 @@ impl Parser<'_> {
                 TokenKind::Star => (BinOp::Mul, 60),
                 TokenKind::Slash => (BinOp::Div, 60),
                 TokenKind::Percent => (BinOp::Mod, 60),
+                // `ch <- v`: send (loosest precedence, below `||`).
                 TokenKind::LtMinus => {
-                    let span = self.peek().span;
+                    if 5 < min_prec {
+                        break;
+                    }
                     self.bump();
-                    self.error(
-                        "E0152",
-                        "channel send/receive executes in Phase 3".to_string(),
+                    let right = self.parse_prec(allow_bare_if, stmt_level, no_struct, 6)?;
+                    let span = left.span.merge(right.span);
+                    left = Sp::new(
+                        ExprKind::Send {
+                            chan: Box::new(left),
+                            value: Box::new(right),
+                        },
                         span,
-                        None,
                     );
-                    // Recover: parse a right-hand side, drop the construct.
-                    let _ = self.parse_unary(false, no_struct);
-                    return Err(());
+                    continue;
                 }
                 TokenKind::Eq => {
                     if stmt_level && min_prec == 0 {
@@ -1070,6 +1189,18 @@ impl Parser<'_> {
                     ExprKind::Unary {
                         op: UnOp::Not,
                         expr: Box::new(expr),
+                    },
+                    span,
+                ))
+            }
+            // `<-ch`: receive.
+            TokenKind::LtMinus => {
+                self.bump();
+                let chan = self.parse_unary(false, no_struct)?;
+                let span = start.merge(chan.span);
+                Ok(Sp::new(
+                    ExprKind::Recv {
+                        chan: Box::new(chan),
                     },
                     span,
                 ))
@@ -1234,6 +1365,28 @@ impl Parser<'_> {
             }
             TokenKind::If => self.parse_if(allow_bare_if, no_struct),
             TokenKind::Fn => self.parse_closure(),
+            // `chan<T>()` / `chan<T>(n)`: channel construction.
+            TokenKind::Chan => {
+                self.bump();
+                self.expect(|k| matches!(k, TokenKind::Lt), "`<`")?;
+                let elem = Box::new(self.parse_type()?);
+                self.expect(|k| matches!(k, TokenKind::Gt), "`>`")?;
+                let paren = self.expect(|k| matches!(k, TokenKind::LParen), "`(`")?.span;
+                let cap = if matches!(self.peek().kind, TokenKind::RParen) {
+                    None
+                } else {
+                    Some(Box::new(self.parse_expr(false, false, false)?))
+                };
+                self.expect_close(paren, &TokenKind::RParen, "(`")?;
+                let span = start.merge(self.prev_span());
+                Ok(Sp::new(ExprKind::ChanNew { elem, cap }, span))
+            }
+            // `close` parses as an ordinary callee; the checker treats it
+            // as a builtin with channel rules (spec §13.1).
+            TokenKind::Close => {
+                self.bump();
+                Ok(Sp::new(ExprKind::Var("close".to_string()), start))
+            }
             // `Result`/`Option` constructors (checked and executed since
             // Phase 2): `Ok(e)`, `Err(e)`, `Some(e)` take exactly one
             // argument; `None` stands alone.
@@ -1271,22 +1424,16 @@ impl Parser<'_> {
                 }
                 Ok(Sp::new(ExprKind::Var(name), start))
             }
+            // `go` is a statement (spec §13.2); it cannot start an
+            // expression. (The `<-` prefix is intercepted by
+            // `parse_unary`, so no `LtMinus` arm is needed here.)
             TokenKind::Go => {
                 self.bump();
+                let span = start.merge(self.prev_span());
                 self.error(
-                    "E0151",
-                    "`go` blocks execute in Phase 3".to_string(),
-                    start.merge(self.prev_span()),
-                    None,
-                );
-                Err(())
-            }
-            TokenKind::LtMinus => {
-                let t = self.bump();
-                self.error(
-                    "E0152",
-                    "channel send/receive executes in Phase 3".to_string(),
-                    t.span,
+                    "E0101",
+                    "expected expression, found `go` (`go` blocks are statements)".to_string(),
+                    span,
                     None,
                 );
                 Err(())
@@ -1328,8 +1475,6 @@ impl Parser<'_> {
             | TokenKind::As
             | TokenKind::SelfKw
             | TokenKind::Defer
-            | TokenKind::Close
-            | TokenKind::Select
             | TokenKind::Loop => {
                 let t = self.bump();
                 self.error(

@@ -262,7 +262,8 @@ The parser recognizes out-of-subset constructs far enough to reject them by
 name. Minimum required rejections (negative corpus, §9.4):
 
 - `go <block>` and any use of `<-` → "channels and `go` blocks execute in
-  Phase 3" (code `E0151` / `E0152`).
+  Phase 3" (code `E0151` / `E0152`). These rejections retire as Phase 3
+  enables the constructs; semantics are specified in §13.
 - Postfix `?` (`expr?`) → **retired in Phase 2**: `?` now parses and
   executes (§11, §12); the `E0153` rejection no longer exists.
 - `fn name<T>(…)` or `struct Name<T> …` (user generics) → "user-defined
@@ -704,12 +705,103 @@ report several independent type errors (at most 16 per file, as in §9.2).
 | `E0311` | duplicate definition (function, struct, parameter, field) |
 | `E0312` | bad or missing `main` |
 | `E0313` | illegal rebinding (`let` reassigned, function assigned) |
+| `E0314` | D3 ownership violation (`go` captures `mut`, use after send-move) |
+| `E0315` | `close` on a channel with no zero value (`chan`/`fn` element) |
 
-## 13. Reserved for later phases (syntax acknowledgment)
+## 13. Concurrency (Phase 3)
 
-- Concurrency: `go <block>`, `chan<T>`, `ch <- v`, `<-ch`, `select`
-  (Phase 3). The `<-` lexical rule (§2.3) and the rejection diagnostics
-  (§3.3) are the only Phase 1 deliverables here.
+Amendment record (2026-11-14, Phase 3 kickoff): the six semantics
+decisions below were specified explicitly by the language owner to
+resolve the Phase 3 spec-silence blocker (channel construction, scopes,
+select, close, cancellation, `go` handles). Each is binding. Points
+marked **[Proposal]** are sub-details neither the PDF nor the owner
+fixed; they follow the Appendix A review process (flagged here, owner
+confirms or corrects — never silent).
+
+### 13.1 Channels
+
+- Type `chan<T>` (§4). Values are created by builtins: `chan<T>()`
+  (unbuffered) and `chan<T>(n)` (bounded, capacity `n`). `n` must be an
+  `int`; a negative capacity panics (`E0204`) **[Proposal]**.
+- The builtin catalog grows 25 → 28: `chan`, `close`, `closed` are added
+  (mandated by this section; §7's freeze is otherwise unchanged). No
+  other channel builtins exist in v1 (`len` does not apply to channels).
+- Send is `ch <- v`, receive is `<-ch` (§2.3). Send blocks when a bounded
+  channel is full, and on an unbuffered channel until a receiver takes
+  the value; receive blocks when the channel is empty. `select` with
+  `default` (§13.3) is the non-blocking path.
+- Ownership (D3, brief-mandated): a `go` block that captures a `mut`
+  binding by reference is a static error; `ch <- x` where `x` is a `mut`
+  binding moves `x` (the sender loses access — any later use is a static
+  error). Both are code `E0314` with a message naming the violated rule.
+  Deep immutability beyond this is by construction (value capture copies
+  scalars per §5.7; containers share) with the Phase 4 race detector as
+  backstop — the checker does not attempt whole-program alias analysis.
+- `close(ch)` marks a channel closed. Send on a closed channel panics;
+  double-close panics (both `E0213` **[Proposal]**). Receive on a
+  closed-and-drained channel yields the zero value of `T`; buffered
+  items are received first. `closed(ch)` reports whether `close` was
+  called (independent of drain state).
+- Zero values **[Proposal]**: `int` 0, `float` 0.0, `string` `""`,
+  `bool` false, `unit` `()`, `Array<T>` `[]`, `Range` `0..0`,
+  `Option<T>` `None`, `Result<T,E>` `Ok(zero of T)`, struct `S` has each
+  field zeroed (well-founded: recursive types are rejected, E0302).
+  `Map` has no values, so a `Map` zero never arises. `chan` and `fn`
+  element types have no zero value: `close` on `chan<chan<T>>` or
+  `chan<fn…>` is a static error (`E0315`) **[Proposal]**.
+
+### 13.2 Tasks and scopes
+
+- `go <block>` is a statement yielding `unit`. Completion is observed
+  through scope waits and channels only; there are no handles and no
+  join operation.
+- Every `go` block is a child scope of the scope executing it; `main`
+  is the root scope. A scope completes when all its children complete;
+  `main` returns (and the process exits) only after all descendants
+  complete. Results flow through channels, not return values.
+- A child panic fails its scope (§11): siblings suspended in
+  send/receive/select are released via the cancellation unwind (§13.4);
+  tasks at non-suspending points run on to their next suspension
+  boundary or completion (cooperative — no preemption). After all
+  children settle, the scope re-panics with the first child's panic,
+  preserving its span and trace **[Proposal: first-panic-wins,
+  settle-then-propagate]**.
+- Deadlock (PDF failure policy): all tasks suspended with none runnable
+  and no pending wakeups (no timers or IO exist in v1) is a runtime
+  panic reporting deadlock with the suspended tasks' spans **[Proposal]**.
+  Task leaks are impossible by construction (scopes always wait);
+  orphaned tasks in soak tests are a bug.
+
+### 13.3 `select`
+
+- Statement form with one or more guarded cases and an optional
+  `default` (which, if present, must be last **[Proposal]**). An empty
+  `select {}` with no cases blocks forever (Go package).
+- Guard forms: `let v = <-ch` (receive and bind) **[Proposal: binding
+  surface]**; `<-ch` (receive and discard); `ch <- expr` (send).
+  Guards are checked like their statement forms (channel types, send
+  value matches `T`). At most one `default`; malformed `select` is a
+  parse error (`E0159`).
+- Semantics (owner-specified): the first ready case runs; choice among
+  simultaneously ready cases is random. With `default`, the statement
+  never blocks. Random tie-breaks use the scheduler RNG, which is
+  seeded in deterministic test mode (brief §2).
+
+### 13.4 Cancellation
+
+- Trigger in Phase 3: child panic failing its scope, only. No explicit
+  cancel operation exists (parked-recv cancellation is Phase 4).
+- Mechanism: a task suspended in send/receive/select when its scope
+  fails is released by panicking at the blocked operation's span
+  (`E0214` **[Proposal]**, message names cancellation). Tasks that
+  complete without suspending again are unaffected; a compute-bound
+  sibling delays failure propagation until it suspends or completes
+  (documented cooperative limitation).
+
+## 14. Reserved for later phases (syntax acknowledgment)
+
+- Concurrency: specified in §13 (Phase 3). The `<-` lexical rule (§2.3)
+  and the rejection diagnostics (§3.3) were the Phase 1 deliverables.
 - FFI: `unsafe extern` blocks, C types (`c_int`, `c_char`, pointers)
   (Phase 5, per D6 rules: rooting for call duration, handle rule, panic
   boundaries, UTF-8 strings, blocking pool, callback queue).
@@ -760,6 +852,18 @@ Reopen triggers: any decision reopens on (a) contradiction with a Phase 2
 checker requirement, (b) dogfooding evidence it rejects ordinary programs,
 or (c) differential-testing friction in Phase 4. Reopening needs a spec
 amendment recorded here — never silent drift.
+
+Phase 3 amendment record (2026-11-14): the owner specified the six
+concurrency semantics (§13) to resolve the Phase 3 spec-silence blocker:
+`chan<T>()` / `chan<T>(n)` construction; `main`-is-root nested scopes;
+guarded-block select with random tie-break; `close(ch)` with zero-value
+recv plus `closed(ch)`; panic-driven scope unwind; `go` as a unit
+statement with no handles. Binding owner decisions. The **[Proposal]**
+sub-details in §13 (negative capacity, `E0213`/`E0214`, the zero-value
+table, `E0315`, first-panic-wins/settle-then-propagate, deadlock panic,
+default-last, `let v = <-ch` binding surface) are flagged for owner
+review: confirm or correct, per this appendix's process. The builtin
+catalog grows 25 → 28 (`chan`, `close`, `closed`); otherwise frozen.
 
 ## Appendix B. Review questions and answers (2026-11-14 review)
 

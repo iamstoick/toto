@@ -1,0 +1,7 @@
+panic[E0202]: division by zero
+ --> conc_neg_main_panic.gzv:7:13
+  |
+7 |     let x = 1 / 0;
+  |             ^^^^^
+stack trace:
+  in main at conc_neg_main_panic.gzv:1:4

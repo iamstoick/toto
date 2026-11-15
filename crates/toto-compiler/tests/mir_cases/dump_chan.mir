@@ -1,0 +1,33 @@
+fn main() -> int {
+  // %0: int (const int)
+  // %1: chan<int> (chan)
+  // %2: chan<int> (ch)
+  // %3: int (recv)
+  // %4: int (v)
+  // %5: unit (close())
+  // %6: int (println())
+  // %7: bool (closed())
+  // %8: int (println())
+  // %9: int (const int)
+  bb0:
+    safepoint entry
+    %0 = const 2:int
+    safepoint alloc
+    %1 = channew int cap %0
+    %2 = copy %1
+    safepoint alloc
+    spawn [%2]
+    safepoint park
+    %3 = recv %2
+    %4 = copy %3
+    safepoint call
+    %5 = builtin close(%2)
+    safepoint call
+    %6 = builtin println(%4)
+    safepoint call
+    %7 = builtin closed(%2)
+    safepoint call
+    %8 = builtin println(%7)
+    %9 = const 0:int
+    ret %9
+}

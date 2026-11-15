@@ -18,7 +18,7 @@ use crate::interp::TraceFrame;
 use crate::interp::Value;
 use crate::span::Span;
 
-pub(crate) type OpResult<T> = Result<T, (Diag, Vec<TraceFrame>)>;
+pub type OpResult<T> = Result<T, (Diag, Vec<TraceFrame>)>;
 
 fn fail(code: &'static str, message: String, span: Span) -> (Diag, Vec<TraceFrame>) {
     fail_help(code, message, span, None)
@@ -35,14 +35,14 @@ fn fail_help(
 
 /// What a function returns, for `?` propagation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum FnRetKind {
+pub enum FnRetKind {
     Result,
     Option,
     Other,
 }
 
 /// Conversion hint shared by all type-mismatch panics.
-pub(crate) fn int_float_hint(a: &Value, b: &Value) -> Option<String> {
+pub fn int_float_hint(a: &Value, b: &Value) -> Option<String> {
     if matches!(
         (a, b),
         (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_))
@@ -56,7 +56,7 @@ pub(crate) fn int_float_hint(a: &Value, b: &Value) -> Option<String> {
     }
 }
 
-pub(crate) fn arith(
+pub fn arith(
     l: Value,
     r: Value,
     span: Span,
@@ -89,7 +89,7 @@ pub(crate) fn arith(
 
 /// Integer division with the explicit zero check (spec §5.2, trap decision
 /// D8-Phase-2: explicit check in codegen, so the check is explicit here).
-pub(crate) fn div_values(l: Value, r: Value, span: Span) -> OpResult<Value> {
+pub fn div_values(l: Value, r: Value, span: Span) -> OpResult<Value> {
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => {
             if b == 0 {
@@ -110,7 +110,7 @@ pub(crate) fn div_values(l: Value, r: Value, span: Span) -> OpResult<Value> {
     }
 }
 
-pub(crate) fn mod_values(l: Value, r: Value, span: Span) -> OpResult<Value> {
+pub fn mod_values(l: Value, r: Value, span: Span) -> OpResult<Value> {
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => {
             if b == 0 {
@@ -132,7 +132,7 @@ pub(crate) fn mod_values(l: Value, r: Value, span: Span) -> OpResult<Value> {
     }
 }
 
-pub(crate) fn neg_value(v: Value, inner_span: Span, span: Span) -> OpResult<Value> {
+pub fn neg_value(v: Value, inner_span: Span, span: Span) -> OpResult<Value> {
     match v {
         Value::Int(i) => match i.checked_neg() {
             Some(n) => Ok(Value::Int(n)),
@@ -147,7 +147,7 @@ pub(crate) fn neg_value(v: Value, inner_span: Span, span: Span) -> OpResult<Valu
     }
 }
 
-pub(crate) fn not_value(v: Value, inner_span: Span) -> OpResult<Value> {
+pub fn not_value(v: Value, inner_span: Span) -> OpResult<Value> {
     match v {
         Value::Bool(b) => Ok(Value::Bool(!b)),
         other => Err(fail(
@@ -158,7 +158,7 @@ pub(crate) fn not_value(v: Value, inner_span: Span) -> OpResult<Value> {
     }
 }
 
-pub(crate) fn equality(l: Value, r: Value, span: Span, want_eq: bool) -> OpResult<Value> {
+pub fn equality(l: Value, r: Value, span: Span, want_eq: bool) -> OpResult<Value> {
     // `Ok`/`Err` share the `Result` family and `Some`/`None` the
     // `Option` family: same-type cross-variant comparison is `false`
     // (the checker guarantees the type arguments agree).
@@ -181,7 +181,7 @@ pub(crate) fn equality(l: Value, r: Value, span: Span, want_eq: bool) -> OpResul
     Ok(Value::Bool(if want_eq { eq } else { !eq }))
 }
 
-pub(crate) fn values_equal(a: &Value, b: &Value, depth: usize) -> bool {
+pub fn values_equal(a: &Value, b: &Value, depth: usize) -> bool {
     if depth > 100 {
         // Cycle guard (spec §5.4): fall back to identity.
         return match (a, b) {
@@ -233,7 +233,7 @@ pub(crate) fn values_equal(a: &Value, b: &Value, depth: usize) -> bool {
     }
 }
 
-pub(crate) fn ordering(op: BinOp, l: Value, r: Value, span: Span) -> OpResult<Value> {
+pub fn ordering(op: BinOp, l: Value, r: Value, span: Span) -> OpResult<Value> {
     let ord = match (&l, &r) {
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Float(a), Value::Float(b)) => {
@@ -263,12 +263,7 @@ pub(crate) fn ordering(op: BinOp, l: Value, r: Value, span: Span) -> OpResult<Va
     Ok(Value::Bool(result))
 }
 
-pub(crate) fn index_read(
-    base: Value,
-    index: Value,
-    span: Span,
-    index_span: Span,
-) -> OpResult<Value> {
+pub fn index_read(base: Value, index: Value, span: Span, index_span: Span) -> OpResult<Value> {
     match (base, index) {
         (Value::Array(cell), Value::Int(n)) => {
             let arr = cell.borrow();
@@ -294,7 +289,7 @@ pub(crate) fn index_read(
     }
 }
 
-pub(crate) fn index_write(
+pub fn index_write(
     base: Value,
     index: Value,
     value: Value,
@@ -327,7 +322,7 @@ pub(crate) fn index_write(
     }
 }
 
-pub(crate) fn field_read(base: Value, name: &str, span: Span) -> OpResult<Value> {
+pub fn field_read(base: Value, name: &str, span: Span) -> OpResult<Value> {
     match base {
         Value::Struct(cell) => {
             let s = cell.borrow();
@@ -348,7 +343,7 @@ pub(crate) fn field_read(base: Value, name: &str, span: Span) -> OpResult<Value>
     }
 }
 
-pub(crate) fn field_write(base: Value, name: &str, value: Value, span: Span) -> OpResult<()> {
+pub fn field_write(base: Value, name: &str, value: Value, span: Span) -> OpResult<()> {
     match base {
         Value::Struct(cell) => {
             let mut s = cell.borrow_mut();
@@ -378,7 +373,7 @@ pub(crate) fn field_write(base: Value, name: &str, value: Value, span: Span) -> 
 /// and the original error value is preserved as the cause. The `E0204` arm
 /// is unreachable in checked programs (both interpreters prove it only via
 /// the checker, never by executing it).
-pub(crate) fn propagate(v: Value, enclosing: FnRetKind, span: Span) -> Result<Value, Propagate> {
+pub fn propagate(v: Value, enclosing: FnRetKind, span: Span) -> Result<Value, Propagate> {
     match (v, enclosing) {
         (Value::Ok(b), _) => Ok(*b),
         (Value::Some(b), _) => Ok(*b),
@@ -389,7 +384,7 @@ pub(crate) fn propagate(v: Value, enclosing: FnRetKind, span: Span) -> Result<Va
 }
 
 /// Outcome of `?` that is not a plain unwrap.
-pub(crate) enum Propagate {
+pub enum Propagate {
     /// Early-return this value from the enclosing function.
     Return(Value),
     /// Unreachable in checked programs; carries the `?` span.

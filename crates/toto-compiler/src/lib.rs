@@ -1,6 +1,7 @@
-//! Toto compiler: lexer, parser, diagnostics, tree-walking interpreter.
-//! Phase 1 delivers the core subset (spec `docs/spec.md`); the checker
-//! and IR arrive in Phase 2. The runtime crate stays empty until Phase 3.
+//! Toto compiler: lexer, parser, diagnostics, tree-walking interpreter,
+//! checker, and MIR (spec `docs/spec.md`). Concurrent execution lives in
+//! the `toto-runtime` crate (Phase 3); this crate's interpreters are
+//! sequential-only.
 
 pub mod ast;
 pub mod builtins;
@@ -16,7 +17,9 @@ pub mod parser;
 pub mod span;
 pub mod token;
 
+use ast::Program;
 use diag::{Diag, render_all};
+use hir::CheckedProgram;
 use interp::{Interp, TraceFrame};
 
 /// What running a source file produces.
@@ -34,28 +37,44 @@ pub enum Outcome {
     },
 }
 
-/// Lex, parse, and interpret a source file. Never panics on user input:
-/// every failure surfaces as `Static` or `RuntimePanic`.
-pub fn run_source(src: &str, _filename: &str) -> Outcome {
+/// Parse and check a source file, returning the AST plus typed HIR.
+/// Static failures (lexer, parser, checker) come back as diagnostics;
+/// the caller decides how to execute (tree-walker or runtime executor).
+pub fn parse_and_check(src: &str) -> Result<(Program, CheckedProgram), Vec<Diag>> {
     let (tokens, lex_errors) = lexer::lex(src);
     if !lex_errors.is_empty() {
         let diags = lex_errors
             .into_iter()
             .map(|e| Diag::new(e.code, e.message, e.span, e.help))
             .collect();
-        return Outcome::Static(diags);
+        return Err(diags);
     }
     let (program, parse_errors) = parser::parse(tokens, src);
     if !parse_errors.is_empty() {
-        return Outcome::Static(parse_errors);
+        return Err(parse_errors);
     }
-    // Phase 2: check before interpreting. A program with type errors
-    // never executes (spec §9.1: exit code 2 for static diagnostics).
     let (checked, check_errors) = check::check(&program);
-    if !check_errors.is_empty() {
-        return Outcome::Static(check_errors);
+    match checked {
+        Some(checked) => {
+            debug_assert!(check_errors.is_empty());
+            Ok((program, checked))
+        }
+        None => Err(check_errors),
     }
-    let _ = checked;
+}
+
+/// Lex, parse, and interpret a source file. Never panics on user input:
+/// every failure surfaces as `Static` or `RuntimePanic`.
+///
+/// Sequential programs only: concurrent programs (those using `go`,
+/// channels, `select`, or `close`) are rejected by the routing tripwire
+/// (`E0215`) — run them through `toto run`, which routes to the runtime
+/// executor.
+pub fn run_source(src: &str, _filename: &str) -> Outcome {
+    let program = match parse_and_check(src) {
+        Ok((program, _)) => program,
+        Err(diags) => return Outcome::Static(diags),
+    };
     // The tree-walking interpreter recurses on the host stack (one Rust
     // call chain per Toto call level). The 8,192-frame semantic limit
     // (spec §5.9) needs more host stack than the default 8 MiB in debug
