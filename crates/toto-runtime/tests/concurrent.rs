@@ -109,6 +109,7 @@ fn concurrent_negatives_exact_under_gc_pressure() {
         "conc_neg_select_send_closed",
         "conc_neg_child_panic",
         "conc_neg_main_panic",
+        "conc18_fneq",
     ] {
         run_case(name);
     }

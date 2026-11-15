@@ -233,11 +233,11 @@ fn gate_panics_no_signal() {
     // are blessed against the source text (each points at the failing
     // operation) and cross-checked with the tree-walking interpreter.
     //
-    // `modzero` documents a cosmetic interpreter divergence the gate
-    // surfaced: MIR `DivCheck` reports "division by zero" for `%`
-    // too (same E0202, same span 39..44); the tree-walker reports
-    // "modulo by zero". The spec (§5.2) pins codes, not messages; no
-    // corpus program covers `% 0`, so no golden pins either wording.
+    // `modzero`: `x % 0` reports "division by zero" (E0202, same
+    // span 39..44) in every executor — unified in Phase 4 (the
+    // tree-walker previously said "modulo by zero"; spec §5.2 pins
+    // codes, not messages). Corpus coverage:
+    // tests/corpus/interp/int04_modzero.
     for (case, code, msg, span, frame) in [
         ("divzero", "E0202", "division by zero", "41..46", "in main"),
         ("overflow", "E0201", "integer overflow", "57..62", "in main"),

@@ -109,7 +109,7 @@ pub struct HFn {
     pub span: Span,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HStructDecl {
     pub name: String,
     pub fields: Vec<(String, Ty)>,

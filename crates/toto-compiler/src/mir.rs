@@ -32,7 +32,7 @@ pub type BlockId = usize;
 pub type Local = usize;
 
 /// A whole MIR program: top-level functions plus struct declarations.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MProgram {
     pub fns: Vec<MFn>,
     pub fn_index: HashMap<String, usize>,
@@ -41,7 +41,7 @@ pub struct MProgram {
 }
 
 /// One function body: locals plus a block graph.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MFn {
     pub name: String,
     pub params: Vec<(String, Ty)>,
@@ -55,7 +55,7 @@ pub struct MFn {
 }
 
 /// A closure body: parameters, explicit captures, then locals and blocks.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MirBody {
     pub params: Vec<(String, Ty)>,
     pub ret: Ty,
@@ -67,14 +67,14 @@ pub struct MirBody {
     pub body_span: Span,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MBlock {
     pub id: BlockId,
     pub instrs: Vec<MInstr>,
     pub term: MTerm,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MInstr {
     Const {
         dst: Local,
@@ -263,7 +263,7 @@ pub enum MInstr {
 
 /// One `select` guard, lowered: channel/value locals plus the bind slot
 /// for receive-and-bind cases.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MSelectCase {
     Recv {
         chan: Local,
@@ -277,7 +277,7 @@ pub enum MSelectCase {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MTerm {
     Return(Option<Local>),
     /// Fell off the end: `E0212` unless the function returns `unit`.
@@ -321,7 +321,7 @@ pub enum SpKind {
     Park,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MConst {
     Int(i64),
     Float(f64),

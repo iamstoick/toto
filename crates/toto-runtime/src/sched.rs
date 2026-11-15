@@ -54,6 +54,15 @@ pub enum ToSched {
         span: Span,
         scope: ScopeId,
     },
+    /// Native `go` body (Phase 4 JIT): spawn a task running compiled
+    /// code. Mirrors `Spawn` but carries a native entry + context
+    /// instead of MIR.
+    SpawnNative {
+        entry: crate::exec::NativeEntry,
+        ctx: u64,
+        span: Span,
+        scope: ScopeId,
+    },
     ChanNew {
         cap: Option<i64>,
         elem: Ty,
@@ -699,8 +708,15 @@ impl Scheduler {
         let co =
             Coroutine::with_stack(stack, move |y: &Yielder<ToTask, ToSched>, _init: ToTask| {
                 let id = id_rx.recv().expect("task id assigned before first resume");
-                let exec = Executor::new(y, &code, &shared, scope, id);
-                exec.run_task(initial, span)
+                match initial {
+                    // Native tasks (Phase 4 JIT) run compiled code
+                    // with the same yielder protocol, no executor.
+                    Initial::Native { entry, ctx } => entry(y, ctx, id, scope),
+                    other => {
+                        let exec = Executor::new(y, &code, &shared, scope, id);
+                        exec.run_task(other, span)
+                    }
+                }
             });
         let mut sched = self.shared.sched.lock().expect("sched lock");
         let id = TaskId(sched.slots.len());
@@ -742,6 +758,64 @@ impl Scheduler {
         let id = self.spawn_task(0, "main".to_string(), root, Initial::Main(main_idx), span);
         self.shared.sched.lock().expect("sched lock").main_task = id;
         id
+    }
+
+    /// Spawn `main` as native code (Phase 4 JIT): like `spawn_main`
+    /// but the task runs `entry` with `ctx` instead of the MIR
+    /// executor.
+    pub fn spawn_native_main(
+        &self,
+        entry: crate::exec::NativeEntry,
+        ctx: u64,
+        span: Span,
+    ) -> TaskId {
+        let root = ScopeTable::root();
+        let id = self.spawn_task(
+            0,
+            "main".to_string(),
+            root,
+            Initial::Native { entry, ctx },
+            span,
+        );
+        self.shared.sched.lock().expect("sched lock").main_task = id;
+        id
+    }
+
+    /// Live task count for drain quiescence (Phase 4 dev): every task
+    /// whose slot is not `Done` — ready, running, and
+    /// suspended/parked tasks all count (a parked task still holds
+    /// live frames).
+    pub fn live_tasks(&self) -> usize {
+        let sched = self.shared.sched.lock().expect("sched lock");
+        sched
+            .slots
+            .iter()
+            .filter(|s| s.state != TaskState::Done)
+            .count()
+    }
+
+    /// Drain cancellation (Phase 4 dev): fail the root scope,
+    /// releasing every parked task in the run with cancellation
+    /// (send/recv/select/blocking — the same sweep as a task panic).
+    /// Running tasks fail fast at their next park op; tasks that
+    /// never suspend keep running (cooperative limit — the drain
+    /// timeout plus the dev restart fallback own that case).
+    pub fn cancel_all(&self) {
+        self.fail_scope(
+            0,
+            ScopeTable::root(),
+            Failure {
+                diag: Diag::new(
+                    "E0214",
+                    String::from(
+                        "drain cancelled: reload superseded this run (tasks released by cancellation)",
+                    ),
+                    Span::new(0, 0),
+                    None,
+                ),
+                trace: Vec::new(),
+            },
+        );
     }
 
     /// Conditionally wake another task: applies only while the task is
@@ -1190,6 +1264,28 @@ impl Scheduler {
                         blocks,
                         captures,
                     },
+                    span,
+                );
+                self.enqueue_on(worker, id, ToTask::Unit);
+            }
+            ToSched::SpawnNative {
+                entry,
+                ctx,
+                span,
+                scope,
+            } => {
+                let child = self
+                    .shared
+                    .scopes
+                    .lock()
+                    .expect("scopes lock")
+                    .new_scope(scope);
+                let n = self.shared.sched.lock().expect("sched lock").tasks_spawned;
+                self.spawn_task(
+                    worker,
+                    format!("go-{n}"),
+                    child,
+                    Initial::Native { entry, ctx },
                     span,
                 );
                 self.enqueue_on(worker, id, ToTask::Unit);

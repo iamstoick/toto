@@ -153,7 +153,10 @@ pub fn run_checked(
     compose(outcome, main_span)
 }
 
-fn compose(outcome: SchedOutcome, main_span: Span) -> RtOutcome {
+/// Compose a scheduler outcome into a run outcome (shared by the
+/// MIR-executor path and the Phase 4 JIT path: identical exit-code,
+/// failure-propagation, and stats semantics by construction).
+pub fn compose(outcome: SchedOutcome, main_span: Span) -> RtOutcome {
     let SchedOutcome {
         main,
         root_failure,

@@ -65,7 +65,7 @@ fn main() {
         std::process::exit(2);
     });
     if let Err(e) = jit.compile(&prog) {
-        eprintln!("panic_probe {case}: subset refused: {e}");
+        eprintln!("panic_probe {case}: compile refused: {e}");
         std::process::exit(2);
     }
     let mut rt = JitRt::new();

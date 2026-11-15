@@ -14,4 +14,6 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+# --nocapture: test stdout (notably the JIT compile-time table) is
+# preserved in CI logs for the phase report.
+cargo test --workspace -- --nocapture

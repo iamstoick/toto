@@ -7,6 +7,7 @@
 > `toto run [--workers N]` routes concurrent programs through the
 > MIR executor on 64 KiB coroutine stacks (default 1, deterministic).
 > See [Phase 3 report](docs/phases/phase-3-runtime.md).
+> Roadmap: [Implementation Roadmap v2.4](docs/) (D1–D8 + ratified decisions; title page verified at Phase 4 kickoff).
 
 ## Layout
 

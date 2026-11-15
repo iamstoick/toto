@@ -14,3 +14,10 @@ jobs:
           components: rustfmt, clippy
       - name: fmt + clippy + test gate
         run: ./scripts/check.sh
+  release-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: release stack + timings gates
+        run: cargo test --release -p toto-jit --test stack_jit --test timings -- --nocapture

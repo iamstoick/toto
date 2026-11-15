@@ -10,9 +10,16 @@ concurrent corpus green with a decided/tested blocking-I/O policy
 (Stage 2); the Tier-2 ABI gate compiles real MIR with Cranelift and
 executes it against the production heap through the frozen ADR-008
 entry points, including a JIT-on-coroutine-stacks proof (Stage 3).
-Two M:N lost-wakeup races and one error-trace fidelity bug were found
+Three M:N races and one error-trace fidelity bug were found
 by stress testing and fixed (no spec or frozen-D8 change). Carry-
 forwards to Phase 4 are listed at the end.
+
+[2026-11-15 record fix (Phase 4 Stage 0): this verdict previously read
+"two races + one trace bug" (three items) but the Stage 2 body lists
+four race/trace items (§Stage 2 items 1–4: check-then-register,
+register-then-park, deadlock-claim-vs-completion-delivery,
+blocking-error trace fidelity). Count corrected to three races + one
+trace bug; no other history rewritten.]
 
 ## Stage 0 confirmation
 

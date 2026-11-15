@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "panic_probe"
 path = "src/bin/panic_probe.rs"
 
+[[bin]]
+name = "jit_probe"
+path = "src/bin/jit_probe.rs"
+
 [dependencies]
 toto-compiler = { path = "../toto-compiler" }
 toto-runtime = { path = "../toto-runtime" }
