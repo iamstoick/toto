@@ -80,3 +80,31 @@ fn workers_flag_rejects_zero() {
             .contains("needs a positive number")
     );
 }
+
+#[test]
+fn opt_level_flag_documented() {
+    let out = toto().arg("--help").output().expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("--opt-level LEVEL")
+    );
+}
+
+#[test]
+fn opt_level_flag_rejects_bad_value() {
+    let out = toto()
+        .arg("dev")
+        .arg("--opt-level")
+        .arg("bogus")
+        .arg("no-such-file.gzv")
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(3));
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("needs off, speed, or speed_and_size")
+    );
+}

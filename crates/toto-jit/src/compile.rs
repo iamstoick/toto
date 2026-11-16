@@ -105,6 +105,46 @@ pub enum CodegenMode {
     Task,
 }
 
+/// Cranelift optimization level for generated code (Phase 4, Stage 3:
+/// the minimal flagged pipeline — one flag, three levels, no passes
+/// of our own). `Off` is the default and preserves the exact
+/// Stage-1 gate behavior (`opt_level=none`); `Speed` and
+/// `SpeedAndSize` select Cranelift's corresponding pipelines. The
+/// level affects machine-code emission only: MIR, the value codec,
+/// entry points, and root publication are identical at every level
+/// (pinned by `opt.rs` equivalence).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OptLevel {
+    /// `opt_level=none`: fastest compile, Stage-1 behavior.
+    #[default]
+    Off,
+    /// `opt_level=speed`.
+    Speed,
+    /// `opt_level=speed_and_size`.
+    SpeedAndSize,
+}
+
+impl OptLevel {
+    /// The `opt_level` flag value for `JITBuilder::with_flags`.
+    fn flag(self) -> &'static str {
+        match self {
+            OptLevel::Off => "none",
+            OptLevel::Speed => "speed",
+            OptLevel::SpeedAndSize => "speed_and_size",
+        }
+    }
+
+    /// Parse a CLI/test flag value (`off`, `speed`, `speed_and_size`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(OptLevel::Off),
+            "speed" => Some(OptLevel::Speed),
+            "speed_and_size" => Some(OptLevel::SpeedAndSize),
+            _ => None,
+        }
+    }
+}
+
 /// What a lowered body is: top-level functions take `(ctx, args)`,
 /// closures take `(ctx, handle, args)`, go bodies take `(task_ctx)`.
 /// Only `Closure`/`Go` are ever collected (top-level functions are
@@ -160,18 +200,31 @@ pub struct Jit {
 
 impl Jit {
     pub fn new() -> Result<Self, String> {
-        Self::with_mode(CodegenMode::Gate)
+        Self::with_mode_and_opt(CodegenMode::Gate, OptLevel::Off)
     }
 
     /// Task-mode session (production path): same import names where
     /// the contract matches, recording panics, suspension support.
     pub fn new_task() -> Result<Self, String> {
-        Self::with_mode(CodegenMode::Task)
+        Self::with_mode_and_opt(CodegenMode::Task, OptLevel::Off)
     }
 
-    fn with_mode(mode: CodegenMode) -> Result<Self, String> {
-        let mut jb = JITBuilder::new(cranelift_module::default_libcall_names())
-            .map_err(|e| e.to_string())?;
+    /// Gate-mode session at an explicit optimization level.
+    pub fn new_with_opt(level: OptLevel) -> Result<Self, String> {
+        Self::with_mode_and_opt(CodegenMode::Gate, level)
+    }
+
+    /// Task-mode session at an explicit optimization level.
+    pub fn new_task_with_opt(level: OptLevel) -> Result<Self, String> {
+        Self::with_mode_and_opt(CodegenMode::Task, level)
+    }
+
+    fn with_mode_and_opt(mode: CodegenMode, opt: OptLevel) -> Result<Self, String> {
+        let mut jb = JITBuilder::with_flags(
+            &[("opt_level", opt.flag())],
+            cranelift_module::default_libcall_names(),
+        )
+        .map_err(|e| e.to_string())?;
         // One symbol table per mode (each takes ctx first). Import
         // names are shared where the contract matches; the Rust
         // implementations differ by context type.

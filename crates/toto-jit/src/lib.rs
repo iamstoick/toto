@@ -14,6 +14,6 @@ pub mod dev;
 pub mod runtime;
 pub mod task;
 
-pub use compile::{Jit, SubsetError};
+pub use compile::{Jit, OptLevel, SubsetError};
 pub use runtime::{JitRt, decode, encode};
 pub use task::{JitSession, run_jit};

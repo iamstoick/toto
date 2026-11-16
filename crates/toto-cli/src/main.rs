@@ -12,7 +12,7 @@ const HELP: &str = "toto — a new programming language (.gzv)\n\
                     \n\
                     Usage:\n\
                     \x20   toto run [--workers N] <file.gzv>   lex, parse, and run a program\n\
-                    \x20   toto dev [--workers N] [--drain-timeout SECS] <file.gzv>\n\
+                    \x20   toto dev [--workers N] [--drain-timeout SECS] [--opt-level LEVEL] <file.gzv>\n\
                     \x20                                      rebuild and restart on every save\n\
                     \x20   toto --help                        show this help\n\
                     \x20   toto --version                     show the version\n\
@@ -23,7 +23,11 @@ const HELP: &str = "toto — a new programming language (.gzv)\n\
                     \x20                 M:N work-stealing with nondeterministic interleavings)\n\
                     \x20   --drain-timeout SECS   `toto dev`: how long a running generation may\n\
                     \x20                 finish draining before it is cancelled (default 5;\n\
-                    \x20                 a wedged generation past cancel+grace restarts)\n";
+                    \x20                 a wedged generation past cancel+grace restarts)\n\
+                    \x20   --opt-level LEVEL   `toto dev`: Cranelift optimization for\n\
+                    \x20                 generated code: off (default), speed, or\n\
+                    \x20                 speed_and_size; behavior is identical\n\
+                    \x20                 at every level (see the opt gate)\n";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -67,10 +71,12 @@ fn main() -> ExitCode {
             }
         }
         Some("dev") => {
-            // `toto dev [--workers N] [--drain-timeout SECS] <file.gzv>`;
+            // `toto dev [--workers N] [--drain-timeout SECS]
+            // [--opt-level off|speed|speed_and_size] <file.gzv>`;
             // flags may precede the path in any order after `dev`.
             let mut workers = 1usize;
             let mut drain_secs = 5u64;
+            let mut opt = toto_jit::OptLevel::Off;
             let mut path: Option<&str> = None;
             let mut rest = args.iter().skip(2);
             while let Some(a) = rest.next() {
@@ -90,6 +96,14 @@ fn main() -> ExitCode {
                             return ExitCode::from(3);
                         }
                     }
+                } else if a == "--opt-level" {
+                    match rest.next().and_then(|n| toto_jit::OptLevel::parse(n)) {
+                        Some(l) => opt = l,
+                        _ => {
+                            eprintln!("toto: `--opt-level` needs off, speed, or speed_and_size");
+                            return ExitCode::from(3);
+                        }
+                    }
                 } else if path.is_none() {
                     path = Some(a);
                 } else {
@@ -98,10 +112,10 @@ fn main() -> ExitCode {
                 }
             }
             match path {
-                Some(p) => dev_watch(p, workers, drain_secs),
+                Some(p) => dev_watch(p, workers, drain_secs, opt),
                 None => {
                     eprintln!(
-                        "toto: `dev` needs a file: toto dev [--workers N] [--drain-timeout SECS] <file.gzv>"
+                        "toto: `dev` needs a file: toto dev [--workers N] [--drain-timeout SECS] [--opt-level LEVEL] <file.gzv>"
                     );
                     ExitCode::from(3)
                 }
@@ -219,7 +233,7 @@ fn ingest(
     }
 }
 
-fn dev_watch(path: &str, workers: usize, drain_secs: u64) -> ExitCode {
+fn dev_watch(path: &str, workers: usize, drain_secs: u64, opt: toto_jit::OptLevel) -> ExitCode {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use toto_jit::dev::{DevDriver, DrainPolicy, PollWatcher, ReexecRestart};
@@ -249,6 +263,7 @@ fn dev_watch(path: &str, workers: usize, drain_secs: u64) -> ExitCode {
             workers,
             ..toto_runtime::RuntimeConfig::default()
         },
+        opt,
     );
     let stop = AtomicBool::new(false);
     ingest(&mut driver, &initial, path);

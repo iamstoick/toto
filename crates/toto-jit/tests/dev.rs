@@ -13,7 +13,7 @@ use toto_jit::dev::{
     ChangeKind, DevDriver, DrainPolicy, Generation, LiveRun, PollWatcher, RebuildOutcome,
     RestartPolicy, SettleOutcome, classify_change, settle_run,
 };
-use toto_jit::{Jit, run_jit};
+use toto_jit::{Jit, OptLevel, run_jit};
 use toto_runtime::sched::RunStats;
 use toto_runtime::{RtOutcome, RuntimeConfig};
 
@@ -250,8 +250,15 @@ fn settle_drains_natural_finish_without_cancel() {
         "s",
     ));
     let (program, checked) = parse_and_check("fn main() -> int { return 0; }\n").expect("checks");
-    let built =
-        Generation::compile(1, "src".into(), "f.gzv".into(), program, checked).expect("compiles");
+    let built = Generation::compile(
+        1,
+        "src".into(),
+        "f.gzv".into(),
+        program,
+        checked,
+        OptLevel::Off,
+    )
+    .expect("compiles");
     let (settle, ended) = settle_run(run, &built, &policy, &restart);
     assert_eq!(settle, SettleOutcome::Drained);
     let ended = ended.expect("output");
@@ -278,8 +285,15 @@ fn settle_cancels_after_drain_timeout() {
         "s",
     ));
     let (program, checked) = parse_and_check("fn main() -> int { return 0; }\n").expect("checks");
-    let built =
-        Generation::compile(1, "src".into(), "f.gzv".into(), program, checked).expect("compiles");
+    let built = Generation::compile(
+        1,
+        "src".into(),
+        "f.gzv".into(),
+        program,
+        checked,
+        OptLevel::Off,
+    )
+    .expect("compiles");
     let (settle, ended) = settle_run(run, &built, &policy, &restart);
     assert_eq!(settle, SettleOutcome::Cancelled);
     let ended = ended.expect("output");
@@ -304,8 +318,15 @@ fn settle_restart_after_cancel_grace() {
     let fired = restart.fired.clone();
     let run = Box::new(StubRun::never(log, "s"));
     let (program, checked) = parse_and_check("fn main() -> int { return 0; }\n").expect("checks");
-    let built =
-        Generation::compile(1, "src".into(), "f.gzv".into(), program, checked).expect("compiles");
+    let built = Generation::compile(
+        1,
+        "src".into(),
+        "f.gzv".into(),
+        program,
+        checked,
+        OptLevel::Off,
+    )
+    .expect("compiles");
     let (settle, ended) = settle_run(run, &built, &policy, &restart);
     assert_eq!(settle, SettleOutcome::Restarted);
     assert!(ended.is_none());
@@ -314,7 +335,12 @@ fn settle_restart_after_cancel_grace() {
 }
 
 fn mock_driver() -> DevDriver<MockRestart> {
-    DevDriver::new(short_policy(), MockRestart::default(), test_config(1))
+    DevDriver::new(
+        short_policy(),
+        MockRestart::default(),
+        test_config(1),
+        OptLevel::Off,
+    )
 }
 
 #[test]

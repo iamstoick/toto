@@ -37,12 +37,29 @@ fn probe_on_panic(info: &toto_jit::runtime::PanicInfo) -> ! {
 fn main() {
     let mut argv = std::env::args();
     let _ = argv.next();
-    let first = argv.next().unwrap_or_default();
-    let (task_mode, path) = if first == "--task" {
-        (true, argv.next().unwrap_or_default())
-    } else {
-        (false, first)
-    };
+    // `--task` and `--opt-level=<off|speed|speed_and_size>` in any
+    // order, then the path (test-only flags; default `off`).
+    let mut task_mode = false;
+    let mut opt = toto_jit::OptLevel::Off;
+    let mut path = String::new();
+    for arg in argv {
+        if arg == "--task" {
+            task_mode = true;
+        } else if let Some(level) = arg.strip_prefix("--opt-level=") {
+            match toto_jit::OptLevel::parse(level) {
+                Some(l) => opt = l,
+                None => {
+                    eprintln!("jit_probe: bad `--opt-level={level}` (off|speed|speed_and_size)");
+                    std::process::exit(3);
+                }
+            }
+        } else if path.is_empty() {
+            path = arg;
+        } else {
+            eprintln!("jit_probe: unexpected argument `{arg}`");
+            std::process::exit(3);
+        }
+    }
     let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         eprintln!("jit_probe: couldn't read `{path}`: {e}");
         std::process::exit(3);
@@ -75,9 +92,9 @@ fn main() {
         std::process::exit(1);
     }
     if task_mode {
-        return run_task_mode(&src, &filename, &program, &checked);
+        return run_task_mode(&src, &filename, &program, &checked, opt);
     }
-    let mut jit = Jit::new().unwrap_or_else(|e| {
+    let mut jit = Jit::new_with_opt(opt).unwrap_or_else(|e| {
         eprintln!("jit_probe: jit session failed: {e}");
         std::process::exit(3);
     });
@@ -134,8 +151,9 @@ fn run_task_mode(
     filename: &str,
     program: &toto_compiler::ast::Program,
     checked: &toto_compiler::hir::CheckedProgram,
+    opt: toto_jit::OptLevel,
 ) {
-    let mut jit = Jit::new_task().unwrap_or_else(|e| {
+    let mut jit = Jit::new_task_with_opt(opt).unwrap_or_else(|e| {
         eprintln!("jit_probe: jit session failed: {e}");
         std::process::exit(3);
     });

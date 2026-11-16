@@ -22,7 +22,7 @@ use toto_compiler::mir::{MBlock, MInstr, MProgram};
 use toto_compiler::{parse_and_check, render_panic};
 use toto_runtime::{RtOutcome, RuntimeConfig};
 
-use crate::compile::Jit;
+use crate::compile::{Jit, OptLevel};
 use crate::task::{JitRun, JitSession, spawn_jit_run};
 
 /// What changed between two checked revisions (reloadability matrix).
@@ -273,9 +273,10 @@ impl Generation {
         filename: String,
         program: Program,
         checked: CheckedProgram,
+        opt: OptLevel,
     ) -> Result<Self, String> {
         let mir = toto_compiler::mir::lower(&checked);
-        let mut jit = Jit::new_task().map_err(|e| e.to_string())?;
+        let mut jit = Jit::new_task_with_opt(opt).map_err(|e| e.to_string())?;
         let session = jit.compile_task(&mir).map_err(|e| e.to_string())?;
         Ok(Self {
             number,
@@ -398,18 +399,23 @@ pub struct DevDriver<R: RestartPolicy = ReexecRestart> {
     policy: DrainPolicy,
     restart: R,
     config: RuntimeConfig,
+    opt: OptLevel,
     next_gen: u64,
     current: Option<ActiveGeneration>,
 }
 
 impl<R: RestartPolicy> DevDriver<R> {
-    /// New driver: drain policy, restart policy, and the scheduler
-    /// config every spawned generation runs under.
-    pub fn new(policy: DrainPolicy, restart: R, config: RuntimeConfig) -> Self {
+    /// New driver: drain policy, restart policy, the scheduler config
+    /// every spawned generation runs under, and the Cranelift
+    /// optimization level every generation compiles at (one flag for
+    /// the whole watch session: mixed-level generations would break
+    /// the strictly-sequential no-mixing contract's auditability).
+    pub fn new(policy: DrainPolicy, restart: R, config: RuntimeConfig, opt: OptLevel) -> Self {
         Self {
             policy,
             restart,
             config,
+            opt,
             next_gen: 1,
             current: None,
         }
@@ -456,6 +462,7 @@ impl<R: RestartPolicy> DevDriver<R> {
                             filename.to_string(),
                             program,
                             checked,
+                            self.opt,
                         ) {
                             Err(e) => {
                                 self.current = Some(active);
@@ -519,6 +526,7 @@ impl<R: RestartPolicy> DevDriver<R> {
             filename.to_string(),
             program,
             checked,
+            self.opt,
         ) {
             Err(e) => RebuildOutcome::CompileRefused(format!("generation {number}: {e}")),
             Ok(built) => match built.spawn(self.config) {
