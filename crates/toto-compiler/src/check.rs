@@ -4,11 +4,11 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{BinOp, Block, Expr, Program, Stmt, Type, TypeKind, UnOp};
+use crate::ast::{BinOp, Block, Expr, ExternFn, Program, Stmt, Type, TypeKind, UnOp};
 use crate::diag::Diag;
 use crate::hir::{
-    CheckedProgram, FnSig, HAssignTarget, HBlock, HExpr, HExprKind, HFn, HItem, HItemKind,
-    HProgram, HSelectCase, HStmt, HStmtKind, HStructDecl, Ty, VarRef,
+    CheckedProgram, FnSig, HAssignTarget, HBlock, HExpr, HExprKind, HExternBlock, HExternFn, HFn,
+    HItem, HItemKind, HProgram, HSelectCase, HStmt, HStmtKind, HStructDecl, Ty, VarRef,
 };
 use crate::span::Span;
 
@@ -29,6 +29,10 @@ pub struct Checker {
     structs: HashMap<String, HStructDecl>,
     fns: Vec<FnSig>,
     fn_index: HashMap<String, usize>,
+    /// Checked foreign signatures by name (Phase 5, Stage 3). Shares
+    /// the flat namespace: a name in `fn_index` and `externs` at once
+    /// is E0311, exactly like two user functions.
+    externs: HashMap<String, HExternFn>,
     scopes: Vec<HashMap<String, Binding>>,
     depth: u32,
     errors: Vec<(Option<String>, Diag)>,
@@ -49,6 +53,7 @@ impl Checker {
             structs: HashMap::new(),
             fns: Vec::new(),
             fn_index: HashMap::new(),
+            externs: HashMap::new(),
             scopes: Vec::new(),
             depth: 0,
             errors: Vec::new(),
@@ -74,6 +79,35 @@ impl Checker {
                     ps.push(self.resolve_ty(p)?);
                 }
                 Ok(Ty::Fn(ps, Box::new(self.resolve_ty(ret)?)))
+            }
+            // C pointer type `*T`: the target must be a C scalar or
+            // `c_void`. `c_void` is intercepted here so it never
+            // reaches `resolve_ty` as a bare type.
+            TypeKind::Ptr(inner) => {
+                if let TypeKind::Named { name, args } = &inner.kind
+                    && name == "c_void"
+                    && args.is_empty()
+                {
+                    return Ok(Ty::CPtr(Box::new(Ty::CVoid)));
+                }
+                let t = self.resolve_ty(inner)?;
+                match &t {
+                    Ty::CChar | Ty::CInt | Ty::CLong | Ty::CDouble | Ty::CVoid => {
+                        Ok(Ty::CPtr(Box::new(t)))
+                    }
+                    _ => {
+                        self.error(
+                            "E0302",
+                            format!("pointer target must be a C type, found {t}"),
+                            inner.span,
+                            Some(
+                                "use `*c_char`, `*c_int`, `*c_long`, `*c_double`, or `*c_void`"
+                                    .to_string(),
+                            ),
+                        );
+                        Err(())
+                    }
+                }
             }
             TypeKind::Named { name, args } => {
                 let arity = args.len();
@@ -161,7 +195,45 @@ impl Checker {
                             );
                             return Err(());
                         }
-                        Ok(Ty::Chan(Box::new(self.resolve_ty(&args[0])?)))
+                        let inner = self.resolve_ty(&args[0])?;
+                        if Self::has_c_type(&inner) {
+                            self.error(
+                                "E0302",
+                                format!("channels of C types are not supported in v1 (found {inner})"),
+                                ty.span,
+                                Some("send the value through as `int`/`float`, or wrap the pointer in a handle struct".to_string()),
+                            );
+                            return Err(());
+                        }
+                        Ok(Ty::Chan(Box::new(inner)))
+                    }
+                    "c_char" | "c_int" | "c_long" | "c_double" => {
+                        if arity != 0 {
+                            self.error(
+                                "E0302",
+                                format!("type `{name}` takes no arguments, got {arity}"),
+                                ty.span,
+                                None,
+                            );
+                            return Err(());
+                        }
+                        Ok(match name.as_str() {
+                            "c_char" => Ty::CChar,
+                            "c_int" => Ty::CInt,
+                            "c_long" => Ty::CLong,
+                            _ => Ty::CDouble,
+                        })
+                    }
+                    // `c_void` is only meaningful as a pointer target;
+                    // it never reaches `resolve_ty` as a bare type.
+                    "c_void" => {
+                        self.error(
+                            "E0302",
+                            "`c_void` is only valid inside a pointer type".to_string(),
+                            ty.span,
+                            Some("use `*c_void` for opaque foreign pointers".to_string()),
+                        );
+                        Err(())
                     }
                     _ => {
                         if !args.is_empty() {
@@ -193,8 +265,168 @@ impl Checker {
         }
     }
 
+    /// Whether a type is legal in a foreign signature: C scalars,
+    /// pointers to them (or to `c_void`), and callbacks over the same
+    /// (parameters all foreign, return foreign or `unit`).
+    fn is_foreign_sig_ty(ty: &Ty) -> bool {
+        match ty {
+            Ty::CChar | Ty::CInt | Ty::CLong | Ty::CDouble | Ty::CVoid => true,
+            Ty::CPtr(t) => matches!(
+                **t,
+                Ty::CChar | Ty::CInt | Ty::CLong | Ty::CDouble | Ty::CVoid
+            ),
+            Ty::Unit => true,
+            Ty::Fn(ps, r) => {
+                ps.iter().all(Self::is_foreign_sig_ty)
+                    && (Self::is_foreign_sig_ty(r) || **r == Ty::Unit)
+            }
+            _ => false,
+        }
+    }
+
+    /// Check one `fn name(p: T, ...) -> R;` foreign declaration: the
+    /// ABI is fixed to `"C"` by the parser, so only the signature is
+    /// validated here.
+    fn check_extern_fn(&mut self, decl: &ExternFn) -> CResult<HExternFn> {
+        let mut params = Vec::new();
+        let mut ok = true;
+        for p in &decl.params {
+            match self.resolve_ty(&p.ty) {
+                Ok(ty) => {
+                    if !Self::is_foreign_sig_ty(&ty) || ty == Ty::Unit {
+                        self.error(
+                            "E0302",
+                            format!(
+                                "foreign parameter `{}` must be a C type, found {}",
+                                p.name, ty
+                            ),
+                            p.name_span,
+                            Some(
+                                "use `c_char`, `c_int`, `c_long`, `c_double`, `*T`, or a `fn` callback type".to_string(),
+                            ),
+                        );
+                        ok = false;
+                    } else if params.iter().any(|(n, _): &(String, Ty)| n == &p.name) {
+                        self.error(
+                            "E0311",
+                            format!(
+                                "duplicate parameter `{}` in foreign function `{}`",
+                                p.name, decl.name
+                            ),
+                            p.name_span,
+                            None,
+                        );
+                        ok = false;
+                    } else {
+                        params.push((p.name.clone(), ty));
+                    }
+                }
+                Err(()) => ok = false,
+            }
+        }
+        let ret = match self.resolve_ty(&decl.ret) {
+            Ok(ty) => {
+                // `string` is allowed as a return ONLY (never as a
+                // parameter): it promises the C side handed back a
+                // NUL-terminated UTF-8 message this call, which the
+                // runtime copies into a Toto string and validates
+                // (non-UTF-8 is E0210, NULL is E0308, a non-string
+                // value is E0308). Today only `strerror` qualifies.
+                let ret_ok = Self::is_foreign_sig_ty(&ty) || ty == Ty::String;
+                if !ret_ok {
+                    self.error(
+                        "E0302",
+                        format!(
+                            "foreign return type must be a C type, `string`, or `unit`, found {ty}"
+                        ),
+                        decl.ret.span,
+                        None,
+                    );
+                    ok = false;
+                    Ty::Unit
+                } else {
+                    ty
+                }
+            }
+            Err(()) => {
+                ok = false;
+                Ty::Unit
+            }
+        };
+        if !ok {
+            return Err(());
+        }
+        Ok(HExternFn {
+            name: decl.name.clone(),
+            params,
+            ret,
+            span: decl.name_span,
+        })
+    }
+
+    /// Whether a type mentions any C type (for the `chan` rejection).
+    fn has_c_type(ty: &Ty) -> bool {
+        match ty {
+            Ty::CChar | Ty::CInt | Ty::CLong | Ty::CDouble | Ty::CVoid | Ty::CPtr(_) => true,
+            Ty::Array(t) | Ty::Option(t) | Ty::Chan(t) => Self::has_c_type(t),
+            Ty::Map(k, v) => Self::has_c_type(k) || Self::has_c_type(v),
+            Ty::Result(t, e) => Self::has_c_type(t) || Self::has_c_type(e),
+            Ty::Fn(ps, r) => ps.iter().any(Self::has_c_type) || Self::has_c_type(r),
+            _ => false,
+        }
+    }
+
+    /// C scalar types are checking-time views of `int`/`float` (a
+    /// foreign call returning `c_int` yields an ordinary `int` value;
+    /// only pointers are distinct values). Both directions coerce.
+    fn c_scalar_compat(found: &Ty, expected: &Ty) -> bool {
+        use Ty::*;
+        matches!(
+            (found, expected),
+            (Int, CChar)
+                | (Int, CInt)
+                | (Int, CLong)
+                | (CChar, Int)
+                | (CInt, Int)
+                | (CLong, Int)
+                | (Float, CDouble)
+                | (CDouble, Float)
+                | (CChar, CChar)
+                | (CInt, CInt)
+                | (CLong, CLong)
+                | (CDouble, CDouble)
+        )
+    }
+
+    /// Numeric family for the C-scalar view rule: C scalars are
+    /// checking-time views of `int`/`float` and coerce both directions
+    /// (spec §5.4/FFI). Operators resolve a mixed pair to the Toto
+    /// scalar (`Int`/`Float`), never to a C type: C-ness only enters
+    /// through signatures, and runtime values are plain ints/floats.
+    /// `true` = int family, `false` = float family.
+    fn num_family(t: &Ty) -> Option<bool> {
+        match t {
+            Ty::Int | Ty::CChar | Ty::CInt | Ty::CLong => Some(true),
+            Ty::Float | Ty::CDouble => Some(false),
+            _ => None,
+        }
+    }
+
+    /// `*c_void` converts to and from any `*T` (the C rule); other
+    /// pointer pairs must match exactly. Integers never coerce to
+    /// pointers (addresses are unforgeable; use the `c_read_*` helpers).
+    fn c_ptr_compat(found: &Ty, expected: &Ty) -> bool {
+        match (found, expected) {
+            (Ty::CPtr(t), Ty::CPtr(u)) => t == u || **t == Ty::CVoid || **u == Ty::CVoid,
+            _ => false,
+        }
+    }
+
     fn expect_ty(&mut self, found: &Ty, expected: &Ty, span: Span) -> CResult<()> {
-        if found == expected {
+        if found == expected
+            || Self::c_scalar_compat(found, expected)
+            || Self::c_ptr_compat(found, expected)
+        {
             Ok(())
         } else {
             self.error(
@@ -240,6 +472,10 @@ impl Checker {
     fn deeply_immutable(ty: &Ty) -> bool {
         match ty {
             Ty::Int | Ty::Float | Ty::String | Ty::Bool | Ty::Unit | Ty::Range => true,
+            // C scalars are plain int/float values; pointers name
+            // mutable foreign memory, so they always move on send.
+            Ty::CChar | Ty::CInt | Ty::CLong | Ty::CDouble => true,
+            Ty::CPtr(_) | Ty::CVoid => false,
             Ty::Chan(_) => true,
             Ty::Array(_) => false,
             Ty::Option(t) => Self::deeply_immutable(t),
@@ -353,6 +589,13 @@ fn captured_vars(body: &HBlock, creation_depth: u32) -> Vec<(String, Ty)> {
                 }
                 HExprKind::Call { callee, args } => {
                     self.walk_expr(callee);
+                    for a in args {
+                        self.walk_expr(a);
+                    }
+                }
+                // The callee is a name, not an expression: callbacks
+                // arriving as arguments are walked below.
+                HExprKind::CallForeign { args, .. } => {
                     for a in args {
                         self.walk_expr(a);
                     }
@@ -597,6 +840,28 @@ pub fn check_with_files(
             }
         }
     }
+    // Pass 1c: foreign signatures. Same flat namespace as user
+    // functions: a name colliding with a `fn` or another `extern`
+    // declaration is E0311.
+    for item in &program.items {
+        c.current_file = item.file.clone();
+        if let crate::ast::ItemKind::Extern(block) = &item.kind {
+            for decl in &block.decls {
+                if c.fn_index.contains_key(&decl.name) || c.externs.contains_key(&decl.name) {
+                    c.error(
+                        "E0311",
+                        format!("duplicate definition of function `{}`", decl.name),
+                        decl.name_span,
+                        None,
+                    );
+                    continue;
+                }
+                if let Ok(sig) = c.check_extern_fn(decl) {
+                    c.externs.insert(decl.name.clone(), sig);
+                }
+            }
+        }
+    }
     // Pass 2: bodies.
     let mut hitems = Vec::new();
     for item in &program.items {
@@ -619,6 +884,24 @@ pub fn check_with_files(
                         span: item.span,
                     });
                 }
+            }
+            crate::ast::ItemKind::Extern(block) => {
+                // Only successfully registered declarations survive;
+                // calls to failed ones fall out as E0301.
+                let mut decls = Vec::new();
+                for decl in &block.decls {
+                    if let Some(sig) = c.externs.get(&decl.name) {
+                        decls.push(sig.clone());
+                    }
+                }
+                hitems.push(HItem {
+                    kind: HItemKind::Extern(HExternBlock {
+                        abi: block.abi.clone(),
+                        decls,
+                        span: item.span,
+                    }),
+                    span: item.span,
+                });
             }
             crate::ast::ItemKind::Import(decl) => {
                 // The multi-file driver strips resolved imports before checking,
@@ -673,6 +956,7 @@ pub fn check_with_files(
             program: HProgram { items: hitems },
             fns: c.fns,
             structs: c.structs,
+            externs: c.externs,
             uses_concurrency: c.uses_concurrency,
         };
         (Some(checked), Vec::new())
@@ -1265,6 +1549,8 @@ impl Checker {
                     UnOp::Neg => match &h.ty {
                         Ty::Int => Ty::Int,
                         Ty::Float => Ty::Float,
+                        t if Self::num_family(t) == Some(true) => Ty::Int,
+                        t if Self::num_family(t) == Some(false) => Ty::Float,
                         other => {
                             self.error("E0303", format!("cannot negate {other}"), inner.span, None);
                             return Err(());
@@ -1446,6 +1732,9 @@ impl Checker {
             }
             ExprKind::None => match expected {
                 Some(Ty::Option(t)) => (HExprKind::None, Ty::Option(t.clone())),
+                // `None` in `*T` position is the null pointer (no
+                // `null` literal in v1; `None` doubles for it).
+                Some(Ty::CPtr(t)) => (HExprKind::None, Ty::CPtr(t.clone())),
                 _ => {
                     self.error(
                         "E0309",
@@ -1607,6 +1896,16 @@ impl Checker {
                 (Ty::Int, Ty::Int) => Ok(Ty::Int),
                 (Ty::Float, Ty::Float) => Ok(Ty::Float),
                 (Ty::String, Ty::String) if verb == "add" => Ok(Ty::String),
+                (a, b)
+                    if Self::num_family(a) == Some(true) && Self::num_family(b) == Some(true) =>
+                {
+                    Ok(Ty::Int)
+                }
+                (a, b)
+                    if Self::num_family(a) == Some(false) && Self::num_family(b) == Some(false) =>
+                {
+                    Ok(Ty::Float)
+                }
                 (a, b) => {
                     c.error(
                         "E0303",
@@ -1643,6 +1942,19 @@ impl Checker {
                 let ty = match (&l.ty, &r.ty) {
                     (Ty::Int, Ty::Int) => Ty::Int,
                     (Ty::Float, Ty::Float) if op == BinOp::Div => Ty::Float,
+                    (a, b)
+                        if Self::num_family(a) == Some(true)
+                            && Self::num_family(b) == Some(true) =>
+                    {
+                        Ty::Int
+                    }
+                    (a, b)
+                        if op == BinOp::Div
+                            && Self::num_family(a) == Some(false)
+                            && Self::num_family(b) == Some(false) =>
+                    {
+                        Ty::Float
+                    }
                     (a, b) => {
                         let verb = if op == BinOp::Div {
                             "divide"
@@ -1694,6 +2006,9 @@ impl Checker {
                 let r = self.check_expr(right, None, ret)?;
                 match (&l.ty, &r.ty) {
                     (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) | (Ty::String, Ty::String) => {}
+                    (a, b)
+                        if Self::num_family(a).is_some()
+                            && Self::num_family(a) == Self::num_family(b) => {}
                     (a, b) => {
                         self.error(
                             "E0303",
@@ -1759,6 +2074,16 @@ impl Checker {
                 ty,
             ));
         }
+        // Foreign calls resolve by name against the `extern` table and
+        // check each argument with FFI coercions (never plain
+        // `expect_ty`): user functions shadow foreign declarations.
+        if let crate::ast::ExprKind::Var(name) = &callee.node
+            && self.lookup(name).is_none()
+            && !self.fn_index.contains_key(name)
+            && let Some(sig) = self.externs.get(name).cloned()
+        {
+            return self.check_foreign_call(&sig, args, span, ret);
+        }
         let hcallee = self.check_expr(callee, None, ret)?;
         let Ty::Fn(params, fret) = &hcallee.ty else {
             self.error(
@@ -1796,6 +2121,121 @@ impl Checker {
             },
             ty,
         ))
+    }
+
+    /// Check a foreign call: arity (E0304) plus per-parameter FFI
+    /// coercions. Ints convert to any C integer width with a DYNAMIC
+    /// range check at the call (E0210 on overflow, like `to_int`);
+    /// floats convert to `c_double`; strings coerce to `*c_char` /
+    /// `*c_void` via a call-duration NUL-copy; `*c_void` converts both
+    /// ways with any `*T`; `None` is the null pointer; function values
+    /// fill callback parameters only on exact signature match.
+    fn check_foreign_call(
+        &mut self,
+        sig: &HExternFn,
+        args: &[Expr],
+        span: Span,
+        ret: &Ty,
+    ) -> CResult<(HExprKind, Ty)> {
+        if !crate::ffi::is_linked(&sig.name) {
+            // A declared-but-unlinked name can never execute, so it
+            // fails here rather than as a runtime surprise. The table
+            // lives in `ffi.rs` (real libc/libm plus the
+            // runtime-provided helpers).
+            self.error(
+                "E0301",
+                format!(
+                    "foreign function `{}` is declared but not linked in this binary (linked: {})",
+                    sig.name,
+                    crate::ffi::LINKED.join(", "),
+                ),
+                span,
+                None,
+            );
+            return Err(());
+        }
+        if args.len() != sig.params.len() {
+            self.error(
+                "E0304",
+                format!(
+                    "wrong number of arguments to foreign `{}`: takes {}, got {}",
+                    sig.name,
+                    sig.params.len(),
+                    args.len()
+                ),
+                span,
+                None,
+            );
+            return Err(());
+        }
+        let mut hargs = Vec::with_capacity(args.len());
+        for ((pname, pty), a) in sig.params.iter().zip(args.iter()) {
+            // Infer argument types freely: `foreign_arg_ok` below is
+            // the SOLE compatibility predicate. Propagating `Some(pty)`
+            // as the expected type would reject the call-scoped
+            // string→`*c_char`/`*c_void` NUL-copy coercion in the
+            // generic tail check (E0303) before it is ever consulted —
+            // and that coercion must stay call-scoped (a bare
+            // `let p: *c_char = s;` has no NUL-copy and stays an
+            // error). The one exception is `None`, which needs the
+            // expected type to infer the null-pointer type `*T`.
+            let h = if matches!(a.node, crate::ast::ExprKind::None) {
+                self.check_expr(a, Some(pty), ret)?
+            } else {
+                self.check_expr(a, None, ret)?
+            };
+            if !Self::foreign_arg_ok(pty, &h.ty) {
+                self.error(
+                    "E0308",
+                    format!(
+                        "cannot pass {} to foreign {} (parameter `{}` of `{}`)",
+                        h.ty, pty, pname, sig.name
+                    ),
+                    a.span,
+                    Some(Self::foreign_arg_help(pty, &h.ty).to_string()),
+                );
+                return Err(());
+            }
+            hargs.push(h);
+        }
+        Ok((
+            HExprKind::CallForeign {
+                name: sig.name.clone(),
+                args: hargs,
+            },
+            sig.ret.clone(),
+        ))
+    }
+
+    /// FFI coercion predicate (see `check_foreign_call`).
+    fn foreign_arg_ok(param: &Ty, actual: &Ty) -> bool {
+        match (param, actual) {
+            (Ty::CChar | Ty::CInt | Ty::CLong, Ty::Int) => true,
+            (Ty::CDouble, Ty::Float) => true,
+            (Ty::CPtr(t), Ty::CPtr(u)) => t == u || **t == Ty::CVoid || **u == Ty::CVoid,
+            // Strings coerce to `*c_char` (and to `*c_void`) through a
+            // call-duration NUL-copy; `None` is the null pointer.
+            (Ty::CPtr(t), Ty::String) => **t == Ty::CChar || **t == Ty::CVoid,
+            (Ty::Fn(ps, r), Ty::Fn(aps, ar)) => ps == aps && r == ar,
+            _ => Self::c_scalar_compat(actual, param) || actual == param,
+        }
+    }
+
+    /// Per-case conversion hint for a rejected foreign argument.
+    fn foreign_arg_help(param: &Ty, actual: &Ty) -> &'static str {
+        match (param, actual) {
+            (Ty::CDouble, Ty::Int) => "convert explicitly with `to_float`",
+            (Ty::CPtr(_), Ty::Int) => {
+                "addresses are unforgeable: allocate with `malloc`, or read memory with the `c_read_*` helpers"
+            }
+            (Ty::CPtr(_), _) => {
+                "strings coerce to `*c_char`/`*c_void`; other pointers must match or go through `*c_void`"
+            }
+            (Ty::Fn(_, _), _) => {
+                "callbacks need the exact declared `fn` type; capture rules are the usual by-value capture"
+            }
+            _ => "check the `unsafe extern` signature",
+        }
     }
 
     /// Frozen builtin signatures (spec §7). The catalog does not grow.

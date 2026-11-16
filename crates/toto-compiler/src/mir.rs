@@ -120,6 +120,15 @@ pub enum MInstr {
         args: Vec<Local>,
         span: Span,
     },
+    /// Direct call to a declared foreign function (executed by the
+    /// interpreter inline and by the runtime executor on the blocking
+    /// pool; the JIT refuses these programs cleanly).
+    CallForeign {
+        dst: Option<Local>,
+        name: String,
+        args: Vec<Local>,
+        span: Span,
+    },
     /// Materialize a top-level function as a value.
     FuncRef {
         dst: Local,
@@ -1192,6 +1201,21 @@ impl<'a> FnBuilder<'a> {
                 });
                 dst
             }
+            HExprKind::CallForeign { name, args } => {
+                let mut vs = Vec::with_capacity(args.len());
+                for a in args {
+                    vs.push(self.lower_expr(a, ret));
+                }
+                let dst = self.fresh(format!("{name}()"), expr.ty.clone());
+                self.emit(MInstr::Safepoint { kind: SpKind::Call });
+                self.emit(MInstr::CallForeign {
+                    dst: Some(dst),
+                    name: name.clone(),
+                    args: vs,
+                    span: expr.span,
+                });
+                dst
+            }
             HExprKind::Field { base, name } => {
                 let b = self.lower_expr(base, ret);
                 let dst = self.fresh(format!("field {name}"), expr.ty.clone());
@@ -1638,6 +1662,22 @@ impl fmt::Display for MInstr {
                 write!(
                     f,
                     "{} = builtin {name}(",
+                    dst.map(local).unwrap_or_else(|| "_".to_string())
+                )?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", local(*a))?;
+                }
+                write!(f, ")")
+            }
+            MInstr::CallForeign {
+                dst, name, args, ..
+            } => {
+                write!(
+                    f,
+                    "{} = foreign {name}(",
                     dst.map(local).unwrap_or_else(|| "_".to_string())
                 )?;
                 for (i, a) in args.iter().enumerate() {

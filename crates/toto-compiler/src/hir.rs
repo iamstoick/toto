@@ -30,6 +30,15 @@ pub enum Ty {
     /// minimal spelling was chosen to keep `apply(f: F, …)` checkable.
     /// Confirm or rename — the spelling is isolated to the type parser.
     Fn(Vec<Ty>, Box<Ty>),
+    /// C ABI types (Phase 5, Stage 3; only in FFI signatures and the
+    /// positions that hold foreign values). `CVoid` is only legal
+    /// inside `CPtr`; a bare `c_void` is rejected by the checker.
+    CChar,
+    CInt,
+    CLong,
+    CDouble,
+    CVoid,
+    CPtr(Box<Ty>),
 }
 
 impl Ty {
@@ -63,6 +72,12 @@ impl fmt::Display for Ty {
                 }
                 write!(f, ") -> {ret}")
             }
+            Ty::CChar => write!(f, "c_char"),
+            Ty::CInt => write!(f, "c_int"),
+            Ty::CLong => write!(f, "c_long"),
+            Ty::CDouble => write!(f, "c_double"),
+            Ty::CVoid => write!(f, "c_void"),
+            Ty::CPtr(t) => write!(f, "*{t}"),
         }
     }
 }
@@ -98,6 +113,7 @@ pub struct HItem {
 pub enum HItemKind {
     Fn(HFn),
     Struct(HStructDecl),
+    Extern(HExternBlock),
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +129,25 @@ pub struct HFn {
 pub struct HStructDecl {
     pub name: String,
     pub fields: Vec<(String, Ty)>,
+    pub span: Span,
+}
+
+/// A checked `unsafe extern` block: signatures only, no bodies.
+#[derive(Clone, Debug)]
+pub struct HExternBlock {
+    pub abi: String,
+    pub decls: Vec<HExternFn>,
+    pub span: Span,
+}
+
+/// One checked foreign signature. Parameter and return types are C
+/// types (`CChar`/`CInt`/`CLong`/`CDouble`/`CPtr`/`Fn` of the same) or
+/// `Unit` returns; anything else is rejected at check time.
+#[derive(Clone, Debug)]
+pub struct HExternFn {
+    pub name: String,
+    pub params: Vec<(String, Ty)>,
+    pub ret: Ty,
     pub span: Span,
 }
 
@@ -247,6 +282,13 @@ pub enum HExprKind {
         name: String,
         args: Vec<HExpr>,
     },
+    /// Direct call to a declared foreign function (checked at the
+    /// call site against the `unsafe extern` signature; executed by
+    /// the interpreter and the runtime executor).
+    CallForeign {
+        name: String,
+        args: Vec<HExpr>,
+    },
     Field {
         base: Box<HExpr>,
         name: String,
@@ -296,6 +338,10 @@ pub struct CheckedProgram {
     pub program: HProgram,
     pub fns: Vec<FnSig>,
     pub structs: HashMap<String, HStructDecl>,
+    /// Checked foreign signatures by name (Phase 5, Stage 3). The
+    /// interpreter and the runtime executor resolve `CallForeign`
+    /// through this table; MIR carries no bodies for them.
+    pub externs: HashMap<String, HExternFn>,
     /// True when the program uses concurrency (`go`, channels, `select`).
     /// The CLI routes such programs to the runtime executor; sequential
     /// programs keep running on the tree-walking interpreter.

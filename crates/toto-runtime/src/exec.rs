@@ -127,6 +127,9 @@ pub struct Executor<'a> {
     frames: Vec<Frame>,
     trace: Vec<TraceFrame>,
     task_result: Option<RtVal>,
+    /// Fired-callback slots awaiting drain, mapped to their Toto
+    /// function (function index or closure value).
+    callbacks: std::collections::HashMap<u64, RtVal>,
 }
 
 impl<'a> Executor<'a> {
@@ -146,10 +149,11 @@ impl<'a> Executor<'a> {
             frames: Vec::new(),
             trace: Vec::new(),
             task_result: None,
+            callbacks: std::collections::HashMap::new(),
         }
     }
 
-    pub fn run_task(mut self, initial: Initial, call_span: Span) -> TaskResult {
+    pub fn run_task(&mut self, initial: Initial, call_span: Span) -> TaskResult {
         match initial {
             Initial::Main(idx) => {
                 let mfn = &self.code.prog.fns[idx];
@@ -456,7 +460,12 @@ impl<'a> Executor<'a> {
                 caller.locals[dst] = v;
                 Ok(false)
             }
-            _ => {
+            // A discarded (`dst == None`) call — an FFI-drained
+            // callback — finishing while caller frames remain is not
+            // the task finishing: drop the value and continue the
+            // caller. Only an empty frame stack ends the task.
+            (None, Some(_)) => Ok(false),
+            (_, None) => {
                 self.task_result = Some(v);
                 Ok(true)
             }
@@ -792,6 +801,14 @@ impl<'a> Executor<'a> {
                 span,
             } => {
                 self.exec_builtin(dst, &name, &args, span)?;
+            }
+            MInstr::CallForeign {
+                dst,
+                ref name,
+                ref args,
+                span,
+            } => {
+                self.exec_foreign(dst, name, args, span)?;
             }
             MInstr::FuncRef { dst, idx } => {
                 self.frames[top].locals[dst] = RtVal::Func(idx);
@@ -1291,19 +1308,32 @@ impl<'a> Executor<'a> {
             _ => {}
         }
         // Shared builtins via conversion (parity by construction; one
-        // memo so shared arguments stay shared).
-        let owned: Vec<RtVal> = args
-            .iter()
-            .map(|a| self.frames[top].locals[*a].clone())
-            .collect();
-        let vs = self.to_interps(&owned, span)?;
+        // memo so shared arguments stay shared). `owned` is scoped so
+        // its slot is dead during the builtin call below.
+        let vs = {
+            let owned: Vec<RtVal> = args
+                .iter()
+                .map(|a| self.frames[top].locals[*a].clone())
+                .collect();
+            self.to_interps(&owned, span)?
+        };
         self.trace.push(TraceFrame {
             name: format!("{name} (builtin)"),
             span,
         });
+        // `print`/`println` bypass `call_builtin`'s 40-arm match
+        // (~24 KiB of debug frame): same canonical implementation via
+        // `call_print`, same trace frame and conversions, a fraction
+        // of the stack. The 64 KiB task budget leaves no room for the
+        // full match on the hottest builtin.
+        let is_print = name == "print" || name == "println";
         let out = {
             let mut output = self.shared.output.lock().expect("output lock");
-            builtins::call_builtin(name, vs, span, &self.code.fns, &mut output)
+            if is_print {
+                builtins::call_print(vs, name == "println", span, &self.code.fns, &mut output)
+            } else {
+                builtins::call_builtin(name, vs, span, &self.code.fns, &mut output)
+            }
         };
         match out {
             Ok(v) => {
@@ -1429,6 +1459,172 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Foreign calls via the dedicated blocking pool (Phase 5, Stage 3;
+    /// same policy as file builtins): arguments convert to owned plain
+    /// data, the pool runs the call, and callbacks drain on this worker
+    /// after the completion. Callback slots are claimed here (mapped to
+    /// their Toto function) and released at drain, on call failure, or
+    /// at task teardown — the pool never releases (single owner).
+    fn exec_foreign(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
+        use crate::sched::{BlockingOp, ForeignArg};
+        use toto_compiler::ffi;
+        let Some(sig) = self.code.externs.get(name).cloned() else {
+            return Err(self.internal("unknown foreign function", span));
+        };
+        let top = self.frames.len() - 1;
+        let mut fargs = Vec::with_capacity(args.len());
+        // `(argument index, slot)`: the pool pairs by argument index,
+        // so positional pairing would misroute (e.g. `pthread_create`
+        // takes its callback at index 2, not 0).
+        let mut slots: Vec<(usize, u64)> = Vec::new();
+        for (i, (local, (_, pty))) in args.iter().zip(sig.params.iter()).enumerate() {
+            let v = self.frames[top].locals[*local].clone();
+            if matches!(pty, toto_compiler::hir::Ty::Fn(..)) {
+                match v {
+                    RtVal::Func(_) | RtVal::Closure(_) => match ffi::claim_slot() {
+                        Ok(s) => {
+                            self.callbacks.insert(s, v);
+                            slots.push((i, s));
+                            fargs.push(ForeignArg::FnPtr(s));
+                        }
+                        Err(ffi::PoolExhausted) => {
+                            for (_, s) in &slots {
+                                self.callbacks.remove(s);
+                                ffi::release_slot(*s);
+                            }
+                            return Err(self.err(
+                                "E0217",
+                                "all 8 callback slots are live; drain running callbacks (join threads) before registering more".to_string(),
+                                span,
+                            ));
+                        }
+                    },
+                    other => {
+                        let st = self.shared.state.lock().expect("shared state lock");
+                        let tn = other.type_name(&st.heap);
+                        return Err(self.internal(
+                            &format!("foreign callback must be a function, got {tn}"),
+                            span,
+                        ));
+                    }
+                }
+            } else {
+                fargs.push(self.foreign_arg(&v, name, span)?);
+            }
+        }
+        if self.scope_failed() {
+            for (_, s) in &slots {
+                self.callbacks.remove(s);
+                ffi::release_slot(*s);
+            }
+            return Err(self.cancelled("blocking", span));
+        }
+        self.maybe_collect();
+        // Push the foreign frame BEFORE parking so a pool-reported
+        // failure carries the same trace as inline calls (the frame
+        // stays on panic). The frame holds no heap references, so
+        // parking with it pushed is root-safe.
+        self.trace.push(TraceFrame {
+            name: format!("{name} (foreign)"),
+            span,
+        });
+        // Cleanup copy: `slots` moves into the job, but failure
+        // paths below need the ids to release the pool slots.
+        let cleanup: Vec<u64> = slots.iter().map(|(_, s)| *s).collect();
+        let op = BlockingOp::Foreign {
+            name: name.to_string(),
+            sig,
+            args: fargs,
+            slots,
+        };
+        match self.y.suspend(crate::sched::ToSched::Blocking { op, span }) {
+            ToTask::Value(v) => {
+                self.trace.pop();
+                if let Some(d) = dst {
+                    let top = self.frames.len() - 1;
+                    self.frames[top].locals[d] = v;
+                }
+                self.drain_callbacks(span)?;
+                Ok(())
+            }
+            ToTask::OpPanic { diag } => {
+                for s in &cleanup {
+                    self.callbacks.remove(s);
+                    ffi::release_slot(*s);
+                }
+                Err(ExecErr::Toto(diag))
+            }
+            ToTask::Cancelled { op } => {
+                for s in &cleanup {
+                    self.callbacks.remove(s);
+                    ffi::release_slot(*s);
+                }
+                self.trace.pop();
+                Err(self.cancelled(op, span))
+            }
+            other => {
+                let _ = other;
+                Err(self.internal("blocking response", span))
+            }
+        }
+    }
+
+    /// One runtime value to owned plain pool data. Callback-typed
+    /// positions never reach here (claimed in `exec_foreign`).
+    fn foreign_arg(
+        &self,
+        v: &RtVal,
+        name: &str,
+        span: Span,
+    ) -> Result<crate::sched::ForeignArg, ExecErr> {
+        use crate::sched::ForeignArg;
+        match v {
+            RtVal::Int(n) => Ok(ForeignArg::Int(*n)),
+            RtVal::Float(f) => Ok(ForeignArg::Float(*f)),
+            RtVal::Heap(r) => {
+                let st = self.shared.state.lock().expect("shared state lock");
+                match st.heap.get(*r) {
+                    Some(crate::heap::Payload::Str(s)) => {
+                        Ok(ForeignArg::Str(s.clone().into_bytes()))
+                    }
+                    _ => {
+                        let tn = v.type_name(&st.heap);
+                        Err(self.internal(&format!("cannot pass {tn} to foreign `{name}`"), span))
+                    }
+                }
+            }
+            RtVal::None => Ok(ForeignArg::Null),
+            RtVal::Ptr(p) => Ok(ForeignArg::Ptr(*p)),
+            other => {
+                let st = self.shared.state.lock().expect("shared state lock");
+                let tn = other.type_name(&st.heap);
+                Err(self.internal(&format!("cannot pass {tn} to foreign `{name}`"), span))
+            }
+        }
+    }
+
+    /// Invoke every fired callback with its raw pointer argument.
+    /// Returns are dropped (channels carry data outward); a panicking
+    /// callback fails the foreign call that drains it.
+    fn drain_callbacks(&mut self, span: Span) -> Result<(), ExecErr> {
+        use toto_compiler::ffi;
+        for (slot, ptr) in ffi::drain_queue() {
+            // Unknown slots are stale entries from an earlier program
+            // in the same process (see `run_checked` hygiene); skip.
+            if let Some(target) = self.callbacks.remove(&slot) {
+                self.call_value(target, vec![RtVal::Ptr(ptr)], span, "callback", None)?;
+            }
+            ffi::release_slot(slot);
+        }
+        Ok(())
+    }
+
     /// Native `len` (array-only in MIR; strings go through the builtin).
     fn builtin_len(
         &mut self,
@@ -1550,5 +1746,17 @@ impl<'a> Executor<'a> {
             self.frames[top].locals[d] = v;
         }
         Ok(())
+    }
+}
+
+impl<'a> Drop for Executor<'a> {
+    /// Task teardown (normal end, panic, or scope cancellation):
+    /// release any callback slots still mapped here. Fired entries for
+    /// them become unknown-slot skips at the next drain; unfired
+    /// threads can no longer be observed, so the slots must not leak.
+    fn drop(&mut self) {
+        for (slot, _) in std::mem::take(&mut self.callbacks) {
+            toto_compiler::ffi::release_slot(slot);
+        }
     }
 }

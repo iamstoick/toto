@@ -1,8 +1,9 @@
 # `gzv.std` — standard library (Phase 5, Stage 2)
 
-Seven modules of ordinary Toto on the frozen 27 builtins. Import by
-canonical path; the sources in `stdlib/*.gzv` are embedded in every
-`toto` binary (see [project.md](project.md)).
+Eight modules of ordinary Toto on the frozen 27 builtins (plus the
+FFI module, which calls real C). Import by canonical path; the
+sources in `stdlib/*.gzv` are embedded in every `toto` binary (see
+[project.md](project.md)).
 
 ```gzv
 import "gzv.std/strings.gzv";
@@ -164,6 +165,17 @@ Recorded limits (all covered by tests in `stdlib/tests/`):
 - Error messages are the contract: `t_errors` pins each one
   (`"unterminated string"`, `"trailing characters after JSON
   value"`, `"unicode escapes (\\u) are not supported"`, …).
+
+## `ffi`
+
+C ABI wrappers over real libc/libm/libpthread (see [ffi.md](ffi.md)
+for the per-binding ownership/encoding/thread-safety contracts).
+The module needs `unsafe extern` support, so it runs under `toto
+run` / `toto test` only — `toto build` refuses FFI programs
+(exit 3). Every wrapper's contract
+(strings as NUL-copies, `open` failing as `-errno`, callbacks
+drained on the joining worker) is pinned by `test_ffi.gzv` and the
+`proj11_ffi` corpus project.
 
 ## Execution paths
 

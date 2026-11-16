@@ -1244,9 +1244,14 @@ fn operand_of_rtval(heap: &Heap, v: &RtVal) -> EqOperand {
                 None => plain(EqKind::Other),
             }
         }
-        RtVal::Range(..) | RtVal::Ok(_) | RtVal::Err(_) | RtVal::Some(_) | RtVal::Closure(_) => {
-            plain(EqKind::Other)
-        }
+        // Opaque foreign pointers never reach JIT equality (the JIT
+        // refuses FFI programs); `Other` compares false, never crashes.
+        RtVal::Range(..)
+        | RtVal::Ok(_)
+        | RtVal::Err(_)
+        | RtVal::Some(_)
+        | RtVal::Closure(_)
+        | RtVal::Ptr(_) => plain(EqKind::Other),
     }
 }
 

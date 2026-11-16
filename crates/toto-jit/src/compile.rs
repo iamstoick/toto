@@ -777,6 +777,9 @@ impl<'a> FnCx<'a> {
     fn trafficable(ty: &Ty) -> Result<bool, String> {
         match ty {
             Ty::Int | Ty::Float | Ty::Bool | Ty::Unit | Ty::Chan(_) => Ok(false),
+            // C scalars ride as immediates like `int`/`float`;
+            // pointers are single-word addresses (never published).
+            Ty::CChar | Ty::CInt | Ty::CLong | Ty::CDouble | Ty::CPtr(_) => Ok(false),
             Ty::String
             | Ty::Array(_)
             | Ty::Struct(_)
@@ -784,7 +787,7 @@ impl<'a> FnCx<'a> {
             | Ty::Result(..)
             | Ty::Option(_)
             | Ty::Fn(..) => Ok(true),
-            Ty::Map(..) => Err(format!("type {ty:?} has no runtime values")),
+            Ty::Map(..) | Ty::CVoid => Err(format!("type {ty:?} has no runtime values")),
         }
     }
 
@@ -1035,6 +1038,7 @@ impl<'a> FnCx<'a> {
             MInstr::Call { dst, .. } | MInstr::CallBuiltin { dst, .. } => {
                 dst.iter().copied().collect()
             }
+            MInstr::CallForeign { dst, .. } => dst.iter().copied().collect(),
             MInstr::SplitRange { lo, hi, .. } => vec![*lo, *hi],
             MInstr::Select { dst, cases, .. } => {
                 let mut out = vec![*dst];
@@ -1083,6 +1087,7 @@ impl<'a> FnCx<'a> {
                 out
             }
             MInstr::CallBuiltin { args, .. } => args.clone(),
+            MInstr::CallForeign { args, .. } => args.clone(),
             MInstr::StructLit { fields, .. } => fields.iter().map(|(_, l)| *l).collect(),
             MInstr::ArrayLit { elems, .. } => elems.clone(),
             MInstr::MakeClosure { captures, .. } | MInstr::Spawn { captures, .. } => {
@@ -1998,6 +2003,15 @@ impl<'a> FnCx<'a> {
             Ty::Result(..) => "Result",
             Ty::Option(_) => "Option",
             Ty::Map(..) => "Map",
+            // C ABI spellings (`Ty::Display`); `*T` mirrors the runtime
+            // `pointer` name for `Ptr` values. Unreachable: the JIT
+            // refuses FFI programs before codegen.
+            Ty::CChar => "c_char",
+            Ty::CInt => "c_int",
+            Ty::CLong => "c_long",
+            Ty::CDouble => "c_double",
+            Ty::CVoid => "c_void",
+            Ty::CPtr(_) => "pointer",
         }
     }
 
@@ -2128,6 +2142,12 @@ impl<'a> FnCx<'a> {
             Ty::Chan(_) => Ok(TAG_CHAN),
             Ty::Fn(..) => Ok(TAG_FN_ANY),
             Ty::Map(..) => Err(format!("type {ty:?} has no runtime values")),
+            // Unreachable: the JIT refuses FFI programs before codegen,
+            // so C-typed words never need a JIT transport tag. `Err`
+            // (not a panic) keeps it a clean refusal if ever reached.
+            Ty::CChar | Ty::CInt | Ty::CLong | Ty::CDouble | Ty::CVoid | Ty::CPtr(_) => {
+                Err(format!("type {ty} has no JIT representation"))
+            }
         }
     }
 
@@ -2337,6 +2357,24 @@ impl<'a> FnCx<'a> {
                 self.funcrefs.insert(*dst, *idx);
                 let v = Self::iconst(b, *idx as i64);
                 self.define(b, *dst, v)?;
+            }
+            MInstr::CallForeign {
+                dst: _,
+                name,
+                args: _,
+                span: _,
+            } => {
+                // FFI executes in the interpreter and the runtime
+                // executor only. The JIT refuses these programs
+                // cleanly (dev reports `CompileRefused`, build refuses
+                // up front); wiring foreign calls into generated code
+                // is a Stage 5 carry-forward.
+                return Err(SubsetError {
+                    func: self.func.clone(),
+                    message: format!(
+                        "foreign function `{name}` is not supported by the JIT in Stage 3 (run with `toto run`/`toto test`)"
+                    ),
+                });
             }
             MInstr::CallBuiltin {
                 dst,

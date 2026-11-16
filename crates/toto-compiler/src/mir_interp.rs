@@ -34,15 +34,25 @@ pub struct MirInterp<'a> {
     /// Inner tree-walking interpreter, used ONLY for builtin dispatch
     /// (output capture and `<fn name>` display). It never runs user code.
     inner: Interp,
+    /// Checked foreign signatures, consulted for `CallForeign`.
+    externs: std::collections::HashMap<String, crate::hir::HExternFn>,
+    /// Fired-callback slots awaiting drain (mirrors `Interp`).
+    callbacks: std::collections::HashMap<u64, Value>,
     call_depth: usize,
     trace: Vec<TraceFrame>,
 }
 
 impl<'a> MirInterp<'a> {
-    pub fn new(ast: &'a crate::ast::Program, prog: &'a MProgram) -> Self {
+    pub fn new(
+        ast: &'a crate::ast::Program,
+        prog: &'a MProgram,
+        externs: std::collections::HashMap<String, crate::hir::HExternFn>,
+    ) -> Self {
         Self {
             prog,
-            inner: Interp::new(ast),
+            inner: Interp::new(ast, externs.clone()),
+            externs,
+            callbacks: std::collections::HashMap::new(),
             call_depth: 0,
             trace: Vec::new(),
         }
@@ -465,6 +475,54 @@ impl<'a> MirInterp<'a> {
                     }
                 }
             }
+            MInstr::CallForeign {
+                dst,
+                name,
+                args,
+                span,
+            } => {
+                let Some(sig) = self.externs.get(name).cloned() else {
+                    // Unreachable: the checker resolves every foreign
+                    // call against the same table.
+                    return Err((
+                        Diag::new(
+                            "E0204",
+                            format!("unknown foreign function `{name}`"),
+                            *span,
+                            None,
+                        ),
+                        std::mem::take(&mut self.trace),
+                    ));
+                };
+                let mut vs = Vec::with_capacity(args.len());
+                for a in args {
+                    vs.push(slots[*a].clone());
+                }
+                self.trace.push(TraceFrame {
+                    name: format!("{name} (foreign)"),
+                    span: *span,
+                });
+                let (value, claimed) = match crate::ffi::call(name, &sig, &vs, *span) {
+                    Ok((v, claimed)) => {
+                        self.trace.pop();
+                        (v, claimed)
+                    }
+                    Err((diag, carried)) => {
+                        let mut trace = std::mem::take(&mut self.trace);
+                        trace.extend(carried);
+                        return Err((diag, trace));
+                    }
+                };
+                for (arg_idx, slot) in claimed {
+                    if let Some(v) = vs.get(arg_idx) {
+                        self.callbacks.insert(slot, v.clone());
+                    }
+                }
+                self.drain_callbacks(*span)?;
+                if let Some(d) = dst {
+                    slots[*d] = value;
+                }
+            }
             MInstr::FuncRef { dst, idx } => {
                 slots[*dst] = Value::Func(*idx);
             }
@@ -657,6 +715,21 @@ impl<'a> MirInterp<'a> {
         Ok(Flow::Continue)
     }
 
+    /// Invoke every fired callback with its raw pointer argument.
+    /// Returns are dropped (channels carry data outward); a panicking
+    /// callback fails the foreign call that drains it.
+    fn drain_callbacks(&mut self, span: Span) -> MResult<()> {
+        for (slot, ptr) in crate::ffi::drain_queue() {
+            // Unknown slots are stale entries from an earlier program
+            // in the same process (see `Interp::run`); skip silently.
+            if let Some(target) = self.callbacks.remove(&slot) {
+                self.call_value(&target, vec![Value::Ptr(ptr)], span, "callback")?;
+            }
+            crate::ffi::release_slot(slot);
+        }
+        Ok(())
+    }
+
     fn call_value(
         &mut self,
         target: &Value,
@@ -702,11 +775,12 @@ pub type MirOutcome = (Result<i32, (Diag, Vec<TraceFrame>)>, Vec<u8>);
 pub fn run_mir(ast: &crate::ast::Program, checked: &CheckedProgram) -> MirOutcome {
     let prog = crate::mir::lower(checked);
     let ast = ast.clone();
+    let externs = checked.externs.clone();
     std::thread::Builder::new()
         .name("toto-mir-interp".to_string())
         .stack_size(256 << 20)
         .spawn(move || {
-            let mut interp = MirInterp::new(&ast, &prog);
+            let mut interp = MirInterp::new(&ast, &prog, externs);
             let result = interp.run();
             let output = interp.output().to_vec();
             (result, output)

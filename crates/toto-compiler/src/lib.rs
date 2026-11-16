@@ -7,6 +7,7 @@ pub mod ast;
 pub mod builtins;
 pub mod check;
 pub mod diag;
+pub mod ffi;
 pub mod hir;
 pub mod interp;
 pub mod lexer;
@@ -18,6 +19,8 @@ pub mod project;
 pub mod span;
 pub mod stdlib;
 pub mod token;
+
+use std::collections::HashMap;
 
 use ast::Program;
 use diag::{Diag, render_all};
@@ -74,11 +77,11 @@ pub fn parse_and_check(src: &str) -> Result<(Program, CheckedProgram), Vec<Diag>
 /// (`E0215`) — run them through `toto run`, which routes to the runtime
 /// executor.
 pub fn run_source(src: &str, _filename: &str) -> Outcome {
-    let program = match parse_and_check(src) {
-        Ok((program, _)) => program,
+    let (program, checked) = match parse_and_check(src) {
+        Ok((program, checked)) => (program, checked),
         Err(diags) => return Outcome::Static(diags),
     };
-    match run_program(&program) {
+    match run_program(&program, &checked.externs) {
         (Ok(code), stdout) => Outcome::Success { code, stdout },
         (Err((diag, trace)), stdout) => Outcome::RuntimePanic {
             diag,
@@ -97,13 +100,17 @@ pub fn run_source(src: &str, _filename: &str) -> Outcome {
 /// builds, so interpretation runs on a dedicated large-stack thread.
 /// A host panic here is an interpreter bug, never a user error: let it
 /// propagate so tests fail loudly instead of hiding it.
-pub fn run_program(program: &Program) -> MirOutcome {
+pub fn run_program(
+    program: &Program,
+    externs: &HashMap<String, crate::hir::HExternFn>,
+) -> MirOutcome {
     let program = program.clone();
+    let externs = externs.clone();
     std::thread::Builder::new()
         .name("toto-interp".to_string())
         .stack_size(256 << 20)
         .spawn(move || {
-            let mut interp = Interp::new(&program);
+            let mut interp = Interp::new(&program, externs);
             let result = interp.run();
             (result, interp.output)
         })

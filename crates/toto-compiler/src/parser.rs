@@ -172,7 +172,9 @@ impl<'a> Parser<'a> {
                 | TokenKind::Struct
                 | TokenKind::At
                 | TokenKind::Import
-                | TokenKind::Pub => {
+                | TokenKind::Pub
+                | TokenKind::Unsafe
+                | TokenKind::Extern => {
                     return;
                 }
                 _ => {
@@ -282,12 +284,43 @@ impl Parser<'_> {
                     file: None,
                 })
             }
+            TokenKind::Unsafe => {
+                self.bump();
+                match self.parse_extern_block(start) {
+                    Ok(block) => {
+                        let span = start.merge(self.prev_span());
+                        Ok(Item {
+                            kind: ItemKind::Extern(block),
+                            span,
+                            file: None,
+                        })
+                    }
+                    Err(()) => {
+                        self.sync_item();
+                        Err(())
+                    }
+                }
+            }
+            TokenKind::Extern => {
+                let t = self.bump();
+                self.error(
+                    "E0155",
+                    format!(
+                        "`extern` without `unsafe` is not allowed ({})",
+                        t.kind.name()
+                    ),
+                    start.merge(t.span),
+                    Some("declare foreign functions in `unsafe extern \"C\" { ... }`".to_string()),
+                );
+                self.sync_item();
+                Err(())
+            }
             _ => {
                 let span = self.peek().span;
                 self.error(
                     "E0101",
                     format!(
-                        "expected `fn`, `struct`, or `import` item, found {}",
+                        "expected `fn`, `struct`, `import`, or `unsafe extern` item, found {}",
                         self.peek().kind.name()
                     ),
                     span,
@@ -300,6 +333,111 @@ impl Parser<'_> {
 
     fn prev_span(&self) -> Span {
         self.toks[self.pos.saturating_sub(1).min(self.toks.len() - 1)].span
+    }
+
+    /// Parse the remainder of `unsafe extern "C" { fn ...; ... }` after
+    /// the `unsafe` keyword. Only the `"C"` ABI exists in v1; every
+    /// declaration needs an explicit return type (as do Toto functions).
+    fn parse_extern_block(&mut self, start: Span) -> PResult<ExternBlock> {
+        self.expect(|k| matches!(k, TokenKind::Extern), "`extern`")?;
+        let abi_tok = self.expect(
+            |k| matches!(k, TokenKind::Str(_)),
+            "an ABI string literal (v1 supports `\"C\"` only)",
+        )?;
+        let abi = match abi_tok.kind {
+            TokenKind::Str(s) => s,
+            _ => unreachable!("expect() guaranteed a string literal"),
+        };
+        if abi != "C" {
+            self.error(
+                "E0101",
+                format!("unsupported extern ABI `\"{abi}\"` (v1 supports `\"C\"` only)"),
+                abi_tok.span,
+                None,
+            );
+            return Err(());
+        }
+        self.expect(|k| matches!(k, TokenKind::LBrace), "`{`")?;
+        let mut decls = Vec::new();
+        loop {
+            if matches!(self.peek().kind, TokenKind::RBrace) {
+                self.bump();
+                break;
+            }
+            if self.at_eof() {
+                let span = self.peek().span;
+                self.error(
+                    "E0103",
+                    "unclosed `unsafe extern` block".to_string(),
+                    span,
+                    Some("add the closing `}`".to_string()),
+                );
+                return Err(());
+            }
+            decls.push(self.parse_extern_fn()?);
+        }
+        Ok(ExternBlock {
+            abi,
+            decls,
+            span: start.merge(self.prev_span()),
+        })
+    }
+
+    /// Parse one `fn name(p: T, ...) -> R;` foreign declaration.
+    fn parse_extern_fn(&mut self) -> PResult<ExternFn> {
+        let start = self.peek().span;
+        self.expect(|k| matches!(k, TokenKind::Fn), "`fn`")?;
+        let name_tok = self.expect(
+            |k| matches!(k, TokenKind::Ident(_)),
+            "a foreign function name",
+        )?;
+        let name = match name_tok.kind {
+            TokenKind::Ident(n) => n,
+            _ => unreachable!("expect() guaranteed an identifier"),
+        };
+        let name_span = name_tok.span;
+        self.expect(|k| matches!(k, TokenKind::LParen), "`(`")?;
+        let mut params = Vec::new();
+        if !matches!(self.peek().kind, TokenKind::RParen) {
+            loop {
+                let pname_tok =
+                    self.expect(|k| matches!(k, TokenKind::Ident(_)), "a parameter name")?;
+                let pname = match pname_tok.kind {
+                    TokenKind::Ident(n) => n,
+                    _ => unreachable!("expect() guaranteed an identifier"),
+                };
+                let pname_span = pname_tok.span;
+                self.expect(|k| matches!(k, TokenKind::Colon), "`:`")?;
+                let pty = self.parse_type()?;
+                params.push(Param {
+                    name: pname,
+                    name_span: pname_span,
+                    ty: pty,
+                    is_mut: false,
+                });
+                if matches!(self.peek().kind, TokenKind::Comma) {
+                    self.bump();
+                    if matches!(self.peek().kind, TokenKind::RParen) {
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_close(start, &TokenKind::RParen, "(")?;
+        self.expect(|k| matches!(k, TokenKind::Arrow), "`->`")?;
+        let ret = self.parse_type()?;
+        if self.expect_semi("after foreign declaration").is_err() {
+            return Err(());
+        }
+        let _ = start;
+        Ok(ExternFn {
+            name,
+            name_span,
+            params,
+            ret,
+        })
     }
 
     fn parse_annotation(&mut self) -> PResult<Annotation> {
@@ -553,6 +691,17 @@ impl Parser<'_> {
 
     fn parse_type(&mut self) -> PResult<Type> {
         let start = self.peek().span;
+        // C pointer type `*T` (Phase 5, Stage 3): right-associative, so
+        // `**c_char` parses as `*(*c_char)`.
+        if matches!(self.peek().kind, TokenKind::Star) {
+            self.bump();
+            let inner = self.parse_type()?;
+            let span = start.merge(inner.span);
+            return Ok(Type {
+                kind: TypeKind::Ptr(Box::new(inner)),
+                span,
+            });
+        }
         // Provisional function-type syntax `fn(T1, T2) -> R` (spec §4 note).
         if matches!(self.peek().kind, TokenKind::Fn) {
             self.bump();

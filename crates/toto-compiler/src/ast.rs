@@ -38,6 +38,28 @@ pub enum ItemKind {
     Fn(FnDecl),
     Struct(StructDecl),
     Import(ImportDecl),
+    Extern(ExternBlock),
+}
+
+/// A top-level `unsafe extern "C" { ... };` block (Phase 5, Stage 3):
+/// foreign-function declarations checked at call sites, executed by
+/// the interpreter and the runtime executor (JIT/AOT refuse FFI).
+#[derive(Clone, Debug)]
+pub struct ExternBlock {
+    pub abi: String,
+    pub decls: Vec<ExternFn>,
+    pub span: Span,
+}
+
+/// One foreign declaration: `fn name(p: T, ...) -> R;` (no body).
+/// Parameter and return types must be C types (`c_char`, `c_int`,
+/// `c_long`, `c_double`, `*T`, `fn(..) -> ..`) or `unit` returns.
+#[derive(Clone, Debug)]
+pub struct ExternFn {
+    pub name: String,
+    pub name_span: Span,
+    pub params: Vec<Param>,
+    pub ret: Type,
 }
 
 /// A top-level `import "path";` statement (Phase 5; resolved by the driver).
@@ -95,6 +117,9 @@ pub struct Type {
 
 #[derive(Clone, Debug)]
 pub enum TypeKind {
+    /// C pointer type `*T` (Phase 5, Stage 3; only in FFI signatures
+    /// and positions holding foreign pointers).
+    Ptr(Box<Type>),
     Named {
         name: String,
         args: Vec<Type>,

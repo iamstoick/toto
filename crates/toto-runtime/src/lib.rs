@@ -130,7 +130,14 @@ pub fn run_checked(
         structs,
         fns,
         fn_blocks,
+        externs: checked.externs.clone(),
     });
+    // Test-isolation hygiene (mirrors `Interp::run`): the callback
+    // queue is process-global, so discard stale firings before tasks
+    // start. No callback can legitimately be live yet.
+    for (slot, _) in toto_compiler::ffi::drain_queue() {
+        toto_compiler::ffi::release_slot(slot);
+    }
     let outcome = std::thread::Builder::new()
         .name("toto-runtime".to_string())
         .stack_size(256 << 20)
@@ -205,6 +212,7 @@ pub fn compose(outcome: SchedOutcome, main_span: Span) -> RtOutcome {
                 crate::value::RtVal::Func(_) | crate::value::RtVal::Closure(_) => "function",
                 crate::value::RtVal::Ok(_) | crate::value::RtVal::Err(_) => "Result",
                 crate::value::RtVal::Some(_) => "Option",
+                crate::value::RtVal::Ptr(_) => "pointer",
                 crate::value::RtVal::Int(_) => "int",
             };
             RtOutcome {

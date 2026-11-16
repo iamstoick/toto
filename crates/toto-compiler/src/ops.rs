@@ -170,6 +170,9 @@ pub fn equality(l: Value, r: Value, span: Span, want_eq: bool) -> OpResult<Value
         (Value::Closure(_), Value::Func(_)) | (Value::Func(_), Value::Closure(_)) => false,
         (Value::Ok(_) | Value::Err(_), Value::Ok(_) | Value::Err(_)) => true,
         (Value::Some(_) | Value::None, Value::Some(_) | Value::None) => true,
+        // Null-pointer checks read naturally (`p == None`); anything
+        // else against a pointer is E0203 as usual.
+        (Value::Ptr(_), Value::None) | (Value::None, Value::Ptr(_)) => true,
         _ => std::mem::discriminant(&l) == std::mem::discriminant(&r),
     };
     if !same_type {
@@ -208,6 +211,9 @@ pub fn values_equal(a: &Value, b: &Value, depth: usize) -> bool {
         (Value::Some(x), Value::Some(y)) => values_equal(x, y, depth + 1),
         (Value::None, Value::None) => true,
         (Value::Some(_), Value::None) | (Value::None, Value::Some(_)) => false,
+        // Pointers compare by address (never printed, so no ASLR leak).
+        (Value::Ptr(x), Value::Ptr(y)) => x == y,
+        (Value::Ptr(p), Value::None) | (Value::None, Value::Ptr(p)) => *p == 0,
         (Value::Array(x), Value::Array(y)) => {
             if Rc::ptr_eq(x, y) {
                 return true;

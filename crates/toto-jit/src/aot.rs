@@ -387,6 +387,17 @@ pub fn ty_to_rust_expr(ty: &Ty) -> String {
             ty_to_rust_expr(t)
         ),
         Ty::Struct(n) => format!("toto_compiler::hir::Ty::Struct({n:?})"),
+        // C scalars render as their Toto views (values genuinely are
+        // `int`/`float`; only pointers are distinct, and they nest).
+        // Unreachable in practice: `toto build` refuses FFI programs
+        // before lowering, and `chan<C>` is rejected statically.
+        Ty::CChar | Ty::CInt | Ty::CLong => "toto_compiler::hir::Ty::Int".to_string(),
+        Ty::CDouble => "toto_compiler::hir::Ty::Float".to_string(),
+        Ty::CVoid => "toto_compiler::hir::Ty::Unit".to_string(),
+        Ty::CPtr(t) => format!(
+            "toto_compiler::hir::Ty::CPtr(Box::new({}))",
+            ty_to_rust_expr(t)
+        ),
         Ty::Fn(params, ret) => {
             let ps = params
                 .iter()

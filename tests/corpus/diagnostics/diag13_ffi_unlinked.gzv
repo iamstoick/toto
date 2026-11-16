@@ -1,0 +1,8 @@
+unsafe extern "C" {
+    fn nosuchlib() -> c_int;
+}
+
+fn main() -> int {
+    println(nosuchlib());
+    return 0;
+}

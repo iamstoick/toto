@@ -179,6 +179,38 @@ fn build_produces_equivalent_executable() {
 }
 
 #[test]
+fn build_refuses_ffi_programs() {
+    // FFI executes under `run`/`test` only; `build` refuses up front
+    // (exit 3) rather than failing deep in codegen.
+    let dir = scratch_project("buildffi");
+    let out = toto()
+        .arg("init")
+        .arg(dir.join("app"))
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let root = dir.join("app");
+    std::fs::write(
+        root.join("main.gzv"),
+        "unsafe extern \"C\" {\n    fn strlen(s: *c_char) -> c_long;\n}\n\nfn main() -> int {\n    println(strlen(\"hi\"));\n    return 0;\n}\n",
+    )
+    .expect("write main");
+    let out = toto()
+        .arg("build")
+        .current_dir(&root)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(3));
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("does not support `unsafe extern` FFI"),
+        "wrong stderr"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn workers_flag_rejects_zero() {
     let out = toto()
         .arg("run")
