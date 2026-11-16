@@ -1,0 +1,45 @@
+// gzv.std/fs — path helpers plus the file builtins' home.
+//
+// read_file/write_file/file_exists stay builtins (this module does not
+// wrap them 1:1); what lives here is pure path surgery shared by every
+// project that touches the filesystem.
+
+import "gzv.std/strings.gzv";
+
+pub fn path_join(a: string, b: string) -> string {
+    if ends_with(a, "/") {
+        return a + b;
+    }
+    return a + "/" + b;
+}
+
+pub fn basename(path: string) -> string {
+    let parts: Array<string> = split(path, "/");
+    return parts[len(parts) - 1];
+}
+
+pub fn extension(path: string) -> string {
+    let base: string = basename(path);
+    let parts: Array<string> = split(base, ".");
+    if len(parts) < 2 {
+        return "";
+    }
+    return parts[len(parts) - 1];
+}
+
+pub fn stem(path: string) -> string {
+    let base: string = basename(path);
+    let parts: Array<string> = split(base, ".");
+    if len(parts) < 2 {
+        return base;
+    }
+    let mut out: Array<string> = [];
+    for i in 0..(len(parts) - 1) {
+        push(out, parts[i]);
+    }
+    return join(out, ".");
+}
+
+pub fn is_absolute(path: string) -> bool {
+    return starts_with(path, "/");
+}

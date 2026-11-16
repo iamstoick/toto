@@ -898,6 +898,14 @@ Phase 5 amendment record (2026-11-16): the owner chose the module model
 duplicates/circular as static errors). Recorded in §1, §3.1, §3.3, §9.1
 and item 17 above.
 
+Stage 2 amendment record (2026-11-16): the `gzv.std/` import prefix
+names embedded standard-library modules (`stdlib/*.gzv`, resolved
+canonically per §3.1, embedded-first with disk fallback). The stdlib
+is ordinary Toto on the frozen builtins; the time module is pure
+(durations over int milliseconds, no wall clock) with the clock
+deferred to Stage 3 FFI per owner decision. Full API in
+`docs/stdlib.md`; execution paths in the Phase 5 report.
+
 ## Appendix B. Review questions and answers (2026-11-14 review)
 
 All eight questions ANSWERED; answers are binding on Phase 1 implementation.

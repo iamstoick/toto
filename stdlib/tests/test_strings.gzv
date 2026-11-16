@@ -1,0 +1,83 @@
+// stdlib strings tests: run with `toto test` from stdlib/.
+import "gzv.std/strings.gzv";
+
+fn main() -> int {
+    let mut failures: int = 0;
+    if !(starts_with("foobar", "foo")) {
+        println("FAIL starts_with basic");
+        failures = failures + 1;
+    }
+    if starts_with("foobar", "bar") {
+        println("FAIL starts_with negative");
+        failures = failures + 1;
+    }
+    if !(starts_with("abc", "")) {
+        println("FAIL starts_with empty");
+        failures = failures + 1;
+    }
+    if !(ends_with("foobar", "bar")) {
+        println("FAIL ends_with basic");
+        failures = failures + 1;
+    }
+    if ends_with("foobar", "foo") {
+        println("FAIL ends_with negative");
+        failures = failures + 1;
+    }
+    if join(["a", "b", "c"], ",") != "a,b,c" {
+        println("FAIL join");
+        failures = failures + 1;
+    }
+    if join([], ",") != "" {
+        println("FAIL join empty");
+        failures = failures + 1;
+    }
+    if repeat("ab", 3) != "ababab" {
+        println("FAIL repeat");
+        failures = failures + 1;
+    }
+    if repeat("ab", 0) != "" {
+        println("FAIL repeat zero");
+        failures = failures + 1;
+    }
+    if replace("aaa", "a", "b") != "bbb" {
+        println("FAIL replace");
+        failures = failures + 1;
+    }
+    if replace("abc", "x", "y") != "abc" {
+        println("FAIL replace absent");
+        failures = failures + 1;
+    }
+    if substring("hello", 1, 4) != "ell" {
+        println("FAIL substring");
+        failures = failures + 1;
+    }
+    if char_at("hello", 0) != "h" {
+        println("FAIL char_at");
+        failures = failures + 1;
+    }
+    if index_of("hello", "ll") != 2 {
+        println("FAIL index_of");
+        failures = failures + 1;
+    }
+    if index_of("hello", "z") != -1 {
+        println("FAIL index_of absent");
+        failures = failures + 1;
+    }
+    if pad_left("7", 3, "0") != "007" {
+        println("FAIL pad_left");
+        failures = failures + 1;
+    }
+    if pad_right("7", 3, "0") != "700" {
+        println("FAIL pad_right");
+        failures = failures + 1;
+    }
+    if !(is_empty("")) {
+        println("FAIL is_empty");
+        failures = failures + 1;
+    }
+    if failures > 0 {
+        println(to_string(failures) + " strings failures");
+        return 1;
+    }
+    return 0;
+}

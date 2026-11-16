@@ -190,3 +190,45 @@ fn lex_errors_abort_parse_without_cascade() {
     );
     assert!(!codes.is_empty());
 }
+
+#[test]
+fn stdlib_prefix_resolves_canonically() {
+    // `gzv.std/` imports resolve independent of the entry's directory.
+    let src = "import \"gzv.std/strings.gzv\";\nfn main() -> int {\n    println(pad_left(\"7\", 3, \"0\"));\n    return 0;\n}\n";
+    let (project, _checked) = load_and_check("deep/nested/main.gzv", src, &|p| {
+        toto_compiler::stdlib::get(p).map(str::to_string)
+    })
+    .expect("stdlib import resolves");
+    assert_eq!(project.files.len(), 2);
+    assert_eq!(project.files[1].path, "gzv.std/strings.gzv");
+}
+
+#[test]
+fn stdlib_all_modules_merge_and_check() {
+    // Every embedded module loads, merges, and checks as one program.
+    let mut src = String::new();
+    for (path, _) in toto_compiler::stdlib::MODULES {
+        src.push_str(&format!("import \"{path}\";\n"));
+    }
+    src.push_str("fn main() -> int {\n    return 0;\n}\n");
+    let (project, _checked) = load_and_check("main.gzv", &src, &|p| {
+        toto_compiler::stdlib::get(p).map(str::to_string)
+    })
+    .expect("all stdlib modules check");
+    assert_eq!(
+        project.files.len(),
+        1 + toto_compiler::stdlib::MODULES.len()
+    );
+}
+
+#[test]
+fn stdlib_table_is_complete() {
+    assert_eq!(toto_compiler::stdlib::MODULES.len(), 7);
+    for (path, src) in toto_compiler::stdlib::MODULES {
+        assert!(
+            path.starts_with("gzv.std/") && path.ends_with(".gzv"),
+            "{path}"
+        );
+        assert!(!src.is_empty(), "{path} empty");
+    }
+}

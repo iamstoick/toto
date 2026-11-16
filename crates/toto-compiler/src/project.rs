@@ -189,7 +189,15 @@ fn normalize(path: &str) -> String {
 
 /// Resolve an import path against the importing file's display path.
 /// Both display paths stay in the same (relative or absolute) space.
+///
+/// A `gzv.std/`-prefixed import names a standard-library module and
+/// resolves canonically (no directory join), so stdlib imports work
+/// from any file in any directory. The read callback serves these
+/// from the embedded `stdlib` table (disk fallback for development).
 fn resolve(importer_display: &str, import: &str) -> String {
+    if import.starts_with("gzv.std/") {
+        return normalize(import);
+    }
     let dir = Path::new(importer_display)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())

@@ -201,8 +201,9 @@ fn run_file(path: &str, workers: usize) -> ExitCode {
     // `load_and_check` resolves `import` statements against the
     // importing file's directory and checks the merged program; files
     // without imports behave exactly as before (single-file project).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let (project, checked) = match toto_compiler::project::load_and_check(path, &src, &|p| {
-        std::fs::read_to_string(p).ok()
+        build_cmd::read_source(&cwd, p)
     }) {
         Ok(loaded) => loaded,
         Err(failed) => {

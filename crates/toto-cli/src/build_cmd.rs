@@ -35,6 +35,17 @@ fn project_root() -> Result<(PathBuf, Manifest), ExitCode> {
     Ok((root, manifest))
 }
 
+/// Read one resolved import path: embedded `gzv.std` sources first
+/// (deterministic toolchain behavior from any directory, including
+/// inside built binaries), then disk anchored at `root` (lets stdlib
+/// developers iterate with a local `gzv.std/` overlay directory).
+pub(crate) fn read_source(root: &Path, p: &str) -> Option<String> {
+    if let Some(src) = toto_compiler::stdlib::get(p) {
+        return Some(src.to_string());
+    }
+    std::fs::read_to_string(root.join(p)).ok()
+}
+
 /// Load + check the project entry; on failure the diagnostics are
 /// already printed and the process exit is returned.
 fn load_project(
@@ -55,9 +66,7 @@ fn load_project(
     })?;
     // Reads anchor at the project root so `toto build` works from any
     // working directory; displays stay root-relative and stable.
-    match toto_compiler::project::load_and_check(&entry_display, &src, &|p| {
-        std::fs::read_to_string(root.join(p)).ok()
-    }) {
+    match toto_compiler::project::load_and_check(&entry_display, &src, &|p| read_source(root, p)) {
         Ok(loaded) => Ok(loaded),
         Err(failed) => {
             for fd in &failed.errors {
@@ -189,6 +198,11 @@ pub fn build(release: bool) -> ExitCode {
     ExitCode::from(0)
 }
 
+/// Rust-safe alias for a closure-body link symbol (see above).
+fn body_alias(id: u32) -> String {
+    format!("toto_body{id}")
+}
+
 /// Generate the shim crate's `main.rs`: embedded sources, link-symbol
 /// tables from the build, and the `run_aot` hosting call.
 fn gen_shim_main(
@@ -220,9 +234,15 @@ fn gen_shim_main(
             "    fn {sym}(ctx: *mut toto_jit::task::JitTaskCtx) -> u64;\n"
         ));
     }
-    for (_, sym) in &artifact.body_symbols {
+    // Body symbols carry a `$` suffix by design (see `body_fn_name`:
+    // Toto identifiers cannot spell it, so user functions can never
+    // collide with closure bodies). Rust identifiers cannot spell `$`
+    // either, so bodies are declared under a safe alias pinned to the
+    // real link symbol with `#[link_name]`.
+    for (id, sym) in &artifact.body_symbols {
         src.push_str(&format!(
-            "    fn {sym}(ctx: *mut toto_jit::task::JitTaskCtx) -> u64;\n"
+            "    #[link_name = \"{sym}\"]\n    fn {}(ctx: *mut toto_jit::task::JitTaskCtx) -> u64;\n",
+            body_alias(*id),
         ));
     }
     src.push_str("}\n\n");
@@ -260,9 +280,10 @@ fn gen_shim_main(
     } else {
         "    let mut bodies = HashMap::new();\n"
     });
-    for (id, sym) in &artifact.body_symbols {
+    for (id, _sym) in &artifact.body_symbols {
         src.push_str(&format!(
-            "    bodies.insert({id}u32, {sym} as *const () as usize);\n"
+            "    bodies.insert({id}u32, {} as *const () as usize);\n",
+            body_alias(*id),
         ));
     }
     src.push_str("    let chan_types: Vec<toto_compiler::hir::Ty> = vec![\n");
@@ -336,9 +357,8 @@ pub fn test_all() -> ExitCode {
             .unwrap_or(case.as_path())
             .to_string_lossy()
             .into_owned();
-        let loaded = toto_compiler::project::load_and_check(&display, &src, &|p| {
-            std::fs::read_to_string(root.join(p)).ok()
-        });
+        let loaded =
+            toto_compiler::project::load_and_check(&display, &src, &|p| read_source(&root, p));
         let (project, checked) = match loaded {
             Ok(ok) => ok,
             Err(failed_load) => {

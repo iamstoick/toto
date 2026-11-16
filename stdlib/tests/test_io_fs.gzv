@@ -1,0 +1,69 @@
+// stdlib io/fs tests: run with `toto test` from stdlib/.
+import "gzv.std/io.gzv";
+import "gzv.std/fs.gzv";
+
+fn main() -> int {
+    let mut failures: int = 0;
+    write_file("test_work.txt", "a\nb\nc");
+    let lines: Array<string> = read_lines("test_work.txt");
+    if len(lines) != 3 || lines[0] != "a" || lines[2] != "c" {
+        println("FAIL read_lines");
+        failures = failures + 1;
+    }
+    write_lines("test_lines.txt", ["x", "y"]);
+    let back: Array<string> = read_lines("test_lines.txt");
+    if len(back) != 2 || back[0] != "x" || back[1] != "y" {
+        println("FAIL write_lines round-trip");
+        failures = failures + 1;
+    }
+    // Seed-then-append is rerun-safe: write_file resets state first
+    // (there is no delete builtin, so tests never rely on absence).
+    write_file("test_app.txt", "zero");
+    append_line("test_app.txt", "one");
+    let app: Array<string> = read_lines("test_app.txt");
+    if len(app) != 2 || app[0] != "zero" || app[1] != "one" {
+        println("FAIL append_line");
+        failures = failures + 1;
+    }
+    if path_join("a", "b") != "a/b" {
+        println("FAIL path_join");
+        failures = failures + 1;
+    }
+    if path_join("a/", "b") != "a/b" {
+        println("FAIL path_join slash");
+        failures = failures + 1;
+    }
+    if basename("a/b/c.gzv") != "c.gzv" {
+        println("FAIL basename");
+        failures = failures + 1;
+    }
+    if extension("c.gzv") != "gzv" {
+        println("FAIL extension");
+        failures = failures + 1;
+    }
+    if extension("noext") != "" {
+        println("FAIL extension absent");
+        failures = failures + 1;
+    }
+    if stem("a/b/c.gzv") != "c" {
+        println("FAIL stem");
+        failures = failures + 1;
+    }
+    if stem("archive.tar.gz") != "archive.tar" {
+        println("FAIL stem double");
+        failures = failures + 1;
+    }
+    if !(is_absolute("/x")) {
+        println("FAIL is_absolute");
+        failures = failures + 1;
+    }
+    if is_absolute("x") {
+        println("FAIL is_absolute relative");
+        failures = failures + 1;
+    }
+    if failures > 0 {
+        println(to_string(failures) + " io/fs failures");
+        return 1;
+    }
+    return 0;
+}

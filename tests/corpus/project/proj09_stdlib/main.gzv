@@ -1,0 +1,30 @@
+import "gzv.std/strings.gzv";
+import "gzv.std/math.gzv";
+import "gzv.std/time.gzv";
+import "gzv.std/collections.gzv";
+import "gzv.std/json.gzv";
+
+fn is_odd(x: int) -> bool {
+    return x - (x / 2) * 2 == 1;
+}
+
+fn summarize() -> Result<string, string> {
+    let nums: JsonVal = json_parse("{\"nums\": [3, 1, 2]}")?;
+    let arr: JsonVal = json_object_get(nums, "nums")?;
+    let n: int = json_array_len(arr)?;
+    let mut total: int = 0;
+    for i in 0..n {
+        total = total + json_as_int(json_array_get(arr, i)?)?;
+    }
+    let odds: Array<int> = filter_ints([1, 2, 3, 4, 5], is_odd);
+    let line: string = pad_left(to_string(factorial(6)), 5, "0")
+        + "|" + format_duration(duration_from_hours(26))
+        + "|" + to_string(sum_ints(odds))
+        + "|" + to_string(total);
+    return Ok(line);
+}
+
+fn main() -> int {
+    println(summarize());
+    return 0;
+}

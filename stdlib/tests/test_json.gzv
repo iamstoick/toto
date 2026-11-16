@@ -1,0 +1,116 @@
+// stdlib json tests: run with `toto test` from stdlib/.
+//
+// Sections return Result<bool, string>: `?` flows parse failures out
+// as Err, and `main` compares against Ok(true) (bare `Ok`/`None`
+// literals need annotations per E0309, so one shared YES per type).
+import "gzv.std/json.gzv";
+
+fn t_literals() -> Result<bool, string> {
+    if json_stringify(json_null()) != "null" {
+        return Err("null");
+    }
+    if json_stringify(json_bool(true)) != "true" {
+        return Err("bool");
+    }
+    if json_stringify(json_int(-42)) != "-42" {
+        return Err("int");
+    }
+    if json_stringify(json_float(1.5)) != "1.5" {
+        return Err("float");
+    }
+    if json_stringify(json_string("a\"b\\c")) != "\"a\\\"b\\\\c\"" {
+        return Err("string escape");
+    }
+    return Ok(true);
+}
+
+fn t_parse_access() -> Result<bool, string> {
+    let v: JsonVal = json_parse("{\"a\": 1, \"b\": [true, null, \"x\"]}")?;
+    let a: JsonVal = json_object_get(v, "a")?;
+    if json_as_int(a)? != 1 {
+        return Err("object_get int");
+    }
+    let b: JsonVal = json_object_get(v, "b")?;
+    if json_array_len(b)? != 3 {
+        return Err("array_len");
+    }
+    if json_as_bool(json_array_get(b, 0)?)? != true {
+        return Err("array_get bool");
+    }
+    if json_as_string(json_array_get(b, 2)?)? != "x" {
+        return Err("array_get string");
+    }
+    if json_kind(b) != "arr" {
+        return Err("kind");
+    }
+    return Ok(true);
+}
+
+fn t_numbers() -> Result<bool, string> {
+    let f: JsonVal = json_parse("1.5")?;
+    if json_as_float(f)? != 1.5 {
+        return Err("as_float");
+    }
+    let e: JsonVal = json_parse("2e3")?;
+    if json_as_float(e)? != 2000.0 {
+        return Err("as_float exp");
+    }
+    let n: JsonVal = json_parse("-17")?;
+    if json_as_int(n)? != -17 {
+        return Err("as_int negative");
+    }
+    // Round-trip: parse then stringify is stable.
+    let rt: JsonVal = json_parse(json_stringify(e))?;
+    if json_as_float(rt)? != 2000.0 {
+        return Err("round-trip");
+    }
+    return Ok(true);
+}
+
+fn expect_err(got: Result<JsonVal, string>, want_msg: string) -> Result<bool, string> {
+    let want: Result<JsonVal, string> = Err(want_msg);
+    if got != want {
+        return Err("wrong error, want `" + want_msg + "`");
+    }
+    return Ok(true);
+}
+
+fn t_errors() -> Result<bool, string> {
+    expect_err(json_parse("{"), "expected string key at position 1")?;
+    expect_err(json_parse("[1,]"), "expected value at position 3")?;
+    expect_err(json_parse("{\"a\"}"), "expected `:` at position 4")?;
+    expect_err(json_parse("\"\\u0041\""), "unicode escapes (\\u) are not supported")?;
+    expect_err(json_parse("01"), "bad number: 01")?;
+    expect_err(json_parse("1 2"), "trailing characters after JSON value")?;
+    expect_err(json_parse("[1, 2"), "unterminated array")?;
+    expect_err(json_object_get(json_int(1), "a"), "expected object, got num")?;
+    expect_err(json_array_get(json_int(1), 0), "expected array, got num")?;
+    expect_err(json_parse("\"abc"), "unterminated string")?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_literals() != yes {
+        println("FAIL literals");
+        failures = failures + 1;
+    }
+    if t_parse_access() != yes {
+        println("FAIL parse_access");
+        failures = failures + 1;
+    }
+    if t_numbers() != yes {
+        println("FAIL numbers");
+        failures = failures + 1;
+    }
+    if t_errors() != yes {
+        println("FAIL errors");
+        failures = failures + 1;
+    }
+    if failures > 0 {
+        println(to_string(failures) + " json failures");
+        return 1;
+    }
+    return 0;
+}

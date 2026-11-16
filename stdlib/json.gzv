@@ -1,0 +1,591 @@
+// gzv.std/json — JSON parse + serialize (Phase 5, Stage 2).
+//
+// Values are `JsonVal` structs. Nested values store as COMPACT JSON
+// strings (`items`/`vals`), parsed on access: Toto v1 rejects
+// recursive types (E0302), so a directly nested DOM is inexpressible
+// and this strata design is the honest encoding. Consequences:
+// - `json_array_get`/`json_object_get` re-parse the nested slice on
+//   every access (O(depth) per descent, no caching).
+// - Numbers keep their RAW literal: `json_as_int` rejects non-integers
+//   and `parse_int` panics E0210 past i64 range (inherited, not wrapped).
+// - Floats parse via float arithmetic (exact decimal semantics is NOT
+//   guaranteed); serialize via `to_string` (Rust Debug, valid JSON).
+// - `\uXXXX` escapes are REJECTED with a clear error: there is no
+//   codepoint-to-char builtin (frozen catalog), so they cannot be
+//   represented. Other C0 controls pass through raw on output.
+// - Depth is bounded by interpreter/JIT stack limits, not by this
+//   module; pathologically nested input can trap. Keep nesting
+//   shallow or pre-validate length.
+
+import "gzv.std/strings.gzv";
+
+pub struct JsonVal {
+    kind: string,
+    raw: string,
+    items: Array<string>,
+    keys: Array<string>,
+    vals: Array<string>
+}
+
+struct JsonParseOut {
+    value: JsonVal,
+    next: int
+}
+
+fn json_make(kind: string, raw: string) -> JsonVal {
+    let a: Array<string> = [];
+    let b: Array<string> = [];
+    let c: Array<string> = [];
+    return JsonVal { kind: kind, raw: raw, items: a, keys: b, vals: c };
+}
+
+pub fn json_null() -> JsonVal {
+    return json_make("null", "");
+}
+
+pub fn json_bool(b: bool) -> JsonVal {
+    if b {
+        return json_make("bool", "true");
+    }
+    return json_make("bool", "false");
+}
+
+pub fn json_int(n: int) -> JsonVal {
+    return json_make("num", to_string(n));
+}
+
+pub fn json_float(f: float) -> JsonVal {
+    return json_make("num", to_string(f));
+}
+
+pub fn json_string(s: string) -> JsonVal {
+    return json_make("str", s);
+}
+
+pub fn json_array(elems: Array<JsonVal>) -> JsonVal {
+    let mut v: JsonVal = json_make("arr", "");
+    for e in elems {
+        push(v.items, json_stringify(e));
+    }
+    return v;
+}
+
+pub fn json_object(keys: Array<string>, vals: Array<JsonVal>) -> Result<JsonVal, string> {
+    if len(keys) != len(vals) {
+        return Err("json_object: keys and vals lengths differ");
+    }
+    let mut v: JsonVal = json_make("obj", "");
+    for i in 0..len(keys) {
+        push(v.keys, keys[i]);
+        push(v.vals, json_stringify(vals[i]));
+    }
+    return Ok(v);
+}
+
+pub fn json_kind(v: JsonVal) -> string {
+    return v.kind;
+}
+
+pub fn json_as_bool(v: JsonVal) -> Result<bool, string> {
+    if v.kind != "bool" {
+        return Err("expected bool, got " + v.kind);
+    }
+    return Ok(v.raw == "true");
+}
+
+pub fn json_as_int(v: JsonVal) -> Result<int, string> {
+    if v.kind != "num" {
+        return Err("expected number, got " + v.kind);
+    }
+    if !(json_is_int_literal(v.raw)) {
+        return Err("not an integer: " + v.raw);
+    }
+    return Ok(parse_int(v.raw));
+}
+
+pub fn json_as_float(v: JsonVal) -> Result<float, string> {
+    if v.kind != "num" {
+        return Err("expected number, got " + v.kind);
+    }
+    return json_parse_number_float(v.raw);
+}
+
+pub fn json_as_string(v: JsonVal) -> Result<string, string> {
+    if v.kind != "str" {
+        return Err("expected string, got " + v.kind);
+    }
+    return Ok(v.raw);
+}
+
+pub fn json_array_len(v: JsonVal) -> Result<int, string> {
+    if v.kind != "arr" {
+        return Err("expected array, got " + v.kind);
+    }
+    return Ok(len(v.items));
+}
+
+pub fn json_array_get(v: JsonVal, i: int) -> Result<JsonVal, string> {
+    if v.kind != "arr" {
+        return Err("expected array, got " + v.kind);
+    }
+    if i < 0 || i >= len(v.items) {
+        return Err("array index out of bounds: " + to_string(i));
+    }
+    return json_parse(v.items[i]);
+}
+
+pub fn json_object_get(v: JsonVal, key: string) -> Result<JsonVal, string> {
+    if v.kind != "obj" {
+        return Err("expected object, got " + v.kind);
+    }
+    for i in 0..len(v.keys) {
+        if v.keys[i] == key {
+            return json_parse(v.vals[i]);
+        } else {
+        }
+    }
+    return Err("missing key: " + key);
+}
+
+pub fn json_stringify(v: JsonVal) -> string {
+    if v.kind == "null" {
+        return "null";
+    }
+    if v.kind == "bool" {
+        return v.raw;
+    }
+    if v.kind == "num" {
+        return v.raw;
+    }
+    if v.kind == "str" {
+        return "\"" + json_escape_string(v.raw) + "\"";
+    }
+    if v.kind == "arr" {
+        return "[" + join(v.items, ",") + "]";
+    }
+    return "{" + json_join_pairs(v.keys, v.vals) + "}";
+}
+
+fn json_join_pairs(keys: Array<string>, vals: Array<string>) -> string {
+    let mut out: string = "";
+    let mut first: bool = true;
+    for i in 0..len(keys) {
+        if first {
+            first = false;
+        } else {
+            out = out + ",";
+        }
+        out = out + "\"" + json_escape_string(keys[i]) + "\":" + vals[i];
+    }
+    return out;
+}
+
+fn json_escape_string(s: string) -> string {
+    let chars: Array<string> = split(s, "");
+    let mut out: string = "";
+    for c in chars {
+        if c == "\"" {
+            out = out + "\\\"";
+        } else {
+            if c == "\\" {
+                out = out + "\\\\";
+            } else {
+                if c == "\n" {
+                    out = out + "\\n";
+                } else {
+                    if c == "\t" {
+                        out = out + "\\t";
+                    } else {
+                        if c == "\r" {
+                            out = out + "\\r";
+                        } else {
+                            out = out + c;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// --- parsing ---
+
+pub fn json_parse(s: string) -> Result<JsonVal, string> {
+    let chars: Array<string> = split(s, "");
+    let end: int = json_skip_ws(chars, 0);
+    let out = json_parse_value(chars, end)?;
+    let after: int = json_skip_ws(chars, out.next);
+    if after != len(chars) {
+        return Err("trailing characters after JSON value");
+    }
+    return Ok(out.value);
+}
+
+fn json_skip_ws(chars: Array<string>, pos: int) -> int {
+    let mut i: int = pos;
+    while i < len(chars) {
+        let c: string = chars[i];
+        if c == " " || c == "\t" || c == "\n" || c == "\r" {
+            i = i + 1;
+        } else {
+            break;
+        }
+    }
+    return i;
+}
+
+fn json_is_digit(c: string) -> bool {
+    return c >= "0" && c <= "9";
+}
+
+fn json_is_int_literal(s: string) -> bool {
+    let chars: Array<string> = split(s, "");
+    if len(chars) == 0 {
+        return false;
+    }
+    let mut i: int = 0;
+    if chars[0] == "-" {
+        i = 1;
+    }
+    if i >= len(chars) {
+        return false;
+    }
+    if chars[i] == "0" {
+        return i + 1 == len(chars);
+    }
+    if !(json_is_digit(chars[i])) {
+        return false;
+    }
+    while i < len(chars) {
+        if !(json_is_digit(chars[i])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Float from a validated JSON number literal: int + frac/10^digits,
+// then the binary exponent. Precision follows float arithmetic.
+fn json_parse_number_float(s: string) -> Result<float, string> {
+    let chars: Array<string> = split(s, "");
+    let mut i: int = 0;
+    let mut neg: bool = false;
+    if chars[i] == "-" {
+        neg = true;
+        i = i + 1;
+    }
+    let mut int_part: string = "";
+    while i < len(chars) && json_is_digit(chars[i]) {
+        int_part = int_part + chars[i];
+        i = i + 1;
+    }
+    if len(int_part) == 0 {
+        return Err("bad number: " + s);
+    }
+    // Digit-by-digit float accumulation: arbitrarily long digit runs
+    // cannot overflow `parse_int`, they just lose float precision.
+    let mut value: float = 0.0;
+    let int_digits: Array<string> = split(int_part, "");
+    for d in int_digits {
+        value = value * 10.0 + to_float(parse_int(d));
+    }
+    if i < len(chars) && chars[i] == "." {
+        i = i + 1;
+        let mut frac: string = "";
+        while i < len(chars) && json_is_digit(chars[i]) {
+            frac = frac + chars[i];
+            i = i + 1;
+        }
+        if len(frac) == 0 {
+            return Err("bad number: " + s);
+        }
+        let mut div: float = 1.0;
+        let frac_digits: Array<string> = split(frac, "");
+        for d in frac_digits {
+            div = div * 10.0;
+            value = value + to_float(parse_int(d)) / div;
+        }
+    }
+    if i < len(chars) && (chars[i] == "e" || chars[i] == "E") {
+        i = i + 1;
+        let mut eneg: bool = false;
+        if i < len(chars) && (chars[i] == "-" || chars[i] == "+") {
+            eneg = chars[i] == "-";
+            i = i + 1;
+        }
+        let mut exp: string = "";
+        while i < len(chars) && json_is_digit(chars[i]) {
+            exp = exp + chars[i];
+            i = i + 1;
+        }
+        if len(exp) == 0 {
+            return Err("bad number: " + s);
+        }
+        let e: int = parse_int(exp);
+        let mut j: int = 0;
+        while j < e {
+            if eneg {
+                value = value / 10.0;
+            } else {
+                value = value * 10.0;
+            }
+            j = j + 1;
+        }
+    }
+    if i != len(chars) {
+        return Err("bad number: " + s);
+    }
+    if neg {
+        value = 0.0 - value;
+    }
+    return Ok(value);
+}
+
+fn json_parse_value(chars: Array<string>, pos: int) -> Result<JsonParseOut, string> {
+    if pos >= len(chars) {
+        return Err("unexpected end of input");
+    }
+    let c: string = chars[pos];
+    if c == "{" {
+        return json_parse_object(chars, pos);
+    }
+    if c == "[" {
+        return json_parse_array(chars, pos);
+    }
+    if c == "\"" {
+        return json_parse_string(chars, pos);
+    }
+    if c == "t" {
+        return json_parse_literal(chars, pos, "true", "bool");
+    }
+    if c == "f" {
+        return json_parse_literal(chars, pos, "false", "bool");
+    }
+    if c == "n" {
+        return json_parse_literal(chars, pos, "null", "null");
+    }
+    return json_parse_number(chars, pos);
+}
+
+fn json_parse_literal(chars: Array<string>, pos: int, word: string, kind: string) -> Result<JsonParseOut, string> {
+    let want: Array<string> = split(word, "");
+    for i in 0..len(want) {
+        if pos + i >= len(chars) || chars[pos + i] != want[i] {
+            return Err("bad literal at position " + to_string(pos));
+        } else {
+        }
+    }
+    if kind == "null" {
+        return Ok(JsonParseOut { value: json_make("null", ""), next: pos + len(want) });
+    }
+    return Ok(JsonParseOut { value: json_make("bool", word), next: pos + len(want) });
+}
+
+fn json_parse_number(chars: Array<string>, pos: int) -> Result<JsonParseOut, string> {
+    let mut i: int = pos;
+    if i < len(chars) && chars[i] == "-" {
+        i = i + 1;
+    }
+    let int_start: int = i;
+    while i < len(chars) && json_is_digit(chars[i]) {
+        i = i + 1;
+    }
+    if i == int_start {
+        return Err("expected value at position " + to_string(pos));
+    }
+    if i < len(chars) && chars[i] == "." {
+        i = i + 1;
+        let frac_start: int = i;
+        while i < len(chars) && json_is_digit(chars[i]) {
+            i = i + 1;
+        }
+        if i == frac_start {
+            return Err("bad number at position " + to_string(pos));
+        } else {
+        }
+    }
+    if i < len(chars) && (chars[i] == "e" || chars[i] == "E") {
+        i = i + 1;
+        if i < len(chars) && (chars[i] == "-" || chars[i] == "+") {
+            i = i + 1;
+        }
+        let exp_start: int = i;
+        while i < len(chars) && json_is_digit(chars[i]) {
+            i = i + 1;
+        }
+        if i == exp_start {
+            return Err("bad number at position " + to_string(pos));
+        } else {
+        }
+    }
+    let mut raw: string = "";
+    for j in pos..i {
+        raw = raw + chars[j];
+    }
+    if !(json_is_canonical_number(raw)) {
+        return Err("bad number: " + raw);
+    }
+    return Ok(JsonParseOut { value: json_make("num", raw), next: i });
+}
+
+// Strict JSON number shape: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+fn json_is_canonical_number(raw: string) -> bool {
+    let chars: Array<string> = split(raw, "");
+    let mut i: int = 0;
+    if chars[i] == "-" {
+        i = i + 1;
+    }
+    if i >= len(chars) {
+        return false;
+    }
+    if chars[i] == "0" {
+        i = i + 1;
+    } else {
+        if !(json_is_digit(chars[i])) {
+            return false;
+        }
+        while i < len(chars) && json_is_digit(chars[i]) {
+            i = i + 1;
+        }
+    }
+    if i < len(chars) && chars[i] == "." {
+        i = i + 1;
+        let frac: int = i;
+        while i < len(chars) && json_is_digit(chars[i]) {
+            i = i + 1;
+        }
+        if i == frac {
+            return false;
+        } else {
+        }
+    }
+    if i < len(chars) && (chars[i] == "e" || chars[i] == "E") {
+        i = i + 1;
+        if i < len(chars) && (chars[i] == "-" || chars[i] == "+") {
+            i = i + 1;
+        }
+        let exp: int = i;
+        while i < len(chars) && json_is_digit(chars[i]) {
+            i = i + 1;
+        }
+        if i == exp {
+            return false;
+        } else {
+        }
+    }
+    return i == len(chars);
+}
+
+fn json_parse_string(chars: Array<string>, pos: int) -> Result<JsonParseOut, string> {
+    let mut i: int = pos + 1;
+    let mut out: string = "";
+    while true {
+        if i >= len(chars) {
+            return Err("unterminated string");
+        }
+        let c: string = chars[i];
+        if c == "\"" {
+            return Ok(JsonParseOut { value: json_make("str", out), next: i + 1 });
+        }
+        if c == "\\" {
+            i = i + 1;
+            if i >= len(chars) {
+                return Err("unterminated escape");
+            }
+            let e: string = chars[i];
+            if e == "\"" {
+                out = out + "\"";
+            } else {
+                if e == "\\" {
+                    out = out + "\\";
+                } else {
+                    if e == "n" {
+                        out = out + "\n";
+                    } else {
+                        if e == "t" {
+                            out = out + "\t";
+                        } else {
+                            if e == "r" {
+                                out = out + "\r";
+                            } else {
+                                if e == "/" {
+                                    out = out + "/";
+                                } else {
+                                    if e == "u" {
+                                        return Err("unicode escapes (\\u) are not supported");
+                                    } else {
+                                        return Err("bad escape: \\" + e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        } else {
+            out = out + c;
+            i = i + 1;
+        }
+    }
+    return Err("unreachable");
+}
+
+fn json_parse_array(chars: Array<string>, pos: int) -> Result<JsonParseOut, string> {
+    let mut v: JsonVal = json_make("arr", "");
+    let mut i: int = json_skip_ws(chars, pos + 1);
+    if i < len(chars) && chars[i] == "]" {
+        return Ok(JsonParseOut { value: v, next: i + 1 });
+    }
+    while true {
+        let elem = json_parse_value(chars, i)?;
+        push(v.items, json_stringify(elem.value));
+        i = json_skip_ws(chars, elem.next);
+        if i >= len(chars) {
+            return Err("unterminated array");
+        }
+        if chars[i] == "]" {
+            return Ok(JsonParseOut { value: v, next: i + 1 });
+        }
+        if chars[i] != "," {
+            return Err("expected `,` or `]` at position " + to_string(i));
+        }
+        i = json_skip_ws(chars, i + 1);
+    }
+    return Err("unreachable");
+}
+
+fn json_parse_object(chars: Array<string>, pos: int) -> Result<JsonParseOut, string> {
+    let mut v: JsonVal = json_make("obj", "");
+    let mut i: int = json_skip_ws(chars, pos + 1);
+    if i < len(chars) && chars[i] == "}" {
+        return Ok(JsonParseOut { value: v, next: i + 1 });
+    }
+    while true {
+        if i >= len(chars) || chars[i] != "\"" {
+            return Err("expected string key at position " + to_string(i));
+        }
+        let key = json_parse_string(chars, i)?;
+        i = json_skip_ws(chars, key.next);
+        if i >= len(chars) || chars[i] != ":" {
+            return Err("expected `:` at position " + to_string(i));
+        }
+        let val = json_parse_value(chars, json_skip_ws(chars, i + 1))?;
+        push(v.keys, key.value.raw);
+        push(v.vals, json_stringify(val.value));
+        i = json_skip_ws(chars, val.next);
+        if i >= len(chars) {
+            return Err("unterminated object");
+        }
+        if chars[i] == "}" {
+            return Ok(JsonParseOut { value: v, next: i + 1 });
+        }
+        if chars[i] != "," {
+            return Err("expected `,` or `}` at position " + to_string(i));
+        }
+        i = json_skip_ws(chars, i + 1);
+    }
+    return Err("unreachable");
+}

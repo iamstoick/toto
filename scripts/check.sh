@@ -17,3 +17,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # --nocapture: test stdout (notably the JIT compile-time table) is
 # preserved in CI logs for the phase report.
 cargo test --workspace -- --nocapture
+# stdlib suite: the toolchain's own test project must stay green.
+# (`toto test` exits 1 on any failure; `set -eu` fails the gate.)
+cargo build -p toto-cli
+(cd stdlib && ../target/debug/toto test)

@@ -1,0 +1,83 @@
+// stdlib time tests: run with `toto test` from stdlib/.
+import "gzv.std/time.gzv";
+
+fn main() -> int {
+    let mut failures: int = 0;
+    if duration_from_secs(2) != 2000 {
+        println("FAIL from_secs");
+        failures = failures + 1;
+    }
+    if duration_from_mins(2) != 120000 {
+        println("FAIL from_mins");
+        failures = failures + 1;
+    }
+    if duration_from_hours(1) != 3600000 {
+        println("FAIL from_hours");
+        failures = failures + 1;
+    }
+    if duration_as_secs(2500) != 2 {
+        println("FAIL as_secs truncates");
+        failures = failures + 1;
+    }
+    if duration_add(1000, 500) != 1500 {
+        println("FAIL add");
+        failures = failures + 1;
+    }
+    if duration_sub(1000, 2500) != -1500 {
+        println("FAIL sub negative");
+        failures = failures + 1;
+    }
+    if duration_compare(1, 2) != -1 {
+        println("FAIL compare lt");
+        failures = failures + 1;
+    }
+    if duration_compare(2, 2) != 0 {
+        println("FAIL compare eq");
+        failures = failures + 1;
+    }
+    if duration_compare(3, 2) != 1 {
+        println("FAIL compare gt");
+        failures = failures + 1;
+    }
+    if format_duration(500) != "500ms" {
+        println("FAIL fmt ms");
+        failures = failures + 1;
+    }
+    if format_duration(90000) != "1m 30s" {
+        println("FAIL fmt m s");
+        failures = failures + 1;
+    }
+    if format_duration(120000) != "2m" {
+        println("FAIL fmt m exact");
+        failures = failures + 1;
+    }
+    if format_duration(3723000) != "1h 2m" {
+        println("FAIL fmt h m");
+        failures = failures + 1;
+    }
+    if format_duration(3600000) != "1h" {
+        println("FAIL fmt h exact");
+        failures = failures + 1;
+    }
+    if format_duration(90000000) != "1d 1h" {
+        println("FAIL fmt d h");
+        failures = failures + 1;
+    }
+    if format_duration(-1500) != "-1s" {
+        println("FAIL fmt negative");
+        failures = failures + 1;
+    }
+    if timestamp_add(1000, 500) != 1500 {
+        println("FAIL ts add");
+        failures = failures + 1;
+    }
+    if timestamp_diff(1500, 1000) != 500 {
+        println("FAIL ts diff");
+        failures = failures + 1;
+    }
+    if failures > 0 {
+        println(to_string(failures) + " time failures");
+        return 1;
+    }
+    return 0;
+}

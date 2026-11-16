@@ -1,0 +1,104 @@
+// stdlib collections tests: run with `toto test` from stdlib/.
+import "gzv.std/collections.gzv";
+
+fn double(x: int) -> int {
+    return x * 2;
+}
+
+fn is_big(x: int) -> bool {
+    return x > 2;
+}
+
+fn add2(x: int, y: int) -> int {
+    return x + y;
+}
+
+fn has_e(s: string) -> bool {
+    return contains(s, "e");
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    if sum_ints([1, 2, 3, 4]) != 10 {
+        println("FAIL sum");
+        failures = failures + 1;
+    }
+    let mapped: Array<int> = map_ints([1, 2, 3], double);
+    if len(mapped) != 3 || mapped[0] != 2 || mapped[2] != 6 {
+        println("FAIL map_ints");
+        failures = failures + 1;
+    }
+    let kept: Array<int> = filter_ints([1, 2, 3, 4], is_big);
+    if len(kept) != 2 || kept[0] != 3 {
+        println("FAIL filter_ints");
+        failures = failures + 1;
+    }
+    if fold_ints([1, 2, 3], 100, add2) != 106 {
+        println("FAIL fold_ints");
+        failures = failures + 1;
+    }
+    if !(any_int([1, 2, 3], is_big)) {
+        println("FAIL any_int true");
+        failures = failures + 1;
+    }
+    if any_int([1, 2], is_big) {
+        println("FAIL any_int false");
+        failures = failures + 1;
+    }
+    if !(all_int([3, 4], is_big)) {
+        println("FAIL all_int true");
+        failures = failures + 1;
+    }
+    if all_int([1, 4], is_big) {
+        println("FAIL all_int false");
+        failures = failures + 1;
+    }
+    if !(all_int([], is_big)) {
+        println("FAIL all_int vacuous");
+        failures = failures + 1;
+    }
+    let idx: Option<int> = find_index_int([1, 2, 3], is_big);
+    let want2: Option<int> = Some(2);
+    if idx != want2 {
+        println("FAIL find_index_int");
+        failures = failures + 1;
+    }
+    let nohit: Option<int> = None;
+    if find_index_int([1, 2], is_big) != nohit {
+        println("FAIL find_index_int absent");
+        failures = failures + 1;
+    }
+    if !(contains_int([1, 2], 2)) {
+        println("FAIL contains_int");
+        failures = failures + 1;
+    }
+    let sorted: Array<int> = sort_ints([3, 1, 2]);
+    if sorted[0] != 1 || sorted[1] != 2 || sorted[2] != 3 {
+        println("FAIL sort_ints");
+        failures = failures + 1;
+    }
+    let rev: Array<int> = reverse_ints([1, 2, 3]);
+    if rev[0] != 3 || rev[2] != 1 {
+        println("FAIL reverse_ints");
+        failures = failures + 1;
+    }
+    let words: Array<string> = filter_strings(["hi", "hey", "yo"], has_e);
+    if len(words) != 1 || words[0] != "hey" {
+        println("FAIL filter_strings");
+        failures = failures + 1;
+    }
+    if !(contains_string(["a", "b"], "b")) {
+        println("FAIL contains_string");
+        failures = failures + 1;
+    }
+    let rstr: Array<string> = reverse_strings(["a", "b"]);
+    if rstr[0] != "b" || rstr[1] != "a" {
+        println("FAIL reverse_strings");
+        failures = failures + 1;
+    }
+    if failures > 0 {
+        println(to_string(failures) + " collections failures");
+        return 1;
+    }
+    return 0;
+}

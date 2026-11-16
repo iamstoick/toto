@@ -1,0 +1,13 @@
+import "gzv.std/io.gzv";
+import "gzv.std/fs.gzv";
+import "gzv.std/strings.gzv";
+
+fn main() -> int {
+    let lines: Array<string> = read_lines("data.txt");
+    println(len(lines));
+    println(join([basename("a/b/c.gzv"), stem("a/b/c.gzv"), extension("a/b/c.gzv")], "|"));
+    write_lines("case_tmp.txt", lines);
+    append_line("case_tmp.txt", "end");
+    println(read_lines("case_tmp.txt"));
+    return 0;
+}

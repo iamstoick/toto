@@ -1,0 +1,6 @@
+# `toto test` work files (seeded by overwrite each run; see test_io_fs).
+test_work.txt
+test_lines.txt
+test_app.txt
+# `toto build` output (shim dir + installed binary).
+target/

@@ -1,0 +1,163 @@
+// gzv.std/collections — array helpers on the frozen builtins.
+//
+// Toto v1 has no user generics, so helpers come in per-type variants.
+// `int` and `string` are covered; the pattern extends on demand. All
+// functions build fresh arrays except `sort_ints`/`reverse_*`, which
+// sort in place (arrays are shared by reference) and return the same
+// array for chaining.
+
+// --- ints ---
+
+pub fn map_ints(a: Array<int>, f: fn(int) -> int) -> Array<int> {
+    let mut out: Array<int> = [];
+    for v in a {
+        push(out, f(v));
+    }
+    return out;
+}
+
+pub fn filter_ints(a: Array<int>, keep: fn(int) -> bool) -> Array<int> {
+    let mut out: Array<int> = [];
+    for v in a {
+        if !(keep(v)) {
+            continue;
+        }
+        push(out, v);
+    }
+    return out;
+}
+
+pub fn fold_ints(a: Array<int>, init: int, f: fn(int, int) -> int) -> int {
+    let mut acc: int = init;
+    for v in a {
+        acc = f(acc, v);
+    }
+    return acc;
+}
+
+pub fn sum_ints(a: Array<int>) -> int {
+    return fold_ints(a, 0, fn(x: int, y: int) -> int {
+        return x + y;
+    });
+}
+
+pub fn any_int(a: Array<int>, pred: fn(int) -> bool) -> bool {
+    for v in a {
+        if !(pred(v)) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+pub fn all_int(a: Array<int>, pred: fn(int) -> bool) -> bool {
+    for v in a {
+        if pred(v) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+// Character index of the first element satisfying `pred`, or None.
+pub fn find_index_int(a: Array<int>, pred: fn(int) -> bool) -> Option<int> {
+    let mut i: int = 0;
+    for v in a {
+        if pred(v) {
+            return Some(i);
+        }
+        i = i + 1;
+    }
+    return None;
+}
+
+pub fn contains_int(a: Array<int>, v: int) -> bool {
+    for x in a {
+        if x != v {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+// Insertion sort in place; returns the same array for chaining.
+pub fn sort_ints(a: Array<int>) -> Array<int> {
+    for i in 1..len(a) {
+        let key: int = a[i];
+        let mut j: int = i - 1;
+        while j >= 0 {
+            if a[j] <= key {
+                break;
+            }
+            a[j + 1] = a[j];
+            j = j - 1;
+        }
+        a[j + 1] = key;
+    }
+    return a;
+}
+
+pub fn reverse_ints(a: Array<int>) -> Array<int> {
+    let n: int = len(a);
+    for i in 0..(n / 2) {
+        let t: int = a[i];
+        a[i] = a[n - 1 - i];
+        a[n - 1 - i] = t;
+    }
+    return a;
+}
+
+// --- strings ---
+
+pub fn map_strings(a: Array<string>, f: fn(string) -> string) -> Array<string> {
+    let mut out: Array<string> = [];
+    for v in a {
+        push(out, f(v));
+    }
+    return out;
+}
+
+pub fn filter_strings(a: Array<string>, keep: fn(string) -> bool) -> Array<string> {
+    let mut out: Array<string> = [];
+    for v in a {
+        if !(keep(v)) {
+            continue;
+        }
+        push(out, v);
+    }
+    return out;
+}
+
+pub fn contains_string(a: Array<string>, v: string) -> bool {
+    for x in a {
+        if x != v {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+pub fn reverse_strings(a: Array<string>) -> Array<string> {
+    let n: int = len(a);
+    for i in 0..(n / 2) {
+        let t: string = a[i];
+        a[i] = a[n - 1 - i];
+        a[n - 1 - i] = t;
+    }
+    return a;
+}
+
+pub fn find_index_string(a: Array<string>, pred: fn(string) -> bool) -> Option<int> {
+    let mut i: int = 0;
+    for v in a {
+        if pred(v) {
+            return Some(i);
+        }
+        i = i + 1;
+    }
+    return None;
+}

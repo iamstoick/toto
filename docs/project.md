@@ -1,4 +1,4 @@
-# Toto projects: modules, build, test (Phase 5, Stage 1)
+# Toto projects: modules, build, test, stdlib (Phase 5, Stages 1–2)
 
 Single-file programs keep working unchanged (`toto run file.gzv`
 resolves imports against the file's directory). A multi-file
@@ -24,6 +24,23 @@ resolves imports against the file's directory). A multi-file
   unique program-wide, so attribution is exact).
 - Same file imported twice (even spelled differently) loads once;
   diamond imports are fine.
+
+## Standard library (`gzv.std`)
+
+- `import "gzv.std/<mod>.gzv";` names a standard-library module.
+  The prefix resolves canonically (no directory join), so stdlib
+  imports work from any file in any directory, and display as
+  `gzv.std/<mod>.gzv` in diagnostics.
+- The sources in `stdlib/*.gzv` are embedded in every `toto`
+  binary: stdlib resolution needs no source tree, not even inside a
+  `toto build` product (the built binary embeds the same sources at
+  build time and re-resolves them at startup).
+- Precedence is embedded-first, disk fallback: a `gzv.std/` path that
+  exists on disk (relative to the project root, or CWD for bare
+  `toto run`) shadows the embedded copy. This is the stdlib
+  development escape hatch; user projects should not rely on it.
+- `toto test` from `stdlib/` runs the library's own suite; the full
+  API with examples is documented in [stdlib.md](stdlib.md).
 
 ## `toto.toml`
 
