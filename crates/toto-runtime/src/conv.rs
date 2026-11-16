@@ -72,6 +72,43 @@ pub fn to_value_memo(
                     }
                     Ok(Value::Struct(cell))
                 }
+                // JIT value families (Phase 4). Not memo-shelled like
+                // arrays/structs: cycles through wrappers are untypable
+                // in checked programs (infinite types), and neither
+                // executor builds them, so plain recursion terminates.
+                Some(Payload::Range { lo, hi }) => Ok(Value::Range(*lo, *hi)),
+                Some(Payload::Result { is_ok, inner }) => {
+                    let c = Box::new(to_value_memo(inner, heap, memo)?);
+                    if *is_ok {
+                        Ok(Value::Ok(c))
+                    } else {
+                        Ok(Value::Err(c))
+                    }
+                }
+                Some(Payload::Option { inner }) => {
+                    Ok(Value::Some(Box::new(to_value_memo(inner, heap, memo)?)))
+                }
+                Some(Payload::Closure { .. }) => {
+                    // Heap closures surface here only for display
+                    // (`<closure>`) and type names: code identity is
+                    // irrelevant, so a dummy body.
+                    Ok(Value::Closure(Rc::new(ClosureVal {
+                        code: ClosureCode::Mir {
+                            params: Vec::new(),
+                            ret: toto_compiler::hir::Ty::Unit,
+                            body: std::sync::Arc::new(toto_compiler::mir::MirBody {
+                                params: Vec::new(),
+                                ret: toto_compiler::hir::Ty::Unit,
+                                captures: Vec::new(),
+                                locals: Vec::new(),
+                                blocks: Vec::new(),
+                                entry: 0,
+                                body_span: toto_compiler::span::Span::new(0, 0),
+                            }),
+                        },
+                        captured: Vec::new(),
+                    })))
+                }
                 None => Ok(Value::Unit),
             }
         }

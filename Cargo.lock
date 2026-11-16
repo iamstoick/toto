@@ -517,6 +517,7 @@ name = "toto-cli"
 version = "0.1.0"
 dependencies = [
  "toto-compiler",
+ "toto-jit",
  "toto-runtime",
 ]
 

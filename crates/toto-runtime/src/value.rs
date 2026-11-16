@@ -64,6 +64,10 @@ impl RtVal {
                 Some(crate::heap::DescKind::Str) => "string",
                 Some(crate::heap::DescKind::Array) => "Array",
                 Some(crate::heap::DescKind::Struct) => "struct",
+                Some(crate::heap::DescKind::Range) => "Range",
+                Some(crate::heap::DescKind::Result) => "Result",
+                Some(crate::heap::DescKind::Option) => "Option",
+                Some(crate::heap::DescKind::Closure) => "function",
                 None => "unknown",
             },
             RtVal::Chan(_) => "chan",
@@ -75,11 +79,21 @@ impl RtVal {
 }
 
 /// Collect every heap reference reachable from `v` (through `Ok` /
-/// `Err` / `Some` wrappers). Used for root publication and gathering.
+/// `Err` / `Some` wrappers and closure captures). Used for root
+/// publication and gathering.
 pub fn heap_refs_of(v: &RtVal, out: &mut Vec<GcRef>) {
     match v {
         RtVal::Heap(r) => out.push(*r),
         RtVal::Ok(inner) | RtVal::Err(inner) | RtVal::Some(inner) => heap_refs_of(inner, out),
+        // Captures are shared references (spec §5.7): they stay alive
+        // as long as the closure does, even after the creating frame
+        // returns. (Phase 4 fix: previously missed, so an escaped
+        // closure's captures could be reclaimed under forced GC.)
+        RtVal::Closure(c) => {
+            for cap in &c.captured {
+                heap_refs_of(cap, out);
+            }
+        }
         _ => {}
     }
 }

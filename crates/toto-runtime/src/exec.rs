@@ -93,6 +93,14 @@ impl Frame {
     }
 }
 
+/// Native task entry (Phase 4 JIT): run compiled code in a fresh
+/// task instead of the MIR executor. Receives the task yielder (the
+/// same `ToSched`/`ToTask` protocol the executor speaks), an opaque
+/// context word owned by the native runtime, and the assigned task
+/// id and scope. Returns how the task finished. A plain `fn` pointer
+/// so the coroutine body holding it stays `'static`.
+pub type NativeEntry = fn(&Yielder<ToTask, ToSched>, u64, TaskId, ScopeId) -> TaskResult;
+
 /// What to run in a fresh task.
 pub enum Initial {
     /// `main` by function index (no arguments; the checker guarantees it).
@@ -104,6 +112,10 @@ pub enum Initial {
         blocks: Arc<[MBlock]>,
         captures: Vec<RtVal>,
     },
+    /// Native code (see `NativeEntry`). Dispatched in the coroutine
+    /// body before the executor exists; reaching `run_task` is a
+    /// harness bug reported as an internal error, never a crash.
+    Native { entry: NativeEntry, ctx: u64 },
 }
 
 pub struct Executor<'a> {
@@ -178,6 +190,20 @@ impl<'a> Executor<'a> {
                     body.body_span,
                     None,
                 );
+            }
+            // The coroutine body dispatches `Native` before the
+            // executor exists; reaching here is a harness bug. A
+            // total internal error, never a crash.
+            Initial::Native { .. } => {
+                return TaskResult::Panic {
+                    diag: Diag::new(
+                        "E0204",
+                        "internal error: native task reached the MIR executor (unreachable in checked programs)".to_string(),
+                        call_span,
+                        None,
+                    ),
+                    trace: std::mem::take(&mut self.trace),
+                };
             }
         }
         match self.loop_frames() {

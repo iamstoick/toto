@@ -129,11 +129,12 @@ fn sequential_matches_goldens_through_runtime() {
     // leaves the tree clean. It is the only file-writing program.
     let _ = std::fs::remove_file(corpus_root().join("interp").join("cli01_tmp.txt"));
     // Exact corpus census (update deliberately when the corpus changes:
-    // 36 status-0 + 3 status-1 runnable; 17 concurrent covered by
-    // `concurrent.rs`; diag10 excluded interpreter-only; 64 static
+    // 36 status-0 + 4 status-1 runnable (int04_modzero joined in
+    // Phase 4); 18 concurrent covered by `concurrent.rs` (conc18_fneq
+    // joined in Phase 4); diag10 excluded interpreter-only; 64 static
     // negatives asserted status-2 above).
-    assert_eq!(ran, 39, "sequential runnable count changed");
-    assert_eq!(skipped_concurrent, 17, "concurrent skip count changed");
+    assert_eq!(ran, 40, "sequential runnable count changed");
+    assert_eq!(skipped_concurrent, 18, "concurrent skip count changed");
     assert_eq!(static_failures, 64, "static negative count changed");
     assert!(
         failures.is_empty(),

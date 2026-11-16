@@ -54,6 +54,15 @@ pub enum ToSched {
         span: Span,
         scope: ScopeId,
     },
+    /// Native `go` body (Phase 4 JIT): spawn a task running compiled
+    /// code. Mirrors `Spawn` but carries a native entry + context
+    /// instead of MIR.
+    SpawnNative {
+        entry: crate::exec::NativeEntry,
+        ctx: u64,
+        span: Span,
+        scope: ScopeId,
+    },
     ChanNew {
         cap: Option<i64>,
         elem: Ty,
@@ -372,6 +381,15 @@ pub struct SchedState {
     /// True once some worker claimed deadlock reporting (exactly one
     /// E0216 outcome per run).
     pub deadlock_claimed: bool,
+    /// Completions whose settle cascade (`fail_scope` wakeups,
+    /// `on_task_done` propagation) is still in flight. A completion
+    /// that already decremented `live` but has not yet enqueued its
+    /// wakeups is invisible to the deadlock check — the same hazard
+    /// `PoolState::in_flight` covers for pool jobs — so the detector
+    /// treats a nonzero count as future work and defers instead of
+    /// claiming a bogus deadlock while a scope failure is still
+    /// propagating.
+    pub settling: usize,
 }
 
 /// Stop-the-world rendezvous state. A safepoint that needs collection
@@ -624,6 +642,7 @@ impl Scheduler {
                 workers_live: workers,
                 finished: false,
                 deadlock_claimed: false,
+                settling: 0,
             }),
             sched_cv: Condvar::new(),
             gc: Mutex::new(GcState {
@@ -699,8 +718,15 @@ impl Scheduler {
         let co =
             Coroutine::with_stack(stack, move |y: &Yielder<ToTask, ToSched>, _init: ToTask| {
                 let id = id_rx.recv().expect("task id assigned before first resume");
-                let exec = Executor::new(y, &code, &shared, scope, id);
-                exec.run_task(initial, span)
+                match initial {
+                    // Native tasks (Phase 4 JIT) run compiled code
+                    // with the same yielder protocol, no executor.
+                    Initial::Native { entry, ctx } => entry(y, ctx, id, scope),
+                    other => {
+                        let exec = Executor::new(y, &code, &shared, scope, id);
+                        exec.run_task(other, span)
+                    }
+                }
             });
         let mut sched = self.shared.sched.lock().expect("sched lock");
         let id = TaskId(sched.slots.len());
@@ -742,6 +768,64 @@ impl Scheduler {
         let id = self.spawn_task(0, "main".to_string(), root, Initial::Main(main_idx), span);
         self.shared.sched.lock().expect("sched lock").main_task = id;
         id
+    }
+
+    /// Spawn `main` as native code (Phase 4 JIT): like `spawn_main`
+    /// but the task runs `entry` with `ctx` instead of the MIR
+    /// executor.
+    pub fn spawn_native_main(
+        &self,
+        entry: crate::exec::NativeEntry,
+        ctx: u64,
+        span: Span,
+    ) -> TaskId {
+        let root = ScopeTable::root();
+        let id = self.spawn_task(
+            0,
+            "main".to_string(),
+            root,
+            Initial::Native { entry, ctx },
+            span,
+        );
+        self.shared.sched.lock().expect("sched lock").main_task = id;
+        id
+    }
+
+    /// Live task count for drain quiescence (Phase 4 dev): every task
+    /// whose slot is not `Done` — ready, running, and
+    /// suspended/parked tasks all count (a parked task still holds
+    /// live frames).
+    pub fn live_tasks(&self) -> usize {
+        let sched = self.shared.sched.lock().expect("sched lock");
+        sched
+            .slots
+            .iter()
+            .filter(|s| s.state != TaskState::Done)
+            .count()
+    }
+
+    /// Drain cancellation (Phase 4 dev): fail the root scope,
+    /// releasing every parked task in the run with cancellation
+    /// (send/recv/select/blocking — the same sweep as a task panic).
+    /// Running tasks fail fast at their next park op; tasks that
+    /// never suspend keep running (cooperative limit — the drain
+    /// timeout plus the dev restart fallback own that case).
+    pub fn cancel_all(&self) {
+        self.fail_scope(
+            0,
+            ScopeTable::root(),
+            Failure {
+                diag: Diag::new(
+                    "E0214",
+                    String::from(
+                        "drain cancelled: reload superseded this run (tasks released by cancellation)",
+                    ),
+                    Span::new(0, 0),
+                    None,
+                ),
+                trace: Vec::new(),
+            },
+        );
     }
 
     /// Conditionally wake another task: applies only while the task is
@@ -948,9 +1032,16 @@ impl Scheduler {
                                         .lock()
                                         .expect("done lock")
                                         .is_empty();
-                                    if !any_running && !pool_active {
-                                        // Nobody can run or wake: deadlock
-                                        // (spec §13.2). Exactly one worker
+                                    if !any_running && !pool_active && sched.settling == 0 {
+                                        // Nobody can run or wake, and no
+                                        // completion is still settling its
+                                        // wakeups: deadlock (spec §13.2).
+                                        // A nonzero `settling` count (like
+                                        // `pool.in_flight`) is future work:
+                                        // defer to the next pass instead of
+                                        // claiming while a scope failure is
+                                        // still propagating.
+                                        // Exactly one worker
                                         // claims the outcome; the rest see
                                         // `finished` and exit.
                                         if !sched.deadlock_claimed {
@@ -1190,6 +1281,28 @@ impl Scheduler {
                         blocks,
                         captures,
                     },
+                    span,
+                );
+                self.enqueue_on(worker, id, ToTask::Unit);
+            }
+            ToSched::SpawnNative {
+                entry,
+                ctx,
+                span,
+                scope,
+            } => {
+                let child = self
+                    .shared
+                    .scopes
+                    .lock()
+                    .expect("scopes lock")
+                    .new_scope(scope);
+                let n = self.shared.sched.lock().expect("sched lock").tasks_spawned;
+                self.spawn_task(
+                    worker,
+                    format!("go-{n}"),
+                    child,
+                    Initial::Native { entry, ctx },
                     span,
                 );
                 self.enqueue_on(worker, id, ToTask::Unit);
@@ -2058,6 +2171,10 @@ impl Scheduler {
                 slot.co = None;
                 slot.state = TaskState::Done;
                 sched.live -= 1;
+                // Open a settle: until the cascade below enqueues its
+                // wakeups, this completion is invisible to the deadlock
+                // check (closed by `settle_done` on every path).
+                sched.settling += 1;
             }
             sched.high_water_max = sched.high_water_max.max(hw);
             let scope = sched.slots[id.0].scope;
@@ -2087,13 +2204,24 @@ impl Scheduler {
             // Still run the settle cascade for clean completions.
             let scope = self.shared.sched.lock().expect("sched lock").slots[id.0].scope;
             self.on_task_done(worker, scope);
+            self.settle_done();
             return;
         }
         let scope = self.shared.sched.lock().expect("sched lock").slots[id.0].scope;
         self.on_task_done(worker, scope);
+        self.settle_done();
         // A finished task may unblock the world: wake sleepers so
         // termination/deadlock is re-evaluated promptly.
         self.shared.sched_cv.notify_all();
+    }
+
+    /// Close a settle opened in `task_done`: the cascade's wakeups are
+    /// all enqueued, so the deadlock check may decide again. Short
+    /// `sched`-lock section only (module lock discipline: no nesting).
+    fn settle_done(&self) {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        debug_assert!(sched.settling > 0, "settle_done without a settle");
+        sched.settling -= 1;
     }
 
     fn on_task_done(&self, worker: usize, scope: ScopeId) {

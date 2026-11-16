@@ -1,4 +1,4 @@
-//! MIR-subset → Cranelift gate compiler.
+//! MIR-subset → Cranelift backend (Phase 4, Stage 1).
 //!
 //! Compiles real `mir::lower` output for the Tier-2 gate. Every
 //! generated function takes the runtime context first (frozen
@@ -42,17 +42,25 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use cranelift_codegen::Context;
-use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, Signature, types::*};
+use cranelift_codegen::ir::{
+    AbiParam, Block, BlockArg, Endianness, InstBuilder, MemFlagsData, Signature, StackSlotData,
+    StackSlotKind, types::*,
+};
 use cranelift_codegen::isa::CallConv;
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId as ClFuncId, Linkage, Module};
 use toto_compiler::hir::Ty;
-use toto_compiler::mir::{MBinOp, MConst, MInstr, MProgram};
+use toto_compiler::mir::{MBinOp, MBlock, MConst, MInstr, MProgram, MSelectCase, MTerm, MirBody};
+use toto_compiler::span::Span;
 
-use crate::runtime::{E_DIV_ZERO, E_OVERFLOW, TAG_BOOL, TAG_FLOAT, TAG_HANDLE, TAG_INT, TAG_UNIT};
+use crate::runtime::{
+    E_DIV_ZERO, E_FALLOFF, E_INTERNAL, E_MISMATCH, E_OVERFLOW, TAG_BOOL, TAG_CHAN, TAG_FLOAT,
+    TAG_FN_ANY, TAG_HANDLE, TAG_INT, TAG_UNIT,
+};
 
 /// Gate boundary: MIR outside the supported subset.
 #[derive(Clone, Debug)]
@@ -63,7 +71,7 @@ pub struct SubsetError {
 
 impl fmt::Display for SubsetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "gate subset: {}: {}", self.func, self.message)
+        write!(f, "toto-jit refuse: {}: {}", self.func, self.message)
     }
 }
 
@@ -86,61 +94,234 @@ fn sig_arity(params: u32, returns: bool) -> Signature {
     sig
 }
 
+/// Codegen mode: diverging panics on a standalone context (gate
+/// harness) vs recording panics with suspension on scheduler tasks
+/// (production path). One mode per `Jit` session: import names are
+/// shared where the contract matches, but the implementations (and
+/// some signatures) differ by context type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CodegenMode {
+    Gate,
+    Task,
+}
+
+/// Cranelift optimization level for generated code (Phase 4, Stage 3:
+/// the minimal flagged pipeline — one flag, three levels, no passes
+/// of our own). `Off` is the default and preserves the exact
+/// Stage-1 gate behavior (`opt_level=none`); `Speed` and
+/// `SpeedAndSize` select Cranelift's corresponding pipelines. The
+/// level affects machine-code emission only: MIR, the value codec,
+/// entry points, and root publication are identical at every level
+/// (pinned by `opt.rs` equivalence).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OptLevel {
+    /// `opt_level=none`: fastest compile, Stage-1 behavior.
+    #[default]
+    Off,
+    /// `opt_level=speed`.
+    Speed,
+    /// `opt_level=speed_and_size`.
+    SpeedAndSize,
+}
+
+impl OptLevel {
+    /// The `opt_level` flag value for `JITBuilder::with_flags`.
+    fn flag(self) -> &'static str {
+        match self {
+            OptLevel::Off => "none",
+            OptLevel::Speed => "speed",
+            OptLevel::SpeedAndSize => "speed_and_size",
+        }
+    }
+
+    /// Parse a CLI/test flag value (`off`, `speed`, `speed_and_size`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(OptLevel::Off),
+            "speed" => Some(OptLevel::Speed),
+            "speed_and_size" => Some(OptLevel::SpeedAndSize),
+            _ => None,
+        }
+    }
+}
+
+/// What a lowered body is: top-level functions take `(ctx, args)`,
+/// closures take `(ctx, handle, args)`, go bodies take `(task_ctx)`.
+/// Only `Closure`/`Go` are ever collected (top-level functions are
+/// lowered directly, never through the body table).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BodyKind {
+    TopLevel,
+    Closure,
+    Go,
+}
+
+/// Borrowed body shape shared by top-level functions and nested
+/// bodies: the lowering core is identical; only the prologue differs
+/// (plain params vs handle/capture fetches).
+struct BodyShape<'a> {
+    name: &'a str,
+    params: &'a [(String, Ty)],
+    ret: &'a Ty,
+    locals: &'a [(String, Ty)],
+    blocks: &'a [MBlock],
+    entry: usize,
+    body_span: Span,
+    kind: BodyKind,
+    /// Capture slots appended after the params (nested bodies only).
+    ncaptures: usize,
+}
+
+/// Hidden body function name (the `$` suffix is unspellable in Toto
+/// source, so user functions can never collide with it).
+fn body_fn_name(id: u32) -> String {
+    format!("toto_body{id}$")
+}
+
 pub struct Jit {
     module: JITModule,
     imports: HashMap<&'static str, ClFuncId>,
     funcs: HashMap<String, ClFuncId>,
+    mode: CodegenMode,
+    /// Owned static bytes (string literals, struct/field/function
+    /// names, messages): addresses baked into generated code as
+    /// immediates, freed with the session (no leak, no rodata yet).
+    statics: Vec<Box<str>>,
+    /// Collected nested bodies: assigned ids during lowering,
+    /// compiled after their parents (fixpoint: bodies nest).
+    bodies: Vec<(u32, BodyKind, Arc<MirBody>)>,
+    next_body: u32,
+    /// Interned channel element types (append-only; ids index it).
+    chan_types: Vec<Ty>,
+    /// Per-function codegen times in definition order
+    /// (`(name, microseconds)`), for the compile-time report.
+    pub timings: Vec<(String, u64)>,
 }
 
 impl Jit {
     pub fn new() -> Result<Self, String> {
-        let mut jb = JITBuilder::new(cranelift_module::default_libcall_names())
-            .map_err(|e| e.to_string())?;
-        // Frozen entry points used by the gate (each takes ctx first).
-        jb.symbol(
-            "toto_alloc_array",
-            crate::runtime::toto_alloc_array as *const u8,
-        );
-        jb.symbol(
-            "toto_write_field",
-            crate::runtime::toto_write_field as *const u8,
-        );
-        jb.symbol(
-            "toto_read_field",
-            crate::runtime::toto_read_field as *const u8,
-        );
-        jb.symbol(
-            "toto_array_len",
-            crate::runtime::toto_array_len as *const u8,
-        );
-        jb.symbol(
-            "toto_alloc_str",
-            crate::runtime::toto_alloc_str as *const u8,
-        );
-        jb.symbol(
-            "toto_shadow_push",
-            crate::runtime::toto_shadow_push as *const u8,
-        );
-        jb.symbol(
-            "toto_shadow_len",
-            crate::runtime::toto_shadow_len as *const u8,
-        );
-        jb.symbol(
-            "toto_shadow_pop_to",
-            crate::runtime::toto_shadow_pop_to as *const u8,
-        );
-        jb.symbol(
-            "toto_gc_collect",
-            crate::runtime::toto_gc_collect as *const u8,
-        );
-        jb.symbol("toto_panic", crate::runtime::toto_panic as *const u8);
-        jb.symbol("toto_yield", crate::runtime::toto_yield as *const u8);
+        Self::with_mode_and_opt(CodegenMode::Gate, OptLevel::Off)
+    }
+
+    /// Task-mode session (production path): same import names where
+    /// the contract matches, recording panics, suspension support.
+    pub fn new_task() -> Result<Self, String> {
+        Self::with_mode_and_opt(CodegenMode::Task, OptLevel::Off)
+    }
+
+    /// Gate-mode session at an explicit optimization level.
+    pub fn new_with_opt(level: OptLevel) -> Result<Self, String> {
+        Self::with_mode_and_opt(CodegenMode::Gate, level)
+    }
+
+    /// Task-mode session at an explicit optimization level.
+    pub fn new_task_with_opt(level: OptLevel) -> Result<Self, String> {
+        Self::with_mode_and_opt(CodegenMode::Task, level)
+    }
+
+    fn with_mode_and_opt(mode: CodegenMode, opt: OptLevel) -> Result<Self, String> {
+        let mut jb = JITBuilder::with_flags(
+            &[("opt_level", opt.flag())],
+            cranelift_module::default_libcall_names(),
+        )
+        .map_err(|e| e.to_string())?;
+        // One symbol table per mode (each takes ctx first). Import
+        // names are shared where the contract matches; the Rust
+        // implementations differ by context type.
+        match mode {
+            CodegenMode::Gate => {
+                use crate::runtime as rt;
+                jb.symbol("toto_alloc_array", rt::toto_alloc_array as *const u8);
+                jb.symbol("toto_alloc_str", rt::toto_alloc_str as *const u8);
+                jb.symbol("toto_alloc_struct", rt::toto_alloc_struct as *const u8);
+                jb.symbol("toto_alloc_range", rt::toto_alloc_range as *const u8);
+                jb.symbol("toto_alloc_result", rt::toto_alloc_result as *const u8);
+                jb.symbol("toto_alloc_some", rt::toto_alloc_some as *const u8);
+                jb.symbol("toto_alloc_closure", rt::toto_alloc_closure as *const u8);
+                jb.symbol("toto_index_read", rt::toto_index_read as *const u8);
+                jb.symbol("toto_index_write", rt::toto_index_write as *const u8);
+                jb.symbol("toto_struct_init", rt::toto_struct_init as *const u8);
+                jb.symbol("toto_struct_get", rt::toto_struct_get as *const u8);
+                jb.symbol("toto_struct_set", rt::toto_struct_set as *const u8);
+                jb.symbol("toto_str_concat", rt::toto_str_concat as *const u8);
+                jb.symbol("toto_range_lo", rt::toto_range_lo as *const u8);
+                jb.symbol("toto_range_hi", rt::toto_range_hi as *const u8);
+                jb.symbol("toto_result_is_ok", rt::toto_result_is_ok as *const u8);
+                jb.symbol("toto_wrap_inner", rt::toto_wrap_inner as *const u8);
+                jb.symbol("toto_closure_body", rt::toto_closure_body as *const u8);
+                jb.symbol("toto_closure_cap", rt::toto_closure_cap as *const u8);
+                jb.symbol("toto_values_eq", rt::toto_values_eq as *const u8);
+                jb.symbol("toto_values_order", rt::toto_values_order as *const u8);
+                jb.symbol("toto_builtin", rt::toto_builtin as *const u8);
+                jb.symbol("toto_len", rt::toto_len as *const u8);
+                jb.symbol("toto_func_entry", rt::toto_func_entry as *const u8);
+                jb.symbol("toto_body_entry", rt::toto_body_entry as *const u8);
+                jb.symbol("toto_shadow_push", rt::toto_shadow_push as *const u8);
+                jb.symbol("toto_shadow_len", rt::toto_shadow_len as *const u8);
+                jb.symbol("toto_shadow_pop_to", rt::toto_shadow_pop_to as *const u8);
+                jb.symbol("toto_gc_collect", rt::toto_gc_collect as *const u8);
+                jb.symbol("toto_panic", rt::toto_panic as *const u8);
+            }
+            CodegenMode::Task => {
+                use crate::task as rt;
+                jb.symbol("toto_alloc_array", rt::task_alloc_array as *const u8);
+                jb.symbol("toto_alloc_str", rt::task_alloc_str as *const u8);
+                jb.symbol("toto_alloc_struct", rt::task_alloc_struct as *const u8);
+                jb.symbol("toto_alloc_range", rt::task_alloc_range as *const u8);
+                jb.symbol("toto_alloc_result", rt::task_alloc_result as *const u8);
+                jb.symbol("toto_alloc_some", rt::task_alloc_some as *const u8);
+                jb.symbol("toto_alloc_closure", rt::task_alloc_closure as *const u8);
+                jb.symbol("toto_index_read", rt::task_index_read as *const u8);
+                jb.symbol("toto_index_write", rt::task_index_write as *const u8);
+                jb.symbol("toto_struct_init", rt::task_struct_init as *const u8);
+                jb.symbol("toto_struct_get", rt::task_struct_get as *const u8);
+                jb.symbol("toto_struct_set", rt::task_struct_set as *const u8);
+                jb.symbol("toto_str_concat", rt::task_str_concat as *const u8);
+                jb.symbol("toto_range_lo", rt::task_range_lo as *const u8);
+                jb.symbol("toto_range_hi", rt::task_range_hi as *const u8);
+                jb.symbol("toto_result_is_ok", rt::task_result_is_ok as *const u8);
+                jb.symbol("toto_wrap_inner", rt::task_wrap_inner as *const u8);
+                jb.symbol("toto_closure_body", rt::task_closure_body as *const u8);
+                jb.symbol("toto_closure_cap", rt::task_closure_cap as *const u8);
+                jb.symbol("toto_values_eq", rt::task_values_eq as *const u8);
+                jb.symbol("toto_values_order", rt::task_values_order as *const u8);
+                jb.symbol("toto_builtin", rt::task_builtin as *const u8);
+                jb.symbol("toto_len", rt::task_len as *const u8);
+                jb.symbol("toto_func_entry", rt::task_func_entry as *const u8);
+                jb.symbol("toto_body_entry", rt::task_body_entry as *const u8);
+                jb.symbol("toto_shadow_push", rt::task_shadow_push as *const u8);
+                jb.symbol("toto_shadow_len", rt::task_shadow_len as *const u8);
+                jb.symbol("toto_shadow_pop_to", rt::task_shadow_pop_to as *const u8);
+                jb.symbol("toto_gc_collect", rt::task_gc_collect as *const u8);
+                jb.symbol("toto_panic", rt::task_panic as *const u8);
+                jb.symbol("toto_yield", rt::task_yield as *const u8);
+                jb.symbol("toto_spawn", rt::task_spawn as *const u8);
+                jb.symbol("toto_chan_make", rt::task_chan_make as *const u8);
+                jb.symbol("toto_check_failed", rt::task_check_failed as *const u8);
+                jb.symbol("toto_task_capture", rt::task_capture as *const u8);
+            }
+        }
         let module = JITModule::new(jb);
         Ok(Self {
             module,
             imports: HashMap::new(),
             funcs: HashMap::new(),
+            mode,
+            statics: Vec::new(),
+            bodies: Vec::new(),
+            next_body: 0,
+            chan_types: Vec::new(),
+            timings: Vec::new(),
         })
+    }
+
+    /// Intern owned static bytes, returning the baked address.
+    fn intern(&mut self, s: &str) -> (u64, u64) {
+        let boxed: Box<str> = s.into();
+        let ptr = boxed.as_ptr() as u64;
+        let len = boxed.len() as u64;
+        self.statics.push(boxed);
+        (ptr, len)
     }
 
     fn import(&mut self, name: &'static str, params: u32, returns: bool) -> ClFuncId {
@@ -157,22 +338,95 @@ impl Jit {
     }
 
     fn declare_runtime(&mut self) {
+        // Arity is words after ctx; `returns` matches the registered
+        // implementation (gate `toto_panic` diverges, task records).
         self.import("toto_alloc_array", 3, true);
-        self.import("toto_write_field", 6, false);
-        self.import("toto_read_field", 4, true);
-        self.import("toto_array_len", 3, true);
         self.import("toto_alloc_str", 4, true);
+        self.import("toto_alloc_struct", 4, true);
+        self.import("toto_alloc_range", 2, true);
+        self.import("toto_alloc_result", 5, true);
+        self.import("toto_alloc_some", 4, true);
+        self.import("toto_alloc_closure", 5, true);
+        self.import("toto_index_read", 8, true);
+        self.import("toto_index_write", 10, true);
+        self.import("toto_struct_init", 7, true);
+        self.import("toto_struct_get", 5, true);
+        self.import("toto_struct_set", 7, true);
+        self.import("toto_str_concat", 4, true);
+        self.import("toto_range_lo", 3, true);
+        self.import("toto_range_hi", 3, true);
+        self.import("toto_result_is_ok", 3, true);
+        self.import("toto_wrap_inner", 3, true);
+        self.import("toto_closure_body", 3, true);
+        self.import("toto_closure_cap", 4, true);
+        self.import("toto_values_eq", 7, true);
+        self.import("toto_values_order", 7, true);
+        self.import("toto_builtin", 5, true);
+        self.import("toto_len", 4, true);
+        self.import("toto_func_entry", 3, true);
+        self.import("toto_body_entry", 3, true);
         self.import("toto_shadow_push", 1, false);
         self.import("toto_shadow_len", 0, true);
         self.import("toto_shadow_pop_to", 1, false);
         self.import("toto_gc_collect", 0, true);
-        self.import("toto_panic", 5, false);
-        self.import("toto_yield", 0, true);
+        self.import("toto_panic", 5, self.mode == CodegenMode::Task);
+        if self.mode == CodegenMode::Task {
+            self.import("toto_yield", 8, true);
+            self.import("toto_spawn", 5, true);
+            self.import("toto_chan_make", 5, true);
+            self.import("toto_check_failed", 4, true);
+            self.import("toto_task_capture", 3, true);
+        }
     }
 
-    /// Compile every function in a real MIR program (two passes:
-    /// declare all, then define all — recursion and any call order).
+    /// Compile every function in a real MIR program (gate mode).
     pub fn compile(&mut self, prog: &MProgram) -> Result<(), SubsetError> {
+        if self.mode != CodegenMode::Gate {
+            return Err(SubsetError {
+                func: String::from("<module>"),
+                message: String::from("compile() needs a gate session (Jit::new)"),
+            });
+        }
+        self.compile_program(prog)
+    }
+
+    /// Compile every function in a real MIR program (task mode),
+    /// returning the shared tables the runner and spawns need.
+    pub fn compile_task(
+        &mut self,
+        prog: &MProgram,
+    ) -> Result<crate::task::JitSession, SubsetError> {
+        if self.mode != CodegenMode::Task {
+            return Err(SubsetError {
+                func: String::from("<module>"),
+                message: String::from("compile_task() needs a task session (Jit::new_task)"),
+            });
+        }
+        self.compile_program(prog)?;
+        let mut entries = HashMap::new();
+        for f in &prog.fns {
+            entries.insert(f.name.clone(), self.ptr(&f.name) as usize);
+        }
+        let mut bodies = HashMap::new();
+        for (id, _, _) in &self.bodies {
+            let name = body_fn_name(*id);
+            bodies.insert(*id, self.ptr(&name) as usize);
+        }
+        let func_names = prog.fns.iter().map(|f| f.name.clone()).collect();
+        Ok(crate::task::JitSession {
+            entries: Arc::new(entries),
+            bodies: Arc::new(bodies),
+            func_names: Arc::new(func_names),
+            chan_types: Arc::new(std::mem::take(&mut self.chan_types)),
+            statics: Arc::new(std::mem::take(&mut self.statics)),
+        })
+    }
+
+    /// Shared driver: declare tops, lower tops (collecting nested
+    /// bodies), compile bodies to fixpoint (bodies nest), finalize.
+    /// Records per-function codegen times. A failed compile leaves
+    /// the session dirty; start a new one (same as the gate).
+    fn compile_program(&mut self, prog: &MProgram) -> Result<(), SubsetError> {
         self.declare_runtime();
         for f in &prog.fns {
             let sig = sig_arity(f.params.len() as u32, true);
@@ -185,29 +439,38 @@ impl Jit {
                 })?;
             self.funcs.insert(f.name.clone(), id);
         }
-        for f in &prog.fns {
-            let cl_id = self.funcs[&f.name];
-            let mut ctx = Context::new();
-            ctx.func.signature = sig_arity(f.params.len() as u32, true);
-            let mut fctx = FunctionBuilderContext::new();
-            {
-                let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-                let entry = b.create_block();
-                b.append_block_params_for_function_params(entry);
-                b.switch_to_block(entry);
-                b.seal_block(entry);
-                let params = b.block_params(entry).to_vec();
-                let mut cx = FnCx::new(&f.name, params);
-                cx.lower_fn(self, &mut b, prog, f)?;
-                let frontend_config = self.module.isa().frontend_config();
-                b.finalize(frontend_config);
+        for fi in 0..prog.fns.len() {
+            self.define_top(prog, fi)?;
+        }
+        let mut done = 0usize;
+        while done < self.bodies.len() {
+            let pending: Vec<(u32, BodyKind, Arc<MirBody>)> = self.bodies[done..].to_vec();
+            for (id, kind, body) in &pending {
+                let nparams = match kind {
+                    BodyKind::Closure => body.params.len() + 1,
+                    BodyKind::Go => 0,
+                    BodyKind::TopLevel => {
+                        return Err(SubsetError {
+                            func: body_fn_name(*id),
+                            message: String::from("top-level body in the body table (unreachable)"),
+                        });
+                    }
+                };
+                let name = body_fn_name(*id);
+                let sig = sig_arity(nparams as u32, true);
+                let cl_id = self
+                    .module
+                    .declare_function(&name, Linkage::Export, &sig)
+                    .map_err(|e| SubsetError {
+                        func: name.clone(),
+                        message: format!("declare failed: {e}"),
+                    })?;
+                self.funcs.insert(name, cl_id);
             }
-            self.module
-                .define_function(cl_id, &mut ctx)
-                .map_err(|e| SubsetError {
-                    func: f.name.clone(),
-                    message: format!("define failed: {e}"),
-                })?;
+            for (id, kind, body) in &pending {
+                self.define_body(prog, *id, *kind, body)?;
+            }
+            done += pending.len();
         }
         self.module
             .finalize_definitions()
@@ -218,12 +481,123 @@ impl Jit {
         Ok(())
     }
 
+    fn define_top(&mut self, prog: &MProgram, fi: usize) -> Result<(), SubsetError> {
+        let f = &prog.fns[fi];
+        let cl_id = self.funcs[&f.name];
+        let mut ctx = Context::new();
+        ctx.func.signature = sig_arity(f.params.len() as u32, true);
+        let mut fctx = FunctionBuilderContext::new();
+        let shape = BodyShape {
+            name: &f.name,
+            params: &f.params,
+            ret: &f.ret,
+            locals: &f.locals,
+            blocks: &f.blocks,
+            entry: f.entry,
+            body_span: f.body_span,
+            kind: BodyKind::TopLevel,
+            ncaptures: 0,
+        };
+        self.define_common(prog, &f.name, cl_id, shape, &mut ctx, &mut fctx)
+    }
+
+    fn define_body(
+        &mut self,
+        prog: &MProgram,
+        id: u32,
+        kind: BodyKind,
+        body: &MirBody,
+    ) -> Result<(), SubsetError> {
+        if self.mode == CodegenMode::Gate && kind == BodyKind::Go {
+            return Err(SubsetError {
+                func: body_fn_name(id),
+                message: String::from("go bodies need a task session (concurrency is task-only)"),
+            });
+        }
+        let name = body_fn_name(id);
+        let cl_id = self.funcs[&name];
+        let nparams = match kind {
+            BodyKind::Closure => body.params.len() + 1,
+            BodyKind::Go => 0,
+            BodyKind::TopLevel => {
+                return Err(SubsetError {
+                    func: name.clone(),
+                    message: String::from("top-level body in the body table (unreachable)"),
+                });
+            }
+        };
+        let mut ctx = Context::new();
+        ctx.func.signature = sig_arity(nparams as u32, true);
+        let mut fctx = FunctionBuilderContext::new();
+        let shape = BodyShape {
+            name: &name,
+            params: &body.params,
+            ret: &body.ret,
+            locals: &body.locals,
+            blocks: &body.blocks,
+            entry: body.entry,
+            body_span: body.body_span,
+            kind,
+            ncaptures: body.captures.len(),
+        };
+        self.define_common(prog, &name, cl_id, shape, &mut ctx, &mut fctx)
+    }
+
+    /// Lower one body behind the totality seatbelt, define it, and
+    /// record its codegen time.
+    fn define_common(
+        &mut self,
+        prog: &MProgram,
+        name: &str,
+        cl_id: ClFuncId,
+        shape: BodyShape<'_>,
+        ctx: &mut Context,
+        fctx: &mut FunctionBuilderContext,
+    ) -> Result<(), SubsetError> {
+        let t0 = std::time::Instant::now();
+        // Seatbelt: cranelift_frontend panics (rather than errors) on
+        // malformed input such as use-before-def; checked MIR cannot
+        // produce it, but the compiler stays total regardless.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b = FunctionBuilder::new(&mut ctx.func, fctx);
+            FnCx::lower(self, &mut b, prog, shape)?;
+            let frontend_config = self.module.isa().frontend_config();
+            b.finalize(frontend_config);
+            Ok(())
+        }));
+        let r = match r {
+            Ok(r) => r,
+            Err(_) => Err(SubsetError {
+                func: name.to_string(),
+                message: String::from("invalid MIR input (use before definition?)"),
+            }),
+        };
+        r?;
+        self.module
+            .define_function(cl_id, ctx)
+            .map_err(|e| SubsetError {
+                func: name.to_string(),
+                message: format!("define failed: {e}"),
+            })?;
+        let dt = t0.elapsed().as_micros() as u64;
+        self.timings.push((name.to_string(), dt));
+        Ok(())
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.funcs.contains_key(name)
     }
 
     pub fn ptr(&self, name: &str) -> *const u8 {
         self.module.get_finalized_function(self.funcs[name])
+    }
+
+    /// Finalized body entry points by body id (for harness wiring).
+    pub fn body_entries(&self) -> Vec<(u32, *const u8)> {
+        self.bodies
+            .iter()
+            .map(|(id, _, _)| (*id, self.ptr(&body_fn_name(*id))))
+            .collect()
     }
 
     /// Call a finalized gate function: `(ctx, args...) -> u64`.
@@ -259,38 +633,43 @@ impl Jit {
     }
 }
 
-/// Per-function lowering state: MIR local → CLIF value, handle-typed
-/// locals (for publication), and the shadow base.
-struct FnCx {
+/// Per-body lowering state: MIR locals lower to Cranelift variables
+/// (MIR is not SSA), handle-typed locals publish at safepoints, and
+/// the shadow base scopes the epilogue.
+struct FnCx<'a> {
+    /// Error context: body name for `SubsetError`.
     func: String,
-    ctx: cranelift_codegen::ir::Value,
-    values: HashMap<usize, cranelift_codegen::ir::Value>,
+    mode: CodegenMode,
+    ctx: CVal,
+    locals: &'a [(String, Ty)],
+    /// MIR local id → variable (all `I64`).
+    vars: Vec<Variable>,
     /// Locals whose `Ty` is heap-managed (published at safepoints).
     handle_locals: HashMap<usize, ()>,
+    /// MIR block id → CLIF block.
+    blocks: HashMap<usize, Block>,
     /// Shadow depth at entry (epilogue pops to it).
-    base: Option<cranelift_codegen::ir::Value>,
+    base: Option<CVal>,
     /// `FuncRef` resolutions seen so far: MIR local → program fn index.
     funcrefs: HashMap<usize, usize>,
+    body_span: Span,
 }
 
 type CVal = cranelift_codegen::ir::Value;
 
-impl FnCx {
-    fn new(func: &str, params: Vec<CVal>) -> Self {
-        let ctx = params[0];
-        let mut values = HashMap::new();
-        // Parameters are locals `0..params.len()-1` (ctx is not a MIR
-        // local); all are defined from function entry.
-        for (i, v) in params.iter().skip(1).enumerate() {
-            values.insert(i, *v);
-        }
+impl<'a> FnCx<'a> {
+    fn new(shape: &BodyShape<'a>, mode: CodegenMode, ctx: CVal) -> Self {
         Self {
-            func: func.to_string(),
+            func: shape.name.to_string(),
+            mode,
             ctx,
-            values,
+            locals: shape.locals,
+            vars: Vec::new(),
             handle_locals: HashMap::new(),
+            blocks: HashMap::new(),
             base: None,
             funcrefs: HashMap::new(),
+            body_span: shape.body_span,
         }
     }
 
@@ -301,13 +680,8 @@ impl FnCx {
         })
     }
 
-    fn local_ty<'p>(
-        &self,
-        _prog: &'p MProgram,
-        f: &'p toto_compiler::mir::MFn,
-        local: usize,
-    ) -> Result<&'p Ty, SubsetError> {
-        f.locals
+    fn local_ty(&self, local: usize) -> Result<&Ty, SubsetError> {
+        self.locals
             .get(local)
             .map(|(_, ty)| ty)
             .ok_or_else(|| SubsetError {
@@ -317,14 +691,24 @@ impl FnCx {
     }
 
     /// Trafficable types: immediates traffic as bit patterns, heap
-    /// families as the handle codec. Returns true for handle types.
-    /// Anything else is out of subset (the gate refuses rather than
-    /// miscompiling a representation).
+    /// families as the handle codec, channels as scheduler ids,
+    /// functions as indices or closure handles. Returns true for
+    /// handle types (published at safepoints). `Fn` is conservatively
+    /// a handle (it may hold a closure; plain indices publish
+    /// harmlessly since they never resolve); channels are
+    /// scheduler-owned and never published. `Map` is refused: it has
+    /// values only as a type, never at runtime.
     fn trafficable(ty: &Ty) -> Result<bool, String> {
         match ty {
-            Ty::Int | Ty::Float | Ty::Bool | Ty::Unit => Ok(false),
-            Ty::String | Ty::Array(_) | Ty::Struct(_) => Ok(true),
-            other => Err(format!("type {other:?} is out of gate subset")),
+            Ty::Int | Ty::Float | Ty::Bool | Ty::Unit | Ty::Chan(_) => Ok(false),
+            Ty::String
+            | Ty::Array(_)
+            | Ty::Struct(_)
+            | Ty::Range
+            | Ty::Result(..)
+            | Ty::Option(_)
+            | Ty::Fn(..) => Ok(true),
+            Ty::Map(..) => Err(format!("type {ty:?} has no runtime values")),
         }
     }
 
@@ -332,9 +716,10 @@ impl FnCx {
         b.ins().iconst(I64, v)
     }
 
-    /// Branch to a `toto_panic` block when `cond` is nonzero; the
-    /// panic block diverges, so control continues in a fresh block.
-    /// No trap instruction: the unreachable path returns a dummy.
+    /// Branch to a `toto_panic` block when `cond` is nonzero; control
+    /// continues in a fresh block. Gate panics diverge there, task
+    /// panics record and return a dummy word (the caller unwinds via
+    /// the sentinel protocol). No trap instruction anywhere.
     fn emit_check(
         jit: &mut Jit,
         b: &mut FunctionBuilder<'_>,
@@ -343,6 +728,24 @@ impl FnCx {
         code: u64,
         span: (u64, u64),
         msg: &'static str,
+    ) {
+        let msg_ptr = Self::iconst(b, msg.as_ptr() as u64 as i64);
+        let msg_len = Self::iconst(b, msg.len() as i64);
+        Self::emit_check_raw(jit, b, ctx, cond, code, span, msg_ptr, msg_len);
+    }
+
+    /// `emit_check` with a baked message address (interned dynamic
+    /// messages, e.g. type-mismatch wordings).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_check_raw(
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        ctx: CVal,
+        cond: CVal,
+        code: u64,
+        span: (u64, u64),
+        msg_ptr: CVal,
+        msg_len: CVal,
     ) {
         use cranelift_codegen::ir::condcodes::IntCC::*;
         // Strict statement sequencing throughout this file: no nested
@@ -360,12 +763,11 @@ impl FnCx {
         let code_v = Self::iconst(b, code as i64);
         let start_v = Self::iconst(b, span.0 as i64);
         let end_v = Self::iconst(b, span.1 as i64);
-        let msg_ptr = Self::iconst(b, msg.as_ptr() as u64 as i64);
-        let msg_len = Self::iconst(b, msg.len() as i64);
         b.ins()
             .call(callee, &[ctx, code_v, start_v, end_v, msg_ptr, msg_len]);
-        // Unreachable (`toto_panic` diverges): return a dummy so the
-        // block is terminated without any trap instruction.
+        // Unreachable at runtime (gate diverges, task unwinds from
+        // here): return a dummy so the block is terminated without
+        // any trap instruction.
         let dummy = Self::iconst(b, 0);
         let ret = [dummy];
         b.ins().return_(&ret);
@@ -374,99 +776,820 @@ impl FnCx {
     }
 
     /// Push every defined handle local (conservative publication).
-    fn publish_all(
-        jit: &mut Jit,
-        b: &mut FunctionBuilder<'_>,
-        ctx: CVal,
-        values: &HashMap<usize, CVal>,
-        handle_locals: &HashMap<usize, ()>,
-    ) {
-        let mut ids: Vec<usize> = handle_locals.keys().copied().collect();
+    /// Handle variables are zero-initialized in the prologue, so every
+    /// variable here is always defined: undefined-on-a-path locals
+    /// publish the null word, which the collector skips (it never
+    /// resolves).
+    fn publish_all(&self, jit: &mut Jit, b: &mut FunctionBuilder<'_>) -> Result<(), SubsetError> {
+        let mut ids: Vec<usize> = self.handle_locals.keys().copied().collect();
         ids.sort();
         for id in ids {
-            if let Some(v) = values.get(&id) {
-                let callee = jit
-                    .module
-                    .declare_func_in_func(jit.imports["toto_shadow_push"], b.func);
-                b.ins().call(callee, &[ctx, *v]);
-            }
+            let v = self.operand(b, id)?;
+            self.call_import(jit, b, "toto_shadow_push", &[self.ctx, v])?;
         }
+        Ok(())
     }
 
-    /// Lower one function body (single block + `Return` only).
-    fn lower_fn(
-        &mut self,
+    /// Lower one body (multi-block): declare variables, emit the
+    /// prologue (params, captures, shadow base), lower each block,
+    /// terminate with the MIR terminators.
+    fn lower(
         jit: &mut Jit,
         b: &mut FunctionBuilder<'_>,
         prog: &MProgram,
-        f: &toto_compiler::mir::MFn,
+        shape: BodyShape<'_>,
     ) -> Result<(), SubsetError> {
-        use toto_compiler::mir::MTerm;
-        if f.blocks.len() != 1 {
-            return self.fail(format!(
-                "function has {} blocks (gate supports single-block bodies)",
-                f.blocks.len()
-            ));
+        Self::check_defined(&shape)?;
+        for (i, (_, ty)) in shape.locals.iter().enumerate() {
+            if let Err(e) = Self::trafficable(ty) {
+                return Err(SubsetError {
+                    func: shape.name.to_string(),
+                    message: format!("local {i}: {e}"),
+                });
+            }
         }
-        let block = &f.blocks[0];
-        if block.id != f.entry {
-            return self.fail(String::from("entry is not the only block"));
+        if Self::trafficable(shape.ret).is_err() {
+            return Err(SubsetError {
+                func: shape.name.to_string(),
+                message: format!("return type {:?} has no runtime values", shape.ret),
+            });
         }
-        // Return type must traffic.
-        if Self::trafficable(&f.ret).is_err() {
-            return self.fail(format!("return type {:?} is out of gate subset", f.ret));
+        // Map MIR blocks to CLIF blocks (entry first: it carries the
+        // function params).
+        let entry_block = b.create_block();
+        b.append_block_params_for_function_params(entry_block);
+        let params = b.block_params(entry_block).to_vec();
+        let ctx = params.first().copied().ok_or_else(|| SubsetError {
+            func: shape.name.to_string(),
+            message: String::from("missing ctx block parameter (unreachable)"),
+        })?;
+        let mut cx = FnCx::new(&shape, jit.mode, ctx);
+        cx.blocks.insert(shape.entry, entry_block);
+        for blk in shape.blocks {
+            if blk.id == shape.entry {
+                continue;
+            }
+            if cx.blocks.contains_key(&blk.id) {
+                return cx.fail(format!("duplicate block id {}", blk.id));
+            }
+            let cb = b.create_block();
+            cx.blocks.insert(blk.id, cb);
         }
-        // Mark handle-typed params (pre-defined locals).
-        for (i, (_, ty)) in f.params.iter().enumerate() {
-            match Self::trafficable(ty) {
-                Ok(true) => {
-                    self.handle_locals.insert(i, ());
+        // Declare one variable per local (index order = declaration
+        // order, matching `cx.vars`).
+        for _ in 0..shape.locals.len() {
+            let var = b.declare_var(I64);
+            cx.vars.push(var);
+        }
+        // Mark handle-typed locals for publication.
+        for (i, (_, ty)) in shape.locals.iter().enumerate() {
+            if Self::trafficable(ty).expect("validated above") {
+                cx.handle_locals.insert(i, ());
+            }
+        }
+        // Prologue in the entry block, then its body.
+        b.switch_to_block(entry_block);
+        cx.prologue(jit, b, &shape, &params)?;
+        let entry_mir = shape
+            .blocks
+            .iter()
+            .find(|blk| blk.id == shape.entry)
+            .ok_or_else(|| SubsetError {
+                func: shape.name.to_string(),
+                message: String::from("entry block missing from body (unreachable)"),
+            })?;
+        for (i, instr) in entry_mir.instrs.iter().enumerate() {
+            cx.lower_instr(jit, b, prog, &entry_mir.instrs, i, instr)?;
+        }
+        cx.lower_term(jit, b, prog, &shape, &entry_mir.term)?;
+        for blk in shape.blocks {
+            if blk.id == shape.entry {
+                continue;
+            }
+            let cb = cx.blocks[&blk.id];
+            b.switch_to_block(cb);
+            for (i, instr) in blk.instrs.iter().enumerate() {
+                cx.lower_instr(jit, b, prog, &blk.instrs, i, instr)?;
+            }
+            cx.lower_term(jit, b, prog, &shape, &blk.term)?;
+        }
+        // MIR block order is not topological (loop back-edges and
+        // short-circuit joins jump to earlier blocks), so no MIR
+        // block is sealed until every branch is emitted; internal
+        // helper blocks stay eagerly sealed (self-contained).
+        b.seal_all_blocks();
+        Ok(())
+    }
+
+    /// Every local read anywhere in the body must be defined somewhere
+    /// (params, capture slots, or an instruction destination). This
+    /// catches malformed input cleanly; dominance itself holds by
+    /// construction (checked MIR) and is guarded by the seatbelt.
+    fn check_defined(shape: &BodyShape<'_>) -> Result<(), SubsetError> {
+        let mut defined = vec![false; shape.locals.len()];
+        for i in 0..shape.params.len() + shape.ncaptures {
+            if i < defined.len() {
+                defined[i] = true;
+            }
+        }
+        for blk in shape.blocks {
+            for instr in &blk.instrs {
+                for d in Self::defs_of(instr) {
+                    if d < defined.len() {
+                        defined[d] = true;
+                    }
                 }
-                Ok(false) => {}
-                Err(e) => return self.fail(format!("param {i}: {e}")),
             }
         }
-        // Prologue: record the shadow base (epilogue pops to it).
-        let callee = jit
-            .module
-            .declare_func_in_func(jit.imports["toto_shadow_len"], b.func);
-        let inst = b.ins().call(callee, &[self.ctx]);
-        self.base = Some(b.inst_results(inst)[0]);
-        for (i, instr) in block.instrs.iter().enumerate() {
-            self.lower_instr(jit, b, prog, f, &block.instrs, i, instr)?;
-        }
-        match &block.term {
-            MTerm::Return(Some(local)) => {
-                let v = self.operand(*local)?;
-                let callee = jit
-                    .module
-                    .declare_func_in_func(jit.imports["toto_shadow_pop_to"], b.func);
-                let base = self.base.expect("prologue recorded base");
-                b.ins().call(callee, &[self.ctx, base]);
-                b.ins().return_(&[v]);
+        let fail = |local: usize| SubsetError {
+            func: shape.name.to_string(),
+            message: format!("local {local} used before definition"),
+        };
+        for blk in shape.blocks {
+            for instr in &blk.instrs {
+                for u in Self::uses_of(instr) {
+                    if u >= defined.len() || !defined[u] {
+                        return Err(fail(u));
+                    }
+                }
             }
-            MTerm::Return(None) => {
-                let callee = jit
-                    .module
-                    .declare_func_in_func(jit.imports["toto_shadow_pop_to"], b.func);
-                let base = self.base.expect("prologue recorded base");
-                b.ins().call(callee, &[self.ctx, base]);
-                let z = Self::iconst(b, 0);
-                let ret = [z];
-                b.ins().return_(&ret);
-            }
-            other => {
-                return self.fail(format!("terminator {other:?} is out of gate subset"));
+            for u in Self::term_uses(&blk.term) {
+                if u >= defined.len() || !defined[u] {
+                    return Err(fail(u));
+                }
             }
         }
         Ok(())
     }
 
-    fn operand(&self, local: usize) -> Result<CVal, SubsetError> {
-        self.values.get(&local).copied().ok_or_else(|| SubsetError {
+    /// Every local an instruction defines (destinations, split bounds,
+    /// select binds — binds are defined by the lowering right after
+    /// the suspending call, ahead of the dispatch branches).
+    fn defs_of(instr: &MInstr) -> Vec<usize> {
+        match instr {
+            MInstr::Const { dst, .. }
+            | MInstr::Copy { dst, .. }
+            | MInstr::Bin { dst, .. }
+            | MInstr::Neg { dst, .. }
+            | MInstr::Not { dst, .. }
+            | MInstr::FuncRef { dst, .. }
+            | MInstr::StructLit { dst, .. }
+            | MInstr::ArrayLit { dst, .. }
+            | MInstr::Snapshot { dst, .. }
+            | MInstr::RangeLit { dst, .. }
+            | MInstr::WrapOk { dst, .. }
+            | MInstr::WrapErr { dst, .. }
+            | MInstr::WrapSome { dst, .. }
+            | MInstr::Propagate { dst, .. }
+            | MInstr::Field { dst, .. }
+            | MInstr::Index { dst, .. }
+            | MInstr::Len { dst, .. }
+            | MInstr::SatIncr { dst, .. }
+            | MInstr::MakeClosure { dst, .. }
+            | MInstr::ChanNew { dst, .. }
+            | MInstr::Recv { dst, .. } => vec![*dst],
+            MInstr::Call { dst, .. } | MInstr::CallBuiltin { dst, .. } => {
+                dst.iter().copied().collect()
+            }
+            MInstr::SplitRange { lo, hi, .. } => vec![*lo, *hi],
+            MInstr::Select { dst, cases, .. } => {
+                let mut out = vec![*dst];
+                for case in cases {
+                    if let MSelectCase::Recv { bind: Some(b), .. } = case {
+                        out.push(*b);
+                    }
+                }
+                out
+            }
+            MInstr::DivCheck { .. }
+            | MInstr::Send { .. }
+            | MInstr::Spawn { .. }
+            | MInstr::StoreField { .. }
+            | MInstr::StoreIndex { .. }
+            | MInstr::Safepoint { .. } => Vec::new(),
+        }
+    }
+
+    /// Every local an instruction reads.
+    fn uses_of(instr: &MInstr) -> Vec<usize> {
+        match instr {
+            MInstr::Copy { src, .. }
+            | MInstr::Neg { operand: src, .. }
+            | MInstr::Not { operand: src, .. }
+            | MInstr::DivCheck { value: src, .. }
+            | MInstr::Snapshot { base: src, .. }
+            | MInstr::WrapOk { inner: src, .. }
+            | MInstr::WrapErr { inner: src, .. }
+            | MInstr::WrapSome { inner: src, .. }
+            | MInstr::Propagate { operand: src, .. }
+            | MInstr::Field { base: src, .. }
+            | MInstr::Len { base: src, .. }
+            | MInstr::SatIncr { operand: src, .. }
+            | MInstr::Recv { chan: src, .. } => vec![*src],
+            MInstr::Bin { l, r, .. } | MInstr::RangeLit { lo: l, hi: r, .. } => vec![*l, *r],
+            MInstr::SplitRange { range, .. } => vec![*range],
+            MInstr::Index { base, index, .. } => vec![*base, *index],
+            MInstr::StoreField { base, value, .. } => vec![*base, *value],
+            MInstr::StoreIndex {
+                base, index, value, ..
+            } => vec![*base, *index, *value],
+            MInstr::Call { func, args, .. } => {
+                let mut out = vec![*func];
+                out.extend(args.iter().copied());
+                out
+            }
+            MInstr::CallBuiltin { args, .. } => args.clone(),
+            MInstr::StructLit { fields, .. } => fields.iter().map(|(_, l)| *l).collect(),
+            MInstr::ArrayLit { elems, .. } => elems.clone(),
+            MInstr::MakeClosure { captures, .. } | MInstr::Spawn { captures, .. } => {
+                captures.clone()
+            }
+            MInstr::ChanNew { cap, .. } => cap.iter().copied().collect(),
+            MInstr::Send { chan, value, .. } => vec![*chan, *value],
+            MInstr::Select { cases, .. } => {
+                let mut out = Vec::new();
+                for case in cases {
+                    match case {
+                        MSelectCase::Recv { chan, .. } => out.push(*chan),
+                        MSelectCase::Send { chan, value, .. } => {
+                            out.push(*chan);
+                            out.push(*value);
+                        }
+                    }
+                }
+                out
+            }
+            MInstr::Const { .. } | MInstr::FuncRef { .. } | MInstr::Safepoint { .. } => Vec::new(),
+        }
+    }
+
+    fn term_uses(term: &MTerm) -> Vec<usize> {
+        match term {
+            MTerm::Return(Some(l)) => vec![*l],
+            MTerm::Branch { cond, .. } => vec![*cond],
+            MTerm::Return(None) | MTerm::FallOff { .. } | MTerm::Jump(_) => Vec::new(),
+        }
+    }
+
+    /// Prologue: zero-initialize handle variables (total publication:
+    /// the null word never resolves, so the collector skips it),
+    /// define params and capture slots, record the shadow base.
+    fn prologue(
+        &mut self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        shape: &BodyShape<'_>,
+        params: &[CVal],
+    ) -> Result<(), SubsetError> {
+        let zero = Self::iconst(b, 0);
+        for id in self.handle_locals.keys() {
+            b.def_var(self.vars[*id], zero);
+        }
+        let want = match shape.kind {
+            BodyKind::TopLevel => shape.params.len() + 1,
+            BodyKind::Closure => shape.params.len() + 2,
+            BodyKind::Go => 1,
+        };
+        if params.len() != want {
+            return self.fail(format!(
+                "block params {} vs {want} expected (unreachable)",
+                params.len()
+            ));
+        }
+        // Record the shadow base BEFORE the capture fetches below:
+        // they end in `check_silent`, which needs the base to unwind.
+        // Capture fetches never push or pop shadows, so reading the
+        // depth here is identical to reading it after them.
+        let base = self.call_value(jit, b, "toto_shadow_len", &[self.ctx])?;
+        self.base = Some(base);
+        match shape.kind {
+            BodyKind::TopLevel => {
+                for (i, v) in params.iter().skip(1).enumerate() {
+                    self.define(b, i, *v)?;
+                }
+            }
+            BodyKind::Closure => {
+                let handle = params[1];
+                for (i, v) in params.iter().skip(2).enumerate() {
+                    self.define(b, i, *v)?;
+                }
+                for i in 0..shape.ncaptures {
+                    let slot = shape.params.len() + i;
+                    let w = self.call_closure_cap(jit, b, handle, i, shape.body_span)?;
+                    self.define(b, slot, w)?;
+                    self.check_silent(jit, b, shape.body_span)?;
+                }
+            }
+            BodyKind::Go => {
+                for i in 0..shape.ncaptures {
+                    let w = self.call_task_capture(jit, b, i, shape.body_span)?;
+                    self.define(b, i, w)?;
+                    self.check_silent(jit, b, shape.body_span)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetch one closure capture word (handle payloads).
+    fn call_closure_cap(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        handle: CVal,
+        idx: usize,
+        span: Span,
+    ) -> Result<CVal, SubsetError> {
+        let i = Self::iconst(b, idx as i64);
+        let start = Self::iconst(b, span.start as i64);
+        let end = Self::iconst(b, span.end as i64);
+        self.call_value(
+            jit,
+            b,
+            "toto_closure_cap",
+            &[self.ctx, handle, i, start, end],
+        )
+    }
+
+    /// Fetch one go-body capture word (task context slots).
+    fn call_task_capture(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        idx: usize,
+        span: Span,
+    ) -> Result<CVal, SubsetError> {
+        let i = Self::iconst(b, idx as i64);
+        let start = Self::iconst(b, span.start as i64);
+        let end = Self::iconst(b, span.end as i64);
+        self.call_value(jit, b, "toto_task_capture", &[self.ctx, i, start, end])
+    }
+
+    /// Epilogue: pop the shadow stack to the prologue-recorded base.
+    fn epilogue(&self, jit: &mut Jit, b: &mut FunctionBuilder<'_>) -> Result<(), SubsetError> {
+        let base = self.base.ok_or_else(|| SubsetError {
             func: self.func.clone(),
-            message: format!("local {local} used before definition"),
-        })
+            message: String::from("missing shadow base (unreachable)"),
+        })?;
+        self.call_import(jit, b, "toto_shadow_pop_to", &[self.ctx, base])?;
+        Ok(())
+    }
+
+    /// Lower a block terminator (all MIR terminators).
+    fn lower_term(
+        &mut self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        prog: &MProgram,
+        shape: &BodyShape<'_>,
+        term: &MTerm,
+    ) -> Result<(), SubsetError> {
+        use cranelift_codegen::ir::condcodes::IntCC;
+        let _ = prog;
+        match term {
+            MTerm::Return(Some(local)) => {
+                let v = self.operand(b, *local)?;
+                self.epilogue(jit, b)?;
+                b.ins().return_(&[v]);
+                Ok(())
+            }
+            MTerm::Return(None) => {
+                self.epilogue(jit, b)?;
+                let z = Self::iconst(b, 0);
+                b.ins().return_(&[z]);
+                Ok(())
+            }
+            MTerm::FallOff { .. } => {
+                if *shape.ret == Ty::Unit {
+                    self.epilogue(jit, b)?;
+                    let z = Self::iconst(b, 0);
+                    b.ins().return_(&[z]);
+                    Ok(())
+                } else {
+                    let msg = match shape.kind {
+                        BodyKind::TopLevel => {
+                            format!("function `{}` exited without returning a value", shape.name)
+                        }
+                        BodyKind::Closure => {
+                            String::from("closure exited without returning a value")
+                        }
+                        BodyKind::Go => {
+                            return self.fail(String::from(
+                                "go body fell off a non-unit return (unreachable)",
+                            ));
+                        }
+                    };
+                    self.emit_terminal_panic(
+                        jit,
+                        b,
+                        E_FALLOFF,
+                        (shape.body_span.start as u64, shape.body_span.end as u64),
+                        &msg,
+                    )
+                }
+            }
+            MTerm::Jump(target) => {
+                let cb = self
+                    .blocks
+                    .get(target)
+                    .copied()
+                    .ok_or_else(|| SubsetError {
+                        func: self.func.clone(),
+                        message: format!("jump to missing block {target}"),
+                    })?;
+                b.ins().jump(cb, &[]);
+                Ok(())
+            }
+            MTerm::Branch {
+                cond,
+                then_b,
+                else_b,
+                ..
+            } => {
+                let c = self.operand(b, *cond)?;
+                // Boolean words are 0/1 by construction (all producers
+                // emit them; checked code never branches on anything
+                // else), so no `E0207` backstop is emitted.
+                let zero = Self::iconst(b, 0);
+                let t = b.ins().icmp(IntCC::NotEqual, c, zero);
+                let then_c = self
+                    .blocks
+                    .get(then_b)
+                    .copied()
+                    .ok_or_else(|| SubsetError {
+                        func: self.func.clone(),
+                        message: format!("branch to missing block {then_b}"),
+                    })?;
+                let else_c = self
+                    .blocks
+                    .get(else_b)
+                    .copied()
+                    .ok_or_else(|| SubsetError {
+                        func: self.func.clone(),
+                        message: format!("branch to missing block {else_b}"),
+                    })?;
+                b.ins().brif(t, then_c, &[], else_c, &[]);
+                Ok(())
+            }
+        }
+    }
+
+    /// Unconditional panic that ends the current block (fall-off and
+    /// other statically-dead failures): calls `toto_panic`, then a
+    /// dummy return. No continuation block — the caller must be at a
+    /// block end.
+    fn emit_terminal_panic(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        code: u64,
+        span: (u64, u64),
+        msg: &str,
+    ) -> Result<(), SubsetError> {
+        let (ptr, len) = jit.intern(msg);
+        let code_v = Self::iconst(b, code as i64);
+        let start_v = Self::iconst(b, span.0 as i64);
+        let end_v = Self::iconst(b, span.1 as i64);
+        let msg_ptr = Self::iconst(b, ptr as i64);
+        let msg_len = Self::iconst(b, len as i64);
+        self.call_import(
+            jit,
+            b,
+            "toto_panic",
+            &[self.ctx, code_v, start_v, end_v, msg_ptr, msg_len],
+        )?;
+        let dummy = Self::iconst(b, 0);
+        b.ins().return_(&[dummy]);
+        Ok(())
+    }
+
+    /// Unconditional mid-block panic (statically-dead failures):
+    /// always-firing check plus a dummy word the caller defines in
+    /// the dead continuation so the function stays well-formed.
+    fn emit_dead_panic(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        code: u64,
+        span: (u64, u64),
+        msg: &str,
+    ) -> Result<CVal, SubsetError> {
+        let (ptr, len) = jit.intern(msg);
+        let one = Self::iconst(b, 1);
+        let msg_ptr = Self::iconst(b, ptr as i64);
+        let msg_len = Self::iconst(b, len as i64);
+        Self::emit_check_raw(jit, b, self.ctx, one, code, span, msg_ptr, msg_len);
+        Ok(Self::iconst(b, 0))
+    }
+
+    /// Sentinel check after a Toto-level call (task mode only): on
+    /// failure the callee frame (`name`, call-site span — the caller
+    /// knows both statically, exactly like the executor pushing at
+    /// call time) is appended and generated code unwinds by returning
+    /// a dummy word immediately. Gate mode needs no check (diverging
+    /// panics). Empty names skip the append (runtime helpers are not
+    /// Toto frames).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_check_failed(
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        ctx: CVal,
+        base: CVal,
+        name_ptr: CVal,
+        name_len: CVal,
+        span: (u64, u64),
+    ) {
+        use cranelift_codegen::ir::condcodes::IntCC;
+        let callee = jit
+            .module
+            .declare_func_in_func(jit.imports["toto_check_failed"], b.func);
+        let start_v = Self::iconst(b, span.0 as i64);
+        let end_v = Self::iconst(b, span.1 as i64);
+        let inst = b
+            .ins()
+            .call(callee, &[ctx, name_ptr, name_len, start_v, end_v]);
+        let failed = b.inst_results(inst)[0];
+        let zero = Self::iconst(b, 0);
+        let is_failed = b.ins().icmp(IntCC::NotEqual, failed, zero);
+        let fail_b = b.create_block();
+        let cont_b = b.create_block();
+        b.ins().brif(is_failed, fail_b, &[], cont_b, &[]);
+        b.switch_to_block(fail_b);
+        b.seal_block(fail_b);
+        let pop = jit
+            .module
+            .declare_func_in_func(jit.imports["toto_shadow_pop_to"], b.func);
+        b.ins().call(pop, &[ctx, base]);
+        let dummy = Self::iconst(b, 0);
+        b.ins().return_(&[dummy]);
+        b.switch_to_block(cont_b);
+        b.seal_block(cont_b);
+    }
+
+    /// Sentinel check after a runtime-helper call (task mode only):
+    /// unwinds explicitly on failure without appending a frame.
+    /// Gate mode needs no check (diverging panics).
+    fn check_silent(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        span: Span,
+    ) -> Result<(), SubsetError> {
+        if self.mode == CodegenMode::Gate {
+            return Ok(());
+        }
+        let base = self.base.ok_or_else(|| SubsetError {
+            func: self.func.clone(),
+            message: String::from("missing shadow base (unreachable)"),
+        })?;
+        let z = Self::iconst(b, 0);
+        Self::emit_check_failed(
+            jit,
+            b,
+            self.ctx,
+            base,
+            z,
+            z,
+            (span.start as u64, span.end as u64),
+        );
+        Ok(())
+    }
+
+    /// Sentinel check after a Toto-level call (task mode only):
+    /// appends the callee frame (`name`, call-site span — the caller
+    /// knows both statically, exactly like the executor pushing at
+    /// call time) and unwinds on failure. Gate mode needs no check
+    /// (diverging panics).
+    fn check_named(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        name: &str,
+        span: Span,
+    ) -> Result<(), SubsetError> {
+        if self.mode == CodegenMode::Gate {
+            return Ok(());
+        }
+        let base = self.base.ok_or_else(|| SubsetError {
+            func: self.func.clone(),
+            message: String::from("missing shadow base (unreachable)"),
+        })?;
+        let (ptr, len) = jit.intern(name);
+        let name_ptr = Self::iconst(b, ptr as i64);
+        let name_len = Self::iconst(b, len as i64);
+        Self::emit_check_failed(
+            jit,
+            b,
+            self.ctx,
+            base,
+            name_ptr,
+            name_len,
+            (span.start as u64, span.end as u64),
+        );
+        Ok(())
+    }
+
+    /// Direct call to a statically resolved top-level function.
+    fn lower_direct_call(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        prog: &MProgram,
+        target: usize,
+        argvals: &[CVal],
+        span: &Span,
+    ) -> Result<CVal, SubsetError> {
+        let callee_fn = prog.fns.get(target).ok_or_else(|| SubsetError {
+            func: self.func.clone(),
+            message: format!("funcref index {target} out of range"),
+        })?;
+        if callee_fn.params.len() != argvals.len() {
+            return self.fail(format!(
+                "call arity {} vs {} params of {} (unreachable: checked code)",
+                argvals.len(),
+                callee_fn.params.len(),
+                callee_fn.name
+            ));
+        }
+        let cl_id = jit
+            .funcs
+            .get(&callee_fn.name)
+            .copied()
+            .ok_or_else(|| SubsetError {
+                func: self.func.clone(),
+                message: format!("callee {} not compiled", callee_fn.name),
+            })?;
+        let callee = jit.module.declare_func_in_func(cl_id, b.func);
+        let mut vals = vec![self.ctx];
+        vals.extend(argvals.iter().copied());
+        let inst = b.ins().call(callee, &vals);
+        let ret = b.inst_results(inst)[0];
+        self.check_named(jit, b, &callee_fn.name, *span)?;
+        Ok(ret)
+    }
+
+    /// Indirect call through a `fn`-typed value: words below 2^32
+    /// call top-level functions, the rest call closures with the
+    /// value as their handle argument. The callee frame carries the
+    /// source display name (or `<value>`), like the interpreters.
+    fn lower_indirect_call(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        func: usize,
+        argvals: &[CVal],
+        span: &Span,
+        display: &str,
+    ) -> Result<CVal, SubsetError> {
+        use cranelift_codegen::ir::condcodes::IntCC;
+        let fty = self.local_ty(func)?.clone();
+        if !matches!(fty, Ty::Fn(..)) {
+            let msg = format!(
+                "call of non-function value ({})",
+                Self::static_type_name(&fty)
+            );
+            return self.emit_dead_panic(
+                jit,
+                b,
+                E_INTERNAL,
+                (span.start as u64, span.end as u64),
+                &msg,
+            );
+        }
+        let fv = self.operand(b, func)?;
+        let bound = Self::iconst(b, 0x1_0000_0000);
+        let is_func = b.ins().icmp(IntCC::UnsignedLessThan, fv, bound);
+        let func_b = b.create_block();
+        let clo_b = b.create_block();
+        let merge_b = b.create_block();
+        b.append_block_param(merge_b, I64);
+        b.ins().brif(is_func, func_b, &[], clo_b, &[]);
+        // Index arm: resolve and call `(ctx, args...)`.
+        b.switch_to_block(func_b);
+        b.seal_block(func_b);
+        let fstart = Self::iconst(b, span.start as i64);
+        let fend = Self::iconst(b, span.end as i64);
+        let entry = self.call_value(jit, b, "toto_func_entry", &[self.ctx, fv, fstart, fend])?;
+        self.check_silent(jit, b, *span)?;
+        let fsig = sig_arity(argvals.len() as u32, true);
+        let fsig = b.func.import_signature(fsig);
+        let mut fvals = vec![self.ctx];
+        fvals.extend(argvals.iter().copied());
+        let finst = b.ins().call_indirect(fsig, entry, &fvals);
+        let fret = b.inst_results(finst)[0];
+        self.check_named(jit, b, display, *span)?;
+        b.ins().jump(merge_b, &[BlockArg::Value(fret)]);
+        // Closure arm: resolve the body and call `(ctx, handle, args...)`.
+        b.switch_to_block(clo_b);
+        b.seal_block(clo_b);
+        let cstart = Self::iconst(b, span.start as i64);
+        let cend = Self::iconst(b, span.end as i64);
+        let body = self.call_value(jit, b, "toto_closure_body", &[self.ctx, fv, cstart, cend])?;
+        self.check_silent(jit, b, *span)?;
+        let centry = self.call_value(jit, b, "toto_body_entry", &[self.ctx, body, cstart, cend])?;
+        self.check_silent(jit, b, *span)?;
+        let csig = sig_arity(argvals.len() as u32 + 1, true);
+        let csig = b.func.import_signature(csig);
+        let mut cvals = vec![self.ctx, fv];
+        cvals.extend(argvals.iter().copied());
+        let cinst = b.ins().call_indirect(csig, centry, &cvals);
+        let cret = b.inst_results(cinst)[0];
+        self.check_named(jit, b, display, *span)?;
+        b.ins().jump(merge_b, &[BlockArg::Value(cret)]);
+        b.switch_to_block(merge_b);
+        b.seal_block(merge_b);
+        Ok(b.block_params(merge_b)[0])
+    }
+
+    /// Call an imported helper, returning its first result (if any).
+    /// Missing imports (a task-only import in gate mode) refuse
+    /// cleanly instead of panicking on the map lookup.
+    fn call_import(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        name: &'static str,
+        args: &[CVal],
+    ) -> Result<Option<CVal>, SubsetError> {
+        let id = jit.imports.get(name).copied().ok_or_else(|| SubsetError {
+            func: self.func.clone(),
+            message: format!("import `{name}` not registered for this mode"),
+        })?;
+        let callee = jit.module.declare_func_in_func(id, b.func);
+        let inst = b.ins().call(callee, args);
+        Ok(b.inst_results(inst).first().copied())
+    }
+
+    /// Call an imported helper that returns a word.
+    fn call_value(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        name: &'static str,
+        args: &[CVal],
+    ) -> Result<CVal, SubsetError> {
+        self.call_import(jit, b, name, args)?
+            .ok_or_else(|| SubsetError {
+                func: self.func.clone(),
+                message: format!("import `{name}` returned no value (unreachable)"),
+            })
+    }
+
+    /// A tagged operand pair (static tag iconst + word) for helpers.
+    fn tagged_operand(
+        &self,
+        b: &mut FunctionBuilder<'_>,
+        local: usize,
+    ) -> Result<(CVal, CVal), SubsetError> {
+        let ty = self.local_ty(local)?.clone();
+        let tag = Self::tag_of(&ty).map_err(|e| SubsetError {
+            func: self.func.clone(),
+            message: format!("operand {local}: {e}"),
+        })?;
+        let word = self.operand(b, local)?;
+        Ok((Self::iconst(b, tag as i64), word))
+    }
+
+    /// Allocate a writable stack slot of `bytes` (8-byte aligned),
+    /// returning its address.
+    fn stack_slot(b: &mut FunctionBuilder<'_>, bytes: u32) -> CVal {
+        let slot =
+            b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, bytes, 3));
+        b.ins().stack_addr(I64, slot, 0)
+    }
+
+    /// Store `v` at `base + idx * 8`.
+    fn stack_store(b: &mut FunctionBuilder<'_>, base: CVal, idx: usize, v: CVal) {
+        b.ins()
+            .store(MemFlagsData::trusted(), v, base, (idx * 8) as i32);
+    }
+
+    /// Load the word at `base + idx * 8`.
+    fn stack_load(b: &mut FunctionBuilder<'_>, base: CVal, idx: usize) -> CVal {
+        b.ins()
+            .load(I64, MemFlagsData::trusted(), base, (idx * 8) as i32)
+    }
+
+    fn operand(&self, b: &mut FunctionBuilder<'_>, local: usize) -> Result<CVal, SubsetError> {
+        let var = self.vars.get(local).copied().ok_or_else(|| SubsetError {
+            func: self.func.clone(),
+            message: format!("local {local} out of range"),
+        })?;
+        Ok(b.use_var(var))
+    }
+
+    fn define(
+        &self,
+        b: &mut FunctionBuilder<'_>,
+        local: usize,
+        v: CVal,
+    ) -> Result<(), SubsetError> {
+        let var = self.vars.get(local).copied().ok_or_else(|| SubsetError {
+            func: self.func.clone(),
+            message: format!("local {local} out of range"),
+        })?;
+        b.def_var(var, v);
+        Ok(())
     }
 
     /// Structured branch returning a value (both arms join with a
@@ -497,11 +1620,46 @@ impl FnCx {
         b.block_params(merge_b)[0]
     }
 
+    /// Float arithmetic on word traffic: operands arrive as `I64`
+    /// bit patterns (frozen single-word `u64` traffic), so bitcast
+    /// to `F64` for the operation and back to `I64` for the result.
+    /// `op` selects add/sub/mul/div in that order (IEEE semantics,
+    /// exactly like the interpreter: no traps, NaN propagates).
+    fn farith(b: &mut FunctionBuilder<'_>, op: u8, a: CVal, c: CVal) -> CVal {
+        let flags = MemFlagsData::new().with_endianness(Endianness::Little);
+        let x = b.ins().bitcast(F64, flags, a);
+        let y = b.ins().bitcast(F64, flags, c);
+        let r = match op {
+            0 => b.ins().fadd(x, y),
+            1 => b.ins().fsub(x, y),
+            2 => b.ins().fmul(x, y),
+            _ => b.ins().fdiv(x, y),
+        };
+        b.ins().bitcast(I64, flags, r)
+    }
+
+    /// Float comparison on word traffic: bitcast both operands to
+    /// `F64` first (same word convention as [`Self::farith`]).
+    fn fcmp_word(
+        b: &mut FunctionBuilder<'_>,
+        cc: cranelift_codegen::ir::condcodes::FloatCC,
+        a: CVal,
+        c: CVal,
+    ) -> CVal {
+        let flags = MemFlagsData::new().with_endianness(Endianness::Little);
+        let x = b.ins().bitcast(F64, flags, a);
+        let y = b.ins().bitcast(F64, flags, c);
+        let e = b.ins().fcmp(cc, x, y);
+        b.ins().uextend(I64, e)
+    }
+
     /// Integer arithmetic with the frozen explicit checks (`E0201`
     /// overflow, `E0202` zero divisor with the `DivCheck` span,
     /// `E0209` is handled at `Index`). Semantics mirror `ops`
     /// exactly, including `MIN/-1` division overflow and
-    /// `wrapping_rem` for `%`.
+    /// `wrapping_rem` for `%`. Same-type pairs the interpreter
+    /// rejects panic `E0203` unconditionally; cross-type pairs
+    /// (checker-impossible) do the same through the helpers.
     #[allow(clippy::too_many_arguments)]
     fn lower_bin(
         &mut self,
@@ -516,10 +1674,6 @@ impl FnCx {
         divcheck_span: (u64, u64),
     ) -> Result<CVal, SubsetError> {
         use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-        let fail_op = |op: MBinOp, lty: &Ty, rty: &Ty| SubsetError {
-            func: self.func.clone(),
-            message: format!("{op:?} on {lty:?} and {rty:?} is out of gate subset"),
-        };
         match (op, lty, rty) {
             (MBinOp::Add, Ty::Int, Ty::Int) => {
                 let r = b.ins().iadd(a, c);
@@ -661,10 +1815,10 @@ impl FnCx {
                     |_, b| b.ins().srem(a, c),
                 ))
             }
-            (MBinOp::Add, Ty::Float, Ty::Float) => Ok(b.ins().fadd(a, c)),
-            (MBinOp::Sub, Ty::Float, Ty::Float) => Ok(b.ins().fsub(a, c)),
-            (MBinOp::Mul, Ty::Float, Ty::Float) => Ok(b.ins().fmul(a, c)),
-            (MBinOp::Div, Ty::Float, Ty::Float) => Ok(b.ins().fdiv(a, c)),
+            (MBinOp::Add, Ty::Float, Ty::Float) => Ok(Self::farith(b, 0, a, c)),
+            (MBinOp::Sub, Ty::Float, Ty::Float) => Ok(Self::farith(b, 1, a, c)),
+            (MBinOp::Mul, Ty::Float, Ty::Float) => Ok(Self::farith(b, 2, a, c)),
+            (MBinOp::Div, Ty::Float, Ty::Float) => Ok(Self::farith(b, 3, a, c)),
             (MBinOp::Eq, Ty::Int, Ty::Int) => {
                 let e = b.ins().icmp(IntCC::Equal, a, c);
                 Ok(b.ins().uextend(I64, e))
@@ -689,43 +1843,206 @@ impl FnCx {
                 let e = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, a, c);
                 Ok(b.ins().uextend(I64, e))
             }
-            (MBinOp::Eq, Ty::Float, Ty::Float) => {
-                let e = b.ins().fcmp(FloatCC::Equal, a, c);
-                Ok(b.ins().uextend(I64, e))
-            }
+            (MBinOp::Eq, Ty::Float, Ty::Float) => Ok(Self::fcmp_word(b, FloatCC::Equal, a, c)),
             (MBinOp::NotEq, Ty::Float, Ty::Float) => {
-                let e = b.ins().fcmp(FloatCC::NotEqual, a, c);
-                Ok(b.ins().uextend(I64, e))
+                Ok(Self::fcmp_word(b, FloatCC::NotEqual, a, c))
             }
-            (MBinOp::Lt, Ty::Float, Ty::Float) => {
-                let e = b.ins().fcmp(FloatCC::LessThan, a, c);
-                Ok(b.ins().uextend(I64, e))
-            }
+            (MBinOp::Lt, Ty::Float, Ty::Float) => Ok(Self::fcmp_word(b, FloatCC::LessThan, a, c)),
             (MBinOp::LtEq, Ty::Float, Ty::Float) => {
-                let e = b.ins().fcmp(FloatCC::LessThanOrEqual, a, c);
-                Ok(b.ins().uextend(I64, e))
+                Ok(Self::fcmp_word(b, FloatCC::LessThanOrEqual, a, c))
             }
             (MBinOp::Gt, Ty::Float, Ty::Float) => {
-                let e = b.ins().fcmp(FloatCC::GreaterThan, a, c);
-                Ok(b.ins().uextend(I64, e))
+                Ok(Self::fcmp_word(b, FloatCC::GreaterThan, a, c))
             }
             (MBinOp::GtEq, Ty::Float, Ty::Float) => {
-                let e = b.ins().fcmp(FloatCC::GreaterThanOrEqual, a, c);
+                Ok(Self::fcmp_word(b, FloatCC::GreaterThanOrEqual, a, c))
+            }
+            // Boolean equality is trivially inline.
+            (MBinOp::Eq, Ty::Bool, Ty::Bool) => {
+                let e = b.ins().icmp(IntCC::Equal, a, c);
                 Ok(b.ins().uextend(I64, e))
             }
-            _ => Err(fail_op(op, lty, rty)),
+            (MBinOp::NotEq, Ty::Bool, Ty::Bool) => {
+                let e = b.ins().icmp(IntCC::NotEqual, a, c);
+                Ok(b.ins().uextend(I64, e))
+            }
+            (MBinOp::Eq, Ty::Unit, Ty::Unit) => Ok(Self::iconst(b, 1)),
+            (MBinOp::NotEq, Ty::Unit, Ty::Unit) => Ok(Self::iconst(b, 0)),
+            // String concatenation runs in a helper (heap reads).
+            (MBinOp::Add, Ty::String, Ty::String) => {
+                let start_v = Self::iconst(b, span.0 as i64);
+                let end_v = Self::iconst(b, span.1 as i64);
+                let v =
+                    self.call_value(jit, b, "toto_str_concat", &[self.ctx, a, c, start_v, end_v])?;
+                self.check_silent(jit, b, Span::new(span.0 as u32, span.1 as u32))?;
+                Ok(v)
+            }
+            // All other equality/ordering: the helpers implement the
+            // exact interpreter rule (including cross-type `E0203`).
+            (MBinOp::Eq, _, _) => self.lower_eq(jit, b, lty, rty, a, c, span, true),
+            (MBinOp::NotEq, _, _) => self.lower_eq(jit, b, lty, rty, a, c, span, false),
+            (MBinOp::Lt, _, _) => self.lower_order(jit, b, 0, lty, rty, a, c, span),
+            (MBinOp::LtEq, _, _) => self.lower_order(jit, b, 1, lty, rty, a, c, span),
+            (MBinOp::Gt, _, _) => self.lower_order(jit, b, 2, lty, rty, a, c, span),
+            (MBinOp::GtEq, _, _) => self.lower_order(jit, b, 3, lty, rty, a, c, span),
+            // Remaining arithmetic (same-type-unsupported and
+            // cross-type): unconditional `E0203` with static names.
+            (MBinOp::Add | MBinOp::Sub | MBinOp::Mul | MBinOp::Div | MBinOp::Mod, _, _) => {
+                self.lower_arith_mismatch(jit, b, op, lty, rty, span)
+            }
         }
     }
 
-    /// Value bits plus transport tag for `toto_write_field`, by MIR type.
+    /// Runtime type name of a static type (for statically-worded
+    /// `E0203` messages; mirrors `type_name` exactly, including
+    /// `struct`/`function` anonymity).
+    fn static_type_name(ty: &Ty) -> &'static str {
+        match ty {
+            Ty::Int => "int",
+            Ty::Float => "float",
+            Ty::String => "string",
+            Ty::Bool => "bool",
+            Ty::Unit => "unit",
+            Ty::Range => "Range",
+            Ty::Array(_) => "Array",
+            Ty::Struct(_) => "struct",
+            Ty::Chan(_) => "chan",
+            Ty::Fn(..) => "function",
+            Ty::Result(..) => "Result",
+            Ty::Option(_) => "Option",
+            Ty::Map(..) => "Map",
+        }
+    }
+
+    /// Statically-unsupported arithmetic: unconditional `E0203` with
+    /// static type names (correct whenever reached: same-type pairs
+    /// the interpreter rejects, or checker-impossible mixes). The
+    /// caller defines the destination in the dead continuation so the
+    /// function stays well-formed.
+    fn lower_arith_mismatch(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        op: MBinOp,
+        lty: &Ty,
+        rty: &Ty,
+        span: (u64, u64),
+    ) -> Result<CVal, SubsetError> {
+        let a = Self::static_type_name(lty);
+        let c = Self::static_type_name(rty);
+        let msg = match op {
+            MBinOp::Add => format!("cannot add {a} and {c}"),
+            MBinOp::Sub => format!("cannot subtract {a} and {c}"),
+            MBinOp::Mul => format!("cannot multiply {a} and {c}"),
+            MBinOp::Div => format!("cannot divide {a} by {c}"),
+            MBinOp::Mod => format!("cannot take modulo of {a} and {c}"),
+            _ => {
+                return self.fail(format!("{op:?} is not arithmetic (unreachable)"));
+            }
+        };
+        let (ptr, len) = jit.intern(&msg);
+        let one = Self::iconst(b, 1);
+        let msg_ptr = Self::iconst(b, ptr as i64);
+        let msg_len = Self::iconst(b, len as i64);
+        Self::emit_check_raw(jit, b, self.ctx, one, E_MISMATCH, span, msg_ptr, msg_len);
+        Ok(Self::iconst(b, 0))
+    }
+
+    /// `==`/`!=` past the inline fast paths: the helper implements
+    /// the exact interpreter rule (same-type check, deep comparison,
+    /// cross-type `E0203` with hint).
+    #[allow(clippy::too_many_arguments)]
+    fn lower_eq(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        lty: &Ty,
+        rty: &Ty,
+        a: CVal,
+        c: CVal,
+        span: (u64, u64),
+        want_eq: bool,
+    ) -> Result<CVal, SubsetError> {
+        let ta = Self::tag_of(lty).map_err(|e| SubsetError {
+            func: self.func.clone(),
+            message: format!("equality operand: {e}"),
+        })?;
+        let tb = Self::tag_of(rty).map_err(|e| SubsetError {
+            func: self.func.clone(),
+            message: format!("equality operand: {e}"),
+        })?;
+        let tag_a = Self::iconst(b, ta as i64);
+        let tag_b = Self::iconst(b, tb as i64);
+        let want = Self::iconst(b, i64::from(want_eq));
+        let start_v = Self::iconst(b, span.0 as i64);
+        let end_v = Self::iconst(b, span.1 as i64);
+        let v = self.call_value(
+            jit,
+            b,
+            "toto_values_eq",
+            &[self.ctx, tag_a, a, tag_b, c, want, start_v, end_v],
+        )?;
+        self.check_silent(jit, b, Span::new(span.0 as u32, span.1 as u32))?;
+        Ok(v)
+    }
+
+    /// `<`/`<=`/`>`/`>=` past the inline fast paths: the helper
+    /// implements the exact interpreter rule. `op` is 0/1/2/3 for
+    /// `Lt`/`LtEq`/`Gt`/`GtEq`.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_order(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        op: u64,
+        lty: &Ty,
+        rty: &Ty,
+        a: CVal,
+        c: CVal,
+        span: (u64, u64),
+    ) -> Result<CVal, SubsetError> {
+        let ta = Self::tag_of(lty).map_err(|e| SubsetError {
+            func: self.func.clone(),
+            message: format!("ordering operand: {e}"),
+        })?;
+        let tb = Self::tag_of(rty).map_err(|e| SubsetError {
+            func: self.func.clone(),
+            message: format!("ordering operand: {e}"),
+        })?;
+        let op_v = Self::iconst(b, op as i64);
+        let tag_a = Self::iconst(b, ta as i64);
+        let tag_b = Self::iconst(b, tb as i64);
+        let start_v = Self::iconst(b, span.0 as i64);
+        let end_v = Self::iconst(b, span.1 as i64);
+        let v = self.call_value(
+            jit,
+            b,
+            "toto_values_order",
+            &[self.ctx, op_v, tag_a, a, tag_b, c, start_v, end_v],
+        )?;
+        self.check_silent(jit, b, Span::new(span.0 as u32, span.1 as u32))?;
+        Ok(v)
+    }
+
+    /// Transport tag for a MIR-typed word, by static type.
+    /// Dynamically-variant families resolve at runtime: `Option`
+    /// words use `TAG_HANDLE` (word 0 decodes as `None`), `fn` words
+    /// use `TAG_FN_ANY` (indices vs closure handles by range).
     fn tag_of(ty: &Ty) -> Result<u64, String> {
         match ty {
             Ty::Int => Ok(TAG_INT),
             Ty::Float => Ok(TAG_FLOAT),
             Ty::Bool => Ok(TAG_BOOL),
-            Ty::String | Ty::Array(_) | Ty::Struct(_) => Ok(TAG_HANDLE),
+            Ty::String
+            | Ty::Array(_)
+            | Ty::Struct(_)
+            | Ty::Range
+            | Ty::Result(..)
+            | Ty::Option(_) => Ok(TAG_HANDLE),
             Ty::Unit => Ok(TAG_UNIT),
-            other => Err(format!("type {other:?} cannot cross the JIT boundary")),
+            Ty::Chan(_) => Ok(TAG_CHAN),
+            Ty::Fn(..) => Ok(TAG_FN_ANY),
+            Ty::Map(..) => Err(format!("type {ty:?} has no runtime values")),
         }
     }
 
@@ -735,7 +2052,6 @@ impl FnCx {
         jit: &mut Jit,
         b: &mut FunctionBuilder<'_>,
         prog: &MProgram,
-        f: &toto_compiler::mir::MFn,
         instrs: &[MInstr],
         idx: usize,
         instr: &MInstr,
@@ -747,52 +2063,39 @@ impl FnCx {
                     MConst::Bool(bv) => Self::iconst(b, i64::from(*bv)),
                     MConst::Unit | MConst::None => Self::iconst(b, 0),
                     MConst::Float(f) => {
-                        b.ins()
-                            .f64const(cranelift_codegen::ir::immediates::Ieee64::with_bits(
-                                f.to_bits(),
-                            ))
+                        // Words traffic as single-word `u64` (frozen D8):
+                        // floats are bit patterns, never native `F64`.
+                        Self::iconst(b, f.to_bits() as i64)
                     }
                     MConst::Str(s) => {
-                        // Gate-owned bytes (leaked for the JIT's
-                        // lifetime; Phase 4 uses rodata). Publishing
-                        // first: other live handles must survive the
-                        // threshold check inside the allocator.
-                        Self::publish_all(jit, b, self.ctx, &self.values, &self.handle_locals);
-                        let leaked: &'static str = Box::leak(s.clone().into_boxed_str());
-                        let ptr = Self::iconst(b, leaked.as_ptr() as u64 as i64);
-                        let len = Self::iconst(b, leaked.len() as i64);
+                        // JIT-owned bytes (freed with the session).
+                        // Publish first: other live handles must
+                        // survive the threshold check inside the
+                        // allocator.
+                        self.publish_all(jit, b)?;
+                        let (ptr, len) = jit.intern(s);
+                        let ptr_v = Self::iconst(b, ptr as i64);
+                        let len_v = Self::iconst(b, len as i64);
                         // Span of a const: no meaningful span exists;
                         // allocation itself cannot fail on valid UTF-8
-                        // (leaked from a checked literal), so zeros.
-                        let callee = jit
-                            .module
-                            .declare_func_in_func(jit.imports["toto_alloc_str"], b.func);
+                        // (interned from a checked literal), so zeros.
                         let z0 = Self::iconst(b, 0);
                         let z1 = Self::iconst(b, 0);
-                        let args = [self.ctx, ptr, len, z0, z1];
-                        let inst = b.ins().call(callee, &args);
-                        b.inst_results(inst)[0]
+                        let v = self.call_value(
+                            jit,
+                            b,
+                            "toto_alloc_str",
+                            &[self.ctx, ptr_v, len_v, z0, z1],
+                        )?;
+                        self.check_silent(jit, b, Span::new(0, 0))?;
+                        v
                     }
                 };
-                let ty = self.local_ty(prog, f, *dst)?;
-                if Self::trafficable(ty).is_err() {
-                    return self.fail(format!("const target type {ty:?} is out of gate subset"));
-                }
-                if Self::trafficable(ty).expect("checked above") {
-                    self.handle_locals.insert(*dst, ());
-                }
-                self.values.insert(*dst, v);
+                self.define(b, *dst, v)?;
             }
             MInstr::Copy { dst, src } => {
-                let v = self.operand(*src)?;
-                let ty = self.local_ty(prog, f, *dst)?;
-                if Self::trafficable(ty).is_err() {
-                    return self.fail(format!("copy target type {ty:?} is out of gate subset"));
-                }
-                if Self::trafficable(ty).expect("checked above") {
-                    self.handle_locals.insert(*dst, ());
-                }
-                self.values.insert(*dst, v);
+                let v = self.operand(b, *src)?;
+                self.define(b, *dst, v)?;
             }
             MInstr::Bin {
                 dst,
@@ -801,15 +2104,18 @@ impl FnCx {
                 r,
                 span,
             } => {
-                let lty = self.local_ty(prog, f, *l)?.clone();
-                let rty = self.local_ty(prog, f, *r)?.clone();
-                // `Div`/`Mod` must be paired with an immediately
-                // preceding `DivCheck` on the divisor (Tier-1 pins
-                // this structurally; the gate verifies instead of
-                // trusting, and reports the check's span on failure —
-                // exactly like the interpreter, where `DivCheck` fires
-                // first).
-                let divcheck_span = if matches!(op, MBinOp::Div | MBinOp::Mod) {
+                let lty = self.local_ty(*l)?.clone();
+                let rty = self.local_ty(*r)?.clone();
+                // Integer `Div`/`Mod` must be paired with an
+                // immediately preceding `DivCheck` on the divisor
+                // (Tier-1 pins this structurally; the backend verifies
+                // instead of trusting, and reports the check's span on
+                // failure — exactly like the interpreters, where
+                // `DivCheck` fires first).
+                let divcheck_span = if matches!(op, MBinOp::Div | MBinOp::Mod)
+                    && matches!(lty, Ty::Int)
+                    && matches!(rty, Ty::Int)
+                {
                     match (idx.checked_sub(1), instrs.get(idx.wrapping_sub(1))) {
                         (Some(_), Some(MInstr::DivCheck { value, span: dspan }))
                             if *value == *r =>
@@ -825,8 +2131,8 @@ impl FnCx {
                 } else {
                     (0, 0)
                 };
-                let a = self.operand(*l)?;
-                let c = self.operand(*r)?;
+                let a = self.operand(b, *l)?;
+                let c = self.operand(b, *r)?;
                 let v = self.lower_bin(
                     jit,
                     b,
@@ -838,15 +2144,11 @@ impl FnCx {
                     (span.start as u64, span.end as u64),
                     divcheck_span,
                 )?;
-                let dty = self.local_ty(prog, f, *dst)?;
-                if Self::trafficable(dty).is_err() {
-                    return self.fail(format!("bin target type {dty:?} is out of gate subset"));
-                }
-                self.values.insert(*dst, v);
+                self.define(b, *dst, v)?;
             }
             MInstr::Neg { dst, operand, span } => {
-                let v = self.operand(*operand)?;
-                let ty = self.local_ty(prog, f, *operand)?.clone();
+                let v = self.operand(b, *operand)?;
+                let ty = self.local_ty(*operand)?.clone();
                 let r = match ty {
                     Ty::Int => {
                         let min = Self::iconst(b, i64::MIN);
@@ -866,23 +2168,51 @@ impl FnCx {
                         let zero = Self::iconst(b, 0);
                         b.ins().isub(zero, v)
                     }
-                    Ty::Float => b.ins().fneg(v),
+                    Ty::Float => {
+                        let flags = MemFlagsData::new().with_endianness(Endianness::Little);
+                        let x = b.ins().bitcast(F64, flags, v);
+                        let r = b.ins().fneg(x);
+                        b.ins().bitcast(I64, flags, r)
+                    }
                     other => {
-                        return self.fail(format!("neg on {other:?} is out of gate subset"));
+                        // Statically impossible (the checker rejects
+                        // negation of non-numbers), panicking
+                        // faithfully if ever reached.
+                        let msg = format!("cannot negate {}", Self::static_type_name(&other));
+                        self.emit_dead_panic(
+                            jit,
+                            b,
+                            E_MISMATCH,
+                            (span.start as u64, span.end as u64),
+                            &msg,
+                        )?
                     }
                 };
-                self.values.insert(*dst, r);
+                self.define(b, *dst, r)?;
             }
             MInstr::Not { dst, operand, .. } => {
-                let v = self.operand(*operand)?;
-                let ty = self.local_ty(prog, f, *operand)?.clone();
+                let v = self.operand(b, *operand)?;
+                let ty = self.local_ty(*operand)?.clone();
                 match ty {
                     Ty::Bool => {
                         let one = Self::iconst(b, 1);
-                        self.values.insert(*dst, b.ins().bxor(v, one));
+                        let r = b.ins().bxor(v, one);
+                        self.define(b, *dst, r)?;
                     }
                     other => {
-                        return self.fail(format!("not on {other:?} is out of gate subset"));
+                        // Statically impossible (the checker rejects
+                        // `!` on non-bools); the body span stands in
+                        // for the missing operand span.
+                        let msg =
+                            format!("`!` needs a bool, got {}", Self::static_type_name(&other));
+                        let r = self.emit_dead_panic(
+                            jit,
+                            b,
+                            E_MISMATCH,
+                            (self.body_span.start as u64, self.body_span.end as u64),
+                            &msg,
+                        )?;
+                        self.define(b, *dst, r)?;
                     }
                 }
             }
@@ -898,65 +2228,30 @@ impl FnCx {
                 span,
                 display,
             } => {
-                let _ = (span, display);
-                let target = self.funcrefs.get(func).copied().ok_or_else(|| SubsetError {
-                    func: self.func.clone(),
-                    message: format!(
-                        "indirect call through local {func} is out of gate subset (only FuncRef-resolved static calls)"
-                    ),
-                })?;
-                let callee_fn = prog.fns.get(target).ok_or_else(|| SubsetError {
-                    func: self.func.clone(),
-                    message: format!("funcref index {target} out of range"),
-                })?;
-                if callee_fn.params.len() != args.len() {
-                    return self.fail(format!(
-                        "call arity {} vs {} params of {}",
-                        args.len(),
-                        callee_fn.params.len(),
-                        callee_fn.name
-                    ));
-                }
-                let cl_id = jit
-                    .funcs
-                    .get(&callee_fn.name)
-                    .copied()
-                    .ok_or_else(|| SubsetError {
-                        func: self.func.clone(),
-                        message: format!("callee {} not compiled", callee_fn.name),
-                    })?;
-                // Publish before the call: the callee may allocate and
-                // collect (frozen safepoint-call rule).
-                Self::publish_all(jit, b, self.ctx, &self.values, &self.handle_locals);
-                let mut vals = vec![self.ctx];
+                // Hoist argument reads and publish once: every path
+                // below may collect.
+                let mut argvals = Vec::with_capacity(args.len());
                 for a in args {
-                    let ty = self.local_ty(prog, f, *a)?.clone();
-                    if Self::trafficable(&ty).is_err() {
-                        return self.fail(format!("call arg type {ty:?} is out of gate subset"));
-                    }
-                    vals.push(self.operand(*a)?);
+                    argvals.push(self.operand(b, *a)?);
                 }
-                let callee = jit.module.declare_func_in_func(cl_id, b.func);
-                let inst = b.ins().call(callee, &vals);
-                let ret = b.inst_results(inst)[0];
+                self.publish_all(jit, b)?;
+                let ret = match self.funcrefs.get(func).copied() {
+                    Some(target) => self.lower_direct_call(jit, b, prog, target, &argvals, span)?,
+                    None => self.lower_indirect_call(jit, b, *func, &argvals, span, display)?,
+                };
                 if let Some(d) = dst {
-                    let dty = self.local_ty(prog, f, *d)?;
-                    match Self::trafficable(dty) {
-                        Ok(true) => {
-                            self.handle_locals.insert(*d, ());
-                        }
-                        Ok(false) => {}
-                        Err(e) => return self.fail(format!("call target: {e}")),
-                    }
-                    self.values.insert(*d, ret);
+                    self.define(b, *d, ret)?;
                 }
             }
             MInstr::FuncRef { dst, idx } => {
                 if prog.fns.get(*idx).is_none() {
                     return self.fail(format!("funcref index {idx} out of range"));
                 }
-                // No code: resolved statically at each `Call`.
+                // Materialize the index (higher-order values read it);
+                // direct calls resolve statically at each `Call`.
                 self.funcrefs.insert(*dst, *idx);
+                let v = Self::iconst(b, *idx as i64);
+                self.define(b, *dst, v)?;
             }
             MInstr::CallBuiltin {
                 dst,
@@ -964,133 +2259,824 @@ impl FnCx {
                 args,
                 span,
             } => {
-                if name != "len" || args.len() != 1 {
-                    return self.fail(format!(
-                        "builtin `{name}` is out of gate subset (only single-arg `len` on arrays)"
-                    ));
+                // Channel builtins run natively (never dispatched).
+                if name == "chan" {
+                    return self.lower_builtin_chan(jit, b, *dst, args, span);
                 }
-                let base = self.operand(args[0])?;
-                let bty = self.local_ty(prog, f, args[0])?.clone();
-                if !matches!(bty, Ty::Array(_)) {
-                    return self.fail(format!("len on {bty:?} is out of gate subset"));
+                if name == "close" || name == "closed" {
+                    return self.lower_builtin_close(jit, b, *dst, name, args, span);
                 }
-                Self::publish_all(jit, b, self.ctx, &self.values, &self.handle_locals);
-                let callee = jit
-                    .module
-                    .declare_func_in_func(jit.imports["toto_array_len"], b.func);
-                let start = Self::iconst(b, span.start as i64);
-                let end = Self::iconst(b, span.end as i64);
-                let args = [self.ctx, base, start, end];
-                let inst = b.ins().call(callee, &args);
-                let v = b.inst_results(inst)[0];
+                let id = crate::runtime::builtin_id(name).ok_or_else(|| SubsetError {
+                    func: self.func.clone(),
+                    message: format!("unknown builtin `{name}` (unreachable: checked code)"),
+                })?;
+                // Marshal (tag, word) pairs into a stack slot.
+                let slot = Self::stack_slot(b, (args.len().max(1) * 16) as u32);
+                for (i, a) in args.iter().enumerate() {
+                    let ty = self.local_ty(*a)?.clone();
+                    let tag = Self::tag_of(&ty).map_err(|e| SubsetError {
+                        func: self.func.clone(),
+                        message: format!("builtin `{name}` argument {}: {e}", i + 1),
+                    })?;
+                    let v = self.operand(b, *a)?;
+                    let tag_v = Self::iconst(b, tag as i64);
+                    Self::stack_store(b, slot, 2 * i, tag_v);
+                    Self::stack_store(b, slot, 2 * i + 1, v);
+                }
+                // Publish before the call: builtins may allocate and
+                // collect (frozen safepoint-call rule).
+                self.publish_all(jit, b)?;
+                let id_v = Self::iconst(b, id as i64);
+                let n_v = Self::iconst(b, args.len() as i64);
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                let v = self.call_value(
+                    jit,
+                    b,
+                    "toto_builtin",
+                    &[self.ctx, id_v, slot, n_v, start_v, end_v],
+                )?;
+                // Builtins push no trace frame on failure (the
+                // executor's leaf errors carry no trace of their own):
+                // silent unwind, like every other helper call.
+                self.check_silent(jit, b, *span)?;
                 if let Some(d) = dst {
-                    self.values.insert(*d, v);
+                    self.define(b, *d, v)?;
                 }
             }
             MInstr::ArrayLit { dst, elems, span } => {
                 // Publish first (threshold check inside the allocator),
                 // then allocate plus one initializing write per element.
-                Self::publish_all(jit, b, self.ctx, &self.values, &self.handle_locals);
-                let callee = jit
-                    .module
-                    .declare_func_in_func(jit.imports["toto_alloc_array"], b.func);
+                self.publish_all(jit, b)?;
                 let alen = Self::iconst(b, elems.len() as i64);
                 let astart = Self::iconst(b, span.start as i64);
                 let aend = Self::iconst(b, span.end as i64);
-                let aargs = [self.ctx, alen, astart, aend];
-                let inst = b.ins().call(callee, &aargs);
-                let arr = b.inst_results(inst)[0];
+                let arr =
+                    self.call_value(jit, b, "toto_alloc_array", &[self.ctx, alen, astart, aend])?;
+                self.check_silent(jit, b, *span)?;
                 for (i, e) in elems.iter().enumerate() {
-                    let v = self.operand(*e)?;
-                    let ety = self.local_ty(prog, f, *e)?.clone();
+                    let v = self.operand(b, *e)?;
+                    let ety = self.local_ty(*e)?.clone();
                     let tag = Self::tag_of(&ety).map_err(|e| SubsetError {
                         func: self.func.clone(),
                         message: format!("array element: {e}"),
                     })?;
-                    let wcallee = jit
-                        .module
-                        .declare_func_in_func(jit.imports["toto_write_field"], b.func);
-                    let fi = Self::iconst(b, i as i64);
-                    let ftag = Self::iconst(b, tag as i64);
-                    let fstart = Self::iconst(b, span.start as i64);
-                    let fend = Self::iconst(b, span.end as i64);
-                    let fargs = [self.ctx, arr, fi, ftag, v, fstart, fend];
-                    b.ins().call(wcallee, &fargs);
+                    let btag = Self::iconst(b, TAG_HANDLE as i64);
+                    let itag = Self::iconst(b, TAG_INT as i64);
+                    let idx = Self::iconst(b, i as i64);
+                    let vtag = Self::iconst(b, tag as i64);
+                    // Index span: the literal span (initializing writes
+                    // never fail bounds/type checks).
+                    self.call_import(
+                        jit,
+                        b,
+                        "toto_index_write",
+                        &[
+                            self.ctx, arr, btag, itag, idx, vtag, v, astart, aend, astart, aend,
+                        ],
+                    )?;
+                    self.check_silent(jit, b, *span)?;
                 }
-                let dty = self.local_ty(prog, f, *dst)?;
-                if !matches!(dty, Ty::Array(_)) {
-                    return self.fail(format!("array target type {dty:?} is out of gate subset"));
-                }
-                self.handle_locals.insert(*dst, ());
-                self.values.insert(*dst, arr);
+                self.define(b, *dst, arr)?;
             }
             MInstr::Index {
                 dst,
                 base,
                 index,
                 span,
-                ..
+                index_span,
             } => {
-                let bty = self.local_ty(prog, f, *base)?.clone();
-                let ity = self.local_ty(prog, f, *index)?.clone();
-                if !matches!(bty, Ty::Array(_)) || !matches!(ity, Ty::Int) {
-                    return self.fail(format!(
-                        "index of {bty:?} by {ity:?} is out of gate subset (array by int only)"
-                    ));
-                }
-                // No publication needed before a read (no collection
-                // inside), but the base must be live: it is defined,
-                // and every safepoint since its definition published it.
-                Self::publish_all(jit, b, self.ctx, &self.values, &self.handle_locals);
-                let callee = jit
-                    .module
-                    .declare_func_in_func(jit.imports["toto_read_field"], b.func);
-                let bbase = self.operand(*base)?;
-                let bidx = self.operand(*index)?;
+                let bty = self.local_ty(*base)?.clone();
+                let ity = self.local_ty(*index)?.clone();
+                let btag = Self::tag_of(&bty).map_err(|e| SubsetError {
+                    func: self.func.clone(),
+                    message: format!("index base: {e}"),
+                })?;
+                let itag = Self::tag_of(&ity).map_err(|e| SubsetError {
+                    func: self.func.clone(),
+                    message: format!("index operand: {e}"),
+                })?;
+                // Pure read (no collection inside): no publish needed,
+                // but the call is fallible, so check it.
+                let bbase = self.operand(b, *base)?;
+                let bidx = self.operand(b, *index)?;
+                let btag_v = Self::iconst(b, btag as i64);
+                let itag_v = Self::iconst(b, itag as i64);
                 let bstart = Self::iconst(b, span.start as i64);
                 let bend = Self::iconst(b, span.end as i64);
-                let bargs = [self.ctx, bbase, bidx, bstart, bend];
-                let inst = b.ins().call(callee, &bargs);
-                let v = b.inst_results(inst)[0];
-                let dty = self.local_ty(prog, f, *dst)?;
-                if Self::trafficable(dty).is_err() {
-                    return self.fail(format!("index target type {dty:?} is out of gate subset"));
-                }
-                if Self::trafficable(dty).expect("checked above") {
-                    self.handle_locals.insert(*dst, ());
-                }
-                self.values.insert(*dst, v);
+                let istart = Self::iconst(b, index_span.start as i64);
+                let iend = Self::iconst(b, index_span.end as i64);
+                let v = self.call_value(
+                    jit,
+                    b,
+                    "toto_index_read",
+                    &[
+                        self.ctx, bbase, btag_v, itag_v, bidx, bstart, bend, istart, iend,
+                    ],
+                )?;
+                self.check_silent(jit, b, *span)?;
+                self.define(b, *dst, v)?;
             }
             MInstr::Len { dst, base, span } => {
-                let bty = self.local_ty(prog, f, *base)?.clone();
-                if !matches!(bty, Ty::Array(_)) {
-                    return self.fail(format!("len on {bty:?} is out of gate subset"));
-                }
-                Self::publish_all(jit, b, self.ctx, &self.values, &self.handle_locals);
-                let callee = jit
-                    .module
-                    .declare_func_in_func(jit.imports["toto_array_len"], b.func);
-                let lbase = self.operand(*base)?;
+                let bty = self.local_ty(*base)?.clone();
+                let tag = Self::tag_of(&bty).map_err(|e| SubsetError {
+                    func: self.func.clone(),
+                    message: format!("len base: {e}"),
+                })?;
+                // Pure read (no collection inside): no publish needed,
+                // but the call is fallible, so check it.
+                let lbase = self.operand(b, *base)?;
+                let ltag = Self::iconst(b, tag as i64);
                 let lstart = Self::iconst(b, span.start as i64);
                 let lend = Self::iconst(b, span.end as i64);
-                let largs = [self.ctx, lbase, lstart, lend];
-                let inst = b.ins().call(callee, &largs);
-                self.values.insert(*dst, b.inst_results(inst)[0]);
+                let v =
+                    self.call_value(jit, b, "toto_len", &[self.ctx, lbase, ltag, lstart, lend])?;
+                self.check_silent(jit, b, *span)?;
+                self.define(b, *dst, v)?;
             }
             MInstr::Safepoint { kind } => {
                 use toto_compiler::mir::SpKind as K;
-                match kind {
-                    K::Entry => {
-                        // Base already recorded in the prologue; the
-                        // publish below covers handle params.
-                    }
-                    K::Call | K::Alloc | K::Loop | K::Park => {}
+                self.publish_all(jit, b)?;
+                // Task mode joins collections at loop/call/entry
+                // points (the rendezvous needs every task to arrive;
+                // allocation and suspension safepoints collect inside
+                // their helpers instead). Gate mode collects in
+                // allocation helpers only.
+                if self.mode == CodegenMode::Task && matches!(kind, K::Loop | K::Call | K::Entry) {
+                    self.call_import(jit, b, "toto_gc_collect", &[self.ctx])?;
                 }
-                Self::publish_all(jit, b, self.ctx, &self.values, &self.handle_locals);
             }
+            MInstr::StructLit {
+                dst,
+                name,
+                fields,
+                span,
+            } => {
+                self.publish_all(jit, b)?;
+                let (name_ptr, name_len) = jit.intern(name);
+                let nptr = Self::iconst(b, name_ptr as i64);
+                let nlen = Self::iconst(b, name_len as i64);
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                let obj = self.call_value(
+                    jit,
+                    b,
+                    "toto_alloc_struct",
+                    &[self.ctx, nptr, nlen, start_v, end_v],
+                )?;
+                self.check_silent(jit, b, *span)?;
+                for (fname, l) in fields {
+                    let v = self.operand(b, *l)?;
+                    let ety = self.local_ty(*l)?.clone();
+                    let tag = Self::tag_of(&ety).map_err(|e| SubsetError {
+                        func: self.func.clone(),
+                        message: format!("struct field `{fname}`: {e}"),
+                    })?;
+                    let (fptr, flen) = jit.intern(fname);
+                    let fptr_v = Self::iconst(b, fptr as i64);
+                    let flen_v = Self::iconst(b, flen as i64);
+                    let vtag = Self::iconst(b, tag as i64);
+                    self.call_import(
+                        jit,
+                        b,
+                        "toto_struct_init",
+                        &[self.ctx, obj, fptr_v, flen_v, vtag, v, start_v, end_v],
+                    )?;
+                    self.check_silent(jit, b, *span)?;
+                }
+                self.define(b, *dst, obj)?;
+            }
+            MInstr::Snapshot { dst, base, span } => {
+                use cranelift_codegen::ir::condcodes::IntCC;
+                // Clone loop: fresh array, then copy element-wise.
+                // (No safepoint inside: bounded straight-line work;
+                // the allocator collected before inserting.)
+                let bobj = self.operand(b, *base)?;
+                let btag = Self::iconst(b, TAG_HANDLE as i64);
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                let len =
+                    self.call_value(jit, b, "toto_len", &[self.ctx, bobj, btag, start_v, end_v])?;
+                self.check_silent(jit, b, *span)?;
+                let ety = match self.local_ty(*base)?.clone() {
+                    Ty::Array(t) => *t,
+                    other => {
+                        return self.fail(format!(
+                            "snapshot base has non-array type {other:?} (unreachable)"
+                        ));
+                    }
+                };
+                let vtag = Self::tag_of(&ety).map_err(|e| SubsetError {
+                    func: self.func.clone(),
+                    message: format!("snapshot element: {e}"),
+                })?;
+                self.publish_all(jit, b)?;
+                let arr =
+                    self.call_value(jit, b, "toto_alloc_array", &[self.ctx, len, start_v, end_v])?;
+                self.check_silent(jit, b, *span)?;
+                let zero = Self::iconst(b, 0);
+                let one = Self::iconst(b, 1);
+                let itag = Self::iconst(b, TAG_INT as i64);
+                let vtag_v = Self::iconst(b, vtag as i64);
+                let head_b = b.create_block();
+                let body_b = b.create_block();
+                let exit_b = b.create_block();
+                b.append_block_param(head_b, I64);
+                b.ins().jump(head_b, &[BlockArg::Value(zero)]);
+                b.switch_to_block(head_b);
+                let i = b.block_params(head_b)[0];
+                let c = b.ins().icmp(IntCC::UnsignedLessThan, i, len);
+                b.ins().brif(c, body_b, &[], exit_b, &[]);
+                b.switch_to_block(body_b);
+                b.seal_block(body_b);
+                let v = self.call_value(
+                    jit,
+                    b,
+                    "toto_index_read",
+                    &[
+                        self.ctx, bobj, btag, itag, i, start_v, end_v, start_v, end_v,
+                    ],
+                )?;
+                self.check_silent(jit, b, *span)?;
+                self.call_import(
+                    jit,
+                    b,
+                    "toto_index_write",
+                    &[
+                        self.ctx, arr, btag, itag, i, vtag_v, v, start_v, end_v, start_v, end_v,
+                    ],
+                )?;
+                self.check_silent(jit, b, *span)?;
+                let i1 = b.ins().iadd(i, one);
+                b.ins().jump(head_b, &[BlockArg::Value(i1)]);
+                b.seal_block(head_b);
+                b.switch_to_block(exit_b);
+                b.seal_block(exit_b);
+                self.define(b, *dst, arr)?;
+            }
+            MInstr::RangeLit { dst, lo, hi, span } => {
+                let lo_v = self.operand(b, *lo)?;
+                let hi_v = self.operand(b, *hi)?;
+                self.publish_all(jit, b)?;
+                let v = self.call_value(jit, b, "toto_alloc_range", &[self.ctx, lo_v, hi_v])?;
+                self.check_silent(jit, b, *span)?;
+                self.define(b, *dst, v)?;
+            }
+            MInstr::SplitRange {
+                lo,
+                hi,
+                range,
+                span,
+            } => {
+                let r = self.operand(b, *range)?;
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                let lo_v =
+                    self.call_value(jit, b, "toto_range_lo", &[self.ctx, r, start_v, end_v])?;
+                self.check_silent(jit, b, *span)?;
+                let hi_v =
+                    self.call_value(jit, b, "toto_range_hi", &[self.ctx, r, start_v, end_v])?;
+                self.check_silent(jit, b, *span)?;
+                self.define(b, *lo, lo_v)?;
+                self.define(b, *hi, hi_v)?;
+            }
+            MInstr::WrapOk { dst, inner } => {
+                let (tag_v, word) = self.tagged_operand(b, *inner)?;
+                self.publish_all(jit, b)?;
+                let is_ok = Self::iconst(b, 1);
+                let (start_v, end_v) = self.body_span_words(b);
+                let v = self.call_value(
+                    jit,
+                    b,
+                    "toto_alloc_result",
+                    &[self.ctx, is_ok, tag_v, word, start_v, end_v],
+                )?;
+                self.check_silent(jit, b, self.body_span)?;
+                self.define(b, *dst, v)?;
+            }
+            MInstr::WrapErr { dst, inner } => {
+                let (tag_v, word) = self.tagged_operand(b, *inner)?;
+                self.publish_all(jit, b)?;
+                let is_ok = Self::iconst(b, 0);
+                let (start_v, end_v) = self.body_span_words(b);
+                let v = self.call_value(
+                    jit,
+                    b,
+                    "toto_alloc_result",
+                    &[self.ctx, is_ok, tag_v, word, start_v, end_v],
+                )?;
+                self.check_silent(jit, b, self.body_span)?;
+                self.define(b, *dst, v)?;
+            }
+            MInstr::WrapSome { dst, inner } => {
+                let (tag_v, word) = self.tagged_operand(b, *inner)?;
+                self.publish_all(jit, b)?;
+                let (start_v, end_v) = self.body_span_words(b);
+                let v = self.call_value(
+                    jit,
+                    b,
+                    "toto_alloc_some",
+                    &[self.ctx, tag_v, word, start_v, end_v],
+                )?;
+                self.check_silent(jit, b, self.body_span)?;
+                self.define(b, *dst, v)?;
+            }
+            MInstr::Propagate { dst, operand, span } => {
+                use cranelift_codegen::ir::condcodes::IntCC;
+                let ty = self.local_ty(*operand)?.clone();
+                let v = self.operand(b, *operand)?;
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                match ty {
+                    Ty::Result(..) => {
+                        let is_ok = self.call_value(
+                            jit,
+                            b,
+                            "toto_result_is_ok",
+                            &[self.ctx, v, start_v, end_v],
+                        )?;
+                        self.check_silent(jit, b, *span)?;
+                        let zero = Self::iconst(b, 0);
+                        let ok_c = b.ins().icmp(IntCC::NotEqual, is_ok, zero);
+                        let ok_b = b.create_block();
+                        let err_b = b.create_block();
+                        let cont_b = b.create_block();
+                        b.ins().brif(ok_c, ok_b, &[], err_b, &[]);
+                        b.switch_to_block(err_b);
+                        b.seal_block(err_b);
+                        self.epilogue(jit, b)?;
+                        b.ins().return_(&[v]);
+                        b.switch_to_block(ok_b);
+                        b.seal_block(ok_b);
+                        let inner = self.call_value(
+                            jit,
+                            b,
+                            "toto_wrap_inner",
+                            &[self.ctx, v, start_v, end_v],
+                        )?;
+                        self.check_silent(jit, b, *span)?;
+                        self.define(b, *dst, inner)?;
+                        b.ins().jump(cont_b, &[]);
+                        b.switch_to_block(cont_b);
+                        b.seal_block(cont_b);
+                    }
+                    Ty::Option(_) => {
+                        // None is word 0: nonzero unwraps, zero returns.
+                        let zero = Self::iconst(b, 0);
+                        let some_c = b.ins().icmp(IntCC::NotEqual, v, zero);
+                        let some_b = b.create_block();
+                        let none_b = b.create_block();
+                        let cont_b = b.create_block();
+                        b.ins().brif(some_c, some_b, &[], none_b, &[]);
+                        b.switch_to_block(none_b);
+                        b.seal_block(none_b);
+                        self.epilogue(jit, b)?;
+                        b.ins().return_(&[zero]);
+                        b.switch_to_block(some_b);
+                        b.seal_block(some_b);
+                        let inner = self.call_value(
+                            jit,
+                            b,
+                            "toto_wrap_inner",
+                            &[self.ctx, v, start_v, end_v],
+                        )?;
+                        self.check_silent(jit, b, *span)?;
+                        self.define(b, *dst, inner)?;
+                        b.ins().jump(cont_b, &[]);
+                        b.switch_to_block(cont_b);
+                        b.seal_block(cont_b);
+                    }
+                    _ => {
+                        // Statically impossible (`?` needs a `Result`
+                        // or `Option` operand).
+                        let r = self.emit_dead_panic(
+                            jit,
+                            b,
+                            E_INTERNAL,
+                            (span.start as u64, span.end as u64),
+                            "`?` outside a matching Result/Option function (unreachable in checked programs)",
+                        )?;
+                        self.define(b, *dst, r)?;
+                    }
+                }
+            }
+            MInstr::Field {
+                dst,
+                base,
+                name,
+                span,
+            } => {
+                let bobj = self.operand(b, *base)?;
+                let (ptr, len) = jit.intern(name);
+                let nptr = Self::iconst(b, ptr as i64);
+                let nlen = Self::iconst(b, len as i64);
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                let v = self.call_value(
+                    jit,
+                    b,
+                    "toto_struct_get",
+                    &[self.ctx, bobj, nptr, nlen, start_v, end_v],
+                )?;
+                self.check_silent(jit, b, *span)?;
+                self.define(b, *dst, v)?;
+            }
+            MInstr::StoreField {
+                base,
+                name,
+                value,
+                span,
+            } => {
+                let bobj = self.operand(b, *base)?;
+                let (vtag, vword) = self.tagged_operand(b, *value)?;
+                let (ptr, len) = jit.intern(name);
+                let nptr = Self::iconst(b, ptr as i64);
+                let nlen = Self::iconst(b, len as i64);
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                self.call_import(
+                    jit,
+                    b,
+                    "toto_struct_set",
+                    &[self.ctx, bobj, nptr, nlen, vtag, vword, start_v, end_v],
+                )?;
+                self.check_silent(jit, b, *span)?;
+            }
+            MInstr::StoreIndex {
+                base,
+                index,
+                value,
+                span,
+                index_span,
+            } => {
+                let bobj = self.operand(b, *base)?;
+                let bty = self.local_ty(*base)?.clone();
+                let ity = self.local_ty(*index)?.clone();
+                let btag = Self::tag_of(&bty).map_err(|e| SubsetError {
+                    func: self.func.clone(),
+                    message: format!("store base: {e}"),
+                })?;
+                let itag = Self::tag_of(&ity).map_err(|e| SubsetError {
+                    func: self.func.clone(),
+                    message: format!("store index: {e}"),
+                })?;
+                let idx = self.operand(b, *index)?;
+                let (vtag, vword) = self.tagged_operand(b, *value)?;
+                let btag_v = Self::iconst(b, btag as i64);
+                let itag_v = Self::iconst(b, itag as i64);
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                let istart = Self::iconst(b, index_span.start as i64);
+                let iend = Self::iconst(b, index_span.end as i64);
+                self.call_import(
+                    jit,
+                    b,
+                    "toto_index_write",
+                    &[
+                        self.ctx, bobj, btag_v, itag_v, idx, vtag, vword, start_v, end_v, istart,
+                        iend,
+                    ],
+                )?;
+                self.check_silent(jit, b, *span)?;
+            }
+            MInstr::SatIncr { dst, operand } => {
+                use cranelift_codegen::ir::condcodes::IntCC;
+                let v = self.operand(b, *operand)?;
+                let max = Self::iconst(b, i64::MAX);
+                let is_max = b.ins().icmp(IntCC::Equal, v, max);
+                let one = Self::iconst(b, 1);
+                let r = Self::if_else(
+                    jit,
+                    b,
+                    is_max,
+                    |_, b| Self::iconst(b, i64::MAX),
+                    |_, b| b.ins().iadd(v, one),
+                );
+                self.define(b, *dst, r)?;
+            }
+            MInstr::MakeClosure {
+                dst,
+                body,
+                captures,
+                span,
+            } => {
+                // Assign a body id and collect the body for later
+                // compilation (both modes lower closures).
+                let id = jit.next_body;
+                jit.next_body += 1;
+                jit.bodies.push((id, BodyKind::Closure, Arc::clone(body)));
+                let slot = Self::stack_slot(b, (captures.len().max(1) * 16) as u32);
+                for (i, c) in captures.iter().enumerate() {
+                    let (tag_v, word) = self.tagged_operand(b, *c)?;
+                    Self::stack_store(b, slot, 2 * i, tag_v);
+                    Self::stack_store(b, slot, 2 * i + 1, word);
+                }
+                self.publish_all(jit, b)?;
+                let id_v = Self::iconst(b, id as i64);
+                let n_v = Self::iconst(b, captures.len() as i64);
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                let v = self.call_value(
+                    jit,
+                    b,
+                    "toto_alloc_closure",
+                    &[self.ctx, id_v, slot, n_v, start_v, end_v],
+                )?;
+                self.check_silent(jit, b, *span)?;
+                self.define(b, *dst, v)?;
+            }
+            MInstr::ChanNew {
+                dst,
+                elem,
+                cap,
+                span,
+            } => {
+                let v = self.chan_new_emit(jit, b, elem, *cap, span)?;
+                self.define(b, *dst, v)?;
+            }
+            MInstr::Send { chan, value, span } => {
+                if self.mode == CodegenMode::Gate {
+                    return self.fail(String::from(
+                        "channels need a task session (concurrency is task-only)",
+                    ));
+                }
+                let chan_w = self.operand(b, *chan)?;
+                let (vtag, vword) = self.tagged_operand(b, *value)?;
+                // Roots ride the preceding `Park` publication; the
+                // suspender collects before parking.
+                let op = Self::iconst(b, crate::task::YIELD_SEND as i64);
+                let z = Self::iconst(b, 0);
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                self.call_import(
+                    jit,
+                    b,
+                    "toto_yield",
+                    &[self.ctx, op, chan_w, vtag, vword, z, z, start_v, end_v],
+                )?;
+                self.check_silent(jit, b, *span)?;
+            }
+            MInstr::Recv { dst, chan, span } => {
+                if self.mode == CodegenMode::Gate {
+                    return self.fail(String::from(
+                        "channels need a task session (concurrency is task-only)",
+                    ));
+                }
+                let chan_w = self.operand(b, *chan)?;
+                let op = Self::iconst(b, crate::task::YIELD_RECV as i64);
+                let z = Self::iconst(b, 0);
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                let v = self.call_value(
+                    jit,
+                    b,
+                    "toto_yield",
+                    &[self.ctx, op, chan_w, z, z, z, z, start_v, end_v],
+                )?;
+                self.check_silent(jit, b, *span)?;
+                self.define(b, *dst, v)?;
+            }
+            MInstr::Spawn {
+                body,
+                captures,
+                span,
+            } => {
+                if self.mode == CodegenMode::Gate {
+                    return self.fail(String::from(
+                        "spawn needs a task session (concurrency is task-only)",
+                    ));
+                }
+                let id = jit.next_body;
+                jit.next_body += 1;
+                jit.bodies.push((id, BodyKind::Go, Arc::clone(body)));
+                let slot = Self::stack_slot(b, (captures.len().max(1) * 16) as u32);
+                for (i, c) in captures.iter().enumerate() {
+                    let (tag_v, word) = self.tagged_operand(b, *c)?;
+                    Self::stack_store(b, slot, 2 * i, tag_v);
+                    Self::stack_store(b, slot, 2 * i + 1, word);
+                }
+                self.publish_all(jit, b)?;
+                let id_v = Self::iconst(b, id as i64);
+                let n_v = Self::iconst(b, captures.len() as i64);
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                self.call_import(
+                    jit,
+                    b,
+                    "toto_spawn",
+                    &[self.ctx, id_v, slot, n_v, start_v, end_v],
+                )?;
+                self.check_silent(jit, b, *span)?;
+            }
+            MInstr::Select {
+                dst,
+                cases,
+                has_default,
+                span,
+            } => {
+                if self.mode == CodegenMode::Gate {
+                    return self.fail(String::from(
+                        "select needs a task session (concurrency is task-only)",
+                    ));
+                }
+                // Marshal 6-word case records + an out word.
+                let slot = Self::stack_slot(b, (cases.len().max(1) * 48) as u32);
+                for (i, case) in cases.iter().enumerate() {
+                    let base = 6 * i;
+                    match case {
+                        MSelectCase::Recv {
+                            chan, span: cspan, ..
+                        } => {
+                            let chan_w = self.operand(b, *chan)?;
+                            let z = Self::iconst(b, 0);
+                            let cs = Self::iconst(b, cspan.start as i64);
+                            let ce = Self::iconst(b, cspan.end as i64);
+                            Self::stack_store(b, slot, base, z);
+                            Self::stack_store(b, slot, base + 1, chan_w);
+                            Self::stack_store(b, slot, base + 2, z);
+                            Self::stack_store(b, slot, base + 3, z);
+                            Self::stack_store(b, slot, base + 4, cs);
+                            Self::stack_store(b, slot, base + 5, ce);
+                        }
+                        MSelectCase::Send {
+                            chan,
+                            value,
+                            span: cspan,
+                        } => {
+                            let chan_w = self.operand(b, *chan)?;
+                            let (vtag, vword) = self.tagged_operand(b, *value)?;
+                            let kind_v = Self::iconst(b, 1);
+                            let cs = Self::iconst(b, cspan.start as i64);
+                            let ce = Self::iconst(b, cspan.end as i64);
+                            Self::stack_store(b, slot, base, kind_v);
+                            Self::stack_store(b, slot, base + 1, chan_w);
+                            Self::stack_store(b, slot, base + 2, vtag);
+                            Self::stack_store(b, slot, base + 3, vword);
+                            Self::stack_store(b, slot, base + 4, cs);
+                            Self::stack_store(b, slot, base + 5, ce);
+                        }
+                    }
+                }
+                let out_slot = Self::stack_slot(b, 8);
+                self.publish_all(jit, b)?;
+                let op = Self::iconst(b, crate::task::YIELD_SELECT as i64);
+                let n_v = Self::iconst(b, cases.len() as i64);
+                let hd_v = Self::iconst(b, i64::from(*has_default));
+                let z = Self::iconst(b, 0);
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                let v = self.call_value(
+                    jit,
+                    b,
+                    "toto_yield",
+                    &[self.ctx, op, slot, n_v, hd_v, out_slot, z, start_v, end_v],
+                )?;
+                self.check_silent(jit, b, *span)?;
+                self.define(b, *dst, v)?;
+                // Bind slots read the out word: only the selected
+                // case's arm uses its bind, and the out word is
+                // always a live value (or 0), so unused binds
+                // publish safely.
+                let out_v = Self::stack_load(b, out_slot, 0);
+                for case in cases {
+                    if let MSelectCase::Recv { bind: Some(l), .. } = case {
+                        self.define(b, *l, out_v)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Body-span words for spanless instructions (wrappers carry no
+    /// span; their failures are unreachable backstops).
+    fn body_span_words(&self, b: &mut FunctionBuilder<'_>) -> (CVal, CVal) {
+        (
+            Self::iconst(b, self.body_span.start as i64),
+            Self::iconst(b, self.body_span.end as i64),
+        )
+    }
+
+    /// Shared channel creation: interns the element type, publishes,
+    /// and calls `toto_chan_make` (task-only).
+    fn chan_new_emit(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        elem: &Ty,
+        cap: Option<usize>,
+        span: &Span,
+    ) -> Result<CVal, SubsetError> {
+        if self.mode == CodegenMode::Gate {
+            return self.fail(String::from(
+                "channels need a task session (concurrency is task-only)",
+            ));
+        }
+        let id = jit.chan_types.len() as u64;
+        jit.chan_types.push(elem.clone());
+        self.publish_all(jit, b)?;
+        let (has_cap, cap_w) = match cap {
+            Some(l) => {
+                let w = self.operand(b, l)?;
+                (Self::iconst(b, 1), w)
+            }
+            None => (Self::iconst(b, 0), Self::iconst(b, 0)),
+        };
+        let ty_v = Self::iconst(b, id as i64);
+        let start_v = Self::iconst(b, span.start as i64);
+        let end_v = Self::iconst(b, span.end as i64);
+        let v = self.call_value(
+            jit,
+            b,
+            "toto_chan_make",
+            &[self.ctx, has_cap, cap_w, ty_v, start_v, end_v],
+        )?;
+        self.check_silent(jit, b, *span)?;
+        Ok(v)
+    }
+
+    /// Defensive `chan` builtin (normally `ChanNew`): capacity from
+    /// the argument list, element type from the destination.
+    fn lower_builtin_chan(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        dst: Option<usize>,
+        args: &[usize],
+        span: &Span,
+    ) -> Result<(), SubsetError> {
+        let d = dst.ok_or_else(|| SubsetError {
+            func: self.func.clone(),
+            message: String::from("chan without a destination (unreachable: checked code)"),
+        })?;
+        let elem = match self.local_ty(d)?.clone() {
+            Ty::Chan(t) => *t,
             other => {
-                return self.fail(format!("{other:?} is out of gate subset"));
+                return self.fail(format!(
+                    "chan destination has type {other:?} (unreachable: checked code)"
+                ));
             }
+        };
+        let cap = match args.len() {
+            0 => None,
+            1 => Some(args[0]),
+            _ => {
+                return self.fail(format!(
+                    "chan takes 0 or 1 arguments, got {} (unreachable: checked code)",
+                    args.len()
+                ));
+            }
+        };
+        let v = self.chan_new_emit(jit, b, &elem, cap, span)?;
+        self.define(b, d, v)?;
+        Ok(())
+    }
+
+    /// Native `close`/`closed` (task-only): scheduler round-trips.
+    fn lower_builtin_close(
+        &self,
+        jit: &mut Jit,
+        b: &mut FunctionBuilder<'_>,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: &Span,
+    ) -> Result<(), SubsetError> {
+        if self.mode == CodegenMode::Gate {
+            return self.fail(format!(
+                "builtin `{name}` needs a task session (concurrency is task-only)"
+            ));
+        }
+        if args.len() != 1 {
+            return self.fail(format!(
+                "builtin `{name}` takes 1 argument, got {} (unreachable: checked code)",
+                args.len()
+            ));
+        }
+        self.publish_all(jit, b)?;
+        let chan = self.operand(b, args[0])?;
+        let op = if name == "close" {
+            crate::task::YIELD_CLOSE
+        } else {
+            crate::task::YIELD_CLOSED
+        };
+        let op_v = Self::iconst(b, op as i64);
+        let z = Self::iconst(b, 0);
+        let start_v = Self::iconst(b, span.start as i64);
+        let end_v = Self::iconst(b, span.end as i64);
+        // (op, chan, 0, 0, 0, 0, span): only the channel word matters.
+        let v = self.call_value(
+            jit,
+            b,
+            "toto_yield",
+            &[self.ctx, op_v, chan, z, z, z, z, start_v, end_v],
+        )?;
+        // `close`/`closed` push no trace frame on failure (builtins
+        // carry no trace of their own in the reference executor):
+        // silent unwind, like every other helper call.
+        self.check_silent(jit, b, *span)?;
+        if let Some(d) = dst {
+            self.define(b, d, v)?;
         }
         Ok(())
     }

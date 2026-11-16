@@ -1,0 +1,14 @@
+fn f(a: int) -> int {
+    return a;
+}
+fn main() -> int {
+    let h = f;
+    let g = fn(a: int) -> int { return a; };
+    let c = chan<int>();
+    go {
+        c <- 1;
+    }
+    let x = <-c;
+    println(h == g);
+    return 0;
+}

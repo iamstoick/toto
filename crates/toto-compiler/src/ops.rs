@@ -114,7 +114,10 @@ pub fn mod_values(l: Value, r: Value, span: Span) -> OpResult<Value> {
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => {
             if b == 0 {
-                return Err(fail("E0202", "modulo by zero".to_string(), span));
+                // Unified Phase 4 wording: every executor reports
+                // "division by zero" for `% 0` (E0202, same span).
+                // Spec §5.2 pins codes, not messages.
+                return Err(fail("E0202", "division by zero".to_string(), span));
             }
             // i64::MIN % -1 is the only overflow; its value is 0.
             Ok(Value::Int(a.wrapping_rem(b)))

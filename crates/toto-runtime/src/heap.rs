@@ -39,15 +39,25 @@ impl GcRef {
 
 /// Type descriptor in the object header: tells the tracer which
 /// payload fields are references (ADR-008: descriptors, not maps).
+/// The Phase 4 JIT families (`Range`, `Result`, `Option`, `Closure`)
+/// are heap objects with the frozen handle codec, allocated through
+/// the frozen per-family allocator names; the MIR executor keeps its
+/// immediate/`Arc` representations and never creates these payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescKind {
     Str,
     Array,
     Struct,
+    Range,
+    Result,
+    Option,
+    Closure,
 }
 
-/// Heap payload. Only composites live on the GC heap; scalars are
-/// executor immediates (`RtVal::Int` etc.) and need no tracing.
+/// Heap payload. Composites and JIT value families live on the GC
+/// heap; scalars are executor immediates (`RtVal::Int` etc.) and need
+/// no tracing. `None` is the immediate word 0, never a payload —
+/// only `Some` allocates (`Payload::Option`).
 #[derive(Clone, Debug)]
 pub enum Payload {
     Str(String),
@@ -55,6 +65,21 @@ pub enum Payload {
     Struct {
         name: String,
         fields: Vec<(String, RtVal)>,
+    },
+    Range {
+        lo: i64,
+        hi: i64,
+    },
+    Result {
+        is_ok: bool,
+        inner: RtVal,
+    },
+    Option {
+        inner: RtVal,
+    },
+    Closure {
+        body: u32,
+        captures: Vec<RtVal>,
     },
 }
 
@@ -174,6 +199,34 @@ impl Heap {
         )
     }
 
+    /// JIT `Range` value (frozen `toto_alloc_range` family).
+    pub fn alloc_range(&mut self, lo: i64, hi: i64) -> GcRef {
+        self.insert(DescKind::Range, Payload::Range { lo, hi }, 32 + 16)
+    }
+
+    /// JIT `Ok`/`Err` value (frozen `toto_alloc_result` family).
+    pub fn alloc_result(&mut self, is_ok: bool, inner: RtVal) -> GcRef {
+        self.insert(DescKind::Result, Payload::Result { is_ok, inner }, 32 + 16)
+    }
+
+    /// JIT `Some` value (frozen `toto_alloc_option` family). `None`
+    /// is the immediate 0 and never allocates.
+    pub fn alloc_some(&mut self, inner: RtVal) -> GcRef {
+        self.insert(DescKind::Option, Payload::Option { inner }, 32 + 16)
+    }
+
+    /// JIT closure value (frozen `toto_alloc_closure` family):
+    /// compiled-body id plus by-value captures (spec §5.7). Captures
+    /// are traced like array elements.
+    pub fn alloc_closure(&mut self, body: u32, captures: Vec<RtVal>) -> GcRef {
+        let bytes = 32 + 16 * captures.len() as u64;
+        self.insert(
+            DescKind::Closure,
+            Payload::Closure { body, captures },
+            bytes,
+        )
+    }
+
     fn resolve(&self, r: GcRef) -> Option<usize> {
         let slot = self.slots.get(r.index as usize)?;
         match &slot.cell {
@@ -229,6 +282,15 @@ impl Heap {
                     }
                     Payload::Struct { fields, .. } => {
                         for (_, v) in fields.iter() {
+                            crate::value::heap_refs_of(v, &mut kids);
+                        }
+                    }
+                    Payload::Range { .. } => {}
+                    Payload::Result { inner, .. } | Payload::Option { inner } => {
+                        crate::value::heap_refs_of(inner, &mut kids);
+                    }
+                    Payload::Closure { captures, .. } => {
+                        for v in captures.iter() {
                             crate::value::heap_refs_of(v, &mut kids);
                         }
                     }

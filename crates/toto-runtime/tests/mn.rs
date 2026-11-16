@@ -1,4 +1,4 @@
-//! Concurrent corpus under the M:N scheduler (Stage 2): the same 17
+//! Concurrent corpus under the M:N scheduler (Stage 2): the same 18
 //! programs run with 4 workers and the forced-collection hook (every
 //! safepoint rendezvouses all workers — maximum barrier pressure).
 //!
@@ -244,6 +244,7 @@ fn mn_negatives_exact() {
         "conc_neg_select_send_closed",
         "conc_neg_child_panic",
         "conc_neg_main_panic",
+        "conc18_fneq",
     ] {
         let out = run_case(name);
         assert_eq!(out.status, "1", "{name}: status");
