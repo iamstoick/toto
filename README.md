@@ -1,12 +1,12 @@
 # Toto (.gzv) — language implementation in Rust
 
-> Phase 3 (runtime + concurrency) complete: single-threaded
-> milestone, M:N work-stealing scheduler with dedicated blocking
-> pool, and the Tier-2 Cranelift ABI gate (real MIR → production
-> heap, JIT-on-coroutine-stacks proof). Gate green (95 tests).
-> `toto run [--workers N]` routes concurrent programs through the
-> MIR executor on 64 KiB coroutine stacks (default 1, deterministic).
-> See [Phase 3 report](docs/phases/phase-3-runtime.md).
+> Phase 4 (Cranelift JIT + `toto dev`) complete: full backend
+> compiling all 123 corpus programs with exact differentials, the
+> fiber-aware race detector (conc10 positive control), the flagged
+> opt pipeline (`off`/`speed`/`speed_and_size`), and drain-then-restart
+> `toto dev` with the parked-recv cancellation proof. Gate green
+> (54 suites, 127 tests).
+> See [Phase 4 report](docs/phases/phase-4-jit-dev.md).
 > Roadmap: [Implementation Roadmap v2.4](docs/) (D1–D8 + ratified decisions; title page verified at Phase 4 kickoff).
 
 ## Layout
@@ -17,8 +17,8 @@
 - `crates/toto-compiler/` — lexer, parser, diagnostics, tree-walking
   interpreter, plus the Phase 2 checker, shared `ops`, HIR, MIR, and MIR
   interpreter (differential-tested against the tree-walker).
-- `crates/toto-cli/` — `toto run [--workers N]` + `--help`/`--version` (Phase 1, workers flag Phase 3).
-- `crates/toto-jit/` — Tier-2 ABI gate (Phase 3): real-MIR subset → Cranelift → production heap. Conformance gate, not the Phase 4 backend.
+- `crates/toto-cli/` — `toto run [--workers N]`, `toto dev [--workers N] [--drain-timeout SECS] [--opt-level LEVEL]` + `--help`/`--version`.
+- `crates/toto-jit/` — full Cranelift backend (Phase 4): real MIR → production heap, Gate + Task modes, `toto dev` driver, race detector, opt pipeline. Conformance gate grown up.
 - `spikes/spike-1-gc-scheduler/` — **isolated prototype** for Spike 1
   (single-threaded cooperative scheduler + stop-the-world tracing GC).
   Throwaway code: it may be deleted, and it is NOT the production runtime.
