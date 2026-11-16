@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use toto_compiler::render_errors;
 
 mod build_cmd;
+mod lsp;
 mod manifest;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -20,6 +21,10 @@ const HELP: &str = "toto — a new programming language (.gzv)\n\
                     \x20   toto init <name>                   scaffold a runnable project\n\
                     \x20   toto build [--release]             build the project executable\n\
                     \x20   toto test                         run the project tests\n\
+                    \x20   toto fmt [--check] <file.gzv>...   format files in place\n\
+                    (--check: list files that would change, no writes)\n\
+                    \x20   toto lsp                          basic LSP server on stdio\n\
+                    (hover, go-to-definition, diagnostics)\n\
                     \x20   toto --help                        show this help\n\
                     \x20   toto --version                     show the version\n\
                     \n\
@@ -159,6 +164,23 @@ fn main() -> ExitCode {
             }
             build_cmd::test_all()
         }
+        Some("fmt") => {
+            let mut check = false;
+            let mut files = Vec::new();
+            for a in args.iter().skip(2) {
+                if a == "--check" {
+                    check = true;
+                } else {
+                    files.push(a.clone());
+                }
+            }
+            if files.is_empty() {
+                eprintln!("toto: `fmt` needs a file: toto fmt [--check] <file.gzv>...");
+                return ExitCode::from(3);
+            }
+            fmt_files(&files, check)
+        }
+        Some("lsp") => lsp::serve(),
         Some(other) => {
             eprintln!("toto: unknown command `{other}`\n\n{HELP}");
             ExitCode::from(3)
@@ -187,6 +209,55 @@ fn init_project(dir: &str) -> ExitCode {
             ExitCode::from(3)
         }
     }
+}
+
+/// Format files in place (or, with `--check`, list the ones that
+/// would change). Broken files are refused with their diagnostics
+/// (exit 2): the formatter never guesses at broken syntax. Each
+/// file formats independently; imports are not resolved.
+fn fmt_files(files: &[String], check: bool) -> ExitCode {
+    let mut changed = Vec::new();
+    for path in files {
+        let src = match std::fs::read_to_string(path) {
+            Ok(src) => src,
+            Err(e) => {
+                eprintln!("toto: couldn't read `{path}`: {e}");
+                return ExitCode::from(3);
+            }
+        };
+        let (tokens, lex_errors) = toto_compiler::lexer::lex(&src);
+        if !lex_errors.is_empty() {
+            let diags: Vec<toto_compiler::diag::Diag> = lex_errors
+                .into_iter()
+                .map(|e| toto_compiler::diag::Diag::new(e.code, e.message, e.span, e.help))
+                .collect();
+            eprint!("{}", toto_compiler::render_errors(&diags, &src, path));
+            return ExitCode::from(2);
+        }
+        let (program, parse_errors) = toto_compiler::parser::parse(tokens, &src);
+        if !parse_errors.is_empty() {
+            eprint!(
+                "{}",
+                toto_compiler::render_errors(&parse_errors, &src, path)
+            );
+            return ExitCode::from(2);
+        }
+        let formatted = toto_compiler::fmt::format_program(&program);
+        if formatted != src {
+            changed.push(path.clone());
+            if !check && let Err(e) = std::fs::write(path, formatted) {
+                eprintln!("toto: couldn't write `{path}`: {e}");
+                return ExitCode::from(3);
+            }
+        }
+    }
+    if check && !changed.is_empty() {
+        for path in &changed {
+            println!("toto: would reformat `{path}`");
+        }
+        return ExitCode::from(1);
+    }
+    ExitCode::from(0)
 }
 
 fn run_file(path: &str, workers: usize) -> ExitCode {

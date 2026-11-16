@@ -256,6 +256,69 @@ fn build_refuses_callback_ffi() {
 }
 
 #[test]
+fn fmt_reformats_and_is_stable() {
+    // Messy input formats in place; a second pass (and `--check`)
+    // reports clean.
+    let dir = scratch_project("fmtbasic");
+    let out = toto()
+        .arg("init")
+        .arg(dir.join("app"))
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let main = dir.join("app").join("main.gzv");
+    std::fs::write(&main, "fn main()->int{\nprintln(  1+2 );\nreturn 0;\n}\n").expect("write");
+    let out = toto().arg("fmt").arg(&main).output().expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let text = std::fs::read_to_string(&main).expect("read back");
+    assert!(text.contains("fn main() -> int {"), "got:\n{text}");
+    assert!(text.contains("println(1 + 2);"), "got:\n{text}");
+    let out = toto()
+        .arg("fmt")
+        .arg("--check")
+        .arg(&main)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fmt_check_flags_and_broken_refuses() {
+    let dir = scratch_project("fmtcheck");
+    let out = toto()
+        .arg("init")
+        .arg(dir.join("app"))
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let main = dir.join("app").join("main.gzv");
+    std::fs::write(&main, "fn main()->int{\nreturn 0;\n}\n").expect("write");
+    let out = toto()
+        .arg("fmt")
+        .arg("--check")
+        .arg(&main)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("would reformat"),
+        "wrong stdout"
+    );
+    std::fs::write(&main, "fn main( -> int {\n").expect("write broken");
+    let out = toto().arg("fmt").arg(&main).output().expect("runs");
+    assert_eq!(out.status.code(), Some(2));
+    // Broken input is never overwritten.
+    assert_eq!(
+        std::fs::read_to_string(&main).expect("read back"),
+        "fn main( -> int {\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn workers_flag_rejects_zero() {
     let out = toto()
         .arg("run")

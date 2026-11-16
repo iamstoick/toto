@@ -8,6 +8,7 @@ pub mod builtins;
 pub mod check;
 pub mod diag;
 pub mod ffi;
+pub mod fmt;
 pub mod hir;
 pub mod interp;
 pub mod lexer;
