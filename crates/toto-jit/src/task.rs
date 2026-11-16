@@ -1246,7 +1246,11 @@ fn eq_snapshot(
         TAG_NONE => Some(plain(EqKind::None)),
         TAG_CHAN => Some(plain(EqKind::Chan)),
         TAG_FUNC => Some(plain(EqKind::Func)),
-        TAG_HANDLE => {
+        // Statically fn-typed words traffic as `TAG_FN_ANY`: small
+        // words are function indices, the rest are closure handles
+        // (same 2^32 discrimination as the task `decode`; frozen D8).
+        TAG_FN_ANY if word < 0x1_0000_0000 => Some(plain(EqKind::Func)),
+        TAG_HANDLE | TAG_FN_ANY => {
             let snap = {
                 let st = ctx.shared.state.lock().expect("shared state lock");
                 payload_owned(&st.heap, word)
@@ -2179,6 +2183,13 @@ pub unsafe extern "C" fn task_check_failed(
         ctx.skip_frame = false;
         return 1;
     }
+    // Silent checks carry no callee frame (the executor pushes frames
+    // only at Toto calls; the root frame is already on the trace), so
+    // unwind without appending — and without touching the null name
+    // pointer silent checks pass.
+    if name_ptr == 0 || name_len == 0 {
+        return 1;
+    }
     let bytes = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize) };
     let name = String::from_utf8_lossy(bytes).into_owned();
     ctx.trace.push(TraceFrame {
@@ -2678,6 +2689,11 @@ pub struct JitSession {
     pub bodies: Arc<HashMap<u32, usize>>,
     pub func_names: Arc<Vec<String>>,
     pub chan_types: Arc<Vec<Ty>>,
+    /// Interned bytes baked as immediates into the machine code
+    /// (trace names, type/field names, panic messages): owned here so
+    /// the code never outlives the bytes it reads, however the
+    /// compiling `Jit` is shared or dropped across M:N workers.
+    pub statics: Arc<Vec<Box<str>>>,
 }
 
 /// Task body for natively compiled code: installs the assignment,

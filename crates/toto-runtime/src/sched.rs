@@ -381,6 +381,15 @@ pub struct SchedState {
     /// True once some worker claimed deadlock reporting (exactly one
     /// E0216 outcome per run).
     pub deadlock_claimed: bool,
+    /// Completions whose settle cascade (`fail_scope` wakeups,
+    /// `on_task_done` propagation) is still in flight. A completion
+    /// that already decremented `live` but has not yet enqueued its
+    /// wakeups is invisible to the deadlock check — the same hazard
+    /// `PoolState::in_flight` covers for pool jobs — so the detector
+    /// treats a nonzero count as future work and defers instead of
+    /// claiming a bogus deadlock while a scope failure is still
+    /// propagating.
+    pub settling: usize,
 }
 
 /// Stop-the-world rendezvous state. A safepoint that needs collection
@@ -633,6 +642,7 @@ impl Scheduler {
                 workers_live: workers,
                 finished: false,
                 deadlock_claimed: false,
+                settling: 0,
             }),
             sched_cv: Condvar::new(),
             gc: Mutex::new(GcState {
@@ -1022,9 +1032,16 @@ impl Scheduler {
                                         .lock()
                                         .expect("done lock")
                                         .is_empty();
-                                    if !any_running && !pool_active {
-                                        // Nobody can run or wake: deadlock
-                                        // (spec §13.2). Exactly one worker
+                                    if !any_running && !pool_active && sched.settling == 0 {
+                                        // Nobody can run or wake, and no
+                                        // completion is still settling its
+                                        // wakeups: deadlock (spec §13.2).
+                                        // A nonzero `settling` count (like
+                                        // `pool.in_flight`) is future work:
+                                        // defer to the next pass instead of
+                                        // claiming while a scope failure is
+                                        // still propagating.
+                                        // Exactly one worker
                                         // claims the outcome; the rest see
                                         // `finished` and exit.
                                         if !sched.deadlock_claimed {
@@ -2154,6 +2171,10 @@ impl Scheduler {
                 slot.co = None;
                 slot.state = TaskState::Done;
                 sched.live -= 1;
+                // Open a settle: until the cascade below enqueues its
+                // wakeups, this completion is invisible to the deadlock
+                // check (closed by `settle_done` on every path).
+                sched.settling += 1;
             }
             sched.high_water_max = sched.high_water_max.max(hw);
             let scope = sched.slots[id.0].scope;
@@ -2183,13 +2204,24 @@ impl Scheduler {
             // Still run the settle cascade for clean completions.
             let scope = self.shared.sched.lock().expect("sched lock").slots[id.0].scope;
             self.on_task_done(worker, scope);
+            self.settle_done();
             return;
         }
         let scope = self.shared.sched.lock().expect("sched lock").slots[id.0].scope;
         self.on_task_done(worker, scope);
+        self.settle_done();
         // A finished task may unblock the world: wake sleepers so
         // termination/deadlock is re-evaluated promptly.
         self.shared.sched_cv.notify_all();
+    }
+
+    /// Close a settle opened in `task_done`: the cascade's wakeups are
+    /// all enqueued, so the deadlock check may decide again. Short
+    /// `sched`-lock section only (module lock discipline: no nesting).
+    fn settle_done(&self) {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        debug_assert!(sched.settling > 0, "settle_done without a settle");
+        sched.settling -= 1;
     }
 
     fn on_task_done(&self, worker: usize, scope: ScopeId) {

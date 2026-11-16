@@ -46,8 +46,8 @@ use std::sync::Arc;
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind,
-    types::*,
+    AbiParam, Block, BlockArg, Endianness, InstBuilder, MemFlagsData, Signature, StackSlotData,
+    StackSlotKind, types::*,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -320,7 +320,7 @@ impl Jit {
         if self.mode == CodegenMode::Task {
             self.import("toto_yield", 8, true);
             self.import("toto_spawn", 5, true);
-            self.import("toto_chan_make", 4, true);
+            self.import("toto_chan_make", 5, true);
             self.import("toto_check_failed", 4, true);
             self.import("toto_task_capture", 3, true);
         }
@@ -365,6 +365,7 @@ impl Jit {
             bodies: Arc::new(bodies),
             func_names: Arc::new(func_names),
             chan_types: Arc::new(std::mem::take(&mut self.chan_types)),
+            statics: Arc::new(std::mem::take(&mut self.statics)),
         })
     }
 
@@ -808,7 +809,6 @@ impl<'a> FnCx<'a> {
             cx.lower_instr(jit, b, prog, &entry_mir.instrs, i, instr)?;
         }
         cx.lower_term(jit, b, prog, &shape, &entry_mir.term)?;
-        b.seal_block(entry_block);
         for blk in shape.blocks {
             if blk.id == shape.entry {
                 continue;
@@ -819,8 +819,12 @@ impl<'a> FnCx<'a> {
                 cx.lower_instr(jit, b, prog, &blk.instrs, i, instr)?;
             }
             cx.lower_term(jit, b, prog, &shape, &blk.term)?;
-            b.seal_block(cb);
         }
+        // MIR block order is not topological (loop back-edges and
+        // short-circuit joins jump to earlier blocks), so no MIR
+        // block is sealed until every branch is emitted; internal
+        // helper blocks stay eagerly sealed (self-contained).
+        b.seal_all_blocks();
         Ok(())
     }
 
@@ -999,6 +1003,12 @@ impl<'a> FnCx<'a> {
                 params.len()
             ));
         }
+        // Record the shadow base BEFORE the capture fetches below:
+        // they end in `check_silent`, which needs the base to unwind.
+        // Capture fetches never push or pop shadows, so reading the
+        // depth here is identical to reading it after them.
+        let base = self.call_value(jit, b, "toto_shadow_len", &[self.ctx])?;
+        self.base = Some(base);
         match shape.kind {
             BodyKind::TopLevel => {
                 for (i, v) in params.iter().skip(1).enumerate() {
@@ -1025,8 +1035,6 @@ impl<'a> FnCx<'a> {
                 }
             }
         }
-        let base = self.call_value(jit, b, "toto_shadow_len", &[self.ctx])?;
-        self.base = Some(base);
         Ok(())
     }
 
@@ -1559,6 +1567,39 @@ impl<'a> FnCx<'a> {
         b.block_params(merge_b)[0]
     }
 
+    /// Float arithmetic on word traffic: operands arrive as `I64`
+    /// bit patterns (frozen single-word `u64` traffic), so bitcast
+    /// to `F64` for the operation and back to `I64` for the result.
+    /// `op` selects add/sub/mul/div in that order (IEEE semantics,
+    /// exactly like the interpreter: no traps, NaN propagates).
+    fn farith(b: &mut FunctionBuilder<'_>, op: u8, a: CVal, c: CVal) -> CVal {
+        let flags = MemFlagsData::new().with_endianness(Endianness::Little);
+        let x = b.ins().bitcast(F64, flags, a);
+        let y = b.ins().bitcast(F64, flags, c);
+        let r = match op {
+            0 => b.ins().fadd(x, y),
+            1 => b.ins().fsub(x, y),
+            2 => b.ins().fmul(x, y),
+            _ => b.ins().fdiv(x, y),
+        };
+        b.ins().bitcast(I64, flags, r)
+    }
+
+    /// Float comparison on word traffic: bitcast both operands to
+    /// `F64` first (same word convention as [`Self::farith`]).
+    fn fcmp_word(
+        b: &mut FunctionBuilder<'_>,
+        cc: cranelift_codegen::ir::condcodes::FloatCC,
+        a: CVal,
+        c: CVal,
+    ) -> CVal {
+        let flags = MemFlagsData::new().with_endianness(Endianness::Little);
+        let x = b.ins().bitcast(F64, flags, a);
+        let y = b.ins().bitcast(F64, flags, c);
+        let e = b.ins().fcmp(cc, x, y);
+        b.ins().uextend(I64, e)
+    }
+
     /// Integer arithmetic with the frozen explicit checks (`E0201`
     /// overflow, `E0202` zero divisor with the `DivCheck` span,
     /// `E0209` is handled at `Index`). Semantics mirror `ops`
@@ -1721,10 +1762,10 @@ impl<'a> FnCx<'a> {
                     |_, b| b.ins().srem(a, c),
                 ))
             }
-            (MBinOp::Add, Ty::Float, Ty::Float) => Ok(b.ins().fadd(a, c)),
-            (MBinOp::Sub, Ty::Float, Ty::Float) => Ok(b.ins().fsub(a, c)),
-            (MBinOp::Mul, Ty::Float, Ty::Float) => Ok(b.ins().fmul(a, c)),
-            (MBinOp::Div, Ty::Float, Ty::Float) => Ok(b.ins().fdiv(a, c)),
+            (MBinOp::Add, Ty::Float, Ty::Float) => Ok(Self::farith(b, 0, a, c)),
+            (MBinOp::Sub, Ty::Float, Ty::Float) => Ok(Self::farith(b, 1, a, c)),
+            (MBinOp::Mul, Ty::Float, Ty::Float) => Ok(Self::farith(b, 2, a, c)),
+            (MBinOp::Div, Ty::Float, Ty::Float) => Ok(Self::farith(b, 3, a, c)),
             (MBinOp::Eq, Ty::Int, Ty::Int) => {
                 let e = b.ins().icmp(IntCC::Equal, a, c);
                 Ok(b.ins().uextend(I64, e))
@@ -1749,29 +1790,19 @@ impl<'a> FnCx<'a> {
                 let e = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, a, c);
                 Ok(b.ins().uextend(I64, e))
             }
-            (MBinOp::Eq, Ty::Float, Ty::Float) => {
-                let e = b.ins().fcmp(FloatCC::Equal, a, c);
-                Ok(b.ins().uextend(I64, e))
-            }
+            (MBinOp::Eq, Ty::Float, Ty::Float) => Ok(Self::fcmp_word(b, FloatCC::Equal, a, c)),
             (MBinOp::NotEq, Ty::Float, Ty::Float) => {
-                let e = b.ins().fcmp(FloatCC::NotEqual, a, c);
-                Ok(b.ins().uextend(I64, e))
+                Ok(Self::fcmp_word(b, FloatCC::NotEqual, a, c))
             }
-            (MBinOp::Lt, Ty::Float, Ty::Float) => {
-                let e = b.ins().fcmp(FloatCC::LessThan, a, c);
-                Ok(b.ins().uextend(I64, e))
-            }
+            (MBinOp::Lt, Ty::Float, Ty::Float) => Ok(Self::fcmp_word(b, FloatCC::LessThan, a, c)),
             (MBinOp::LtEq, Ty::Float, Ty::Float) => {
-                let e = b.ins().fcmp(FloatCC::LessThanOrEqual, a, c);
-                Ok(b.ins().uextend(I64, e))
+                Ok(Self::fcmp_word(b, FloatCC::LessThanOrEqual, a, c))
             }
             (MBinOp::Gt, Ty::Float, Ty::Float) => {
-                let e = b.ins().fcmp(FloatCC::GreaterThan, a, c);
-                Ok(b.ins().uextend(I64, e))
+                Ok(Self::fcmp_word(b, FloatCC::GreaterThan, a, c))
             }
             (MBinOp::GtEq, Ty::Float, Ty::Float) => {
-                let e = b.ins().fcmp(FloatCC::GreaterThanOrEqual, a, c);
-                Ok(b.ins().uextend(I64, e))
+                Ok(Self::fcmp_word(b, FloatCC::GreaterThanOrEqual, a, c))
             }
             // Boolean equality is trivially inline.
             (MBinOp::Eq, Ty::Bool, Ty::Bool) => {
@@ -1979,10 +2010,9 @@ impl<'a> FnCx<'a> {
                     MConst::Bool(bv) => Self::iconst(b, i64::from(*bv)),
                     MConst::Unit | MConst::None => Self::iconst(b, 0),
                     MConst::Float(f) => {
-                        b.ins()
-                            .f64const(cranelift_codegen::ir::immediates::Ieee64::with_bits(
-                                f.to_bits(),
-                            ))
+                        // Words traffic as single-word `u64` (frozen D8):
+                        // floats are bit patterns, never native `F64`.
+                        Self::iconst(b, f.to_bits() as i64)
                     }
                     MConst::Str(s) => {
                         // JIT-owned bytes (freed with the session).
@@ -2085,7 +2115,12 @@ impl<'a> FnCx<'a> {
                         let zero = Self::iconst(b, 0);
                         b.ins().isub(zero, v)
                     }
-                    Ty::Float => b.ins().fneg(v),
+                    Ty::Float => {
+                        let flags = MemFlagsData::new().with_endianness(Endianness::Little);
+                        let x = b.ins().bitcast(F64, flags, v);
+                        let r = b.ins().fneg(x);
+                        b.ins().bitcast(I64, flags, r)
+                    }
                     other => {
                         // Statically impossible (the checker rejects
                         // negation of non-numbers), panicking
@@ -2208,7 +2243,10 @@ impl<'a> FnCx<'a> {
                     "toto_builtin",
                     &[self.ctx, id_v, slot, n_v, start_v, end_v],
                 )?;
-                self.check_named(jit, b, &format!("{name} (builtin)"), *span)?;
+                // Builtins push no trace frame on failure (the
+                // executor's leaf errors carry no trace of their own):
+                // silent unwind, like every other helper call.
+                self.check_silent(jit, b, *span)?;
                 if let Some(d) = dst {
                     self.define(b, *d, v)?;
                 }
@@ -2980,7 +3018,10 @@ impl<'a> FnCx<'a> {
             "toto_yield",
             &[self.ctx, op_v, chan, z, z, z, z, start_v, end_v],
         )?;
-        self.check_named(jit, b, &format!("{name} (builtin)"), *span)?;
+        // `close`/`closed` push no trace frame on failure (builtins
+        // carry no trace of their own in the reference executor):
+        // silent unwind, like every other helper call.
+        self.check_silent(jit, b, *span)?;
         if let Some(d) = dst {
             self.define(b, d, v)?;
         }

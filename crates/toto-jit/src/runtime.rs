@@ -1106,7 +1106,11 @@ fn eq_snapshot(rt: &mut JitRt, who: &str, tag: u64, word: u64, start: u64, end: 
         TAG_NONE => plain(EqKind::None),
         TAG_CHAN => plain(EqKind::Chan),
         TAG_FUNC => plain(EqKind::Func),
-        TAG_HANDLE => match payload_owned(&rt.heap, word) {
+        // Statically fn-typed words traffic as `TAG_FN_ANY`: small
+        // words are function indices, the rest are closure handles
+        // (same 2^32 discrimination as `decode_tagged`; frozen D8).
+        TAG_FN_ANY if word < 0x1_0000_0000 => plain(EqKind::Func),
+        TAG_HANDLE | TAG_FN_ANY => match payload_owned(&rt.heap, word) {
             Some(Payload::Str(_)) => plain(EqKind::Str),
             Some(Payload::Array(_)) => plain(EqKind::Array),
             Some(Payload::Struct { name, .. }) => EqOperand {

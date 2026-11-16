@@ -539,11 +539,16 @@ impl<'a> FnBuilder<'a> {
                         let b = self.lower_expr(base, ret);
                         let i = self.lower_expr(index, ret);
                         let ispan = index.span;
+                        // OOB reports the whole store statement (the
+                        // tree-walker's rule in `ops::index_write`),
+                        // not just the assign target; `index_span`
+                        // stays the index expression (non-int index).
+                        let _ = span;
                         self.emit(MInstr::StoreIndex {
                             base: b,
                             index: i,
                             value: v,
-                            span: *span,
+                            span: stmt.span,
                             index_span: ispan,
                         });
                     }

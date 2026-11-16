@@ -150,12 +150,17 @@ fn differential_task_sequential() {
                         continue;
                     }
                     let interp = interp.expect("interpreter ran on checked code");
+                    // JIT file IO resolves against the case dir, exactly
+                    // like the interpreter above: re-enter it for both
+                    // runs (the cwd was restored after `run_source`).
+                    std::env::set_current_dir(&dir).expect("set case cwd");
                     for (force_gc, tag) in [(false, ""), (true, " [forced GC]")] {
                         match jit_outcome(&program, &checked, force_gc) {
                             Ok(jit) => compare(&name, tag, &src, &interp, &jit, &mut failures),
                             Err(e) => failures.push(format!("{name}{tag}: task JIT refused: {e}")),
                         }
                     }
+                    std::env::set_current_dir(&saved_cwd).expect("restore cwd");
                     ran += 1;
                 }
             }
