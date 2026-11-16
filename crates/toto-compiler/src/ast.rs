@@ -33,6 +33,14 @@ pub struct Item {
 pub enum ItemKind {
     Fn(FnDecl),
     Struct(StructDecl),
+    Import(ImportDecl),
+}
+
+/// A top-level `import "path";` statement (Phase 5; resolved by the driver).
+#[derive(Clone, Debug)]
+pub struct ImportDecl {
+    pub path: String,
+    pub path_span: Span,
 }
 
 #[derive(Clone, Debug)]

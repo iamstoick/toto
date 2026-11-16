@@ -598,6 +598,19 @@ pub fn check(program: &Program) -> (Option<CheckedProgram>, Vec<Diag>) {
                     });
                 }
             }
+            crate::ast::ItemKind::Import(decl) => {
+                // The multi-file driver strips resolved imports before checking,
+                // so an Import item here comes from single-file mode: reject it.
+                c.error(
+                    "E0401",
+                    format!(
+                        "cannot resolve `import \"{}\"` in single-file mode",
+                        decl.path
+                    ),
+                    decl.path_span,
+                    None,
+                );
+            }
         }
     }
     // Entry point checks. (Cloned: the checks below borrow `c` mutably.)

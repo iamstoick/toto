@@ -55,3 +55,37 @@ fn out_of_subset_names_its_phase() {
 fn missing_return_type_is_an_error() {
     assert!(codes("fn main() {\n return 0;\n}\n").contains(&"E0101"),);
 }
+
+#[test]
+fn import_and_pub_top_level_items() {
+    use toto_compiler::ast::ItemKind;
+    use toto_compiler::parse_and_check;
+
+    // A well-formed import parses to an Import item carrying the path.
+    let src = "import \"lib/util.gzv\";\nfn main() -> int {\n return 0;\n}\n";
+    let (toks, _) = lex(src);
+    let (program, errors) = parse(toks, src);
+    assert!(errors.is_empty());
+    assert_eq!(program.items.len(), 2);
+    match &program.items[0].kind {
+        ItemKind::Import(decl) => assert_eq!(decl.path, "lib/util.gzv"),
+        other => panic!("expected Import item, got {:?}", other),
+    }
+    // `pub` is accepted on top-level items and has no effect.
+    assert!(codes("pub fn main() -> int {\n return 0;\n}\n").is_empty());
+    assert!(codes("pub struct P { x: int }\nfn main() -> int {\n return 0;\n}\n").is_empty());
+    assert!(codes("pub import \"a.gzv\";\nfn main() -> int {\n return 0;\n}\n").is_empty());
+    // A non-string import path is E0101; a missing `;` is E0102.
+    assert!(codes("import foo;\nfn main() -> int {\n return 0;\n}\n").contains(&"E0101"));
+    assert!(codes("import \"a.gzv\"\nfn main() -> int {\n return 0;\n}\n").contains(&"E0102"));
+    // `mod` / `use` stay rejected; `import` is top-level-only.
+    assert!(codes("mod m;\nfn main() -> int {\n return 0;\n}\n").contains(&"E0157"));
+    assert!(codes("use \"a.gzv\";\nfn main() -> int {\n return 0;\n}\n").contains(&"E0157"));
+    assert!(codes("fn main() -> int {\n import \"a.gzv\";\n return 0;\n}\n").contains(&"E0157"));
+    // A surviving import reaches the checker as E0401 (single-file mode).
+    let Err(diags) = parse_and_check("import \"a.gzv\";\nfn main() -> int {\n return 0;\n}\n")
+    else {
+        panic!("expected E0401 for a single-file import");
+    };
+    assert!(diags.iter().any(|d| d.code == "E0401"));
+}

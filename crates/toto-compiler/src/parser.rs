@@ -168,7 +168,13 @@ impl<'a> Parser<'a> {
     fn sync_item(&mut self) {
         while !self.at_eof() {
             match self.peek().kind {
-                TokenKind::Fn | TokenKind::Struct | TokenKind::At => return,
+                TokenKind::Fn
+                | TokenKind::Struct
+                | TokenKind::At
+                | TokenKind::Import
+                | TokenKind::Pub => {
+                    return;
+                }
                 _ => {
                     self.bump();
                 }
@@ -203,15 +209,52 @@ impl Parser<'_> {
     fn parse_item(&mut self) -> PResult<Item> {
         let start = self.peek().span;
         let mut annotations = Vec::new();
-        while matches!(self.peek().kind, TokenKind::At) {
-            annotations.push(self.parse_annotation()?);
+        loop {
+            match self.peek().kind {
+                TokenKind::At => annotations.push(self.parse_annotation()?),
+                // `pub` is accepted on top-level items and has no effect (flat namespace).
+                TokenKind::Pub => {
+                    self.bump();
+                }
+                _ => break,
+            }
         }
         match self.peek().kind.clone() {
-            TokenKind::Import | TokenKind::Mod | TokenKind::Use | TokenKind::Pub => {
+            TokenKind::Import => {
+                self.bump();
+                let path_tok = match self.expect(
+                    |k| matches!(k, TokenKind::Str(_)),
+                    "a string literal path after `import`",
+                ) {
+                    Ok(t) => t,
+                    Err(()) => {
+                        self.sync_item();
+                        return Err(());
+                    }
+                };
+                let path = match path_tok.kind {
+                    TokenKind::Str(s) => s,
+                    _ => unreachable!("expect() guaranteed a string literal"),
+                };
+                let path_span = path_tok.span;
+                if self.expect_semi("after `import`").is_err() {
+                    self.sync_item();
+                    return Err(());
+                }
+                let span = start.merge(self.prev_span());
+                Ok(Item {
+                    kind: ItemKind::Import(ImportDecl { path, path_span }),
+                    span,
+                })
+            }
+            TokenKind::Mod | TokenKind::Use => {
                 let t = self.bump();
                 self.error(
                     "E0157",
-                    format!("{} modules and imports arrive in Phase 2", t.kind.name()),
+                    format!(
+                        "{} is not supported in v1 (multi-file programs use `import \"path\"`)",
+                        t.kind.name()
+                    ),
                     start.merge(t.span),
                     None,
                 );
@@ -241,7 +284,7 @@ impl Parser<'_> {
                 self.error(
                     "E0101",
                     format!(
-                        "expected `fn` or `struct` item, found {}",
+                        "expected `fn`, `struct`, or `import` item, found {}",
                         self.peek().kind.name()
                     ),
                     span,
@@ -921,11 +964,25 @@ impl Parser<'_> {
                 self.sync_stmt();
                 Err(())
             }
-            TokenKind::Import | TokenKind::Mod | TokenKind::Use | TokenKind::Pub => {
+            TokenKind::Import => {
                 let t = self.bump();
                 self.error(
                     "E0157",
-                    format!("{} modules and imports arrive in Phase 2", t.kind.name()),
+                    "`import` is only allowed at the top level (as `import \"path\";`)".to_string(),
+                    start.merge(t.span),
+                    None,
+                );
+                self.sync_stmt();
+                Err(())
+            }
+            TokenKind::Mod | TokenKind::Use | TokenKind::Pub => {
+                let t = self.bump();
+                self.error(
+                    "E0157",
+                    format!(
+                        "{} is not supported in v1 (multi-file programs use `import \"path\"`)",
+                        t.kind.name()
+                    ),
                     start.merge(t.span),
                     None,
                 );
@@ -1458,11 +1515,24 @@ impl Parser<'_> {
                 );
                 Err(())
             }
-            TokenKind::Import | TokenKind::Mod | TokenKind::Use | TokenKind::Pub => {
+            TokenKind::Import => {
                 let t = self.bump();
                 self.error(
                     "E0157",
-                    format!("{} modules and imports arrive in Phase 2", t.kind.name()),
+                    "`import` is only allowed at the top level (as `import \"path\";`)".to_string(),
+                    start.merge(t.span),
+                    None,
+                );
+                Err(())
+            }
+            TokenKind::Mod | TokenKind::Use | TokenKind::Pub => {
+                let t = self.bump();
+                self.error(
+                    "E0157",
+                    format!(
+                        "{} is not supported in v1 (multi-file programs use `import \"path\"`)",
+                        t.kind.name()
+                    ),
                     start.merge(t.span),
                     None,
                 );

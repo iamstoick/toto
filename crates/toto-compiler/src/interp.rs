@@ -245,6 +245,11 @@ impl Interp {
                 ItemKind::Struct(decl) => {
                     structs.insert(decl.name.clone(), decl.clone());
                 }
+                ItemKind::Import(_) => {
+                    // Resolved and stripped by the multi-file driver before execution;
+                    // the checker rejects surviving imports (E0401), so there is
+                    // nothing to register here.
+                }
             }
         }
         Self {

@@ -4,8 +4,8 @@ error[E0156]: `match` pattern matching is a Phase 2 concern
 2 |     match x {
   |     ^^^^^
 
-error[E0157]: `import` modules and imports arrive in Phase 2
- --> parse07_reject_match_mod.gzv:8:1
+error[E0101]: expected a string literal path after `import`, found identifier
+ --> parse07_reject_match_mod.gzv:8:8
   |
 8 | import foo;
-  | ^^^^^^
+  |        ^^^
