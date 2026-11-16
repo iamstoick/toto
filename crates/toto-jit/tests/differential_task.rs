@@ -167,12 +167,13 @@ fn differential_task_sequential() {
         }
     }
     let _ = std::fs::remove_file(corpus_root().join("interp").join("cli01_tmp.txt"));
-    // Exact census (125 cases: 40 runnable + 19 concurrent
-    // (conc19_chan_eq joined in Phase 5) + 65 static
-    // (type37_index_range joined in Phase 5) + diag10 excluded).
+    // Exact census (128 cases: 40 runnable + 19 concurrent
+    // (conc19_chan_eq joined in Phase 5) + 68 static
+    // (type37_index_range + diag13-15 FFI joined in Phase 5) +
+    // diag10 excluded).
     assert_eq!(ran, 40, "task differential runnable count changed");
     assert_eq!(skipped_concurrent, 19, "concurrent skip count changed");
-    assert_eq!(static_failures, 65, "static negative count changed");
+    assert_eq!(static_failures, 68, "static negative count changed");
     assert!(
         failures.is_empty(),
         "{} differential divergence(s):\n{}",
