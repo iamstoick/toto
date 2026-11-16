@@ -206,11 +206,7 @@ impl Heap {
 
     /// JIT `Ok`/`Err` value (frozen `toto_alloc_result` family).
     pub fn alloc_result(&mut self, is_ok: bool, inner: RtVal) -> GcRef {
-        self.insert(
-            DescKind::Result,
-            Payload::Result { is_ok, inner },
-            32 + 16,
-        )
+        self.insert(DescKind::Result, Payload::Result { is_ok, inner }, 32 + 16)
     }
 
     /// JIT `Some` value (frozen `toto_alloc_option` family). `None`

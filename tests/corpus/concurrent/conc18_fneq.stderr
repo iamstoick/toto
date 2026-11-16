@@ -1,7 +1,7 @@
 panic[E0203]: cannot compare function with function
  --> conc18_fneq.gzv:12:13
-  |
+   |
 12 |     println(h == g);
-  |             ^^^^^^
+   |             ^^^^^^
 stack trace:
   in main at conc18_fneq.gzv:4:4
