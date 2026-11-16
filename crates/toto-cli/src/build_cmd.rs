@@ -109,17 +109,10 @@ pub fn build(release: bool) -> ExitCode {
         Ok(ok) => ok,
         Err(code) => return code,
     };
-    // FFI executes in the interpreter and the runtime executor only;
-    // wiring foreign calls into generated code is a carry-forward
-    // (the JIT/AOT lowerers refuse `CallForeign` with the same
-    // message). Refuse up front with a build-specific diagnostic
-    // rather than a codegen error deep in the backend.
-    if !checked.externs.is_empty() {
-        eprintln!(
-            "toto: build does not support `unsafe extern` FFI in Stage 3 (run with `toto run` / `toto test`)"
-        );
-        return ExitCode::from(3);
-    }
+    // Foreign calls lower to `toto_foreign` (Phase 5, Stage 5):
+    // non-callback FFI builds and runs from generated code;
+    // callback-taking externs still refuse at compile time with the
+    // `toto run` / `toto test` workaround.
     let mir = toto_compiler::mir::lower(&checked);
     let opt = if release {
         toto_jit::compile::OptLevel::Speed

@@ -119,6 +119,7 @@ fn main() {
             _ => None,
         })
         .collect();
+    rt.install_externs(&checked.externs);
     rt.on_panic = probe_on_panic;
     rt.func = String::from("main");
     let out = unsafe { Jit::call_ptr(jit.ptr("main"), rt.ctx_ptr(), &[]) };

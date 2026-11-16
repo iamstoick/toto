@@ -39,7 +39,13 @@ diagnostics `diag13`–`diag15`, CLI `build_refuses_ffi_programs`.
   (never bare `-1`): `errno` is thread-local while FFI runs on a
   thread pool, so reading `errno` later could see another thread's
   value. Negate back and feed the number to `strerror`, which needs
-  no `errno` state.
+  no `errno` state. `read` and `toto_rt_close` follow the same
+  in-band discipline; `c_read_file` funnels every failure (open,
+  mid-read, close) into `Err` with the `errno` text.
+- **Whole-file reads compose.** `c_read_file` opens, loops 4 KiB
+  `read`s, decodes each chunk with `toto_rt_read_str`, and closes;
+  the fd and buffer release on every path, including mid-read I/O
+  errors.
 - **Blocking calls use the dedicated pool.** Foreign calls suspend
   the task on the blocking pool exactly like file builtins, so a
   `sleep` (or `join`) never stalls other green threads.
@@ -68,6 +74,9 @@ runtime helpers. Ownership, encoding, and thread-safety per binding:
 | `toto_rt_read_i32` | `errno_value` | aligned `i32` load; the pointer must be valid (runtime-owned) |
 | `toto_rt_read_i64` | `c_read_i64` | aligned `i64` load; the pointer must be valid |
 | `toto_rt_write_i64` | `c_write_i64` | aligned `i64` store; the pointer must be valid |
+| `read` | `c_read` | byte count (0 is EOF) or `-errno` in-band, like `open`; the buffer must hold `n` bytes |
+| `toto_rt_close` | `c_close` | `close(2)` alias (`close` itself is unnameable — reserved channel token); `Ok(0)` or `Err` with the `errno` text |
+| `toto_rt_read_str` | `c_read_str` | counted bytes to a Toto string, UTF-8 validated (`E0210` on bad bytes, `E0308` on NULL); backs `c_read_file` chunk decoding |
 
 Two linked names have no wrapper: `close` cannot be named in an
 `unsafe extern` block (`close` is the channel builtin — reserved

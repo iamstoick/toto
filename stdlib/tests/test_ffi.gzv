@@ -1,5 +1,6 @@
 // stdlib FFI tests: run with `toto test` from stdlib/.
 import "gzv.std/ffi.gzv";
+import "gzv.std/strings.gzv";
 
 fn t_strings() -> Result<bool, string> {
     if c_strlen("hello") != 5 {
@@ -67,6 +68,62 @@ fn t_memory() -> Result<bool, string> {
     return Ok(true);
 }
 
+fn t_fileio() -> Result<bool, string> {
+    // Whole-file read through FFI only: a 7500-byte file exercises
+    // the multi-chunk loop; the content must round-trip byte-exact.
+    let big = repeat("abcd\n", 1500);
+    write_file("test_ffi_tmp.txt", big);
+    let got: Result<string, string> = c_read_file("test_ffi_tmp.txt");
+    let want: Result<string, string> = Ok(big);
+    if got != want {
+        return Err("c_read_file round-trip");
+    }
+    // Missing file: ENOENT, dynamically built (no libc text pinned).
+    let missing: Result<string, string> = c_read_file("/nope-missing-ffi-test");
+    let enoent: Result<string, string> = Err(errno_message(2));
+    if missing != enoent {
+        return Err("c_read_file missing should fail ENOENT");
+    }
+    // Chunked primitives directly: open, partial read, string copy,
+    // close. `read` returns the byte count; `c_close` is `Ok(0)`.
+    // (Error paths close the fd too; a close failure there replaces
+    // the original error so no `Result` goes unexamined.)
+    let ok0: Result<int, string> = Ok(0);
+    let fd = open("test_ffi_tmp.txt", 0);
+    if fd < 0 {
+        return Err("open test_ffi_tmp");
+    }
+    let buf: *c_void = c_malloc(16);
+    let r = c_read(fd, buf, 10);
+    if r != 10 {
+        c_free(buf);
+        let drop1: Result<int, string> = c_close(fd);
+        if drop1 != ok0 {
+            return Err("c_close on c_read error path");
+        }
+        return Err("c_read count");
+    }
+    if c_read_str(buf, r) != "abcd\nabcd\n" {
+        c_free(buf);
+        let drop2: Result<int, string> = c_close(fd);
+        if drop2 != ok0 {
+            return Err("c_close on c_read_str error path");
+        }
+        return Err("c_read_str prefix");
+    }
+    c_free(buf);
+    let closed: Result<int, string> = c_close(fd);
+    if closed != ok0 {
+        return Err("c_close");
+    }
+    // Closing a bogus fd fails (EBADF) instead of corrupting.
+    let bogus: Result<int, string> = c_close(999999);
+    if bogus == ok0 {
+        return Err("c_close bogus should fail");
+    }
+    return Ok(true);
+}
+
 fn answer_fn(arg: *c_void) -> *c_void {
     c_write_i64(arg, 42);
     return None;
@@ -110,6 +167,10 @@ fn main() -> int {
     }
     if t_memory() != yes {
         println("FAIL t_memory");
+        failures = failures + 1;
+    }
+    if t_fileio() != yes {
+        println("FAIL t_fileio");
         failures = failures + 1;
     }
     if t_thread() != yes {

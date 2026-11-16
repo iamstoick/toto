@@ -2,5 +2,6 @@
 test_work.txt
 test_lines.txt
 test_app.txt
+test_ffi_tmp.txt
 # `toto build` output (shim dir + installed binary).
 target/

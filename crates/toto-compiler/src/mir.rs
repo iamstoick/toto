@@ -38,6 +38,10 @@ pub struct MProgram {
     pub fn_index: HashMap<String, usize>,
     /// Name span of `main` for exit-code diagnostics (tree-walker parity).
     pub main_span: Span,
+    /// Checked foreign signatures, kept out of the text dump (which
+    /// prints functions only): the JIT/AOT backend needs them to
+    /// marshal `CallForeign` arguments and refuse callback params.
+    pub externs: HashMap<String, crate::hir::HExternFn>,
 }
 
 /// One function body: locals plus a block graph.
@@ -367,6 +371,7 @@ pub fn lower(checked: &CheckedProgram) -> MProgram {
         fns,
         fn_index,
         main_span,
+        externs: checked.externs.clone(),
     }
 }
 

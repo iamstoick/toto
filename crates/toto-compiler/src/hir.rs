@@ -143,7 +143,7 @@ pub struct HExternBlock {
 /// One checked foreign signature. Parameter and return types are C
 /// types (`CChar`/`CInt`/`CLong`/`CDouble`/`CPtr`/`Fn` of the same) or
 /// `Unit` returns; anything else is rejected at check time.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HExternFn {
     pub name: String,
     pub params: Vec<(String, Ty)>,

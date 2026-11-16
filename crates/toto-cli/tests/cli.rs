@@ -179,9 +179,9 @@ fn build_produces_equivalent_executable() {
 }
 
 #[test]
-fn build_refuses_ffi_programs() {
-    // FFI executes under `run`/`test` only; `build` refuses up front
-    // (exit 3) rather than failing deep in codegen.
+fn build_runs_ffi_programs() {
+    // Non-callback FFI lowers to `toto_foreign` and builds: the
+    // built binary must match `run` byte-for-byte.
     let dir = scratch_project("buildffi");
     let out = toto()
         .arg("init")
@@ -192,7 +192,52 @@ fn build_refuses_ffi_programs() {
     let root = dir.join("app");
     std::fs::write(
         root.join("main.gzv"),
-        "unsafe extern \"C\" {\n    fn strlen(s: *c_char) -> c_long;\n}\n\nfn main() -> int {\n    println(strlen(\"hi\"));\n    return 0;\n}\n",
+        "unsafe extern \"C\" {\n    fn strlen(s: *c_char) -> c_long;\n    fn pow(x: c_double, y: c_double) -> c_double;\n}\n\nfn main() -> int {\n    println(strlen(\"hi\"));\n    println(pow(2.0, 10.0));\n    return 0;\n}\n",
+    )
+    .expect("write main");
+    let out = toto()
+        .arg("build")
+        .current_dir(&root)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0), "build failed");
+    let bin = root.join("target").join("app");
+    assert!(bin.is_file(), "no binary at {}", bin.display());
+    let built = std::process::Command::new(&bin)
+        .output()
+        .expect("built binary runs");
+    let run = toto()
+        .arg("run")
+        .arg(root.join("main.gzv"))
+        .output()
+        .expect("runs");
+    assert_eq!(built.status.code(), run.status.code());
+    assert_eq!(built.stdout, run.stdout);
+    assert_eq!(built.stderr, run.stderr);
+    assert_eq!(
+        String::from_utf8(built.stdout).unwrap(),
+        "2\n1024.0\n",
+        "wrong output"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn build_refuses_callback_ffi() {
+    // Callbacks need evaluator drain with callable invocation,
+    // which generated code cannot do: clean refusal with the
+    // `run`/`test` workaround, never a miscompile.
+    let dir = scratch_project("buildfficb");
+    let out = toto()
+        .arg("init")
+        .arg(dir.join("app"))
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let root = dir.join("app");
+    std::fs::write(
+        root.join("main.gzv"),
+        "unsafe extern \"C\" {\n    fn pthread_create(t: *c_void, attr: *c_void, f: fn(*c_void) -> *c_void, arg: *c_void) -> c_int;\n}\n\nfn answer(arg: *c_void) -> *c_void {\n    return arg;\n}\n\nfn main() -> int {\n    println(pthread_create(None, None, answer, None));\n    return 0;\n}\n",
     )
     .expect("write main");
     let out = toto()
@@ -204,7 +249,7 @@ fn build_refuses_ffi_programs() {
     assert!(
         String::from_utf8(out.stderr)
             .unwrap()
-            .contains("does not support `unsafe extern` FFI"),
+            .contains("takes a callback"),
         "wrong stderr"
     );
     let _ = std::fs::remove_dir_all(&dir);

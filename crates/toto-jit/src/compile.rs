@@ -59,7 +59,7 @@ use toto_compiler::span::Span;
 
 use crate::runtime::{
     E_DIV_ZERO, E_FALLOFF, E_INTERNAL, E_MISMATCH, E_OVERFLOW, TAG_BOOL, TAG_CHAN, TAG_FLOAT,
-    TAG_FN_ANY, TAG_HANDLE, TAG_INT, TAG_UNIT,
+    TAG_FN_ANY, TAG_HANDLE, TAG_INT, TAG_PTR, TAG_UNIT,
 };
 
 /// Gate boundary: MIR outside the supported subset.
@@ -233,6 +233,7 @@ pub(crate) fn declare_runtime_imports(sess: &mut impl Session, task: bool) {
     sess.import("toto_values_eq", 7, true);
     sess.import("toto_values_order", 7, true);
     sess.import("toto_builtin", 5, true);
+    sess.import("toto_foreign", 5, true);
     sess.import("toto_len", 4, true);
     sess.import("toto_func_entry", 3, true);
     sess.import("toto_body_entry", 3, true);
@@ -325,6 +326,7 @@ impl Jit {
                 jb.symbol("toto_values_eq", rt::toto_values_eq as *const u8);
                 jb.symbol("toto_values_order", rt::toto_values_order as *const u8);
                 jb.symbol("toto_builtin", rt::toto_builtin as *const u8);
+                jb.symbol("toto_foreign", rt::toto_foreign as *const u8);
                 jb.symbol("toto_len", rt::toto_len as *const u8);
                 jb.symbol("toto_func_entry", rt::toto_func_entry as *const u8);
                 jb.symbol("toto_body_entry", rt::toto_body_entry as *const u8);
@@ -358,6 +360,7 @@ impl Jit {
                 jb.symbol("toto_values_eq", rt::task_values_eq as *const u8);
                 jb.symbol("toto_values_order", rt::task_values_order as *const u8);
                 jb.symbol("toto_builtin", rt::task_builtin as *const u8);
+                jb.symbol("toto_foreign", rt::task_foreign as *const u8);
                 jb.symbol("toto_len", rt::task_len as *const u8);
                 jb.symbol("toto_func_entry", rt::task_func_entry as *const u8);
                 jb.symbol("toto_body_entry", rt::task_body_entry as *const u8);
@@ -2123,10 +2126,24 @@ impl<'a> FnCx<'a> {
         Ok(v)
     }
 
+    /// Deterministic foreign-function index: position in the
+    /// name-sorted extern table. Runtime contexts build the same
+    /// table at install time, so codegen and runtime agree without
+    /// threading order-sensitive state through lowering (HashMap
+    /// iteration order would bake nondeterminism into objects).
+    fn extern_index(prog: &MProgram, name: &str) -> Option<u64> {
+        let mut names: Vec<&str> = prog.externs.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names.iter().position(|n| *n == name).map(|i| i as u64)
+    }
+
     /// Transport tag for a MIR-typed word, by static type.
     /// Dynamically-variant families resolve at runtime: `Option`
     /// words use `TAG_HANDLE` (word 0 decodes as `None`), `fn` words
-    /// use `TAG_FN_ANY` (indices vs closure handles by range).
+    /// use `TAG_FN_ANY` (indices vs closure handles by range). C
+    /// scalars ride their Toto-view tags (`c_int` as `TAG_INT`,
+    /// `c_double` as `TAG_FLOAT`, pointers as `TAG_PTR`), matching
+    /// the executor's checking-time view rule.
     fn tag_of(ty: &Ty) -> Result<u64, String> {
         match ty {
             Ty::Int => Ok(TAG_INT),
@@ -2141,13 +2158,10 @@ impl<'a> FnCx<'a> {
             Ty::Unit => Ok(TAG_UNIT),
             Ty::Chan(_) => Ok(TAG_CHAN),
             Ty::Fn(..) => Ok(TAG_FN_ANY),
-            Ty::Map(..) => Err(format!("type {ty:?} has no runtime values")),
-            // Unreachable: the JIT refuses FFI programs before codegen,
-            // so C-typed words never need a JIT transport tag. `Err`
-            // (not a panic) keeps it a clean refusal if ever reached.
-            Ty::CChar | Ty::CInt | Ty::CLong | Ty::CDouble | Ty::CVoid | Ty::CPtr(_) => {
-                Err(format!("type {ty} has no JIT representation"))
-            }
+            Ty::Map(..) | Ty::CVoid => Err(format!("type {ty:?} has no runtime values")),
+            Ty::CChar | Ty::CInt | Ty::CLong => Ok(TAG_INT),
+            Ty::CDouble => Ok(TAG_FLOAT),
+            Ty::CPtr(_) => Ok(TAG_PTR),
         }
     }
 
@@ -2359,22 +2373,72 @@ impl<'a> FnCx<'a> {
                 self.define(b, *dst, v)?;
             }
             MInstr::CallForeign {
-                dst: _,
+                dst,
                 name,
-                args: _,
-                span: _,
+                args,
+                span,
             } => {
-                // FFI executes in the interpreter and the runtime
-                // executor only. The JIT refuses these programs
-                // cleanly (dev reports `CompileRefused`, build refuses
-                // up front); wiring foreign calls into generated code
-                // is a Stage 5 carry-forward.
-                return Err(SubsetError {
+                // Foreign calls lower to `toto_foreign`, which reuses
+                // `ffi::call` for marshaling (range checks, NUL-copies,
+                // in-band errno, pool execution in task mode): C
+                // scalars ride Toto-view tags, strings cross as
+                // handles the shim copies, pointers as `TAG_PTR`.
+                let sig = prog.externs.get(name).cloned().ok_or_else(|| SubsetError {
                     func: self.func.clone(),
                     message: format!(
-                        "foreign function `{name}` is not supported by the JIT in Stage 3 (run with `toto run`/`toto test`)"
+                        "foreign function `{name}` has no checked signature (unreachable: checked code)"
                     ),
-                });
+                })?;
+                // Callbacks need evaluator drain with callable
+                // invocation, which generated code cannot do: refuse
+                // the call with the workaround, never miscompile it.
+                if sig.params.iter().any(|(_, ty)| matches!(ty, Ty::Fn(..))) {
+                    return Err(SubsetError {
+                        func: self.func.clone(),
+                        message: format!(
+                            "foreign function `{name}` takes a callback, which the JIT does not support (run with `toto run`/`toto test`)"
+                        ),
+                    });
+                }
+                let idx = Self::extern_index(prog, name).ok_or_else(|| SubsetError {
+                    func: self.func.clone(),
+                    message: format!(
+                        "foreign function `{name}` has no runtime index (unreachable: checked code)"
+                    ),
+                })?;
+                // Marshal (tag, word) pairs into a stack slot, exactly
+                // like builtins.
+                let slot = Self::stack_slot(b, (args.len().max(1) * 16) as u32);
+                for (i, a) in args.iter().enumerate() {
+                    let ty = self.local_ty(*a)?.clone();
+                    let tag = Self::tag_of(&ty).map_err(|e| SubsetError {
+                        func: self.func.clone(),
+                        message: format!("foreign `{name}` argument {}: {e}", i + 1),
+                    })?;
+                    let v = self.operand(b, *a)?;
+                    let tag_v = Self::iconst(b, tag as i64);
+                    Self::stack_store(b, slot, 2 * i, tag_v);
+                    Self::stack_store(b, slot, 2 * i + 1, v);
+                }
+                // Publish before the call (the shim may allocate and
+                // collect; frozen safepoint-call rule).
+                self.publish_all(sess, b)?;
+                let idx_v = Self::iconst(b, idx as i64);
+                let n_v = Self::iconst(b, args.len() as i64);
+                let start_v = Self::iconst(b, span.start as i64);
+                let end_v = Self::iconst(b, span.end as i64);
+                let v = self.call_value(
+                    sess,
+                    b,
+                    "toto_foreign",
+                    &[self.ctx, idx_v, slot, n_v, start_v, end_v],
+                )?;
+                // Foreign calls push no trace frame on failure (leaf
+                // errors, like builtins): silent unwind.
+                self.check_silent(sess, b, *span)?;
+                if let Some(d) = dst {
+                    self.define(b, *d, v)?;
+                }
             }
             MInstr::CallBuiltin {
                 dst,

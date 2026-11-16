@@ -58,6 +58,7 @@ unsafe extern "C" {
     ) -> c_int;
     fn pthread_join(thread: u64, retval: *mut *mut c_void) -> c_int;
     fn sleep(seconds: c_int) -> c_int;
+    fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
 }
 
 #[link(name = "m")]
@@ -97,6 +98,22 @@ pub extern "C" fn toto_rt_write_i64(p: *mut c_void, v: c_long) {
         (p as *mut c_long).write_unaligned(v);
     }
 }
+
+/// Close a file descriptor. `close(2)` cannot be named in a Toto
+/// `unsafe extern` block (`close` is the reserved channel builtin),
+/// so this alias is the sanctioned spelling; `stdlib/ffi.gzv` wraps
+/// it as `c_close`.
+#[unsafe(no_mangle)]
+pub extern "C" fn toto_rt_close(fd: c_int) -> c_int {
+    // SAFETY: `fd` is just a number to the kernel; a bogus fd fails
+    // with EBADF, never UB.
+    unsafe { close(fd) }
+}
+
+// `toto_rt_read_str` (counted foreign bytes to a Toto string, UTF-8
+// validated) is implemented entirely in its call handler below,
+// like `strerror`: validation can fail, and a C ABI cannot carry
+// that failure, so there is no direct symbol to link.
 
 // ---------------------------------------------------------------------------
 // Callback trampolines + queue.
@@ -240,6 +257,9 @@ pub const LINKED: &[&str] = &[
     "toto_rt_read_i32",
     "toto_rt_read_i64",
     "toto_rt_write_i64",
+    "toto_rt_close",
+    "toto_rt_read_str",
+    "read",
 ];
 
 pub fn is_linked(name: &str) -> bool {
@@ -436,6 +456,54 @@ fn call_inner(
         "close" => {
             let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
             Ok(Value::Int(unsafe { close(fd) } as i64))
+        }
+        "read" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let buf = ptr_arg(&args[1], span)? as *mut c_void;
+            let n = size_arg(&args[2], span)?;
+            // Same in-band `-errno` discipline as `open`: `errno`
+            // is thread-local across the pool, so capture it here.
+            // Success is the byte count (0 is EOF), never negative.
+            let r = unsafe { read(fd, buf, n) };
+            if r < 0 {
+                let e = unsafe { *__errno_location() };
+                Ok(Value::Int(-(e as i64)))
+            } else {
+                Ok(Value::Int(r as i64))
+            }
+        }
+        "toto_rt_close" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let rc = toto_rt_close(fd);
+            if rc < 0 {
+                let e = unsafe { *__errno_location() };
+                Ok(Value::Int(-(e as i64)))
+            } else {
+                Ok(Value::Int(0))
+            }
+        }
+        "toto_rt_read_str" => {
+            let p = ptr_arg(&args[0], span)? as *const u8;
+            let n = size_arg(&args[1], span)?;
+            if p.is_null() {
+                return Err(fail(
+                    "E0308",
+                    "cannot read a string from the null pointer".to_string(),
+                    span,
+                ));
+            }
+            // SAFETY: the caller guarantees `p` points at `n` live
+            // readable bytes (a just-`read` malloc'd buffer in the
+            // proof); the copy below bounds the read at `n`.
+            let bytes = unsafe { std::slice::from_raw_parts(p, n) };
+            match std::str::from_utf8(bytes) {
+                Ok(s) => Ok(Value::Str(Rc::new(s.to_string()))),
+                Err(_) => Err(fail(
+                    "E0210",
+                    "foreign bytes are not valid UTF-8".to_string(),
+                    span,
+                )),
+            }
         }
         "strerror" => {
             let e = int_arg(&args[0], &sig.params[0].1, span)? as c_int;

@@ -42,6 +42,10 @@ pub const TAG_FUNC: u64 = 8;
 /// handles never do (generations start at 1), so the helper tells
 /// them apart by range.
 pub const TAG_FN_ANY: u64 = 9;
+/// Opaque foreign pointer (Phase 5, Stage 5): a raw address word.
+/// Never published (addresses are not heap references); equality is
+/// by address with `None` as the null-pointer check (interp parity).
+pub const TAG_PTR: u64 = 10;
 
 /// What a `toto_panic` call carried.
 #[derive(Clone, Debug)]
@@ -88,6 +92,10 @@ pub struct JitRt {
     /// Top-level function declarations for value display (`<fn name>`
     /// in `print`). Set by the harness from the parsed program.
     pub fns: Vec<toto_compiler::ast::FnDecl>,
+    /// Checked foreign signatures, name-sorted (codegen's
+    /// `extern_index` order). Set by the harness from the checked
+    /// program; empty when the program declares no externs.
+    pub externs: Vec<(String, toto_compiler::hir::HExternFn)>,
 }
 
 impl JitRt {
@@ -105,7 +113,23 @@ impl JitRt {
             fns: Vec::new(),
             func_names: Vec::new(),
             bodies: std::collections::HashMap::new(),
+            externs: Vec::new(),
         }
+    }
+
+    /// Install the checked extern table in codegen order
+    /// (`extern_index`: name-sorted). Called by harnesses that run
+    /// programs declaring foreign functions.
+    pub fn install_externs(
+        &mut self,
+        externs: &std::collections::HashMap<String, toto_compiler::hir::HExternFn>,
+    ) {
+        let mut v: Vec<(String, toto_compiler::hir::HExternFn)> = externs
+            .iter()
+            .map(|(k, sig)| (k.clone(), sig.clone()))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        self.externs = v;
     }
 
     pub fn with_threshold(mut self, bytes: u64) -> Self {
@@ -198,6 +222,7 @@ fn decode_tagged(tag: u64, value: u64) -> Result<RtVal, ()> {
         TAG_FUNC => Ok(RtVal::Func(value as usize)),
         TAG_FN_ANY if value < 0x1_0000_0000 => Ok(RtVal::Func(value as usize)),
         TAG_FN_ANY => Ok(RtVal::Heap(decode(value))),
+        TAG_PTR => Ok(RtVal::Ptr(value)),
         _ => Err(()),
     }
 }
@@ -215,6 +240,7 @@ fn encode_val(v: &RtVal) -> Option<u64> {
         RtVal::Heap(r) => Some(encode(*r)),
         RtVal::Chan(c) => Some(c.0 as u64),
         RtVal::Func(i) => Some(*i as u64),
+        RtVal::Ptr(p) => Some(*p),
         _ => None,
     }
 }
@@ -1086,6 +1112,9 @@ enum EqKind {
     Err,
     Some,
     None,
+    /// Opaque foreign pointer: by address, with `None` as the
+    /// null-pointer check (`ops::values_equal` parity).
+    Ptr,
     /// Unreachable wrapper (exotic immediates inside JIT heaps, or
     /// a handle that died mid-compare — impossible: comparison never
     /// collects). Compares false against everything.
@@ -1110,6 +1139,7 @@ fn eq_snapshot(rt: &mut JitRt, who: &str, tag: u64, word: u64, start: u64, end: 
         // words are function indices, the rest are closure handles
         // (same 2^32 discrimination as `decode_tagged`; frozen D8).
         TAG_FN_ANY if word < 0x1_0000_0000 => plain(EqKind::Func),
+        TAG_PTR => plain(EqKind::Ptr),
         TAG_HANDLE | TAG_FN_ANY => match payload_owned(&rt.heap, word) {
             Some(Payload::Str(_)) => plain(EqKind::Str),
             Some(Payload::Array(_)) => plain(EqKind::Array),
@@ -1156,6 +1186,7 @@ fn eq_name(kind: EqKind) -> &'static str {
         EqKind::Struct => "struct",
         EqKind::Ok | EqKind::Err => "Result",
         EqKind::Some | EqKind::None => "Option",
+        EqKind::Ptr => "pointer",
         EqKind::Other => "unknown",
     }
 }
@@ -1169,6 +1200,7 @@ fn eq_same_type(a: &EqOperand, b: &EqOperand) -> bool {
         (EqKind::Closure, EqKind::Func) | (EqKind::Func, EqKind::Closure) => false,
         (EqKind::Ok | EqKind::Err, EqKind::Ok | EqKind::Err) => true,
         (EqKind::Some | EqKind::None, EqKind::Some | EqKind::None) => true,
+        (EqKind::Ptr, EqKind::None) | (EqKind::None, EqKind::Ptr) => true,
         _ => a.kind == b.kind,
     }
 }
@@ -1244,14 +1276,16 @@ fn operand_of_rtval(heap: &Heap, v: &RtVal) -> EqOperand {
                 None => plain(EqKind::Other),
             }
         }
-        // Opaque foreign pointers never reach JIT equality (the JIT
-        // refuses FFI programs); `Other` compares false, never crashes.
-        RtVal::Range(..)
-        | RtVal::Ok(_)
-        | RtVal::Err(_)
-        | RtVal::Some(_)
-        | RtVal::Closure(_)
-        | RtVal::Ptr(_) => plain(EqKind::Other),
+        RtVal::Ptr(p) => EqOperand {
+            kind: EqKind::Ptr,
+            word: *p,
+            struct_name: None,
+        },
+        // Untrafficked immediates never reach JIT equality;
+        // `Other` compares false, never crashes.
+        RtVal::Range(..) | RtVal::Ok(_) | RtVal::Err(_) | RtVal::Some(_) | RtVal::Closure(_) => {
+            plain(EqKind::Other)
+        }
     }
 }
 
@@ -1317,6 +1351,15 @@ fn jit_values_equal(heap: &Heap, a: &EqOperand, b: &EqOperand, depth: usize) -> 
         }
         (EqKind::None, EqKind::None) => true,
         (EqKind::Some, EqKind::None) | (EqKind::None, EqKind::Some) => false,
+        (EqKind::Ptr, EqKind::Ptr) => a.word == b.word,
+        (EqKind::Ptr, EqKind::None) | (EqKind::None, EqKind::Ptr) => {
+            let p = if a.kind == EqKind::Ptr {
+                a.word
+            } else {
+                b.word
+            };
+            p == 0
+        }
         (EqKind::Array, EqKind::Array) => {
             if a.word == b.word {
                 return true;
@@ -1751,6 +1794,154 @@ pub unsafe extern "C" fn toto_builtin(
     }
 }
 
+/// Dispatch one foreign call: `name_idx` is the `extern_index`
+/// position in the harness-installed table, `args_ptr` addresses
+/// `(tag, word)` pairs in generated-code stack memory. Marshaling
+/// reuses `ffi::call` exactly (range checks, NUL-copies, in-band
+/// errno); callbacks cannot arrive (codegen refuses fn-typed
+/// params), so any drained queue entry is stale hygiene and is
+/// released, never invoked. Gate-only: the call runs inline on the
+/// calling thread (no blocking pool in the gate harness).
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn toto_foreign(
+    ctx: *mut JitRt,
+    name_idx: u64,
+    args_ptr: u64,
+    nargs: u64,
+    start: u64,
+    end: u64,
+) -> u64 {
+    let rt = rt(ctx);
+    let entry = rt
+        .externs
+        .get(name_idx as usize)
+        .map(|(n, s)| (n.clone(), s.clone()));
+    let (name, sig) = match entry {
+        Some(ok) => ok,
+        None => do_panic(
+            rt,
+            E_INTERNAL,
+            start,
+            end,
+            format!("foreign index {name_idx} out of range (unreachable: checked code)"),
+        ),
+    };
+    let n = nargs as usize;
+    let words = unsafe { std::slice::from_raw_parts(args_ptr as *const u64, n.saturating_mul(2)) };
+    let mut decoded = Vec::with_capacity(n);
+    for i in 0..n {
+        let (tag, word) = (words[2 * i], words[2 * i + 1]);
+        let v = match decode_tagged(tag, word) {
+            Ok(v) => v,
+            Err(()) => do_panic(
+                rt,
+                E_INTERNAL,
+                start,
+                end,
+                format!(
+                    "foreign `{name}` argument {} has unknown tag {tag} (unreachable: checked code)",
+                    i + 1
+                ),
+            ),
+        };
+        if let RtVal::Heap(r) = v
+            && rt.heap.get(r).is_none()
+        {
+            do_panic(
+                rt,
+                E_INTERNAL,
+                start,
+                end,
+                format!(
+                    "stale handle in foreign `{name}` argument {} (unreachable: checked code)",
+                    i + 1
+                ),
+            );
+        }
+        decoded.push(v);
+    }
+    let span = toto_compiler::span::Span::new(start as u32, end as u32);
+    use std::collections::HashMap;
+    let mut memo = HashMap::new();
+    let mut args = Vec::with_capacity(decoded.len());
+    for v in &decoded {
+        match toto_runtime::conv::to_value_memo(v, &rt.heap, &mut memo) {
+            Ok(c) => args.push(c),
+            Err(_) => do_panic(
+                rt,
+                E_INTERNAL,
+                start,
+                end,
+                format!("foreign `{name}` argument is not convertible (unreachable: checked code)"),
+            ),
+        }
+    }
+    match toto_compiler::ffi::call(&name, &sig, &args, span) {
+        Ok((v, claimed)) => {
+            // Codegen refuses callback params, so no slot may be
+            // claimed: a non-empty set is a refusal hole, never a
+            // callable to run.
+            if !claimed.is_empty() {
+                for (_, s) in &claimed {
+                    toto_compiler::ffi::release_slot(*s);
+                }
+                do_panic(
+                    rt,
+                    E_INTERNAL,
+                    start,
+                    end,
+                    format!(
+                        "foreign `{name}` claimed callback slots (unreachable: codegen refuses callbacks)"
+                    ),
+                );
+            }
+            // Stale-entry hygiene (same-process reruns): release,
+            // never invoke — nothing here is ours.
+            for (slot, _) in toto_compiler::ffi::drain_queue() {
+                toto_compiler::ffi::release_slot(slot);
+            }
+            let back = match toto_runtime::conv::from_value(&v, &mut rt.heap) {
+                Ok(r) => r,
+                Err(_) => do_panic(
+                    rt,
+                    E_INTERNAL,
+                    start,
+                    end,
+                    String::from(
+                        "internal error: function from foreign call (unreachable in checked programs)",
+                    ),
+                ),
+            };
+            match encode_val(&back) {
+                Some(w) => w,
+                None => do_panic(
+                    rt,
+                    E_INTERNAL,
+                    start,
+                    end,
+                    String::from(
+                        "foreign result is not JIT-trafficable (unreachable: checked code)",
+                    ),
+                ),
+            }
+        }
+        Err((diag, _)) => {
+            let code = diag
+                .code
+                .strip_prefix('E')
+                .and_then(|c| c.parse::<u64>().ok())
+                .unwrap_or(E_INTERNAL);
+            do_panic(
+                rt,
+                code,
+                diag.span.start as u64,
+                diag.span.end as u64,
+                diag.message,
+            )
+        }
+    }
+}
+
 /// Array length for `MInstr::Len` (arrays only, `E0209` — unlike the
 /// `E0210` builtin `len`, which also takes strings). Stale objects
 /// diverge `E0204`.
@@ -1772,6 +1963,7 @@ pub unsafe extern "C" fn toto_len(
             TAG_NONE => "Option",
             TAG_CHAN => "chan",
             TAG_FUNC => "function",
+            TAG_PTR => "pointer",
             _ => "unknown",
         };
         do_panic(
@@ -1820,6 +2012,7 @@ fn index_operand_name(rt: &JitRt, tag: u64, word: u64) -> &'static str {
         TAG_NONE => "Option",
         TAG_CHAN => "chan",
         TAG_FUNC => "function",
+        TAG_PTR => "pointer",
         TAG_HANDLE => RtVal::Heap(decode(word)).type_name(&rt.heap),
         _ => "unknown",
     }

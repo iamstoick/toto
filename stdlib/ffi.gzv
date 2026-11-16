@@ -37,6 +37,9 @@ unsafe extern "C" {
     fn toto_rt_read_i32(p: *c_void) -> c_int;
     fn toto_rt_read_i64(p: *c_void) -> c_long;
     fn toto_rt_write_i64(p: *c_void, v: c_long) -> unit;
+    fn toto_rt_close(fd: c_int) -> c_int;
+    fn toto_rt_read_str(p: *c_void, n: c_long) -> string;
+    fn read(fd: c_int, buf: *c_void, n: c_long) -> c_long;
 }
 
 // Byte length of the NUL-copy (== the string length; interior NUL
@@ -149,4 +152,61 @@ fn c_thread_join(id: int) -> Result<int, string> {
         return Err(errno_message(rc));
     }
     return Ok(0);
+}
+
+// Raw `read(2)`: byte count (0 is EOF) or `-errno` in-band, like
+// `open`. The buffer must hold at least `n` bytes.
+fn c_read(fd: int, buf: *c_void, n: int) -> int {
+    return read(fd, buf, n);
+}
+
+// Close an `open` fd. `close(2)` cannot be named in an `unsafe
+// extern` block (`close` is the reserved channel builtin), so this
+// alias is the sanctioned spelling. Success is `Ok(0)`.
+fn c_close(fd: int) -> Result<int, string> {
+    let rc = toto_rt_close(fd);
+    if rc < 0 {
+        return Err(errno_message(-rc));
+    }
+    return Ok(0);
+}
+
+// Copy `n` foreign bytes into a Toto string (UTF-8 validated:
+// misuse panics E0210, NULL panics E0308).
+fn c_read_str(p: *c_void, n: int) -> string {
+    return toto_rt_read_str(p, n);
+}
+
+// Whole-file read through FFI only: open, chunked `read`, close.
+// Missing/unreadable paths and mid-read I/O errors are `Err` with
+// the `errno` text; the fd and buffer release on every path.
+fn c_read_file(path: string) -> Result<string, string> {
+    let fd = open(path, 0);
+    if fd < 0 {
+        return Err(errno_message(-fd));
+    }
+    let buf: *c_void = malloc(4096);
+    let mut acc = "";
+    let mut failed = "";
+    while true {
+        let r = read(fd, buf, 4096);
+        if r < 0 {
+            failed = errno_message(-r);
+            break;
+        }
+        if r == 0 {
+            break;
+        }
+        acc = acc + toto_rt_read_str(buf, r);
+    }
+    free(buf);
+    let close_rc: Result<int, string> = c_close(fd);
+    if failed != "" {
+        return Err(failed);
+    }
+    let ok0: Result<int, string> = Ok(0);
+    if close_rc != ok0 {
+        return Err("close failed");
+    }
+    return Ok(acc);
 }
