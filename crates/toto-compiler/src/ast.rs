@@ -27,6 +27,10 @@ pub struct Program {
 pub struct Item {
     pub kind: ItemKind,
     pub span: Span,
+    /// Origin file display path, set by the multi-file driver after
+    /// parsing (single-file parses leave it `None`; rendering and
+    /// checking fall back to the caller-supplied filename).
+    pub file: Option<String>,
 }
 
 #[derive(Clone, Debug)]

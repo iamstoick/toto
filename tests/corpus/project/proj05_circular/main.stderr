@@ -1,0 +1,5 @@
+error[E0402]: circular import of `main.gzv`
+ --> b.gzv:1:8
+  |
+1 | import "main.gzv";
+  |        ^^^^^^^^^^

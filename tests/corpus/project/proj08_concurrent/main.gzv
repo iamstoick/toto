@@ -1,0 +1,9 @@
+import "lib/worker.gzv";
+fn main() -> int {
+    let c = chan<int>(1);
+    go {
+        produce(c);
+    }
+    println(<-c);
+    return 0;
+}

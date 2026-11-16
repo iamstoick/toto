@@ -31,13 +31,16 @@ pub struct Checker {
     fn_index: HashMap<String, usize>,
     scopes: Vec<HashMap<String, Binding>>,
     depth: u32,
-    errors: Vec<Diag>,
+    errors: Vec<(Option<String>, Diag)>,
     /// Creation depths of enclosing `go` bodies (spec §13.2). Any use of
     /// an outer `mut` binding at or outside the innermost depth is E0314.
     go_stack: Vec<u32>,
     /// Set when the program uses concurrency; copied to CheckedProgram
     /// so the CLI can route it to the runtime executor.
     uses_concurrency: bool,
+    /// Origin file of the item currently being checked (multi-file
+    /// programs); stamped onto every diagnostic. `None` for single file.
+    current_file: Option<String>,
 }
 
 impl Checker {
@@ -51,11 +54,16 @@ impl Checker {
             errors: Vec::new(),
             go_stack: Vec::new(),
             uses_concurrency: false,
+            current_file: None,
         }
     }
 
     fn error(&mut self, code: &'static str, message: String, span: Span, help: Option<String>) {
-        self.errors.push(Diag::new(code, message, span, help));
+        // Out-of-band attribution: the (file, diag) pair lives on the
+        // heap, never in `Diag` (see the `Diag` layout note).
+        let file = self.current_file.clone();
+        self.errors
+            .push((file, Diag::new(code, message, span, help)));
     }
 
     fn resolve_ty(&mut self, ty: &Type) -> CResult<Ty> {
@@ -473,10 +481,22 @@ fn captured_vars(body: &HBlock, creation_depth: u32) -> Vec<(String, Ty)> {
 
 /// Check a program: returns typed HIR, or `None` with diagnostics.
 pub fn check(program: &Program) -> (Option<CheckedProgram>, Vec<Diag>) {
+    let (checked, pairs) = check_with_files(program);
+    let diags = pairs.into_iter().map(|(_, d)| d).collect();
+    (checked, diags)
+}
+
+/// Check a program, pairing each diagnostic with its origin file
+/// (`None` for single-file programs). The pairing travels out-of-band
+/// so `Diag` stays lean (see the `Diag` layout note).
+pub fn check_with_files(
+    program: &Program,
+) -> (Option<CheckedProgram>, Vec<(Option<String>, Diag)>) {
     let mut c = Checker::new();
     // Pass 1a: struct declarations (field types resolved now so that
     // signatures can reference structs declared later in the file).
     for item in &program.items {
+        c.current_file = item.file.clone();
         if let crate::ast::ItemKind::Struct(decl) = &item.kind {
             if c.structs.contains_key(&decl.name) {
                 c.error(
@@ -521,6 +541,7 @@ pub fn check(program: &Program) -> (Option<CheckedProgram>, Vec<Diag>) {
     }
     // Pass 1b: function signatures.
     for item in &program.items {
+        c.current_file = item.file.clone();
         if let crate::ast::ItemKind::Fn(decl) = &item.kind {
             if c.fn_index.contains_key(&decl.name) {
                 c.error(
@@ -579,6 +600,7 @@ pub fn check(program: &Program) -> (Option<CheckedProgram>, Vec<Diag>) {
     // Pass 2: bodies.
     let mut hitems = Vec::new();
     for item in &program.items {
+        c.current_file = item.file.clone();
         match &item.kind {
             crate::ast::ItemKind::Struct(decl) => {
                 if let Some(h) = c.structs.get(&decl.name) {
@@ -624,18 +646,22 @@ pub fn check(program: &Program) -> (Option<CheckedProgram>, Vec<Diag>) {
         ),
         [sig] => {
             if !sig.params.is_empty() {
+                let (span, file) = item_span_for(program, "main");
+                c.current_file = file;
                 c.error(
                     "E0312",
                     "`main` takes no parameters".to_string(),
-                    item_span_for(program, "main"),
+                    span,
                     None,
                 );
             }
             if sig.ret != Ty::Int {
+                let (span, file) = item_span_for(program, "main");
+                c.current_file = file;
                 c.error(
                     "E0312",
                     format!("`main` must return `int`, not {}", sig.ret),
-                    item_span_for(program, "main"),
+                    span,
                     None,
                 );
             }
@@ -655,15 +681,15 @@ pub fn check(program: &Program) -> (Option<CheckedProgram>, Vec<Diag>) {
     }
 }
 
-fn item_span_for(program: &Program, name: &str) -> Span {
+fn item_span_for(program: &Program, name: &str) -> (Span, Option<String>) {
     for item in &program.items {
         if let crate::ast::ItemKind::Fn(decl) = &item.kind
             && decl.name == name
         {
-            return decl.name_span;
+            return (decl.name_span, item.file.clone());
         }
     }
-    Span::new(0, 0)
+    (Span::new(0, 0), None)
 }
 
 impl Checker {

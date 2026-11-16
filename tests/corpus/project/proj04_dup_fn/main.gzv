@@ -1,0 +1,7 @@
+import "lib/dup.gzv";
+fn helper(x: int) -> int {
+    return x * 2;
+}
+fn main() -> int {
+    return 0;
+}

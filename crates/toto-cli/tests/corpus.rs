@@ -22,6 +22,27 @@ fn cases() -> Vec<PathBuf> {
         .collect();
     areas.sort();
     for area in areas {
+        // Multi-file project cases live one level down: each immediate
+        // subdirectory with a `main.gzv` is one case (support files are
+        // never run standalone). Every other area runs top-level `*.gzv`.
+        if area.file_name().is_some_and(|n| n == "project") {
+            let mut dirs: Vec<_> = std::fs::read_dir(&area)
+                .expect("project area readable")
+                .map(|e| e.expect("dir entry").path())
+                .filter(|p| p.is_dir())
+                .collect();
+            dirs.sort();
+            for dir in dirs {
+                let main = dir.join("main.gzv");
+                assert!(
+                    main.is_file(),
+                    "project case {} has no main.gzv",
+                    dir.display()
+                );
+                out.push(main);
+            }
+            continue;
+        }
         let mut files: Vec<_> = std::fs::read_dir(&area)
             .expect("area readable")
             .map(|e| e.expect("dir entry").path())

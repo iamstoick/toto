@@ -46,8 +46,8 @@ use std::sync::Arc;
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, Endianness, InstBuilder, MemFlagsData, Signature, StackSlotData,
-    StackSlotKind, types::*,
+    AbiParam, Block, BlockArg, Endianness, FuncRef, Function, InstBuilder, MemFlagsData, Signature,
+    StackSlotData, StackSlotKind, types::*,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -82,7 +82,7 @@ impl std::error::Error for SubsetError {}
 static MSG_DIV_ZERO: &str = "division by zero";
 static MSG_OVERFLOW: &str = "integer overflow";
 
-fn sig_arity(params: u32, returns: bool) -> Signature {
+pub(crate) fn sig_arity(params: u32, returns: bool) -> Signature {
     let mut sig = Signature::new(CallConv::SystemV);
     sig.params.push(AbiParam::new(I64)); // ctx first (frozen)
     for _ in 0..params {
@@ -125,8 +125,8 @@ pub enum OptLevel {
 }
 
 impl OptLevel {
-    /// The `opt_level` flag value for `JITBuilder::with_flags`.
-    fn flag(self) -> &'static str {
+    /// The Cranelift `optlevel`/`opt_level` flag value.
+    pub(crate) fn flag(self) -> &'static str {
         match self {
             OptLevel::Off => "none",
             OptLevel::Speed => "speed",
@@ -150,7 +150,7 @@ impl OptLevel {
 /// Only `Closure`/`Go` are ever collected (top-level functions are
 /// lowered directly, never through the body table).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BodyKind {
+pub(crate) enum BodyKind {
     TopLevel,
     Closure,
     Go,
@@ -159,23 +159,95 @@ enum BodyKind {
 /// Borrowed body shape shared by top-level functions and nested
 /// bodies: the lowering core is identical; only the prologue differs
 /// (plain params vs handle/capture fetches).
-struct BodyShape<'a> {
-    name: &'a str,
-    params: &'a [(String, Ty)],
-    ret: &'a Ty,
-    locals: &'a [(String, Ty)],
-    blocks: &'a [MBlock],
-    entry: usize,
-    body_span: Span,
-    kind: BodyKind,
+pub(crate) struct BodyShape<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) params: &'a [(String, Ty)],
+    pub(crate) ret: &'a Ty,
+    pub(crate) locals: &'a [(String, Ty)],
+    pub(crate) blocks: &'a [MBlock],
+    pub(crate) entry: usize,
+    pub(crate) body_span: Span,
+    pub(crate) kind: BodyKind,
     /// Capture slots appended after the params (nested bodies only).
-    ncaptures: usize,
+    pub(crate) ncaptures: usize,
 }
 
 /// Hidden body function name (the `$` suffix is unspellable in Toto
 /// source, so user functions can never collide with it).
-fn body_fn_name(id: u32) -> String {
+pub(crate) fn body_fn_name(id: u32) -> String {
     format!("toto_body{id}$")
+}
+
+/// Codegen session abstraction shared by the in-memory JIT (`Jit`)
+/// and the AOT object driver (`ObjSession` in `aot.rs`): everything
+/// the lowering core (`FnCx`) needs from its session. Import keys are
+/// always the `toto_*` contract names; each session maps them to its
+/// own link symbols (JIT registers host addresses, AOT declares
+/// `task_*` imports resolved at link time).
+pub(crate) trait Session {
+    /// Gate or task import set / codegen flavor (AOT is task-mode).
+    fn mode(&self) -> CodegenMode;
+    /// Declare (or fetch) a runtime import; returns its function id.
+    fn import(&mut self, name: &'static str, params: u32, returns: bool) -> ClFuncId;
+    /// Look up a declared import.
+    fn import_id(&self, name: &'static str) -> Option<ClFuncId>;
+    /// Emit `(ptr, len)` values for static bytes `s` into `b`
+    /// (JIT: session addresses; AOT: module-data references).
+    fn intern_str(&mut self, b: &mut FunctionBuilder, s: &str) -> (CVal, CVal);
+    /// Reference a declared function inside `func`.
+    fn declare_in_func(&mut self, id: ClFuncId, func: &mut Function) -> FuncRef;
+    /// Look up a declared user function or body by name.
+    fn func_id(&self, name: &str) -> Option<ClFuncId>;
+    /// Collect a nested body; returns its body id.
+    fn alloc_body(&mut self, kind: BodyKind, body: Arc<MirBody>) -> u32;
+    /// Intern a channel element type; returns its type id.
+    fn intern_chan_type(&mut self, elem: Ty) -> u64;
+}
+
+/// Shared runtime-import declaration list (JIT and AOT object
+/// drivers): keys are the `toto_*` contract names; each session maps
+/// them to its own link symbols. `task` selects the task-mode set
+/// (AOT is always task-mode: it supports concurrent programs).
+pub(crate) fn declare_runtime_imports(sess: &mut impl Session, task: bool) {
+    // Arity is words after ctx; `returns` matches the registered
+    // implementation (gate `toto_panic` diverges, task records).
+    sess.import("toto_alloc_array", 3, true);
+    sess.import("toto_alloc_str", 4, true);
+    sess.import("toto_alloc_struct", 4, true);
+    sess.import("toto_alloc_range", 2, true);
+    sess.import("toto_alloc_result", 5, true);
+    sess.import("toto_alloc_some", 4, true);
+    sess.import("toto_alloc_closure", 5, true);
+    sess.import("toto_index_read", 8, true);
+    sess.import("toto_index_write", 10, true);
+    sess.import("toto_struct_init", 7, true);
+    sess.import("toto_struct_get", 5, true);
+    sess.import("toto_struct_set", 7, true);
+    sess.import("toto_str_concat", 4, true);
+    sess.import("toto_range_lo", 3, true);
+    sess.import("toto_range_hi", 3, true);
+    sess.import("toto_result_is_ok", 3, true);
+    sess.import("toto_wrap_inner", 3, true);
+    sess.import("toto_closure_body", 3, true);
+    sess.import("toto_closure_cap", 4, true);
+    sess.import("toto_values_eq", 7, true);
+    sess.import("toto_values_order", 7, true);
+    sess.import("toto_builtin", 5, true);
+    sess.import("toto_len", 4, true);
+    sess.import("toto_func_entry", 3, true);
+    sess.import("toto_body_entry", 3, true);
+    sess.import("toto_shadow_push", 1, false);
+    sess.import("toto_shadow_len", 0, true);
+    sess.import("toto_shadow_pop_to", 1, false);
+    sess.import("toto_gc_collect", 0, true);
+    sess.import("toto_panic", 5, task);
+    if task {
+        sess.import("toto_yield", 8, true);
+        sess.import("toto_spawn", 5, true);
+        sess.import("toto_chan_make", 5, true);
+        sess.import("toto_check_failed", 4, true);
+        sess.import("toto_task_capture", 3, true);
+    }
 }
 
 pub struct Jit {
@@ -338,45 +410,7 @@ impl Jit {
     }
 
     fn declare_runtime(&mut self) {
-        // Arity is words after ctx; `returns` matches the registered
-        // implementation (gate `toto_panic` diverges, task records).
-        self.import("toto_alloc_array", 3, true);
-        self.import("toto_alloc_str", 4, true);
-        self.import("toto_alloc_struct", 4, true);
-        self.import("toto_alloc_range", 2, true);
-        self.import("toto_alloc_result", 5, true);
-        self.import("toto_alloc_some", 4, true);
-        self.import("toto_alloc_closure", 5, true);
-        self.import("toto_index_read", 8, true);
-        self.import("toto_index_write", 10, true);
-        self.import("toto_struct_init", 7, true);
-        self.import("toto_struct_get", 5, true);
-        self.import("toto_struct_set", 7, true);
-        self.import("toto_str_concat", 4, true);
-        self.import("toto_range_lo", 3, true);
-        self.import("toto_range_hi", 3, true);
-        self.import("toto_result_is_ok", 3, true);
-        self.import("toto_wrap_inner", 3, true);
-        self.import("toto_closure_body", 3, true);
-        self.import("toto_closure_cap", 4, true);
-        self.import("toto_values_eq", 7, true);
-        self.import("toto_values_order", 7, true);
-        self.import("toto_builtin", 5, true);
-        self.import("toto_len", 4, true);
-        self.import("toto_func_entry", 3, true);
-        self.import("toto_body_entry", 3, true);
-        self.import("toto_shadow_push", 1, false);
-        self.import("toto_shadow_len", 0, true);
-        self.import("toto_shadow_pop_to", 1, false);
-        self.import("toto_gc_collect", 0, true);
-        self.import("toto_panic", 5, self.mode == CodegenMode::Task);
-        if self.mode == CodegenMode::Task {
-            self.import("toto_yield", 8, true);
-            self.import("toto_spawn", 5, true);
-            self.import("toto_chan_make", 5, true);
-            self.import("toto_check_failed", 4, true);
-            self.import("toto_task_capture", 3, true);
-        }
+        declare_runtime_imports(self, self.mode == CodegenMode::Task);
     }
 
     /// Compile every function in a real MIR program (gate mode).
@@ -636,7 +670,7 @@ impl Jit {
 /// Per-body lowering state: MIR locals lower to Cranelift variables
 /// (MIR is not SSA), handle-typed locals publish at safepoints, and
 /// the shadow base scopes the epilogue.
-struct FnCx<'a> {
+pub(crate) struct FnCx<'a> {
     /// Error context: body name for `SubsetError`.
     func: String,
     mode: CodegenMode,
@@ -656,6 +690,48 @@ struct FnCx<'a> {
 }
 
 type CVal = cranelift_codegen::ir::Value;
+
+impl Session for Jit {
+    fn mode(&self) -> CodegenMode {
+        self.mode
+    }
+
+    fn import(&mut self, name: &'static str, params: u32, returns: bool) -> ClFuncId {
+        Jit::import(self, name, params, returns)
+    }
+
+    fn import_id(&self, name: &'static str) -> Option<ClFuncId> {
+        self.imports.get(name).copied()
+    }
+
+    fn intern_str(&mut self, b: &mut FunctionBuilder, s: &str) -> (CVal, CVal) {
+        let (ptr, len) = self.intern(s);
+        let ptr_v = b.ins().iconst(I64, ptr as i64);
+        let len_v = b.ins().iconst(I64, len as i64);
+        (ptr_v, len_v)
+    }
+
+    fn declare_in_func(&mut self, id: ClFuncId, func: &mut Function) -> FuncRef {
+        self.module.declare_func_in_func(id, func)
+    }
+
+    fn func_id(&self, name: &str) -> Option<ClFuncId> {
+        self.funcs.get(name).copied()
+    }
+
+    fn alloc_body(&mut self, kind: BodyKind, body: Arc<MirBody>) -> u32 {
+        let id = self.next_body;
+        self.next_body += 1;
+        self.bodies.push((id, kind, body));
+        id
+    }
+
+    fn intern_chan_type(&mut self, elem: Ty) -> u64 {
+        let id = self.chan_types.len() as u64;
+        self.chan_types.push(elem);
+        id
+    }
+}
 
 impl<'a> FnCx<'a> {
     fn new(shape: &BodyShape<'a>, mode: CodegenMode, ctx: CVal) -> Self {
@@ -721,7 +797,7 @@ impl<'a> FnCx<'a> {
     /// panics record and return a dummy word (the caller unwinds via
     /// the sentinel protocol). No trap instruction anywhere.
     fn emit_check(
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         ctx: CVal,
         cond: CVal,
@@ -729,16 +805,18 @@ impl<'a> FnCx<'a> {
         span: (u64, u64),
         msg: &'static str,
     ) {
-        let msg_ptr = Self::iconst(b, msg.as_ptr() as u64 as i64);
-        let msg_len = Self::iconst(b, msg.len() as i64);
-        Self::emit_check_raw(jit, b, ctx, cond, code, span, msg_ptr, msg_len);
+        // Through the session interner, never a baked address: the JIT
+        // could use the binary's own `msg` address, but AOT objects
+        // outlive the build process.
+        let (msg_ptr, msg_len) = sess.intern_str(b, msg);
+        Self::emit_check_raw(sess, b, ctx, cond, code, span, msg_ptr, msg_len);
     }
 
     /// `emit_check` with a baked message address (interned dynamic
     /// messages, e.g. type-mismatch wordings).
     #[allow(clippy::too_many_arguments)]
     fn emit_check_raw(
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         ctx: CVal,
         cond: CVal,
@@ -757,9 +835,11 @@ impl<'a> FnCx<'a> {
         b.ins().brif(nonzero, panic_b, &[], cont_b, &[]);
         b.switch_to_block(panic_b);
         b.seal_block(panic_b);
-        let callee = jit
-            .module
-            .declare_func_in_func(jit.imports["toto_panic"], b.func);
+        let callee = sess.declare_in_func(
+            sess.import_id("toto_panic")
+                .expect("runtime import declared"),
+            b.func,
+        );
         let code_v = Self::iconst(b, code as i64);
         let start_v = Self::iconst(b, span.0 as i64);
         let end_v = Self::iconst(b, span.1 as i64);
@@ -780,12 +860,16 @@ impl<'a> FnCx<'a> {
     /// variable here is always defined: undefined-on-a-path locals
     /// publish the null word, which the collector skips (it never
     /// resolves).
-    fn publish_all(&self, jit: &mut Jit, b: &mut FunctionBuilder<'_>) -> Result<(), SubsetError> {
+    fn publish_all(
+        &self,
+        sess: &mut impl Session,
+        b: &mut FunctionBuilder<'_>,
+    ) -> Result<(), SubsetError> {
         let mut ids: Vec<usize> = self.handle_locals.keys().copied().collect();
         ids.sort();
         for id in ids {
             let v = self.operand(b, id)?;
-            self.call_import(jit, b, "toto_shadow_push", &[self.ctx, v])?;
+            self.call_import(sess, b, "toto_shadow_push", &[self.ctx, v])?;
         }
         Ok(())
     }
@@ -793,8 +877,8 @@ impl<'a> FnCx<'a> {
     /// Lower one body (multi-block): declare variables, emit the
     /// prologue (params, captures, shadow base), lower each block,
     /// terminate with the MIR terminators.
-    fn lower(
-        jit: &mut Jit,
+    pub(crate) fn lower(
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         prog: &MProgram,
         shape: BodyShape<'_>,
@@ -823,7 +907,7 @@ impl<'a> FnCx<'a> {
             func: shape.name.to_string(),
             message: String::from("missing ctx block parameter (unreachable)"),
         })?;
-        let mut cx = FnCx::new(&shape, jit.mode, ctx);
+        let mut cx = FnCx::new(&shape, sess.mode(), ctx);
         cx.blocks.insert(shape.entry, entry_block);
         for blk in shape.blocks {
             if blk.id == shape.entry {
@@ -849,7 +933,7 @@ impl<'a> FnCx<'a> {
         }
         // Prologue in the entry block, then its body.
         b.switch_to_block(entry_block);
-        cx.prologue(jit, b, &shape, &params)?;
+        cx.prologue(sess, b, &shape, &params)?;
         let entry_mir = shape
             .blocks
             .iter()
@@ -859,9 +943,9 @@ impl<'a> FnCx<'a> {
                 message: String::from("entry block missing from body (unreachable)"),
             })?;
         for (i, instr) in entry_mir.instrs.iter().enumerate() {
-            cx.lower_instr(jit, b, prog, &entry_mir.instrs, i, instr)?;
+            cx.lower_instr(sess, b, prog, &entry_mir.instrs, i, instr)?;
         }
-        cx.lower_term(jit, b, prog, &shape, &entry_mir.term)?;
+        cx.lower_term(sess, b, prog, &shape, &entry_mir.term)?;
         for blk in shape.blocks {
             if blk.id == shape.entry {
                 continue;
@@ -869,9 +953,9 @@ impl<'a> FnCx<'a> {
             let cb = cx.blocks[&blk.id];
             b.switch_to_block(cb);
             for (i, instr) in blk.instrs.iter().enumerate() {
-                cx.lower_instr(jit, b, prog, &blk.instrs, i, instr)?;
+                cx.lower_instr(sess, b, prog, &blk.instrs, i, instr)?;
             }
-            cx.lower_term(jit, b, prog, &shape, &blk.term)?;
+            cx.lower_term(sess, b, prog, &shape, &blk.term)?;
         }
         // MIR block order is not topological (loop back-edges and
         // short-circuit joins jump to earlier blocks), so no MIR
@@ -1036,7 +1120,7 @@ impl<'a> FnCx<'a> {
     /// define params and capture slots, record the shadow base.
     fn prologue(
         &mut self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         shape: &BodyShape<'_>,
         params: &[CVal],
@@ -1060,7 +1144,7 @@ impl<'a> FnCx<'a> {
         // they end in `check_silent`, which needs the base to unwind.
         // Capture fetches never push or pop shadows, so reading the
         // depth here is identical to reading it after them.
-        let base = self.call_value(jit, b, "toto_shadow_len", &[self.ctx])?;
+        let base = self.call_value(sess, b, "toto_shadow_len", &[self.ctx])?;
         self.base = Some(base);
         match shape.kind {
             BodyKind::TopLevel => {
@@ -1075,16 +1159,16 @@ impl<'a> FnCx<'a> {
                 }
                 for i in 0..shape.ncaptures {
                     let slot = shape.params.len() + i;
-                    let w = self.call_closure_cap(jit, b, handle, i, shape.body_span)?;
+                    let w = self.call_closure_cap(sess, b, handle, i, shape.body_span)?;
                     self.define(b, slot, w)?;
-                    self.check_silent(jit, b, shape.body_span)?;
+                    self.check_silent(sess, b, shape.body_span)?;
                 }
             }
             BodyKind::Go => {
                 for i in 0..shape.ncaptures {
-                    let w = self.call_task_capture(jit, b, i, shape.body_span)?;
+                    let w = self.call_task_capture(sess, b, i, shape.body_span)?;
                     self.define(b, i, w)?;
-                    self.check_silent(jit, b, shape.body_span)?;
+                    self.check_silent(sess, b, shape.body_span)?;
                 }
             }
         }
@@ -1094,7 +1178,7 @@ impl<'a> FnCx<'a> {
     /// Fetch one closure capture word (handle payloads).
     fn call_closure_cap(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         handle: CVal,
         idx: usize,
@@ -1104,7 +1188,7 @@ impl<'a> FnCx<'a> {
         let start = Self::iconst(b, span.start as i64);
         let end = Self::iconst(b, span.end as i64);
         self.call_value(
-            jit,
+            sess,
             b,
             "toto_closure_cap",
             &[self.ctx, handle, i, start, end],
@@ -1114,7 +1198,7 @@ impl<'a> FnCx<'a> {
     /// Fetch one go-body capture word (task context slots).
     fn call_task_capture(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         idx: usize,
         span: Span,
@@ -1122,23 +1206,27 @@ impl<'a> FnCx<'a> {
         let i = Self::iconst(b, idx as i64);
         let start = Self::iconst(b, span.start as i64);
         let end = Self::iconst(b, span.end as i64);
-        self.call_value(jit, b, "toto_task_capture", &[self.ctx, i, start, end])
+        self.call_value(sess, b, "toto_task_capture", &[self.ctx, i, start, end])
     }
 
     /// Epilogue: pop the shadow stack to the prologue-recorded base.
-    fn epilogue(&self, jit: &mut Jit, b: &mut FunctionBuilder<'_>) -> Result<(), SubsetError> {
+    fn epilogue(
+        &self,
+        sess: &mut impl Session,
+        b: &mut FunctionBuilder<'_>,
+    ) -> Result<(), SubsetError> {
         let base = self.base.ok_or_else(|| SubsetError {
             func: self.func.clone(),
             message: String::from("missing shadow base (unreachable)"),
         })?;
-        self.call_import(jit, b, "toto_shadow_pop_to", &[self.ctx, base])?;
+        self.call_import(sess, b, "toto_shadow_pop_to", &[self.ctx, base])?;
         Ok(())
     }
 
     /// Lower a block terminator (all MIR terminators).
     fn lower_term(
         &mut self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         prog: &MProgram,
         shape: &BodyShape<'_>,
@@ -1149,19 +1237,19 @@ impl<'a> FnCx<'a> {
         match term {
             MTerm::Return(Some(local)) => {
                 let v = self.operand(b, *local)?;
-                self.epilogue(jit, b)?;
+                self.epilogue(sess, b)?;
                 b.ins().return_(&[v]);
                 Ok(())
             }
             MTerm::Return(None) => {
-                self.epilogue(jit, b)?;
+                self.epilogue(sess, b)?;
                 let z = Self::iconst(b, 0);
                 b.ins().return_(&[z]);
                 Ok(())
             }
             MTerm::FallOff { .. } => {
                 if *shape.ret == Ty::Unit {
-                    self.epilogue(jit, b)?;
+                    self.epilogue(sess, b)?;
                     let z = Self::iconst(b, 0);
                     b.ins().return_(&[z]);
                     Ok(())
@@ -1180,7 +1268,7 @@ impl<'a> FnCx<'a> {
                         }
                     };
                     self.emit_terminal_panic(
-                        jit,
+                        sess,
                         b,
                         E_FALLOFF,
                         (shape.body_span.start as u64, shape.body_span.end as u64),
@@ -1240,20 +1328,18 @@ impl<'a> FnCx<'a> {
     /// block end.
     fn emit_terminal_panic(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         code: u64,
         span: (u64, u64),
         msg: &str,
     ) -> Result<(), SubsetError> {
-        let (ptr, len) = jit.intern(msg);
         let code_v = Self::iconst(b, code as i64);
         let start_v = Self::iconst(b, span.0 as i64);
         let end_v = Self::iconst(b, span.1 as i64);
-        let msg_ptr = Self::iconst(b, ptr as i64);
-        let msg_len = Self::iconst(b, len as i64);
+        let (msg_ptr, msg_len) = sess.intern_str(b, msg);
         self.call_import(
-            jit,
+            sess,
             b,
             "toto_panic",
             &[self.ctx, code_v, start_v, end_v, msg_ptr, msg_len],
@@ -1268,17 +1354,15 @@ impl<'a> FnCx<'a> {
     /// the dead continuation so the function stays well-formed.
     fn emit_dead_panic(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         code: u64,
         span: (u64, u64),
         msg: &str,
     ) -> Result<CVal, SubsetError> {
-        let (ptr, len) = jit.intern(msg);
         let one = Self::iconst(b, 1);
-        let msg_ptr = Self::iconst(b, ptr as i64);
-        let msg_len = Self::iconst(b, len as i64);
-        Self::emit_check_raw(jit, b, self.ctx, one, code, span, msg_ptr, msg_len);
+        let (msg_ptr, msg_len) = sess.intern_str(b, msg);
+        Self::emit_check_raw(sess, b, self.ctx, one, code, span, msg_ptr, msg_len);
         Ok(Self::iconst(b, 0))
     }
 
@@ -1291,7 +1375,7 @@ impl<'a> FnCx<'a> {
     /// Toto frames).
     #[allow(clippy::too_many_arguments)]
     fn emit_check_failed(
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         ctx: CVal,
         base: CVal,
@@ -1300,9 +1384,11 @@ impl<'a> FnCx<'a> {
         span: (u64, u64),
     ) {
         use cranelift_codegen::ir::condcodes::IntCC;
-        let callee = jit
-            .module
-            .declare_func_in_func(jit.imports["toto_check_failed"], b.func);
+        let callee = sess.declare_in_func(
+            sess.import_id("toto_check_failed")
+                .expect("runtime import declared"),
+            b.func,
+        );
         let start_v = Self::iconst(b, span.0 as i64);
         let end_v = Self::iconst(b, span.1 as i64);
         let inst = b
@@ -1316,9 +1402,11 @@ impl<'a> FnCx<'a> {
         b.ins().brif(is_failed, fail_b, &[], cont_b, &[]);
         b.switch_to_block(fail_b);
         b.seal_block(fail_b);
-        let pop = jit
-            .module
-            .declare_func_in_func(jit.imports["toto_shadow_pop_to"], b.func);
+        let pop = sess.declare_in_func(
+            sess.import_id("toto_shadow_pop_to")
+                .expect("runtime import declared"),
+            b.func,
+        );
         b.ins().call(pop, &[ctx, base]);
         let dummy = Self::iconst(b, 0);
         b.ins().return_(&[dummy]);
@@ -1331,7 +1419,7 @@ impl<'a> FnCx<'a> {
     /// Gate mode needs no check (diverging panics).
     fn check_silent(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         span: Span,
     ) -> Result<(), SubsetError> {
@@ -1344,7 +1432,7 @@ impl<'a> FnCx<'a> {
         })?;
         let z = Self::iconst(b, 0);
         Self::emit_check_failed(
-            jit,
+            sess,
             b,
             self.ctx,
             base,
@@ -1362,7 +1450,7 @@ impl<'a> FnCx<'a> {
     /// (diverging panics).
     fn check_named(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         name: &str,
         span: Span,
@@ -1374,11 +1462,9 @@ impl<'a> FnCx<'a> {
             func: self.func.clone(),
             message: String::from("missing shadow base (unreachable)"),
         })?;
-        let (ptr, len) = jit.intern(name);
-        let name_ptr = Self::iconst(b, ptr as i64);
-        let name_len = Self::iconst(b, len as i64);
+        let (name_ptr, name_len) = sess.intern_str(b, name);
         Self::emit_check_failed(
-            jit,
+            sess,
             b,
             self.ctx,
             base,
@@ -1392,7 +1478,7 @@ impl<'a> FnCx<'a> {
     /// Direct call to a statically resolved top-level function.
     fn lower_direct_call(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         prog: &MProgram,
         target: usize,
@@ -1411,20 +1497,16 @@ impl<'a> FnCx<'a> {
                 callee_fn.name
             ));
         }
-        let cl_id = jit
-            .funcs
-            .get(&callee_fn.name)
-            .copied()
-            .ok_or_else(|| SubsetError {
-                func: self.func.clone(),
-                message: format!("callee {} not compiled", callee_fn.name),
-            })?;
-        let callee = jit.module.declare_func_in_func(cl_id, b.func);
+        let cl_id = sess.func_id(&callee_fn.name).ok_or_else(|| SubsetError {
+            func: self.func.clone(),
+            message: format!("callee {} not compiled", callee_fn.name),
+        })?;
+        let callee = sess.declare_in_func(cl_id, b.func);
         let mut vals = vec![self.ctx];
         vals.extend(argvals.iter().copied());
         let inst = b.ins().call(callee, &vals);
         let ret = b.inst_results(inst)[0];
-        self.check_named(jit, b, &callee_fn.name, *span)?;
+        self.check_named(sess, b, &callee_fn.name, *span)?;
         Ok(ret)
     }
 
@@ -1434,7 +1516,7 @@ impl<'a> FnCx<'a> {
     /// source display name (or `<value>`), like the interpreters.
     fn lower_indirect_call(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         func: usize,
         argvals: &[CVal],
@@ -1449,7 +1531,7 @@ impl<'a> FnCx<'a> {
                 Self::static_type_name(&fty)
             );
             return self.emit_dead_panic(
-                jit,
+                sess,
                 b,
                 E_INTERNAL,
                 (span.start as u64, span.end as u64),
@@ -1469,32 +1551,33 @@ impl<'a> FnCx<'a> {
         b.seal_block(func_b);
         let fstart = Self::iconst(b, span.start as i64);
         let fend = Self::iconst(b, span.end as i64);
-        let entry = self.call_value(jit, b, "toto_func_entry", &[self.ctx, fv, fstart, fend])?;
-        self.check_silent(jit, b, *span)?;
+        let entry = self.call_value(sess, b, "toto_func_entry", &[self.ctx, fv, fstart, fend])?;
+        self.check_silent(sess, b, *span)?;
         let fsig = sig_arity(argvals.len() as u32, true);
         let fsig = b.func.import_signature(fsig);
         let mut fvals = vec![self.ctx];
         fvals.extend(argvals.iter().copied());
         let finst = b.ins().call_indirect(fsig, entry, &fvals);
         let fret = b.inst_results(finst)[0];
-        self.check_named(jit, b, display, *span)?;
+        self.check_named(sess, b, display, *span)?;
         b.ins().jump(merge_b, &[BlockArg::Value(fret)]);
         // Closure arm: resolve the body and call `(ctx, handle, args...)`.
         b.switch_to_block(clo_b);
         b.seal_block(clo_b);
         let cstart = Self::iconst(b, span.start as i64);
         let cend = Self::iconst(b, span.end as i64);
-        let body = self.call_value(jit, b, "toto_closure_body", &[self.ctx, fv, cstart, cend])?;
-        self.check_silent(jit, b, *span)?;
-        let centry = self.call_value(jit, b, "toto_body_entry", &[self.ctx, body, cstart, cend])?;
-        self.check_silent(jit, b, *span)?;
+        let body = self.call_value(sess, b, "toto_closure_body", &[self.ctx, fv, cstart, cend])?;
+        self.check_silent(sess, b, *span)?;
+        let centry =
+            self.call_value(sess, b, "toto_body_entry", &[self.ctx, body, cstart, cend])?;
+        self.check_silent(sess, b, *span)?;
         let csig = sig_arity(argvals.len() as u32 + 1, true);
         let csig = b.func.import_signature(csig);
         let mut cvals = vec![self.ctx, fv];
         cvals.extend(argvals.iter().copied());
         let cinst = b.ins().call_indirect(csig, centry, &cvals);
         let cret = b.inst_results(cinst)[0];
-        self.check_named(jit, b, display, *span)?;
+        self.check_named(sess, b, display, *span)?;
         b.ins().jump(merge_b, &[BlockArg::Value(cret)]);
         b.switch_to_block(merge_b);
         b.seal_block(merge_b);
@@ -1506,16 +1589,16 @@ impl<'a> FnCx<'a> {
     /// cleanly instead of panicking on the map lookup.
     fn call_import(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         name: &'static str,
         args: &[CVal],
     ) -> Result<Option<CVal>, SubsetError> {
-        let id = jit.imports.get(name).copied().ok_or_else(|| SubsetError {
+        let id = sess.import_id(name).ok_or_else(|| SubsetError {
             func: self.func.clone(),
             message: format!("import `{name}` not registered for this mode"),
         })?;
-        let callee = jit.module.declare_func_in_func(id, b.func);
+        let callee = sess.declare_in_func(id, b.func);
         let inst = b.ins().call(callee, args);
         Ok(b.inst_results(inst).first().copied())
     }
@@ -1523,12 +1606,12 @@ impl<'a> FnCx<'a> {
     /// Call an imported helper that returns a word.
     fn call_value(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         name: &'static str,
         args: &[CVal],
     ) -> Result<CVal, SubsetError> {
-        self.call_import(jit, b, name, args)?
+        self.call_import(sess, b, name, args)?
             .ok_or_else(|| SubsetError {
                 func: self.func.clone(),
                 message: format!("import `{name}` returned no value (unreachable)"),
@@ -1595,12 +1678,12 @@ impl<'a> FnCx<'a> {
     /// Structured branch returning a value (both arms join with a
     /// block param). `cond` is a raw comparison result, like Spike 3's
     /// `brif` use.
-    fn if_else(
-        jit: &mut Jit,
+    fn if_else<S: Session>(
+        sess: &mut S,
         b: &mut FunctionBuilder<'_>,
         cond: CVal,
-        then_branch: impl FnOnce(&mut Jit, &mut FunctionBuilder<'_>) -> CVal,
-        else_branch: impl FnOnce(&mut Jit, &mut FunctionBuilder<'_>) -> CVal,
+        then_branch: impl FnOnce(&mut S, &mut FunctionBuilder<'_>) -> CVal,
+        else_branch: impl FnOnce(&mut S, &mut FunctionBuilder<'_>) -> CVal,
     ) -> CVal {
         let then_b = b.create_block();
         let else_b = b.create_block();
@@ -1609,11 +1692,11 @@ impl<'a> FnCx<'a> {
         b.ins().brif(cond, then_b, &[], else_b, &[]);
         b.switch_to_block(then_b);
         b.seal_block(then_b);
-        let v1 = then_branch(jit, b);
+        let v1 = then_branch(sess, b);
         b.ins().jump(merge_b, &[BlockArg::Value(v1)]);
         b.switch_to_block(else_b);
         b.seal_block(else_b);
-        let v0 = else_branch(jit, b);
+        let v0 = else_branch(sess, b);
         b.ins().jump(merge_b, &[BlockArg::Value(v0)]);
         b.switch_to_block(merge_b);
         b.seal_block(merge_b);
@@ -1663,7 +1746,7 @@ impl<'a> FnCx<'a> {
     #[allow(clippy::too_many_arguments)]
     fn lower_bin(
         &mut self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         op: MBinOp,
         a: CVal,
@@ -1686,7 +1769,7 @@ impl<'a> FnCx<'a> {
                 let c2 = b.ins().icmp(IntCC::SignedLessThan, t2, zero);
                 let diff = b.ins().uextend(I64, c2);
                 let ov = b.ins().band(same, diff);
-                Self::emit_check(jit, b, self.ctx, ov, E_OVERFLOW, span, MSG_OVERFLOW);
+                Self::emit_check(sess, b, self.ctx, ov, E_OVERFLOW, span, MSG_OVERFLOW);
                 Ok(r)
             }
             (MBinOp::Sub, Ty::Int, Ty::Int) => {
@@ -1701,7 +1784,7 @@ impl<'a> FnCx<'a> {
                 let c2 = b.ins().icmp(IntCC::SignedLessThan, t2, zero);
                 let dr = b.ins().uextend(I64, c2);
                 let ov = b.ins().band(ds, dr);
-                Self::emit_check(jit, b, self.ctx, ov, E_OVERFLOW, span, MSG_OVERFLOW);
+                Self::emit_check(sess, b, self.ctx, ov, E_OVERFLOW, span, MSG_OVERFLOW);
                 Ok(r)
             }
             (MBinOp::Mul, Ty::Int, Ty::Int) => {
@@ -1720,28 +1803,28 @@ impl<'a> FnCx<'a> {
                 // against MIN; otherwise `(a*b)/a == b` iff exact
                 // (compiler-rt rule).
                 let ov = Self::if_else(
-                    jit,
+                    sess,
                     b,
                     e_a0,
                     |_, b| Self::iconst(b, 0),
-                    |jit, b| {
+                    |sess, b| {
                         Self::if_else(
-                            jit,
+                            sess,
                             b,
                             e_c0,
                             |_, b| Self::iconst(b, 0),
-                            |jit, b| {
+                            |sess, b| {
                                 Self::if_else(
-                                    jit,
+                                    sess,
                                     b,
                                     e_an1,
                                     |_, b| {
                                         let e = b.ins().icmp(IntCC::Equal, c, min);
                                         b.ins().uextend(I64, e)
                                     },
-                                    |jit, b| {
+                                    |sess, b| {
                                         Self::if_else(
-                                            jit,
+                                            sess,
                                             b,
                                             e_cn1,
                                             |_, b| {
@@ -1760,7 +1843,7 @@ impl<'a> FnCx<'a> {
                         )
                     },
                 );
-                Self::emit_check(jit, b, self.ctx, ov, E_OVERFLOW, span, MSG_OVERFLOW);
+                Self::emit_check(sess, b, self.ctx, ov, E_OVERFLOW, span, MSG_OVERFLOW);
                 Ok(r)
             }
             (MBinOp::Div, Ty::Int, Ty::Int) => {
@@ -1768,7 +1851,7 @@ impl<'a> FnCx<'a> {
                 let z = b.ins().icmp(IntCC::Equal, c, zero);
                 let z64 = b.ins().uextend(I64, z);
                 Self::emit_check(
-                    jit,
+                    sess,
                     b,
                     self.ctx,
                     z64,
@@ -1784,7 +1867,7 @@ impl<'a> FnCx<'a> {
                 let e2 = b.ins().icmp(IntCC::Equal, c, neg_one);
                 let b_neg = b.ins().uextend(I64, e2);
                 let ov = b.ins().band(a_min, b_neg);
-                Self::emit_check(jit, b, self.ctx, ov, E_OVERFLOW, span, MSG_OVERFLOW);
+                Self::emit_check(sess, b, self.ctx, ov, E_OVERFLOW, span, MSG_OVERFLOW);
                 Ok(b.ins().sdiv(a, c))
             }
             (MBinOp::Mod, Ty::Int, Ty::Int) => {
@@ -1792,7 +1875,7 @@ impl<'a> FnCx<'a> {
                 let z = b.ins().icmp(IntCC::Equal, c, zero);
                 let z64 = b.ins().uextend(I64, z);
                 Self::emit_check(
-                    jit,
+                    sess,
                     b,
                     self.ctx,
                     z64,
@@ -1808,7 +1891,7 @@ impl<'a> FnCx<'a> {
                 let e2 = b.ins().icmp(IntCC::Equal, c, neg_one);
                 let special = b.ins().band(e1, e2);
                 Ok(Self::if_else(
-                    jit,
+                    sess,
                     b,
                     special,
                     |_, b| Self::iconst(b, 0),
@@ -1872,23 +1955,27 @@ impl<'a> FnCx<'a> {
             (MBinOp::Add, Ty::String, Ty::String) => {
                 let start_v = Self::iconst(b, span.0 as i64);
                 let end_v = Self::iconst(b, span.1 as i64);
-                let v =
-                    self.call_value(jit, b, "toto_str_concat", &[self.ctx, a, c, start_v, end_v])?;
-                self.check_silent(jit, b, Span::new(span.0 as u32, span.1 as u32))?;
+                let v = self.call_value(
+                    sess,
+                    b,
+                    "toto_str_concat",
+                    &[self.ctx, a, c, start_v, end_v],
+                )?;
+                self.check_silent(sess, b, Span::new(span.0 as u32, span.1 as u32))?;
                 Ok(v)
             }
             // All other equality/ordering: the helpers implement the
             // exact interpreter rule (including cross-type `E0203`).
-            (MBinOp::Eq, _, _) => self.lower_eq(jit, b, lty, rty, a, c, span, true),
-            (MBinOp::NotEq, _, _) => self.lower_eq(jit, b, lty, rty, a, c, span, false),
-            (MBinOp::Lt, _, _) => self.lower_order(jit, b, 0, lty, rty, a, c, span),
-            (MBinOp::LtEq, _, _) => self.lower_order(jit, b, 1, lty, rty, a, c, span),
-            (MBinOp::Gt, _, _) => self.lower_order(jit, b, 2, lty, rty, a, c, span),
-            (MBinOp::GtEq, _, _) => self.lower_order(jit, b, 3, lty, rty, a, c, span),
+            (MBinOp::Eq, _, _) => self.lower_eq(sess, b, lty, rty, a, c, span, true),
+            (MBinOp::NotEq, _, _) => self.lower_eq(sess, b, lty, rty, a, c, span, false),
+            (MBinOp::Lt, _, _) => self.lower_order(sess, b, 0, lty, rty, a, c, span),
+            (MBinOp::LtEq, _, _) => self.lower_order(sess, b, 1, lty, rty, a, c, span),
+            (MBinOp::Gt, _, _) => self.lower_order(sess, b, 2, lty, rty, a, c, span),
+            (MBinOp::GtEq, _, _) => self.lower_order(sess, b, 3, lty, rty, a, c, span),
             // Remaining arithmetic (same-type-unsupported and
             // cross-type): unconditional `E0203` with static names.
             (MBinOp::Add | MBinOp::Sub | MBinOp::Mul | MBinOp::Div | MBinOp::Mod, _, _) => {
-                self.lower_arith_mismatch(jit, b, op, lty, rty, span)
+                self.lower_arith_mismatch(sess, b, op, lty, rty, span)
             }
         }
     }
@@ -1921,7 +2008,7 @@ impl<'a> FnCx<'a> {
     /// function stays well-formed.
     fn lower_arith_mismatch(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         op: MBinOp,
         lty: &Ty,
@@ -1940,11 +2027,9 @@ impl<'a> FnCx<'a> {
                 return self.fail(format!("{op:?} is not arithmetic (unreachable)"));
             }
         };
-        let (ptr, len) = jit.intern(&msg);
         let one = Self::iconst(b, 1);
-        let msg_ptr = Self::iconst(b, ptr as i64);
-        let msg_len = Self::iconst(b, len as i64);
-        Self::emit_check_raw(jit, b, self.ctx, one, E_MISMATCH, span, msg_ptr, msg_len);
+        let (msg_ptr, msg_len) = sess.intern_str(b, &msg);
+        Self::emit_check_raw(sess, b, self.ctx, one, E_MISMATCH, span, msg_ptr, msg_len);
         Ok(Self::iconst(b, 0))
     }
 
@@ -1954,7 +2039,7 @@ impl<'a> FnCx<'a> {
     #[allow(clippy::too_many_arguments)]
     fn lower_eq(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         lty: &Ty,
         rty: &Ty,
@@ -1977,12 +2062,12 @@ impl<'a> FnCx<'a> {
         let start_v = Self::iconst(b, span.0 as i64);
         let end_v = Self::iconst(b, span.1 as i64);
         let v = self.call_value(
-            jit,
+            sess,
             b,
             "toto_values_eq",
             &[self.ctx, tag_a, a, tag_b, c, want, start_v, end_v],
         )?;
-        self.check_silent(jit, b, Span::new(span.0 as u32, span.1 as u32))?;
+        self.check_silent(sess, b, Span::new(span.0 as u32, span.1 as u32))?;
         Ok(v)
     }
 
@@ -1992,7 +2077,7 @@ impl<'a> FnCx<'a> {
     #[allow(clippy::too_many_arguments)]
     fn lower_order(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         op: u64,
         lty: &Ty,
@@ -2015,12 +2100,12 @@ impl<'a> FnCx<'a> {
         let start_v = Self::iconst(b, span.0 as i64);
         let end_v = Self::iconst(b, span.1 as i64);
         let v = self.call_value(
-            jit,
+            sess,
             b,
             "toto_values_order",
             &[self.ctx, op_v, tag_a, a, tag_b, c, start_v, end_v],
         )?;
-        self.check_silent(jit, b, Span::new(span.0 as u32, span.1 as u32))?;
+        self.check_silent(sess, b, Span::new(span.0 as u32, span.1 as u32))?;
         Ok(v)
     }
 
@@ -2049,7 +2134,7 @@ impl<'a> FnCx<'a> {
     #[allow(clippy::too_many_arguments)]
     fn lower_instr(
         &mut self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         prog: &MProgram,
         instrs: &[MInstr],
@@ -2072,22 +2157,20 @@ impl<'a> FnCx<'a> {
                         // Publish first: other live handles must
                         // survive the threshold check inside the
                         // allocator.
-                        self.publish_all(jit, b)?;
-                        let (ptr, len) = jit.intern(s);
-                        let ptr_v = Self::iconst(b, ptr as i64);
-                        let len_v = Self::iconst(b, len as i64);
+                        self.publish_all(sess, b)?;
+                        let (ptr_v, len_v) = sess.intern_str(b, s);
                         // Span of a const: no meaningful span exists;
                         // allocation itself cannot fail on valid UTF-8
                         // (interned from a checked literal), so zeros.
                         let z0 = Self::iconst(b, 0);
                         let z1 = Self::iconst(b, 0);
                         let v = self.call_value(
-                            jit,
+                            sess,
                             b,
                             "toto_alloc_str",
                             &[self.ctx, ptr_v, len_v, z0, z1],
                         )?;
-                        self.check_silent(jit, b, Span::new(0, 0))?;
+                        self.check_silent(sess, b, Span::new(0, 0))?;
                         v
                     }
                 };
@@ -2134,7 +2217,7 @@ impl<'a> FnCx<'a> {
                 let a = self.operand(b, *l)?;
                 let c = self.operand(b, *r)?;
                 let v = self.lower_bin(
-                    jit,
+                    sess,
                     b,
                     *op,
                     a,
@@ -2157,7 +2240,7 @@ impl<'a> FnCx<'a> {
                                 .icmp(cranelift_codegen::ir::condcodes::IntCC::Equal, v, min);
                         let is_min64 = b.ins().uextend(I64, is_min);
                         Self::emit_check(
-                            jit,
+                            sess,
                             b,
                             self.ctx,
                             is_min64,
@@ -2180,7 +2263,7 @@ impl<'a> FnCx<'a> {
                         // faithfully if ever reached.
                         let msg = format!("cannot negate {}", Self::static_type_name(&other));
                         self.emit_dead_panic(
-                            jit,
+                            sess,
                             b,
                             E_MISMATCH,
                             (span.start as u64, span.end as u64),
@@ -2206,7 +2289,7 @@ impl<'a> FnCx<'a> {
                         let msg =
                             format!("`!` needs a bool, got {}", Self::static_type_name(&other));
                         let r = self.emit_dead_panic(
-                            jit,
+                            sess,
                             b,
                             E_MISMATCH,
                             (self.body_span.start as u64, self.body_span.end as u64),
@@ -2234,10 +2317,12 @@ impl<'a> FnCx<'a> {
                 for a in args {
                     argvals.push(self.operand(b, *a)?);
                 }
-                self.publish_all(jit, b)?;
+                self.publish_all(sess, b)?;
                 let ret = match self.funcrefs.get(func).copied() {
-                    Some(target) => self.lower_direct_call(jit, b, prog, target, &argvals, span)?,
-                    None => self.lower_indirect_call(jit, b, *func, &argvals, span, display)?,
+                    Some(target) => {
+                        self.lower_direct_call(sess, b, prog, target, &argvals, span)?
+                    }
+                    None => self.lower_indirect_call(sess, b, *func, &argvals, span, display)?,
                 };
                 if let Some(d) = dst {
                     self.define(b, *d, ret)?;
@@ -2261,10 +2346,10 @@ impl<'a> FnCx<'a> {
             } => {
                 // Channel builtins run natively (never dispatched).
                 if name == "chan" {
-                    return self.lower_builtin_chan(jit, b, *dst, args, span);
+                    return self.lower_builtin_chan(sess, b, *dst, args, span);
                 }
                 if name == "close" || name == "closed" {
-                    return self.lower_builtin_close(jit, b, *dst, name, args, span);
+                    return self.lower_builtin_close(sess, b, *dst, name, args, span);
                 }
                 let id = crate::runtime::builtin_id(name).ok_or_else(|| SubsetError {
                     func: self.func.clone(),
@@ -2285,13 +2370,13 @@ impl<'a> FnCx<'a> {
                 }
                 // Publish before the call: builtins may allocate and
                 // collect (frozen safepoint-call rule).
-                self.publish_all(jit, b)?;
+                self.publish_all(sess, b)?;
                 let id_v = Self::iconst(b, id as i64);
                 let n_v = Self::iconst(b, args.len() as i64);
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
                 let v = self.call_value(
-                    jit,
+                    sess,
                     b,
                     "toto_builtin",
                     &[self.ctx, id_v, slot, n_v, start_v, end_v],
@@ -2299,7 +2384,7 @@ impl<'a> FnCx<'a> {
                 // Builtins push no trace frame on failure (the
                 // executor's leaf errors carry no trace of their own):
                 // silent unwind, like every other helper call.
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
                 if let Some(d) = dst {
                     self.define(b, *d, v)?;
                 }
@@ -2307,13 +2392,13 @@ impl<'a> FnCx<'a> {
             MInstr::ArrayLit { dst, elems, span } => {
                 // Publish first (threshold check inside the allocator),
                 // then allocate plus one initializing write per element.
-                self.publish_all(jit, b)?;
+                self.publish_all(sess, b)?;
                 let alen = Self::iconst(b, elems.len() as i64);
                 let astart = Self::iconst(b, span.start as i64);
                 let aend = Self::iconst(b, span.end as i64);
                 let arr =
-                    self.call_value(jit, b, "toto_alloc_array", &[self.ctx, alen, astart, aend])?;
-                self.check_silent(jit, b, *span)?;
+                    self.call_value(sess, b, "toto_alloc_array", &[self.ctx, alen, astart, aend])?;
+                self.check_silent(sess, b, *span)?;
                 for (i, e) in elems.iter().enumerate() {
                     let v = self.operand(b, *e)?;
                     let ety = self.local_ty(*e)?.clone();
@@ -2328,14 +2413,14 @@ impl<'a> FnCx<'a> {
                     // Index span: the literal span (initializing writes
                     // never fail bounds/type checks).
                     self.call_import(
-                        jit,
+                        sess,
                         b,
                         "toto_index_write",
                         &[
                             self.ctx, arr, btag, itag, idx, vtag, v, astart, aend, astart, aend,
                         ],
                     )?;
-                    self.check_silent(jit, b, *span)?;
+                    self.check_silent(sess, b, *span)?;
                 }
                 self.define(b, *dst, arr)?;
             }
@@ -2367,14 +2452,14 @@ impl<'a> FnCx<'a> {
                 let istart = Self::iconst(b, index_span.start as i64);
                 let iend = Self::iconst(b, index_span.end as i64);
                 let v = self.call_value(
-                    jit,
+                    sess,
                     b,
                     "toto_index_read",
                     &[
                         self.ctx, bbase, btag_v, itag_v, bidx, bstart, bend, istart, iend,
                     ],
                 )?;
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
                 self.define(b, *dst, v)?;
             }
             MInstr::Len { dst, base, span } => {
@@ -2390,20 +2475,20 @@ impl<'a> FnCx<'a> {
                 let lstart = Self::iconst(b, span.start as i64);
                 let lend = Self::iconst(b, span.end as i64);
                 let v =
-                    self.call_value(jit, b, "toto_len", &[self.ctx, lbase, ltag, lstart, lend])?;
-                self.check_silent(jit, b, *span)?;
+                    self.call_value(sess, b, "toto_len", &[self.ctx, lbase, ltag, lstart, lend])?;
+                self.check_silent(sess, b, *span)?;
                 self.define(b, *dst, v)?;
             }
             MInstr::Safepoint { kind } => {
                 use toto_compiler::mir::SpKind as K;
-                self.publish_all(jit, b)?;
+                self.publish_all(sess, b)?;
                 // Task mode joins collections at loop/call/entry
                 // points (the rendezvous needs every task to arrive;
                 // allocation and suspension safepoints collect inside
                 // their helpers instead). Gate mode collects in
                 // allocation helpers only.
                 if self.mode == CodegenMode::Task && matches!(kind, K::Loop | K::Call | K::Entry) {
-                    self.call_import(jit, b, "toto_gc_collect", &[self.ctx])?;
+                    self.call_import(sess, b, "toto_gc_collect", &[self.ctx])?;
                 }
             }
             MInstr::StructLit {
@@ -2412,19 +2497,17 @@ impl<'a> FnCx<'a> {
                 fields,
                 span,
             } => {
-                self.publish_all(jit, b)?;
-                let (name_ptr, name_len) = jit.intern(name);
-                let nptr = Self::iconst(b, name_ptr as i64);
-                let nlen = Self::iconst(b, name_len as i64);
+                self.publish_all(sess, b)?;
+                let (nptr, nlen) = sess.intern_str(b, name);
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
                 let obj = self.call_value(
-                    jit,
+                    sess,
                     b,
                     "toto_alloc_struct",
                     &[self.ctx, nptr, nlen, start_v, end_v],
                 )?;
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
                 for (fname, l) in fields {
                     let v = self.operand(b, *l)?;
                     let ety = self.local_ty(*l)?.clone();
@@ -2432,17 +2515,15 @@ impl<'a> FnCx<'a> {
                         func: self.func.clone(),
                         message: format!("struct field `{fname}`: {e}"),
                     })?;
-                    let (fptr, flen) = jit.intern(fname);
-                    let fptr_v = Self::iconst(b, fptr as i64);
-                    let flen_v = Self::iconst(b, flen as i64);
+                    let (fptr_v, flen_v) = sess.intern_str(b, fname);
                     let vtag = Self::iconst(b, tag as i64);
                     self.call_import(
-                        jit,
+                        sess,
                         b,
                         "toto_struct_init",
                         &[self.ctx, obj, fptr_v, flen_v, vtag, v, start_v, end_v],
                     )?;
-                    self.check_silent(jit, b, *span)?;
+                    self.check_silent(sess, b, *span)?;
                 }
                 self.define(b, *dst, obj)?;
             }
@@ -2456,8 +2537,8 @@ impl<'a> FnCx<'a> {
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
                 let len =
-                    self.call_value(jit, b, "toto_len", &[self.ctx, bobj, btag, start_v, end_v])?;
-                self.check_silent(jit, b, *span)?;
+                    self.call_value(sess, b, "toto_len", &[self.ctx, bobj, btag, start_v, end_v])?;
+                self.check_silent(sess, b, *span)?;
                 let ety = match self.local_ty(*base)?.clone() {
                     Ty::Array(t) => *t,
                     other => {
@@ -2470,10 +2551,14 @@ impl<'a> FnCx<'a> {
                     func: self.func.clone(),
                     message: format!("snapshot element: {e}"),
                 })?;
-                self.publish_all(jit, b)?;
-                let arr =
-                    self.call_value(jit, b, "toto_alloc_array", &[self.ctx, len, start_v, end_v])?;
-                self.check_silent(jit, b, *span)?;
+                self.publish_all(sess, b)?;
+                let arr = self.call_value(
+                    sess,
+                    b,
+                    "toto_alloc_array",
+                    &[self.ctx, len, start_v, end_v],
+                )?;
+                self.check_silent(sess, b, *span)?;
                 let zero = Self::iconst(b, 0);
                 let one = Self::iconst(b, 1);
                 let itag = Self::iconst(b, TAG_INT as i64);
@@ -2490,23 +2575,23 @@ impl<'a> FnCx<'a> {
                 b.switch_to_block(body_b);
                 b.seal_block(body_b);
                 let v = self.call_value(
-                    jit,
+                    sess,
                     b,
                     "toto_index_read",
                     &[
                         self.ctx, bobj, btag, itag, i, start_v, end_v, start_v, end_v,
                     ],
                 )?;
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
                 self.call_import(
-                    jit,
+                    sess,
                     b,
                     "toto_index_write",
                     &[
                         self.ctx, arr, btag, itag, i, vtag_v, v, start_v, end_v, start_v, end_v,
                     ],
                 )?;
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
                 let i1 = b.ins().iadd(i, one);
                 b.ins().jump(head_b, &[BlockArg::Value(i1)]);
                 b.seal_block(head_b);
@@ -2517,9 +2602,9 @@ impl<'a> FnCx<'a> {
             MInstr::RangeLit { dst, lo, hi, span } => {
                 let lo_v = self.operand(b, *lo)?;
                 let hi_v = self.operand(b, *hi)?;
-                self.publish_all(jit, b)?;
-                let v = self.call_value(jit, b, "toto_alloc_range", &[self.ctx, lo_v, hi_v])?;
-                self.check_silent(jit, b, *span)?;
+                self.publish_all(sess, b)?;
+                let v = self.call_value(sess, b, "toto_alloc_range", &[self.ctx, lo_v, hi_v])?;
+                self.check_silent(sess, b, *span)?;
                 self.define(b, *dst, v)?;
             }
             MInstr::SplitRange {
@@ -2532,53 +2617,53 @@ impl<'a> FnCx<'a> {
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
                 let lo_v =
-                    self.call_value(jit, b, "toto_range_lo", &[self.ctx, r, start_v, end_v])?;
-                self.check_silent(jit, b, *span)?;
+                    self.call_value(sess, b, "toto_range_lo", &[self.ctx, r, start_v, end_v])?;
+                self.check_silent(sess, b, *span)?;
                 let hi_v =
-                    self.call_value(jit, b, "toto_range_hi", &[self.ctx, r, start_v, end_v])?;
-                self.check_silent(jit, b, *span)?;
+                    self.call_value(sess, b, "toto_range_hi", &[self.ctx, r, start_v, end_v])?;
+                self.check_silent(sess, b, *span)?;
                 self.define(b, *lo, lo_v)?;
                 self.define(b, *hi, hi_v)?;
             }
             MInstr::WrapOk { dst, inner } => {
                 let (tag_v, word) = self.tagged_operand(b, *inner)?;
-                self.publish_all(jit, b)?;
+                self.publish_all(sess, b)?;
                 let is_ok = Self::iconst(b, 1);
                 let (start_v, end_v) = self.body_span_words(b);
                 let v = self.call_value(
-                    jit,
+                    sess,
                     b,
                     "toto_alloc_result",
                     &[self.ctx, is_ok, tag_v, word, start_v, end_v],
                 )?;
-                self.check_silent(jit, b, self.body_span)?;
+                self.check_silent(sess, b, self.body_span)?;
                 self.define(b, *dst, v)?;
             }
             MInstr::WrapErr { dst, inner } => {
                 let (tag_v, word) = self.tagged_operand(b, *inner)?;
-                self.publish_all(jit, b)?;
+                self.publish_all(sess, b)?;
                 let is_ok = Self::iconst(b, 0);
                 let (start_v, end_v) = self.body_span_words(b);
                 let v = self.call_value(
-                    jit,
+                    sess,
                     b,
                     "toto_alloc_result",
                     &[self.ctx, is_ok, tag_v, word, start_v, end_v],
                 )?;
-                self.check_silent(jit, b, self.body_span)?;
+                self.check_silent(sess, b, self.body_span)?;
                 self.define(b, *dst, v)?;
             }
             MInstr::WrapSome { dst, inner } => {
                 let (tag_v, word) = self.tagged_operand(b, *inner)?;
-                self.publish_all(jit, b)?;
+                self.publish_all(sess, b)?;
                 let (start_v, end_v) = self.body_span_words(b);
                 let v = self.call_value(
-                    jit,
+                    sess,
                     b,
                     "toto_alloc_some",
                     &[self.ctx, tag_v, word, start_v, end_v],
                 )?;
-                self.check_silent(jit, b, self.body_span)?;
+                self.check_silent(sess, b, self.body_span)?;
                 self.define(b, *dst, v)?;
             }
             MInstr::Propagate { dst, operand, span } => {
@@ -2590,12 +2675,12 @@ impl<'a> FnCx<'a> {
                 match ty {
                     Ty::Result(..) => {
                         let is_ok = self.call_value(
-                            jit,
+                            sess,
                             b,
                             "toto_result_is_ok",
                             &[self.ctx, v, start_v, end_v],
                         )?;
-                        self.check_silent(jit, b, *span)?;
+                        self.check_silent(sess, b, *span)?;
                         let zero = Self::iconst(b, 0);
                         let ok_c = b.ins().icmp(IntCC::NotEqual, is_ok, zero);
                         let ok_b = b.create_block();
@@ -2604,17 +2689,17 @@ impl<'a> FnCx<'a> {
                         b.ins().brif(ok_c, ok_b, &[], err_b, &[]);
                         b.switch_to_block(err_b);
                         b.seal_block(err_b);
-                        self.epilogue(jit, b)?;
+                        self.epilogue(sess, b)?;
                         b.ins().return_(&[v]);
                         b.switch_to_block(ok_b);
                         b.seal_block(ok_b);
                         let inner = self.call_value(
-                            jit,
+                            sess,
                             b,
                             "toto_wrap_inner",
                             &[self.ctx, v, start_v, end_v],
                         )?;
-                        self.check_silent(jit, b, *span)?;
+                        self.check_silent(sess, b, *span)?;
                         self.define(b, *dst, inner)?;
                         b.ins().jump(cont_b, &[]);
                         b.switch_to_block(cont_b);
@@ -2630,17 +2715,17 @@ impl<'a> FnCx<'a> {
                         b.ins().brif(some_c, some_b, &[], none_b, &[]);
                         b.switch_to_block(none_b);
                         b.seal_block(none_b);
-                        self.epilogue(jit, b)?;
+                        self.epilogue(sess, b)?;
                         b.ins().return_(&[zero]);
                         b.switch_to_block(some_b);
                         b.seal_block(some_b);
                         let inner = self.call_value(
-                            jit,
+                            sess,
                             b,
                             "toto_wrap_inner",
                             &[self.ctx, v, start_v, end_v],
                         )?;
-                        self.check_silent(jit, b, *span)?;
+                        self.check_silent(sess, b, *span)?;
                         self.define(b, *dst, inner)?;
                         b.ins().jump(cont_b, &[]);
                         b.switch_to_block(cont_b);
@@ -2650,7 +2735,7 @@ impl<'a> FnCx<'a> {
                         // Statically impossible (`?` needs a `Result`
                         // or `Option` operand).
                         let r = self.emit_dead_panic(
-                            jit,
+                            sess,
                             b,
                             E_INTERNAL,
                             (span.start as u64, span.end as u64),
@@ -2667,18 +2752,16 @@ impl<'a> FnCx<'a> {
                 span,
             } => {
                 let bobj = self.operand(b, *base)?;
-                let (ptr, len) = jit.intern(name);
-                let nptr = Self::iconst(b, ptr as i64);
-                let nlen = Self::iconst(b, len as i64);
+                let (nptr, nlen) = sess.intern_str(b, name);
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
                 let v = self.call_value(
-                    jit,
+                    sess,
                     b,
                     "toto_struct_get",
                     &[self.ctx, bobj, nptr, nlen, start_v, end_v],
                 )?;
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
                 self.define(b, *dst, v)?;
             }
             MInstr::StoreField {
@@ -2689,18 +2772,16 @@ impl<'a> FnCx<'a> {
             } => {
                 let bobj = self.operand(b, *base)?;
                 let (vtag, vword) = self.tagged_operand(b, *value)?;
-                let (ptr, len) = jit.intern(name);
-                let nptr = Self::iconst(b, ptr as i64);
-                let nlen = Self::iconst(b, len as i64);
+                let (nptr, nlen) = sess.intern_str(b, name);
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
                 self.call_import(
-                    jit,
+                    sess,
                     b,
                     "toto_struct_set",
                     &[self.ctx, bobj, nptr, nlen, vtag, vword, start_v, end_v],
                 )?;
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
             }
             MInstr::StoreIndex {
                 base,
@@ -2729,7 +2810,7 @@ impl<'a> FnCx<'a> {
                 let istart = Self::iconst(b, index_span.start as i64);
                 let iend = Self::iconst(b, index_span.end as i64);
                 self.call_import(
-                    jit,
+                    sess,
                     b,
                     "toto_index_write",
                     &[
@@ -2737,7 +2818,7 @@ impl<'a> FnCx<'a> {
                         iend,
                     ],
                 )?;
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
             }
             MInstr::SatIncr { dst, operand } => {
                 use cranelift_codegen::ir::condcodes::IntCC;
@@ -2746,7 +2827,7 @@ impl<'a> FnCx<'a> {
                 let is_max = b.ins().icmp(IntCC::Equal, v, max);
                 let one = Self::iconst(b, 1);
                 let r = Self::if_else(
-                    jit,
+                    sess,
                     b,
                     is_max,
                     |_, b| Self::iconst(b, i64::MAX),
@@ -2762,27 +2843,25 @@ impl<'a> FnCx<'a> {
             } => {
                 // Assign a body id and collect the body for later
                 // compilation (both modes lower closures).
-                let id = jit.next_body;
-                jit.next_body += 1;
-                jit.bodies.push((id, BodyKind::Closure, Arc::clone(body)));
+                let id = sess.alloc_body(BodyKind::Closure, Arc::clone(body));
                 let slot = Self::stack_slot(b, (captures.len().max(1) * 16) as u32);
                 for (i, c) in captures.iter().enumerate() {
                     let (tag_v, word) = self.tagged_operand(b, *c)?;
                     Self::stack_store(b, slot, 2 * i, tag_v);
                     Self::stack_store(b, slot, 2 * i + 1, word);
                 }
-                self.publish_all(jit, b)?;
+                self.publish_all(sess, b)?;
                 let id_v = Self::iconst(b, id as i64);
                 let n_v = Self::iconst(b, captures.len() as i64);
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
                 let v = self.call_value(
-                    jit,
+                    sess,
                     b,
                     "toto_alloc_closure",
                     &[self.ctx, id_v, slot, n_v, start_v, end_v],
                 )?;
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
                 self.define(b, *dst, v)?;
             }
             MInstr::ChanNew {
@@ -2791,7 +2870,7 @@ impl<'a> FnCx<'a> {
                 cap,
                 span,
             } => {
-                let v = self.chan_new_emit(jit, b, elem, *cap, span)?;
+                let v = self.chan_new_emit(sess, b, elem, *cap, span)?;
                 self.define(b, *dst, v)?;
             }
             MInstr::Send { chan, value, span } => {
@@ -2809,12 +2888,12 @@ impl<'a> FnCx<'a> {
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
                 self.call_import(
-                    jit,
+                    sess,
                     b,
                     "toto_yield",
                     &[self.ctx, op, chan_w, vtag, vword, z, z, start_v, end_v],
                 )?;
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
             }
             MInstr::Recv { dst, chan, span } => {
                 if self.mode == CodegenMode::Gate {
@@ -2828,12 +2907,12 @@ impl<'a> FnCx<'a> {
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
                 let v = self.call_value(
-                    jit,
+                    sess,
                     b,
                     "toto_yield",
                     &[self.ctx, op, chan_w, z, z, z, z, start_v, end_v],
                 )?;
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
                 self.define(b, *dst, v)?;
             }
             MInstr::Spawn {
@@ -2846,27 +2925,25 @@ impl<'a> FnCx<'a> {
                         "spawn needs a task session (concurrency is task-only)",
                     ));
                 }
-                let id = jit.next_body;
-                jit.next_body += 1;
-                jit.bodies.push((id, BodyKind::Go, Arc::clone(body)));
+                let id = sess.alloc_body(BodyKind::Go, Arc::clone(body));
                 let slot = Self::stack_slot(b, (captures.len().max(1) * 16) as u32);
                 for (i, c) in captures.iter().enumerate() {
                     let (tag_v, word) = self.tagged_operand(b, *c)?;
                     Self::stack_store(b, slot, 2 * i, tag_v);
                     Self::stack_store(b, slot, 2 * i + 1, word);
                 }
-                self.publish_all(jit, b)?;
+                self.publish_all(sess, b)?;
                 let id_v = Self::iconst(b, id as i64);
                 let n_v = Self::iconst(b, captures.len() as i64);
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
                 self.call_import(
-                    jit,
+                    sess,
                     b,
                     "toto_spawn",
                     &[self.ctx, id_v, slot, n_v, start_v, end_v],
                 )?;
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
             }
             MInstr::Select {
                 dst,
@@ -2918,7 +2995,7 @@ impl<'a> FnCx<'a> {
                     }
                 }
                 let out_slot = Self::stack_slot(b, 8);
-                self.publish_all(jit, b)?;
+                self.publish_all(sess, b)?;
                 let op = Self::iconst(b, crate::task::YIELD_SELECT as i64);
                 let n_v = Self::iconst(b, cases.len() as i64);
                 let hd_v = Self::iconst(b, i64::from(*has_default));
@@ -2926,12 +3003,12 @@ impl<'a> FnCx<'a> {
                 let start_v = Self::iconst(b, span.start as i64);
                 let end_v = Self::iconst(b, span.end as i64);
                 let v = self.call_value(
-                    jit,
+                    sess,
                     b,
                     "toto_yield",
                     &[self.ctx, op, slot, n_v, hd_v, out_slot, z, start_v, end_v],
                 )?;
-                self.check_silent(jit, b, *span)?;
+                self.check_silent(sess, b, *span)?;
                 self.define(b, *dst, v)?;
                 // Bind slots read the out word: only the selected
                 // case's arm uses its bind, and the out word is
@@ -2961,7 +3038,7 @@ impl<'a> FnCx<'a> {
     /// and calls `toto_chan_make` (task-only).
     fn chan_new_emit(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         elem: &Ty,
         cap: Option<usize>,
@@ -2972,9 +3049,8 @@ impl<'a> FnCx<'a> {
                 "channels need a task session (concurrency is task-only)",
             ));
         }
-        let id = jit.chan_types.len() as u64;
-        jit.chan_types.push(elem.clone());
-        self.publish_all(jit, b)?;
+        let id = sess.intern_chan_type(elem.clone());
+        self.publish_all(sess, b)?;
         let (has_cap, cap_w) = match cap {
             Some(l) => {
                 let w = self.operand(b, l)?;
@@ -2986,12 +3062,12 @@ impl<'a> FnCx<'a> {
         let start_v = Self::iconst(b, span.start as i64);
         let end_v = Self::iconst(b, span.end as i64);
         let v = self.call_value(
-            jit,
+            sess,
             b,
             "toto_chan_make",
             &[self.ctx, has_cap, cap_w, ty_v, start_v, end_v],
         )?;
-        self.check_silent(jit, b, *span)?;
+        self.check_silent(sess, b, *span)?;
         Ok(v)
     }
 
@@ -2999,7 +3075,7 @@ impl<'a> FnCx<'a> {
     /// the argument list, element type from the destination.
     fn lower_builtin_chan(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         dst: Option<usize>,
         args: &[usize],
@@ -3027,7 +3103,7 @@ impl<'a> FnCx<'a> {
                 ));
             }
         };
-        let v = self.chan_new_emit(jit, b, &elem, cap, span)?;
+        let v = self.chan_new_emit(sess, b, &elem, cap, span)?;
         self.define(b, d, v)?;
         Ok(())
     }
@@ -3035,7 +3111,7 @@ impl<'a> FnCx<'a> {
     /// Native `close`/`closed` (task-only): scheduler round-trips.
     fn lower_builtin_close(
         &self,
-        jit: &mut Jit,
+        sess: &mut impl Session,
         b: &mut FunctionBuilder<'_>,
         dst: Option<usize>,
         name: &str,
@@ -3053,7 +3129,7 @@ impl<'a> FnCx<'a> {
                 args.len()
             ));
         }
-        self.publish_all(jit, b)?;
+        self.publish_all(sess, b)?;
         let chan = self.operand(b, args[0])?;
         let op = if name == "close" {
             crate::task::YIELD_CLOSE
@@ -3066,7 +3142,7 @@ impl<'a> FnCx<'a> {
         let end_v = Self::iconst(b, span.end as i64);
         // (op, chan, 0, 0, 0, 0, span): only the channel word matters.
         let v = self.call_value(
-            jit,
+            sess,
             b,
             "toto_yield",
             &[self.ctx, op_v, chan, z, z, z, z, start_v, end_v],
@@ -3074,7 +3150,7 @@ impl<'a> FnCx<'a> {
         // `close`/`closed` push no trace frame on failure (builtins
         // carry no trace of their own in the reference executor):
         // silent unwind, like every other helper call.
-        self.check_silent(jit, b, *span)?;
+        self.check_silent(sess, b, *span)?;
         if let Some(d) = dst {
             self.define(b, d, v)?;
         }

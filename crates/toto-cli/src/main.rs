@@ -4,7 +4,10 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use toto_compiler::{Outcome, parse_and_check, render_errors, render_panic, run_source};
+use toto_compiler::render_errors;
+
+mod build_cmd;
+mod manifest;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -14,6 +17,9 @@ const HELP: &str = "toto — a new programming language (.gzv)\n\
                     \x20   toto run [--workers N] <file.gzv>   lex, parse, and run a program\n\
                     \x20   toto dev [--workers N] [--drain-timeout SECS] [--opt-level LEVEL] <file.gzv>\n\
                     \x20                                      rebuild and restart on every save\n\
+                    \x20   toto init <name>                   scaffold a runnable project\n\
+                    \x20   toto build [--release]             build the project executable\n\
+                    \x20   toto test                         run the project tests\n\
                     \x20   toto --help                        show this help\n\
                     \x20   toto --version                     show the version\n\
                     \n\
@@ -121,12 +127,63 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("init") => {
+            let rest: Vec<&str> = args.iter().skip(2).map(String::as_str).collect();
+            match rest.as_slice() {
+                [name] => init_project(name),
+                _ => {
+                    eprintln!("toto: `init` needs a name: toto init <name>");
+                    ExitCode::from(3)
+                }
+            }
+        }
+        Some("build") => {
+            let release = args.iter().skip(2).any(|a| a == "--release");
+            let bad: Vec<&str> = args
+                .iter()
+                .skip(2)
+                .map(String::as_str)
+                .filter(|a| *a != "--release")
+                .collect();
+            if !bad.is_empty() {
+                eprintln!("toto: unexpected `build` flags: {}", bad.join(" "));
+                return ExitCode::from(3);
+            }
+            build_cmd::build(release)
+        }
+        Some("test") => {
+            let rest: Vec<&str> = args.iter().skip(2).map(String::as_str).collect();
+            if !rest.is_empty() {
+                eprintln!("toto: `test` takes no arguments");
+                return ExitCode::from(3);
+            }
+            build_cmd::test_all()
+        }
         Some(other) => {
             eprintln!("toto: unknown command `{other}`\n\n{HELP}");
             ExitCode::from(3)
         }
         None => {
             eprintln!("{HELP}");
+            ExitCode::from(3)
+        }
+    }
+}
+
+fn init_project(dir: &str) -> ExitCode {
+    let path = std::path::Path::new(dir);
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match manifest::init_project(path, &name) {
+        Ok(dir) => {
+            println!("toto: initialized `{}`", dir.display());
+            println!("toto:   toto.toml / main.gzv / tests/example.gzv");
+            ExitCode::from(0)
+        }
+        Err(e) => {
+            eprintln!("{}", e.message);
             ExitCode::from(3)
         }
     }
@@ -141,56 +198,29 @@ fn run_file(path: &str, workers: usize) -> ExitCode {
         }
     };
     // Diagnostic paths show the path as given on the command line.
-    let filename = path;
-    // Route concurrent programs to the runtime executor (spec §13);
-    // sequential programs stay on the tree-walking interpreter.
-    let (program, checked) = match parse_and_check(&src) {
-        Ok(parsed) => parsed,
-        Err(diags) => {
-            eprint!("{}", render_errors(&diags, &src, filename));
+    // `load_and_check` resolves `import` statements against the
+    // importing file's directory and checks the merged program; files
+    // without imports behave exactly as before (single-file project).
+    let (project, checked) = match toto_compiler::project::load_and_check(path, &src, &|p| {
+        std::fs::read_to_string(p).ok()
+    }) {
+        Ok(loaded) => loaded,
+        Err(failed) => {
+            for fd in &failed.errors {
+                let f = &failed.files[fd.file];
+                eprint!(
+                    "{}",
+                    toto_compiler::render_errors(&fd.diags, &f.src, &f.path)
+                );
+            }
             return ExitCode::from(2);
         }
     };
-    if checked.uses_concurrency {
-        let outcome = toto_runtime::run_checked(
-            &program,
-            &checked,
-            toto_runtime::RuntimeConfig {
-                workers,
-                ..toto_runtime::RuntimeConfig::default()
-            },
-        );
-        return match outcome.result {
-            Ok(code) => {
-                let _ = std::io::stdout().write_all(&outcome.stdout);
-                ExitCode::from(code as u8)
-            }
-            Err((diag, trace)) => {
-                let _ = std::io::stdout().write_all(&outcome.stdout);
-                eprint!("{}", render_panic(&diag, &trace, &src, filename));
-                ExitCode::from(1)
-            }
-        };
-    }
-    match run_source(&src, filename) {
-        Outcome::Success { code, stdout } => {
-            let _ = std::io::stdout().write_all(&stdout);
-            ExitCode::from(code as u8)
-        }
-        Outcome::Static(diags) => {
-            eprint!("{}", render_errors(&diags, &src, filename));
-            ExitCode::from(2)
-        }
-        Outcome::RuntimePanic {
-            diag,
-            trace,
-            stdout,
-        } => {
-            let _ = std::io::stdout().write_all(&stdout);
-            eprint!("{}", render_panic(&diag, &trace, &src, filename));
-            ExitCode::from(1)
-        }
-    }
+    // One execution path for `run` and `test` (see `run_loaded`).
+    let (code, stdout, stderr_text) = build_cmd::run_loaded(&project, &checked, workers);
+    let _ = std::io::stdout().write_all(&stdout);
+    eprint!("{stderr_text}");
+    ExitCode::from(code as u8)
 }
 
 /// Ingest one source revision into the dev driver: forward the retired

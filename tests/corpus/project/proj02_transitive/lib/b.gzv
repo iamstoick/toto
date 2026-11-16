@@ -1,0 +1,4 @@
+import "shared.gzv";
+pub fn other(x: int) -> int {
+    return shared(x) - 1;
+}

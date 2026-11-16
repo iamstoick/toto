@@ -64,6 +64,120 @@ fn workers_flag_runs_concurrent() {
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "42\n");
 }
 
+/// Scratch project root unique to one test (pid-scoped; cleaned up).
+fn scratch_project(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("toto-cli-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+#[test]
+fn init_scaffolds_runnable_project() {
+    let dir = scratch_project("init");
+    let target = dir.join("hello");
+    let out = toto().arg("init").arg(&target).output().expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(target.join("toto.toml").is_file());
+    assert!(target.join("main.gzv").is_file());
+    assert!(target.join("tests").join("example.gzv").is_file());
+    // The scaffold runs as-is.
+    let out = toto()
+        .arg("run")
+        .arg(target.join("main.gzv"))
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "hello from toto\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_refuses_existing_dir() {
+    let dir = scratch_project("init-exists");
+    let target = dir.join("taken");
+    std::fs::create_dir_all(&target).expect("scratch dir");
+    let out = toto().arg("init").arg(&target).output().expect("runs");
+    assert_eq!(out.status.code(), Some(3));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const BUILD_PROG: &str = "fn fact(n: int) -> int {\n    if n <= 1 {\n        return 1;\n    }\n    return n * fact(n - 1);\n}\n\nfn main() -> int {\n    println(fact(10));\n    let x: Result<int, string> = Ok(7);\n    println(x);\n    let s = \"answer\";\n    println(s);\n    return 0;\n}\n";
+
+#[test]
+fn test_command_reports_pass_and_fail() {
+    let dir = scratch_project("testcmd");
+    let out = toto()
+        .arg("init")
+        .arg(dir.join("app"))
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let root = dir.join("app");
+    std::fs::write(
+        root.join("tests").join("good.gzv"),
+        "fn main() -> int {\n    println(\"good\");\n    return 0;\n}\n",
+    )
+    .expect("write test");
+    std::fs::write(
+        root.join("tests").join("bad.gzv"),
+        "fn main() -> int {\n    return 1;\n}\n",
+    )
+    .expect("write test");
+    // The scaffold's own example passes too: 2 pass, 1 fail.
+    let out = toto()
+        .arg("test")
+        .current_dir(&root)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("ok example.gzv"), "stdout was:\n{stdout}");
+    assert!(stdout.contains("ok good.gzv"), "stdout was:\n{stdout}");
+    assert!(
+        stdout.contains("FAIL bad.gzv (exit 1)"),
+        "stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("2 passed, 1 failed"),
+        "stdout was:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn build_produces_equivalent_executable() {
+    let dir = scratch_project("build");
+    let out = toto()
+        .arg("init")
+        .arg(dir.join("calc"))
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let root = dir.join("calc");
+    std::fs::write(root.join("main.gzv"), BUILD_PROG).expect("write main");
+    let out = toto()
+        .arg("build")
+        .current_dir(&root)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0), "build failed");
+    let bin = root.join("target").join("calc");
+    assert!(bin.is_file(), "no binary at {}", bin.display());
+    let built = std::process::Command::new(&bin)
+        .output()
+        .expect("built binary runs");
+    let run = toto()
+        .arg("run")
+        .arg(root.join("main.gzv"))
+        .output()
+        .expect("runs");
+    assert_eq!(built.status.code(), run.status.code());
+    assert_eq!(built.stdout, run.stdout);
+    assert_eq!(built.stderr, run.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn workers_flag_rejects_zero() {
     let out = toto()

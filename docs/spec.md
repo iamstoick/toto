@@ -251,14 +251,18 @@ static error).
 
 Multi-file programs (Phase 5) use path imports: a top-level
 `import "path";` statement pulls the other file's items into the single
-flat top-level namespace (no nested modules). `pub` may prefix any
-top-level item and has no effect — there are no private items. `mod` and
-`use` are not in v1. An `import` in statement or expression position is a
-parse error (`E0157`); an `import` the single-file driver cannot resolve
-is a static error (`E0401`). Duplicate top-level names across imported
-files are static errors (`E0311`, as for duplicates in one file); a file
-that imports itself, directly or through other files, is a static error
-(`E0402`, circular import).
+flat top-level namespace (no nested modules). Import paths resolve
+against the importing file's directory; an already-loaded file loads
+once (diamond imports are fine). `pub` may prefix any top-level item
+and has no effect — there are no private items. `mod` and `use` are not
+in v1. An `import` in statement or expression position is a parse error
+(`E0157`); an `import` that cannot be resolved is a static error
+(`E0401`: single-file mode, or the file is missing). Duplicate
+top-level names across imported files are static errors (`E0311`, as
+for duplicates in one file, reported at the later file); a file that
+imports itself, directly or through other files, is a static error
+(`E0402`, circular import, reported at the import that closes the
+cycle). Diagnostics name their origin file (`docs/project.md`).
 
 ### 3.2 Semicolons
 

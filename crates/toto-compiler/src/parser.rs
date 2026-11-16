@@ -245,6 +245,7 @@ impl Parser<'_> {
                 Ok(Item {
                     kind: ItemKind::Import(ImportDecl { path, path_span }),
                     span,
+                    file: None,
                 })
             }
             TokenKind::Mod | TokenKind::Use => {
@@ -268,6 +269,7 @@ impl Parser<'_> {
                 Ok(Item {
                     kind: ItemKind::Fn(decl),
                     span,
+                    file: None,
                 })
             }
             TokenKind::Struct => {
@@ -277,6 +279,7 @@ impl Parser<'_> {
                 Ok(Item {
                     kind: ItemKind::Struct(decl),
                     span,
+                    file: None,
                 })
             }
             _ => {

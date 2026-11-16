@@ -1,0 +1,5 @@
+error[E0401]: cannot resolve `import "nope.gzv"`: file not found
+ --> main.gzv:1:8
+  |
+1 | import "nope.gzv";
+  |        ^^^^^^^^^^

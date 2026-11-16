@@ -10,6 +10,13 @@ pub struct Diag {
     pub message: String,
     pub span: Span,
     pub help: Option<String>,
+    // NOTE: no origin-file field here by design. `Diag` values ride in
+    // `Result` error payloads through the MIR executor's coroutine
+    // frames (debug builds spill them per match arm); every extra word
+    // costs ~10 KiB of coroutine stack in the giant `exec_instr` /
+    // `call_builtin` matches, and that path already uses ~58 KiB of
+    // its 64 KiB budget. Multi-file attribution travels out-of-band
+    // (`check_with_files`), never on the struct.
 }
 
 impl Diag {
