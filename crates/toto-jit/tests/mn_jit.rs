@@ -1,11 +1,12 @@
 //! M:N hammer through the JIT path (Phase 4 re-run of the Phase 3
 //! stress suite): race-free exact goldens, tie-break membership,
 //! racy legal outcomes, negatives exact, the pair hammer at 1/2/4/8
-//! workers plus a forced-GC pass, and the 1,620-run looped hammer
-//! (18 programs × 30 rounds × workers {1,2,4} under forced GC — the
-//! 1,530-run Phase 3 shape grown by `conc18_fneq`). The single
-//! transient Phase 3 `mn` failure is dispositioned by this file's
-//! green run: reproduced-and-fixed, or absent — never unexplained.
+//! workers plus a forced-GC pass, and the 1,710-run looped hammer
+//! (19 programs × 30 rounds × workers {1,2,4} under forced GC — the
+//! 1,530-run Phase 3 shape grown by `conc18_fneq` and
+//! `conc19_chan_eq`). The single transient Phase 3 `mn` failure is
+//! dispositioned by this file's green run: reproduced-and-fixed, or
+//! absent — never unexplained.
 
 use std::path::{Path, PathBuf};
 
@@ -111,6 +112,7 @@ fn mn_jit_exact_race_free() {
         "conc08_go_early_return",
         "conc09_nested_go",
         "conc11_chan_of_chan",
+        "conc19_chan_eq",
     ] {
         let out = run_case(name, mn_config());
         assert_eq!(
@@ -148,7 +150,9 @@ fn mn_jit_racy_select_legal_outcomes() {
         assert_eq!(out.stdout, b"1\n2\n".to_vec());
     } else {
         assert_eq!(out.status, "1");
-        assert!(out.stdout.is_empty());
+        // The E0216 branch prints `2` first (the select took the `b`
+        // branch, then the trailing `<-b` deadlocks) — never empty.
+        assert_eq!(out.stdout, b"2\n".to_vec());
         assert!(
             out.stderr.contains("panic[E0216]"),
             "conc10: non-deadlock failure is illegal: {}",
@@ -260,6 +264,7 @@ const RACE_FREE: &[&str] = &[
     "conc08_go_early_return",
     "conc09_nested_go",
     "conc11_chan_of_chan",
+    "conc19_chan_eq",
 ];
 
 const NEGATIVES: &[&str] = &[
@@ -287,8 +292,9 @@ fn check_legal(name: &str, out: &CaseOut, failures: &mut Vec<String>) {
         }
     } else if name == "conc10_select_send" {
         let legal_ok = out.status == "0" && out.stdout == b"1\n2\n".to_vec();
-        let legal_race =
-            out.status == "1" && out.stdout.is_empty() && out.stderr.contains("panic[E0216]");
+        let legal_race = out.status == "1"
+            && out.stdout == b"2\n".to_vec()
+            && out.stderr.contains("panic[E0216]");
         if !(legal_ok || legal_race) {
             failures.push(format!("{name}: illegal racy outcome {}", out.status));
         }
@@ -305,8 +311,8 @@ fn check_legal(name: &str, out: &CaseOut, failures: &mut Vec<String>) {
 }
 
 #[test]
-fn mn_jit_hammer_1620() {
-    // 18 programs × 30 rounds × workers {1,2,4}, forced GC. Compile
+fn mn_jit_hammer_1710() {
+    // 19 programs × 30 rounds × workers {1,2,4}, forced GC. Compile
     // once per program (compile is deterministic), run hot: this
     // hammers the runtime for flakes, including the transient
     // Phase 3 `mn` failure (absent here or reproduced-and-fixed).
@@ -315,7 +321,7 @@ fn mn_jit_hammer_1620() {
     names.push("conc03_select_two");
     names.push("conc10_select_send");
     names.extend(NEGATIVES.iter().copied());
-    assert_eq!(names.len(), 18, "hammer program count changed");
+    assert_eq!(names.len(), 19, "hammer program count changed");
     let mut failures = Vec::new();
     let mut runs = 0u32;
     for name in names {
@@ -332,7 +338,7 @@ fn mn_jit_hammer_1620() {
             }
         }
     }
-    assert_eq!(runs, 1620, "hammer volume changed");
+    assert_eq!(runs, 1710, "hammer volume changed");
     assert!(
         failures.is_empty(),
         "{} hammer failure(s):\n{}",

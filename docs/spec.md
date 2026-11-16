@@ -367,7 +367,11 @@ wants deep immutability for `let`.
   `string` by contents; `Range` by endpoints; `Array`/struct **structural
   (deep)** equality with cycle detection — cyclic structures fall back to
   identity comparison rather than recursing forever; functions/closures by
-  **identity** (same value, not same code).
+  **identity** (same value, not same code);
+  channels compare equal to every channel (`c == c` and `c1 == c2` are
+  both `true`; `!=` is `false`) — channel identity is not observable
+  through equality. Pinned by `conc19_chan_eq`; all executors agree
+  (recorded Phase 5, divergence disposition).
 - Ordering `< <= > >=`: `int`, `float` (NaN comparisons are `false`, per
   IEEE), and `string` (lexicographic byte order). Other types are a runtime
   panic.

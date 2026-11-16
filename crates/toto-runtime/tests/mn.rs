@@ -1,5 +1,5 @@
-//! Concurrent corpus under the M:N scheduler (Stage 2): the same 18
-//! programs run with 4 workers and the forced-collection hook (every
+//! Concurrent corpus under the M:N scheduler (Stage 2): the same 19
+//! programs (conc19_chan_eq joined in Phase 5) run with 4 workers and the forced-collection hook (every
 //! safepoint rendezvouses all workers — maximum barrier pressure).
 //!
 //! Interleavings are genuinely nondeterministic under M:N, so:
@@ -102,6 +102,7 @@ fn mn_exact_race_free_programs() {
         "conc08_go_early_return",
         "conc09_nested_go",
         "conc11_chan_of_chan",
+        "conc19_chan_eq",
     ] {
         let out = run_case(name);
         assert_eq!(

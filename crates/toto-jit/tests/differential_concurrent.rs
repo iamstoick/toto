@@ -135,7 +135,7 @@ fn differential_task_concurrent() {
         }
         ran += 1;
     }
-    assert_eq!(ran, 18, "concurrent differential count changed");
+    assert_eq!(ran, 19, "concurrent differential count changed");
     assert!(
         failures.is_empty(),
         "{} concurrent divergence(s):\n{}",

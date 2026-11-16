@@ -132,10 +132,11 @@ fn jit_compile_timings() {
             }
         }
     }
-    // Exact census (123 cases: 41 sequential checking incl. diag10,
-    // 18 concurrent, 64 static).
+    // Exact census (125 cases: 41 sequential checking incl. diag10,
+    // 19 concurrent (conc19_chan_eq joined in Phase 5), 65 static
+    // (type37_index_range joined in Phase 5)).
     assert_eq!(gate_compiled, 41, "gate-compiled count changed");
-    assert_eq!(task_compiled, 59, "task-compiled count changed");
+    assert_eq!(task_compiled, 60, "task-compiled count changed");
     assert!(
         failures.is_empty(),
         "{} timing/compile failure(s):\n{}",

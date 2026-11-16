@@ -48,6 +48,7 @@ const PROGRAMS: &[&str] = &[
     "conc10_select_send",
     "conc11_chan_of_chan",
     "conc18_fneq",
+    "conc19_chan_eq",
     "conc_neg_child_panic",
     "conc_neg_deadlock",
     "conc_neg_double_close",
@@ -203,7 +204,7 @@ fn detector_flags_conc10_and_only_conc10() {
     for (name, classes) in &table {
         println!("{name},{}", classes.len());
     }
-    assert_eq!(PROGRAMS.len(), 18, "concurrent census changed");
+    assert_eq!(PROGRAMS.len(), 19, "concurrent census changed");
     assert!(
         failures.is_empty(),
         "detector findings:\n{}",

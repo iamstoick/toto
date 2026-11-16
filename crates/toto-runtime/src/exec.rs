@@ -947,14 +947,11 @@ impl<'a> Executor<'a> {
                                 .and_then(|k: usize| elems.get(k).cloned()),
                             _ => None,
                         },
-                        (RtVal::Range(a, b), RtVal::Int(i)) => {
-                            let len = b.saturating_sub(*a);
-                            if *i >= 0 && *i < len {
-                                Some(RtVal::Int(a + i))
-                            } else {
-                                None
-                            }
-                        }
+                        // No `Range` fast path: indexing a non-array is
+                        // `E0209` (spec §5.8), raised via the fallback
+                        // below like every other executor. The checker
+                        // rejects `Range` bases statically (`E0310`),
+                        // so this arm is unreachable in checked code.
                         _ => None,
                     }
                 };
