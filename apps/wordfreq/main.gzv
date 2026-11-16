@@ -1,0 +1,52 @@
+// wordfreq: concurrent word/line statistics over input.txt.
+//
+// Pipeline: read needle.txt + input.txt, split the lines into two
+// chunks, scan each chunk on its own green thread (stdlib string
+// ops + a libc `strlen` per line through the FFI), fan the two
+// summaries back in over channels, and write the JSON report to
+// report.json. Partitioned input makes the result deterministic
+// under any worker count.
+import "lib/scan.gzv";
+import "gzv.std/io.gzv";
+
+fn first_line(path: string) -> string {
+    let lines: Array<string> = read_lines(path);
+    return trim(lines[0]);
+}
+
+fn main() -> int {
+    let needle: string = first_line("needle.txt");
+    let all: Array<string> = read_lines("input.txt");
+    let total: int = len(all);
+    let mid: int = total / 2;
+    let mut lo: Array<string> = [];
+    let mut hi: Array<string> = [];
+    let mut i: int = 0;
+    for line in all {
+        if i < mid {
+            push(lo, line);
+        } else {
+            push(hi, line);
+        }
+        i = i + 1;
+    }
+    // Freeze the chunks into immutable bindings: `go` blocks cannot
+    // capture `mut` bindings by reference (D3).
+    let chunk0 = lo;
+    let chunk1 = hi;
+    let r0 = chan<Array<int>>();
+    let r1 = chan<Array<int>>();
+    go {
+        r0 <- scan(chunk0, needle);
+    }
+    go {
+        r1 <- scan(chunk1, needle);
+    }
+    let a: Array<int> = <-r0;
+    let b: Array<int> = <-r1;
+    let sum: Array<int> = add_reports(a, b);
+    let report: string = report_json(sum[0], sum[1], sum[2], sum[3], needle, 2);
+    write_file("report.json", report);
+    println(report);
+    return 0;
+}

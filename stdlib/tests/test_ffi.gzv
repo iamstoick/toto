@@ -1,5 +1,6 @@
 // stdlib FFI tests: run with `toto test` from stdlib/.
 import "gzv.std/ffi.gzv";
+import "gzv.std/ffi_thread.gzv";
 import "gzv.std/strings.gzv";
 
 fn t_strings() -> Result<bool, string> {

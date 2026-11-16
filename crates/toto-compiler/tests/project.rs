@@ -223,7 +223,7 @@ fn stdlib_all_modules_merge_and_check() {
 
 #[test]
 fn stdlib_table_is_complete() {
-    assert_eq!(toto_compiler::stdlib::MODULES.len(), 8);
+    assert_eq!(toto_compiler::stdlib::MODULES.len(), 9);
     for (path, src) in toto_compiler::stdlib::MODULES {
         assert!(
             path.starts_with("gzv.std/") && path.ends_with(".gzv"),

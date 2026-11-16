@@ -1,4 +1,5 @@
 import "gzv.std/ffi.gzv";
+import "gzv.std/ffi_thread.gzv";
 
 fn answer(arg: *c_void) -> *c_void {
     c_write_i64(arg, 42);

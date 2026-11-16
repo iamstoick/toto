@@ -1,0 +1,58 @@
+// Pure scan logic for wordfreq: line stats over one chunk.
+// A chunk summary is [lines, words, hits, bytes] so workers can
+// ship it over a channel without sharing state.
+import "gzv.std/strings.gzv";
+import "gzv.std/json.gzv";
+import "gzv.std/ffi.gzv";
+
+pub fn count_words(line: string) -> int {
+    let parts: Array<string> = split(line, " ");
+    let mut n: int = 0;
+    for w in parts {
+        if !is_empty(w) {
+            n = n + 1;
+        };
+    }
+    return n;
+}
+
+pub fn scan(chunk: Array<string>, needle: string) -> Array<int> {
+    let mut lines: int = 0;
+    let mut words: int = 0;
+    let mut hits: int = 0;
+    let mut bytes: int = 0;
+    for line in chunk {
+        lines = lines + 1;
+        words = words + count_words(line);
+        // Byte length through libc `strlen` (FFI): proves the C
+        // boundary on every line, not just once at startup.
+        bytes = bytes + c_strlen(line);
+        if contains(line, needle) {
+            hits = hits + 1;
+        };
+    }
+    return [lines, words, hits, bytes];
+}
+
+pub fn add_reports(a: Array<int>, b: Array<int>) -> Array<int> {
+    return [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]];
+}
+
+// Render the final report: a JSON array with a fixed positional
+// schema [lines, words, hits, bytes, needle, workers]. An array
+// (not an object) because `json_array` is infallible while
+// `json_object` reports duplicate keys as `Result`; the schema
+// order is part of this module's contract, pinned by the tests.
+// The caller writes it wherever the report should live; IO stays
+// out of this module.
+pub fn report_json(lines: int, words: int, hits: int, bytes: int, needle: string, workers: int) -> string {
+    let vals: Array<JsonVal> = [
+        json_int(lines),
+        json_int(words),
+        json_int(hits),
+        json_int(bytes),
+        json_string(needle),
+        json_int(workers),
+    ];
+    return json_stringify(json_array(vals));
+}

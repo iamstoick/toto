@@ -85,3 +85,16 @@ and the runtime executor no longer ends a task when a drained
 `close(2)` cannot be named in an `unsafe extern` block (`close` is
 the reserved channel builtin), so fd lifecycle ends at process
 exit in examples. Decision unchanged.
+
+## Refinement (Stage 5, 2026-11-16): `ffi` / `ffi_thread` split
+
+`stdlib/ffi.gzv` held both buildable wrappers and `c_thread_spawn`
+(whose body calls callback-taking `pthread_create`). Whole-program
+lowering refused any program importing it — dead code poisoned the
+build. Fix: `c_thread_spawn` + `c_thread_join` moved to
+`gzv.std/ffi_thread` (run/test-only, documented); `ffi.gzv` keeps
+the declarations plus all non-callback wrappers and stays
+buildable. Rule established: unused callback *declarations* never
+poison a build — only a *called* callback site refuses (exit 3).
+`apps/wordfreq` is the proof: per-line `c_strlen` through the
+buildable surface, `ffi_thread` untouched. Decision unchanged.

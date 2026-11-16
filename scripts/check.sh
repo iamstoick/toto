@@ -21,3 +21,7 @@ cargo test --workspace -- --nocapture
 # (`toto test` exits 1 on any failure; `set -eu` fails the gate.)
 cargo build -p toto-cli
 (cd stdlib && ../target/debug/toto test)
+# wordfreq sample app (Phase 5, Stage 5): project tests green, and
+# the built executable matches the interpreter byte-for-byte.
+(cd apps/wordfreq && ../../target/debug/toto test)
+(cd apps/wordfreq && ../../target/debug/toto run main.gzv > /tmp/wordfreq_interp.out && ../../target/debug/toto build >/dev/null && rm -f report.json && ./target/wordfreq > /tmp/wordfreq_built.out && cmp /tmp/wordfreq_interp.out /tmp/wordfreq_built.out && rm -f report.json)

@@ -5,14 +5,21 @@ accepts C scalar types (`c_char`, `c_int`, `c_long`, `c_double`),
 raw pointers (`*T`), callbacks (`fn(..) -> ..`), `string` as a
 return type only, and `unit`. Anything else in an extern signature
 is `E0302`; calling a declared-but-unlinked name is `E0301`.
-`toto run` and `toto test` execute FFI; `toto build` refuses FFI
-programs up front (exit 3) — generated code never sees
-`CallForeign`.
+`toto run` and `toto test` execute all FFI; `toto build` lowers
+non-callback FFI to `toto_foreign` and links a standalone binary
+whose stdout is byte-identical to the interpreter. Only a CALLED
+callback site refuses at compile time (exit 3, with the run/test
+workaround in the message): unused callback declarations never
+poison a build, so importing `gzv.std/ffi` stays buildable.
 
 The canonical wrappers live in `gzv.std/ffi` (`stdlib/ffi.gzv`);
-prefer them over raw extern declarations. Tests:
+foreign threads live in `gzv.std/ffi_thread`
+(`stdlib/ffi_thread.gzv`), which is run/test-only because
+`c_thread_spawn` hands a callback to `pthread_create`. Prefer the
+wrappers over raw extern declarations. Tests:
 `stdlib/tests/test_ffi.gzv`, project corpus `proj11_ffi`,
-diagnostics `diag13`–`diag15`, CLI `build_refuses_ffi_programs`.
+diagnostics `diag13`–`diag15`, CLI `build_runs_ffi_programs` +
+`build_refuses_callback_ffi`.
 
 ## Rules (enforced by construction + checks)
 

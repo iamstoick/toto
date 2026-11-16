@@ -170,18 +170,20 @@ Recorded limits (all covered by tests in `stdlib/tests/`):
 
 C ABI wrappers over real libc/libm/libpthread (see [ffi.md](ffi.md)
 for the per-binding ownership/encoding/thread-safety contracts).
-The module needs `unsafe extern` support, so it runs under `toto
-run` / `toto test` only — `toto build` refuses FFI programs
-(exit 3). Every wrapper's contract
-(strings as NUL-copies, `open` failing as `-errno`, callbacks
-drained on the joining worker) is pinned by `test_ffi.gzv` and the
-`proj11_ffi` corpus project.
+Non-callback wrappers build: `apps/wordfreq` (per-line `c_strlen`)
+links a standalone binary with byte-identical output. Foreign
+threads live in `gzv.std/ffi_thread`, which is run/test-only —
+`c_thread_spawn` hands a callback to `pthread_create`, and a called
+callback site refuses at compile time (exit 3). Every wrapper's
+contract (strings as NUL-copies, `open` failing as `-errno`,
+callbacks drained on the joining worker) is pinned by
+`test_ffi.gzv` and the `proj11_ffi` corpus project.
 
 ## Execution paths
 
 | Path | Status | Evidence |
 |---|---|---|
-| Interpreter (`toto run` / `toto test`) | Full suite green | `toto: 7 passed, 0 failed` in `stdlib/`; corpus `proj09`/`proj10` goldens |
+| Interpreter (`toto run` / `toto test`) | Full suite green | `toto: 8 passed, 0 failed` in `stdlib/`; corpus `proj09`/`proj10` goldens |
 | Runtime executor (concurrent) | Green | `test_concurrent.gzv` (pipeline over channels) |
 | Built executable (`toto build`) | Output-equivalent | `stdlib` smoke: binary stdout byte-identical to interpreter |
 | JIT via `toto dev` | Unsupported | `dev` is single-file scope (`parse_and_check` only); multi-file dev loop is the known carry-forward |

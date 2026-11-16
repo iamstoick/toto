@@ -1,0 +1,84 @@
+// wordfreq tests: run with `toto test` from apps/wordfreq/.
+// Expected values are hand-computed from input.txt/needle.txt
+// (see README.md); a mismatch is a bug, not a stale golden.
+import "../lib/scan.gzv";
+import "gzv.std/io.gzv";
+
+fn main() -> int {
+    let mut failures: int = 0;
+    // Unit: word counting.
+    if count_words("toto is a language") != 4 {
+        println("FAIL count_words");
+        failures = failures + 1;
+    };
+    if count_words("") != 0 {
+        println("FAIL count_words empty");
+        failures = failures + 1;
+    };
+    // Unit: one chunk through scan (FFI strlen inside).
+    let got: Array<int> = scan(["toto is a language", "no match here"], "toto");
+    if got[0] != 2 {
+        println("FAIL scan lines");
+        failures = failures + 1;
+    };
+    if got[1] != 7 {
+        println("FAIL scan words");
+        failures = failures + 1;
+    };
+    if got[2] != 1 {
+        println("FAIL scan hits");
+        failures = failures + 1;
+    };
+    if got[3] != 31 {
+        println("FAIL scan bytes");
+        failures = failures + 1;
+    };
+    // Unit: combining is plain addition.
+    let sum: Array<int> = add_reports([2, 7, 1, 31], [4, 16, 2, 107]);
+    if sum[0] != 6 {
+        println("FAIL add lines");
+        failures = failures + 1;
+    };
+    if sum[1] != 23 {
+        println("FAIL add words");
+        failures = failures + 1;
+    };
+    if sum[2] != 3 {
+        println("FAIL add hits");
+        failures = failures + 1;
+    };
+    if sum[3] != 138 {
+        println("FAIL add bytes");
+        failures = failures + 1;
+    };
+    // Unit: report schema order [lines, words, hits, bytes, needle, workers].
+    if report_json(6, 23, 3, 138, "toto", 2) != "[6,23,3,138,\"toto\",2]" {
+        println("FAIL report_json");
+        failures = failures + 1;
+    };
+    // Integration: the real fixtures end to end through scan.
+    let all: Array<string> = read_lines("input.txt");
+    let needle_lines: Array<string> = read_lines("needle.txt");
+    let needle: string = trim(needle_lines[0]);
+    let mid: int = len(all) / 2;
+    let mut lo: Array<string> = [];
+    let mut hi: Array<string> = [];
+    let mut i: int = 0;
+    for line in all {
+        if i < mid {
+            push(lo, line);
+        } else {
+            push(hi, line);
+        };
+        i = i + 1;
+    }
+    let total: Array<int> = add_reports(scan(lo, needle), scan(hi, needle));
+    if report_json(total[0], total[1], total[2], total[3], needle, 2) != "[6,23,3,138,\"toto\",2]" {
+        println("FAIL integration");
+        failures = failures + 1;
+    };
+    if failures == 0 {
+        println("wordfreq: all checks passed");
+    };
+    return failures;
+}
