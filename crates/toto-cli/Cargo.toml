@@ -10,4 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 toto-compiler = { path = "../toto-compiler" }
+toto-jit = { path = "../toto-jit" }
 toto-runtime = { path = "../toto-runtime" }
