@@ -135,7 +135,8 @@ fn differential_task_concurrent() {
         }
         ran += 1;
     }
-    assert_eq!(ran, 19, "concurrent differential count changed");
+    // 21 concurrent cases (state06-07 joined in Phase 6).
+    assert_eq!(ran, 21, "concurrent differential count changed");
     assert!(
         failures.is_empty(),
         "{} concurrent divergence(s):\n{}",

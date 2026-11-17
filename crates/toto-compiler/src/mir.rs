@@ -25,7 +25,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::hir::{CheckedProgram, HAssignTarget, HBlock, HExpr, HExprKind, HFn, HStmtKind, Ty};
+use crate::hir::{
+    CheckedProgram, HAssignTarget, HBlock, HExpr, HExprKind, HFn, HStmtKind, Ty, VarRef,
+};
 use crate::span::Span;
 
 pub type BlockId = usize;
@@ -42,6 +44,10 @@ pub struct MProgram {
     /// prints functions only): the JIT/AOT backend needs them to
     /// marshal `CallForeign` arguments and refuse callback params.
     pub externs: HashMap<String, crate::hir::HExternFn>,
+    /// Lowered migration bodies, in `CheckedProgram.migrates` order.
+    /// Never called during single-generation execution; the reload
+    /// protocol invokes them (spec amendment, Phase 6).
+    pub migrates: Vec<MFn>,
 }
 
 /// One function body: locals plus a block graph.
@@ -272,6 +278,21 @@ pub enum MInstr {
     Safepoint {
         kind: SpKind,
     },
+    /// Read declared-state slot `slot` (spec amendment, Phase 6).
+    /// Slots are declaration order across the program's one state
+    /// block; every executor owns a same-ordered cell vector.
+    StateGet {
+        dst: Local,
+        slot: u32,
+        span: Span,
+    },
+    /// Write declared-state slot `slot`. Revisions are atomic at
+    /// the op level; cross-op atomicity is the reload protocol's job.
+    StateSet {
+        slot: u32,
+        src: Local,
+        span: Span,
+    },
 }
 
 /// One `select` guard, lowered: channel/value locals plus the bind slot
@@ -351,6 +372,7 @@ pub fn lower(checked: &CheckedProgram) -> MProgram {
     let mut fns = Vec::new();
     let mut fn_index = HashMap::new();
     let mut main_span = Span::new(0, 0);
+    let mut saw_main = false;
     for (idx, sig) in checked.fns.iter().enumerate() {
         fn_index.insert(sig.name.clone(), idx);
         let hfn = checked
@@ -364,14 +386,33 @@ pub fn lower(checked: &CheckedProgram) -> MProgram {
             .expect("checked function has an HIR body");
         if sig.name == "main" {
             main_span = hfn.span;
+            saw_main = true;
         }
         fns.push(lower_fn(checked, hfn));
+    }
+    // State without `main` lowers nothing: `main` is mandatory
+    // (E0312), so a checked program with state always has it.
+    debug_assert!(checked.state.is_empty() || saw_main);
+    let mut migrates = Vec::new();
+    for m in &checked.migrates {
+        let sty = Ty::Struct(m.target.clone());
+        migrates.push(lower_fn(
+            checked,
+            &crate::hir::HFn {
+                name: format!("migrate {}", m.target),
+                params: vec![(m.param.clone(), sty.clone(), false)],
+                ret: sty,
+                body: m.body.clone(),
+                span: m.span,
+            },
+        ));
     }
     MProgram {
         fns,
         fn_index,
         main_span,
         externs: checked.externs.clone(),
+        migrates,
     }
 }
 
@@ -384,7 +425,17 @@ fn lower_fn(checked: &CheckedProgram, hfn: &HFn) -> MFn {
             .expect("scope underflow")
             .insert(name.clone(), l);
     }
+    // Declared-state initialization (spec amendment, Phase 6): the
+    // entry block of `main` evaluates initializers in declaration
+    // order before any user code. Channel bindings construct their
+    // (always unbuffered) channel. Earlier bindings are visible to
+    // later initializers through ordinary `StateGet` lowering. The
+    // entry safepoint stays first: init code allocates and carries
+    // the same per-op guards as ordinary code.
     b.entry_safepoint();
+    if hfn.name == "main" {
+        b.lower_state_init();
+    }
     b.lower_stmts(&hfn.body.stmts, &hfn.ret);
     if !b.sealed {
         match &hfn.body.tail {
@@ -418,10 +469,17 @@ struct FnBuilder<'a> {
     sealed: bool,
     scopes: Vec<HashMap<String, Local>>,
     loop_stack: Vec<(BlockId, BlockId)>,
+    /// Declared-state name → slot (declaration order). Slots are the
+    /// cross-executor contract; every lowering and executor agrees.
+    state_slots: HashMap<String, u32>,
 }
 
 impl<'a> FnBuilder<'a> {
     fn new(checked: &'a CheckedProgram) -> Self {
+        let mut state_slots = HashMap::new();
+        for (slot, s) in checked.state.iter().enumerate() {
+            state_slots.insert(s.name.clone(), slot as u32);
+        }
         Self {
             checked,
             locals: Vec::new(),
@@ -432,6 +490,54 @@ impl<'a> FnBuilder<'a> {
             sealed: false,
             scopes: vec![HashMap::new()],
             loop_stack: Vec::new(),
+            state_slots,
+        }
+    }
+
+    /// Lower declared-state initializers into the current (entry)
+    /// block, in declaration order. Channel bindings construct their
+    /// channel; data bindings evaluate their initializer. Earlier
+    /// bindings resolve through ordinary `StateGet` lowering.
+    fn lower_state_init(&mut self) {
+        let count = self.checked.state.len();
+        for slot in 0..count {
+            let (name, ty, init, span) = {
+                let s = &self.checked.state[slot];
+                (s.name.clone(), s.ty.clone(), s.init.clone(), s.span)
+            };
+            match init {
+                Some(h) => {
+                    let v = self.lower_expr(&h, &ty);
+                    self.emit(MInstr::StateSet {
+                        slot: slot as u32,
+                        src: v,
+                        span,
+                    });
+                }
+                None => {
+                    let Ty::Chan(elem) = &ty else {
+                        // Unreachable: the checker enforces bare ==
+                        // channel and initialized == data.
+                        debug_assert!(false, "bare state binding without channel type");
+                        continue;
+                    };
+                    let dst = self.fresh(format!("{name} (state chan)"), ty.clone());
+                    self.emit(MInstr::Safepoint {
+                        kind: SpKind::Alloc,
+                    });
+                    self.emit(MInstr::ChanNew {
+                        dst,
+                        elem: (**elem).clone(),
+                        cap: None,
+                        span,
+                    });
+                    self.emit(MInstr::StateSet {
+                        slot: slot as u32,
+                        src: dst,
+                        span,
+                    });
+                }
+            }
         }
     }
 
@@ -535,10 +641,24 @@ impl<'a> FnBuilder<'a> {
             HStmtKind::Assign { target, value } => {
                 let v = self.lower_expr(value, ret);
                 match target {
-                    HAssignTarget::Var(name, _, span) => {
-                        let dst = self.resolve(name);
-                        self.emit(MInstr::Copy { dst, src: v });
-                        let _ = span;
+                    HAssignTarget::Var(name, varref, span) => {
+                        // Declared-state stores bypass locals (see the
+                        // `StateGet` arm above for why matching the
+                        // resolved form is exact).
+                        if let VarRef::State { .. } = varref {
+                            let slot = self.state_slots.get(name).unwrap_or_else(|| {
+                                panic!("checked state binding `{name}` has no slot")
+                            });
+                            self.emit(MInstr::StateSet {
+                                slot: *slot,
+                                src: v,
+                                span: *span,
+                            });
+                        } else {
+                            let dst = self.resolve(name);
+                            self.emit(MInstr::Copy { dst, src: v });
+                            let _ = span;
+                        }
                     }
                     HAssignTarget::Field(base, name, span) => {
                         let b = self.lower_expr(base, ret);
@@ -1029,7 +1149,24 @@ impl<'a> FnBuilder<'a> {
             HExprKind::Bool(b) => self.const_local(MConst::Bool(*b), Ty::Bool, "bool"),
             HExprKind::Unit => self.const_local(MConst::Unit, Ty::Unit, "unit"),
             HExprKind::None => self.const_local(MConst::None, expr.ty.clone(), "none"),
-            HExprKind::Var(name, _) => {
+            HExprKind::Var(name, varref) => {
+                // Declared state resolves by slot (spec amendment,
+                // Phase 6). A shadowing local would have resolved to
+                // `VarRef::Local` in the checker, so matching the
+                // resolved form is exact — no scope-order subtlety.
+                if let VarRef::State { .. } = varref {
+                    let slot = *self
+                        .state_slots
+                        .get(name)
+                        .unwrap_or_else(|| panic!("checked state binding `{name}` has no slot"));
+                    let dst = self.fresh(format!("{name} (state)"), expr.ty.clone());
+                    self.emit(MInstr::StateGet {
+                        dst,
+                        slot,
+                        span: expr.span,
+                    });
+                    return dst;
+                }
                 if let Some(l) = self.scopes.iter().rev().find_map(|s| s.get(name)) {
                     *l
                 } else if let Some(idx) = self.checked_fn_index(name) {
@@ -1567,6 +1704,12 @@ impl fmt::Display for MProgram {
             }
             write!(f, "{func}")?;
         }
+        // Migration bodies print after functions (they share `MFn`
+        // shape but never run during single-generation execution).
+        for mig in self.migrates.iter() {
+            writeln!(f)?;
+            write!(f, "{mig}")?;
+        }
         Ok(())
     }
 }
@@ -1776,6 +1919,12 @@ impl fmt::Display for MInstr {
                 )
             }
             MInstr::Len { dst, base, .. } => write!(f, "{} = len {}", local(*dst), local(*base)),
+            MInstr::StateGet { dst, slot, .. } => {
+                write!(f, "{} = state_get #{slot}", local(*dst))
+            }
+            MInstr::StateSet { slot, src, .. } => {
+                write!(f, "state_set #{slot} = {}", local(*src))
+            }
             MInstr::SatIncr { dst, operand } => {
                 write!(f, "{} = satincr {}", local(*dst), local(*operand))
             }

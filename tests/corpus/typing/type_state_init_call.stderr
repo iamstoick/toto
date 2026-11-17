@@ -1,0 +1,5 @@
+error[E0320]: state initializer for `y` cannot call user functions
+ --> type_state_init_call.gzv:6:14
+  |
+6 |     y: int = helper(21);
+  |              ^^^^^^^^^^ help: initializers run once at load, before `main`

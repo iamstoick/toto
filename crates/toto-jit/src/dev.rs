@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,9 @@ use toto_compiler::ast::Program;
 use toto_compiler::hir::CheckedProgram;
 use toto_compiler::mir::{MBlock, MInstr, MProgram};
 use toto_compiler::{parse_and_check, render_panic};
+use toto_runtime::heap::{GcRef, Heap};
+use toto_runtime::sched::{ClosureModules, Shared};
+use toto_runtime::value::RtVal;
 use toto_runtime::{RtOutcome, RuntimeConfig};
 
 use crate::compile::{Jit, OptLevel};
@@ -295,9 +299,25 @@ impl Generation {
     /// `Err` carries the immediate outcome when no run starts (same
     /// shape as `spawn_jit_run`; kept unboxed for call-site ergonomics).
     #[allow(clippy::result_large_err)]
-    pub fn spawn(&self, config: RuntimeConfig) -> Result<Box<dyn LiveRun>, RtOutcome> {
-        match spawn_jit_run(&self.program, &self.checked, config, &self.session) {
-            Ok(run) => Ok(Box::new(run)),
+    pub fn spawn(
+        &self,
+        config: RuntimeConfig,
+        heap: Heap,
+        modules: ClosureModules,
+    ) -> Result<(Box<dyn LiveRun>, Arc<Shared>), RtOutcome> {
+        match spawn_jit_run(
+            &self.program,
+            &self.checked,
+            config,
+            &self.session,
+            heap,
+            self.number,
+            modules,
+        ) {
+            Ok(run) => {
+                let shared = Arc::clone(run.shared());
+                Ok((Box::new(run), shared))
+            }
             Err(outcome) => Err(outcome),
         }
     }
@@ -392,9 +412,80 @@ struct ActiveGeneration {
     run: Box<dyn LiveRun>,
 }
 
+/// Why a carried function reference failed to rebind to the new
+/// generation. Every variant routes to loud atomic restart —
+/// never to a guessed index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RelinkFail {
+    /// `Func` index with no function at that position (defensive:
+    /// unreachable from real checked code).
+    IndexOutOfRange { idx: usize },
+    /// The old function no longer exists under its name.
+    NameGone { name: String },
+    /// Same name, different parameter or return types. The new
+    /// generation's code was checked against the new signature,
+    /// so rebinding would silently change what the value calls.
+    SignatureChanged { name: String },
+}
+
+/// Rebind an old-generation `Func` index into the new generation
+/// (Phase 6, Stage 2a): look the old index up by NAME in the old
+/// MIR table, find the same name in the new MIR table, and require
+/// identical parameter and return TYPES (parameter names are
+/// binding-site and ignored). Returns the new index on success.
+///
+/// Positions are MIR order on both sides — the same lowering the
+/// runtime uses to build its dispatch tables, so the returned
+/// index resolves through the new generation's `func_names` exactly
+/// like a natively created `Func` value.
+pub fn relink_func(
+    old_checked: &CheckedProgram,
+    new_checked: &CheckedProgram,
+    old_idx: usize,
+) -> Result<usize, RelinkFail> {
+    let old_mir = toto_compiler::mir::lower(old_checked);
+    let (name, params, ret) = match old_mir.fns.get(old_idx) {
+        Some(f) => (
+            f.name.clone(),
+            f.params.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>(),
+            f.ret.clone(),
+        ),
+        None => return Err(RelinkFail::IndexOutOfRange { idx: old_idx }),
+    };
+    let new_mir = toto_compiler::mir::lower(new_checked);
+    match new_mir.fns.iter().position(|f| f.name == name) {
+        None => Err(RelinkFail::NameGone { name }),
+        Some(new_idx) => {
+            let nf = &new_mir.fns[new_idx];
+            let new_params: Vec<_> = nf.params.iter().map(|(_, t)| t.clone()).collect();
+            if new_params == params && nf.ret == ret {
+                Ok(new_idx)
+            } else {
+                Err(RelinkFail::SignatureChanged { name })
+            }
+        }
+    }
+}
+
+/// What the last retire check decided, per retired generation
+/// number (observability for tests and the Stage 4 soak).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct RetireReport {
+    pub retained: Vec<u64>,
+    pub dropped: Vec<u64>,
+}
+
 /// The `toto dev` state machine: generations, drain-vs-cancel
 /// rebuild, respawn. Owns no files and prints nothing; the CLI owns
 /// the watcher, the loop, and all output.
+///
+/// Phase 6, Stage 2a: the driver additionally owns the
+/// cross-generation closure→module table and the retired-module
+/// set. Retention is by REAL GC reachability (`Heap::is_live`
+/// over the shared heap): a retired module lives exactly while a
+/// live closure names it. Nothing here changes the drain-first
+/// order — quiescence is still established by settle before any
+/// retire decision.
 pub struct DevDriver<R: RestartPolicy = ReexecRestart> {
     policy: DrainPolicy,
     restart: R,
@@ -402,6 +493,11 @@ pub struct DevDriver<R: RestartPolicy = ReexecRestart> {
     opt: OptLevel,
     next_gen: u64,
     current: Option<ActiveGeneration>,
+    current_shared: Option<Arc<Shared>>,
+    module_table: ClosureModules,
+    retired: Vec<Generation>,
+    carried: Vec<RtVal>,
+    last_retire: RetireReport,
 }
 
 impl<R: RestartPolicy> DevDriver<R> {
@@ -418,6 +514,11 @@ impl<R: RestartPolicy> DevDriver<R> {
             opt,
             next_gen: 1,
             current: None,
+            current_shared: None,
+            module_table: toto_runtime::sched::fresh_closure_modules(),
+            retired: Vec::new(),
+            carried: Vec::new(),
+            last_retire: RetireReport::default(),
         }
     }
 
@@ -432,6 +533,21 @@ impl<R: RestartPolicy> DevDriver<R> {
     /// one spawns: generations are strictly sequential, so old and
     /// new code can never mix. The first call starts generation 1.
     pub fn rebuild(&mut self, src: &str, filename: &str) -> RebuildOutcome {
+        self.rebuild_with(src, filename, &[])
+    }
+
+    /// `rebuild` plus an explicit held-value set (Phase 6, Stage 2a):
+    /// values the caller keeps alive across the reload. `Func`
+    /// values are relinked by name against the new generation
+    /// (failure → loud atomic restart, never a guessed index);
+    /// closure handles must name a table entry or the same atomic
+    /// restart fires (fail-safe on unknown handles). On success the
+    /// relinked values are readable via `take_carried`; the old
+    /// module is retained while any carried closure is live.
+    /// Production callers pass `&[]` until Stage 3 wires declared
+    /// state through here; the 2a proofs drive it directly.
+    pub fn rebuild_with(&mut self, src: &str, filename: &str, carry: &[RtVal]) -> RebuildOutcome {
+        self.carried = Vec::new();
         let (program, checked) = match parse_and_check(src) {
             Ok(parsed) => parsed,
             Err(diags) => return RebuildOutcome::StillBroken(diags),
@@ -473,35 +589,117 @@ impl<R: RestartPolicy> DevDriver<R> {
                         let (settle, ended) =
                             settle_run(active.run, &active.compiled, &self.policy, &self.restart);
                         match settle {
-                            SettleOutcome::Restarted => RebuildOutcome::Restarted,
+                            SettleOutcome::Restarted => {
+                                // Abandon everything: the process
+                                // restarts (production) or the test
+                                // double recorded it. Nothing is
+                                // preserved — the next rebuild starts
+                                // from a fresh heap with a clean
+                                // table, so no stale handle can ever
+                                // resolve into the new world.
+                                self.retired.clear();
+                                self.module_table.lock().expect("module table lock").clear();
+                                self.current_shared = None;
+                                self.last_retire = RetireReport::default();
+                                RebuildOutcome::Restarted
+                            }
                             drained_or_cancelled => {
-                                match next.spawn(self.config) {
-                                    Ok(run) => {
-                                        self.current = Some(ActiveGeneration {
-                                            compiled: next,
-                                            run,
-                                        });
-                                        self.next_gen = number + 1;
-                                        RebuildOutcome::Rebuilt {
+                                // Move the heap out of the drained
+                                // run (safe: settle joined every
+                                // task, and this clone is the sole
+                                // remaining owner of the old Shared).
+                                let mut heap = match self.current_shared.take() {
+                                    Some(shared) => std::mem::replace(
+                                        &mut shared.state.lock().expect("shared state lock").heap,
+                                        Heap::new(),
+                                    ),
+                                    None => Heap::new(),
+                                };
+                                // Validate + relink carried values
+                                // against old→new. ANY failure routes
+                                // to loud atomic restart: nothing is
+                                // preserved, the old module is NOT
+                                // retained, the new generation gets a
+                                // fresh heap.
+                                let carried = match Self::relink_carry(
+                                    &active.compiled.checked,
+                                    &next.checked,
+                                    &self.module_table,
+                                    &heap,
+                                    carry,
+                                ) {
+                                    Ok(values) => values,
+                                    Err(_) => {
+                                        let dropped = self
+                                            .retired
+                                            .iter()
+                                            .map(|c| c.number)
+                                            .collect::<Vec<_>>();
+                                        self.retired.clear();
+                                        self.module_table
+                                            .lock()
+                                            .expect("module table lock")
+                                            .clear();
+                                        self.last_retire = RetireReport {
+                                            retained: Vec::new(),
+                                            dropped,
+                                        };
+                                        let outcome = self.spawn_next(
+                                            next,
                                             ended,
-                                            settle: Some(drained_or_cancelled),
-                                        }
+                                            Some(drained_or_cancelled),
+                                            Heap::new(),
+                                            number,
+                                        );
+                                        self.carried = Vec::new();
+                                        return outcome;
                                     }
-                                    Err(outcome) => {
-                                        // Spawn fails only when no run
-                                        // starts at all (missing main:
-                                        // checked code cannot do this).
-                                        // Retire the old run's output
-                                        // anyway; wait for the next
-                                        // change.
-                                        let ended = Some(next.render(&outcome));
-                                        self.next_gen = number + 1;
-                                        RebuildOutcome::Rebuilt {
-                                            ended,
-                                            settle: Some(drained_or_cancelled),
-                                        }
-                                    }
+                                };
+                                // The drained generation's number
+                                // (read before the move below): a
+                                // carried `Func` names it without
+                                // pinning heap.
+                                let drained_no = active.compiled.number;
+                                if !carried.is_empty() {
+                                    // Retention: the drained module
+                                    // stays callable while a carried
+                                    // closure names it. Quiescence
+                                    // holds by construction (settle
+                                    // joined every task above).
+                                    self.retired.push(active.compiled);
                                 }
+                                if !self.retired.is_empty() {
+                                    let mut held = Vec::new();
+                                    for v in &carried {
+                                        toto_runtime::value::heap_refs_of(v, &mut held);
+                                    }
+                                    // A carried `Func` names the
+                                    // just-drained generation
+                                    // without pinning heap: retain
+                                    // it for exactly this span.
+                                    let force_retain = carried
+                                        .iter()
+                                        .any(|v| matches!(v, toto_runtime::value::RtVal::Func(_)))
+                                        .then_some(drained_no);
+                                    self.last_retire =
+                                        self.prune_retired(&mut heap, &held, force_retain);
+                                }
+                                // Cheap table hygiene every rebuild
+                                // (no collect): drop entries whose
+                                // slots were swept since.
+                                self.module_table
+                                    .lock()
+                                    .expect("module table lock")
+                                    .retain(|r, _| heap.is_live(*r));
+                                let outcome = self.spawn_next(
+                                    next,
+                                    ended,
+                                    Some(drained_or_cancelled),
+                                    heap,
+                                    number,
+                                );
+                                self.carried = carried;
+                                outcome
                             }
                         }
                     }
@@ -529,27 +727,145 @@ impl<R: RestartPolicy> DevDriver<R> {
             self.opt,
         ) {
             Err(e) => RebuildOutcome::CompileRefused(format!("generation {number}: {e}")),
-            Ok(built) => match built.spawn(self.config) {
-                Err(outcome) => {
-                    self.next_gen = number + 1;
-                    RebuildOutcome::Rebuilt {
-                        ended: Some(built.render(&outcome)),
-                        settle: None,
-                    }
-                }
-                Ok(run) => {
-                    self.current = Some(ActiveGeneration {
-                        compiled: built,
-                        run,
-                    });
-                    self.next_gen = number + 1;
-                    RebuildOutcome::Rebuilt {
-                        ended: None,
-                        settle: None,
-                    }
-                }
-            },
+            Ok(built) => {
+                let outcome = self.spawn_next(built, None, None, Heap::new(), number);
+                // Fresh heaps never retain: make that explicit so a
+                // stale `last_retire` can never be misread later.
+                self.last_retire = RetireReport::default();
+                outcome
+            }
         }
+    }
+
+    /// Spawn `next` as the current generation on `heap`, recording
+    /// the run's shared state for the next rebuild's heap move.
+    /// The spawn-failure arm is byte-identical to the pre-Phase-6
+    /// path (missing main is unreachable in checked code).
+    fn spawn_next(
+        &mut self,
+        next: Generation,
+        ended: Option<EndedRun>,
+        settle: Option<SettleOutcome>,
+        heap: Heap,
+        number: u64,
+    ) -> RebuildOutcome {
+        match next.spawn(self.config, heap, self.module_table.clone()) {
+            Ok((run, shared)) => {
+                self.current_shared = Some(shared);
+                self.current = Some(ActiveGeneration {
+                    compiled: next,
+                    run,
+                });
+                self.next_gen = number + 1;
+                RebuildOutcome::Rebuilt { ended, settle }
+            }
+            Err(outcome) => {
+                let ended = Some(next.render(&outcome));
+                self.next_gen = number + 1;
+                RebuildOutcome::Rebuilt { ended, settle }
+            }
+        }
+    }
+
+    /// Validate + relink held values old→new (Phase 6, Stage 2a).
+    /// `Func` indices rebind by name with identical signatures
+    /// (`relink_func`); closure handles must name a table entry.
+    /// Anything else fails LOUD (`Err(())`) and the caller routes
+    /// to atomic restart — never a guessed index, never a silent
+    /// drop of one value while keeping the rest.
+    fn relink_carry(
+        old_checked: &CheckedProgram,
+        new_checked: &CheckedProgram,
+        table: &ClosureModules,
+        heap: &Heap,
+        carry: &[RtVal],
+    ) -> Result<Vec<RtVal>, ()> {
+        let table = table.lock().expect("module table lock");
+        let mut out = Vec::with_capacity(carry.len());
+        for v in carry {
+            match v {
+                RtVal::Func(i) => match relink_func(old_checked, new_checked, *i) {
+                    Ok(new_i) => out.push(RtVal::Func(new_i)),
+                    Err(_) => return Err(()),
+                },
+                RtVal::Heap(r) => {
+                    // Table hit AND slot still owned by this
+                    // generation: a swept slot (or a stale copy
+                    // aliasing a reused slot) fails the whole
+                    // carry rather than preserving half a state.
+                    // The table is keyed by full `GcRef`
+                    // (index + generation), so a reused slot
+                    // never aliases: it misses the table.
+                    if table.contains_key(r) && heap.get(*r).is_some() {
+                        out.push(v.clone());
+                    } else {
+                        return Err(());
+                    }
+                }
+                plain => out.push(plain.clone()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Retire check (Phase 6, Stage 2a): force a collection with
+    /// the held roots, then drop every retired module no live
+    /// closure names and prune dead table entries. Decisions are
+    /// exact at decision time (the forced collect precedes every
+    /// `is_live` read); between checks dead closures may retain
+    /// their module for at most one collection (the stated bound).
+    /// Quiescence is the caller's contract: call only after the
+    /// old run settled (no frames execute old code).
+    ///
+    /// `force_retain` names the just-drained generation when a
+    /// carried `Func` validated against it: a plain-function
+    /// reference pins no heap object (`heap_refs_of(Func)` is
+    /// empty), so without this the collect below would drop a
+    /// module the caller still names. The reference itself is the
+    /// root; release (dropping the carried value) reclaims at the
+    /// next check.
+    fn prune_retired(
+        &mut self,
+        heap: &mut Heap,
+        held: &[GcRef],
+        force_retain: Option<u64>,
+    ) -> RetireReport {
+        let report = heap.collect(held);
+        let _ = report;
+        let table = self.module_table.lock().expect("module table lock");
+        let mut retained = Vec::new();
+        let mut dropped = Vec::new();
+        self.retired.retain(|old| {
+            let live = force_retain == Some(old.number)
+                || table
+                    .iter()
+                    .any(|(r, g)| *g == old.number && heap.is_live(*r));
+            if live {
+                retained.push(old.number);
+                true
+            } else {
+                dropped.push(old.number);
+                false
+            }
+        });
+        drop(table);
+        self.module_table
+            .lock()
+            .expect("module table lock")
+            .retain(|r, _| heap.is_live(*r));
+        RetireReport { retained, dropped }
+    }
+
+    /// Drain the last successful carry (Stage 3 consumes these into
+    /// state slots; the 2a proofs assert them directly). Always
+    /// empty after a non-carry rebuild — never stale.
+    pub fn take_carried(&mut self) -> Vec<RtVal> {
+        std::mem::take(&mut self.carried)
+    }
+
+    /// Last retire decision (observability for tests and soak).
+    pub fn last_retire(&self) -> &RetireReport {
+        &self.last_retire
     }
 }
 
@@ -586,4 +902,494 @@ pub fn settle_run(
         built.number
     ));
     (SettleOutcome::Restarted, None)
+}
+
+/// Stage 2a retention/relink/callability proofs (authorization
+/// §2.12): retention with REAL GC reachability in generated code
+/// (no acquire/release stand-ins — the roots ARE the carried
+/// values, `prune_retired` collects with exactly those roots),
+/// relink including failure → loud atomic restart, and the
+/// closure/function-pointer reference case: a retained reference
+/// keeps its module callable across a reload, then release +
+/// reclamation at the next check.
+#[cfg(test)]
+mod retain_proofs {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use toto_compiler::ast::{FnDecl, ItemKind};
+    use toto_compiler::span::Span;
+    use toto_runtime::channel::TaskId;
+    use toto_runtime::heap::Payload;
+    use toto_runtime::sched::ScopeId;
+
+    use crate::runtime::encode;
+    use crate::task::{JitTaskCtx, sorted_externs};
+
+    fn test_config() -> RuntimeConfig {
+        RuntimeConfig {
+            gc_threshold_bytes: u64::MAX,
+            rng_seed: 0x9E37_79B9_7F4A_7C15,
+            stack_bytes: 64 * 1024,
+            collect_at_every_safepoint_for_test: false,
+            workers: 1,
+            blocking_pool_threads: 2,
+        }
+    }
+
+    fn test_driver() -> DevDriver<ReexecRestart> {
+        DevDriver::new(
+            DrainPolicy {
+                drain_timeout: Duration::from_millis(300),
+                cancel_grace: Duration::from_millis(300),
+            },
+            ReexecRestart,
+            test_config(),
+            OptLevel::Off,
+        )
+    }
+
+    fn wait_finished(drv: &DevDriver<ReexecRestart>, what: &str) {
+        let t0 = Instant::now();
+        loop {
+            let done = drv
+                .current
+                .as_ref()
+                .map(|a| a.run.is_finished())
+                .unwrap_or(false);
+            if done {
+                return;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(30),
+                "run never finished: {what}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn cur_number(drv: &DevDriver<ReexecRestart>) -> u64 {
+        drv.current.as_ref().expect("current").compiled.number
+    }
+
+    fn func_idx(drv: &DevDriver<ReexecRestart>, name: &str) -> usize {
+        drv.current
+            .as_ref()
+            .expect("current")
+            .compiled
+            .session
+            .func_names
+            .iter()
+            .position(|n| n == name)
+            .expect("function present")
+    }
+
+    fn rebuilt(
+        drv: &mut DevDriver<ReexecRestart>,
+        src: &str,
+        carry: &[RtVal],
+        what: &str,
+    ) -> (Option<EndedRun>, Option<SettleOutcome>) {
+        match drv.rebuild_with(src, "t.gzv", carry) {
+            RebuildOutcome::Rebuilt { ended, settle } => (ended, settle),
+            RebuildOutcome::StillBroken(diags) => {
+                panic!("{what}: unexpectedly StillBroken ({} diags)", diags.len())
+            }
+            RebuildOutcome::NoChange => panic!("{what}: unexpectedly NoChange"),
+            RebuildOutcome::CompileRefused(e) => {
+                panic!("{what}: unexpectedly CompileRefused: {e}")
+            }
+            RebuildOutcome::Restarted => panic!("{what}: unexpectedly Restarted"),
+        }
+    }
+
+    fn ended_stdout(ended: &Option<EndedRun>, what: &str) -> Vec<u8> {
+        let e = ended
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what}: no ended run"));
+        assert_eq!(e.code, "0", "{what}: exit code");
+        e.stdout.clone()
+    }
+
+    /// First spawn of a driver: no old run exists, so there is
+    /// nothing to settle and nothing streamed (`(None, None)`).
+    /// The new run's own output surfaces via the NEXT rebuild's
+    /// `ended` (stream-on-retire).
+    fn spawn_first(drv: &mut DevDriver<ReexecRestart>, src: &str, what: &str) {
+        let (ended, settle) = rebuilt(drv, src, &[], what);
+        assert!(ended.is_none(), "{what}: fresh spawn streams nothing");
+        assert!(settle.is_none(), "{what}: fresh spawn settles nothing");
+        wait_finished(drv, what);
+    }
+
+    fn closure_refs_of(drv: &DevDriver<ReexecRestart>) -> Vec<(GcRef, u32)> {
+        drv.current_shared
+            .as_ref()
+            .expect("shared")
+            .state
+            .lock()
+            .expect("shared state lock")
+            .heap
+            .closure_refs()
+    }
+
+    /// Call a retained closure body directly through its retired
+    /// module's entry address. TEST-ONLY conditions (not a product
+    /// path — production cross-generation calls go through real
+    /// tasks with real shadows in Stage 3): the bodies under test
+    /// allocate nothing (no safepoint can fire mid-call), the
+    /// driver's threshold is `u64::MAX` (no background collect can
+    /// fire either), and missed-shadow publication is a no-op (the
+    /// `task_shadow_push` missing-slot skip). The `handle` word
+    /// uses the frozen ADR-008 codec (`(gen << 32) | index`).
+    ///
+    /// Closed-world dispatch: every table (`entries`, `bodies`,
+    /// `func_names`, `chan_types`, `externs`) and the AST function
+    /// list come from the RETIRED generation, never the current
+    /// one. Old code therefore resolves every callee to an old
+    /// address — it can never call new code (the Stage-3 contract
+    /// for production cross-generation calls).
+    fn call_retained_closure(
+        drv: &DevDriver<ReexecRestart>,
+        retired_no: usize,
+        r: GcRef,
+        arg: u64,
+    ) -> u64 {
+        let shared = std::sync::Arc::clone(drv.current_shared.as_ref().expect("shared"));
+        let body = match shared.state.lock().expect("shared state lock").heap.get(r) {
+            Some(Payload::Closure { body, .. }) => *body,
+            _ => panic!("retained handle is not a closure payload"),
+        };
+        let ret = &drv.retired[retired_no];
+        let entry = *ret.session.bodies.get(&body).expect("retained body entry");
+        let sess = &ret.session;
+        let mut fns: Vec<FnDecl> = Vec::new();
+        for item in &ret.program.items {
+            if let ItemKind::Fn(d) = &item.kind {
+                fns.push(d.clone());
+            }
+        }
+        let ctx = JitTaskCtx {
+            shared,
+            task: TaskId(usize::MAX),
+            scope: ScopeId(usize::MAX),
+            yielder: None,
+            entry: 0,
+            captures: Vec::new(),
+            root_name: "retain_proof".to_string(),
+            root_span: Span::new(0, 0),
+            is_main: false,
+            failed: false,
+            diag: None,
+            skip_frame: false,
+            trace: Vec::new(),
+            fns: std::sync::Arc::new(fns),
+            entries: std::sync::Arc::clone(&sess.entries),
+            bodies: std::sync::Arc::clone(&sess.bodies),
+            func_names: std::sync::Arc::clone(&sess.func_names),
+            chan_types: std::sync::Arc::clone(&sess.chan_types),
+            externs: std::sync::Arc::new(sorted_externs(&ret.checked)),
+        };
+        let mut boxed = Box::new(ctx);
+        let handle = encode(r);
+        let ret = unsafe {
+            // SAFETY: `entry` is the retired module's compiled body
+            // address (same transmute shape `compile.rs` uses for
+            // helper calls); the call runs no safepoint (see above),
+            // touches no task state, and the box outlives the call.
+            let f: unsafe extern "C" fn(*mut JitTaskCtx, u64, u64) -> u64 =
+                std::mem::transmute(entry);
+            f((&mut *boxed) as *mut JitTaskCtx, handle, arg)
+        };
+        assert!(!boxed.failed, "retained call recorded a failure");
+        assert!(boxed.diag.is_none(), "retained call recorded a diag");
+        ret
+    }
+
+    /// Call a retained plain function directly through its retired
+    /// module's entry address. Same test-only conditions as
+    /// `call_retained_closure`; entry signature is `(ctx, args...)`
+    /// with no handle word (the index arm of the call emission).
+    fn call_retained_func(
+        drv: &DevDriver<ReexecRestart>,
+        retired_no: usize,
+        name: &str,
+        arg: u64,
+    ) -> u64 {
+        let shared = std::sync::Arc::clone(drv.current_shared.as_ref().expect("shared"));
+        let ret = &drv.retired[retired_no];
+        let entry = *ret
+            .session
+            .entries
+            .get(name)
+            .expect("retained function entry");
+        let sess = &ret.session;
+        let mut fns: Vec<FnDecl> = Vec::new();
+        for item in &ret.program.items {
+            if let ItemKind::Fn(d) = &item.kind {
+                fns.push(d.clone());
+            }
+        }
+        let ctx = JitTaskCtx {
+            shared,
+            task: TaskId(usize::MAX),
+            scope: ScopeId(usize::MAX),
+            yielder: None,
+            entry: 0,
+            captures: Vec::new(),
+            root_name: "retain_proof".to_string(),
+            root_span: Span::new(0, 0),
+            is_main: false,
+            failed: false,
+            diag: None,
+            skip_frame: false,
+            trace: Vec::new(),
+            fns: std::sync::Arc::new(fns),
+            entries: std::sync::Arc::clone(&sess.entries),
+            bodies: std::sync::Arc::clone(&sess.bodies),
+            func_names: std::sync::Arc::clone(&sess.func_names),
+            chan_types: std::sync::Arc::clone(&sess.chan_types),
+            externs: std::sync::Arc::new(sorted_externs(&ret.checked)),
+        };
+        let mut boxed = Box::new(ctx);
+        let ret = unsafe {
+            // SAFETY: same conditions as `call_retained_closure`.
+            let f: unsafe extern "C" fn(*mut JitTaskCtx, u64) -> u64 = std::mem::transmute(entry);
+            f((&mut *boxed) as *mut JitTaskCtx, arg)
+        };
+        assert!(!boxed.failed, "retained call recorded a failure");
+        assert!(boxed.diag.is_none(), "retained call recorded a diag");
+        ret
+    }
+
+    // The closure calls back into its own module (`helper`):
+    // the closed-world case. GEN2 changes `helper`'s body (same
+    // signature, so relink still validates) — a retained call that
+    // dispatches through the NEW tables would observe `a * 100`,
+    // the closed world observes `a * 2`.
+    const GEN1: &str = "fn adder(x: int) -> fn(int) -> int {\n    return fn(y: int) -> int { return helper(x + y); };\n}\nfn helper(a: int) -> int {\n    return a * 2;\n}\nfn main() -> int {\n    let add2 = adder(2);\n    println(add2(3));\n    println(helper(21));\n    return 0;\n}\n";
+    const GEN2: &str = "fn adder(x: int) -> fn(int) -> int {\n    return fn(y: int) -> int { return helper(x + y); };\n}\nfn helper(a: int) -> int {\n    return a * 100;\n}\nfn main() -> int {\n    let add10 = adder(10);\n    println(add10(3));\n    println(helper(20));\n    return 0;\n}\n";
+    const GEN3: &str = "fn adder(x: int) -> fn(int) -> int {\n    return fn(y: int) -> int { return helper(x + y); };\n}\nfn helper(a: int) -> int {\n    return a * 100;\n}\nfn main() -> int {\n    let add11 = adder(11);\n    println(add11(3));\n    println(helper(19));\n    return 0;\n}\n";
+
+    /// Exit criterion (ii)+(iv), closure side: a carried closure
+    /// keeps its module alive across a reload (real GC
+    /// reachability — the collect roots ARE the carried values),
+    /// the old code stays callable with old captures, then release
+    /// + reclamation at the next check.
+    #[test]
+    fn closure_retained_callable_then_reclaimed() {
+        let mut drv = test_driver();
+        spawn_first(&mut drv, GEN1, "gen1 spawn");
+        let n1 = cur_number(&drv);
+
+        // Exactly one closure exists, stamped with gen 1 in the
+        // retention table (`closure_refs` reports body ids, not
+        // versions — the version lives in the table).
+        let closures = closure_refs_of(&drv);
+        assert_eq!(closures.len(), 1, "one closure allocated: {closures:?}");
+        let (r, _) = closures[0];
+        let stamp = drv
+            .module_table
+            .lock()
+            .expect("module table lock")
+            .get(&r)
+            .copied();
+        assert_eq!(stamp, Some(n1), "closure stamped with gen 1");
+        let helper_idx = func_idx(&drv, "helper");
+
+        // Reload with a main-only edit, carrying the closure and a
+        // plain-function reference.
+        let (ended, settle) = rebuilt(
+            &mut drv,
+            GEN2,
+            &[RtVal::Heap(r), RtVal::Func(helper_idx)],
+            "gen2",
+        );
+        assert_eq!(settle, Some(SettleOutcome::Drained), "gen2 drains");
+        assert_eq!(ended_stdout(&ended, "gen1"), b"10\n42\n");
+        wait_finished(&drv, "gen2");
+
+        // Retention: gen 1 survives while the carried closure is
+        // live; the carried values come back unchanged in shape.
+        assert_eq!(drv.last_retire().retained, vec![n1], "gen 1 retained");
+        assert!(drv.last_retire().dropped.is_empty(), "nothing dropped");
+        let carried = drv.take_carried();
+        assert_eq!(carried.len(), 2, "both values carried");
+        assert!(
+            matches!(carried[0], RtVal::Heap(rr) if rr == r),
+            "closure unchanged"
+        );
+        let new_helper = func_idx(&drv, "helper");
+        assert!(
+            matches!(carried[1], RtVal::Func(i) if i == new_helper),
+            "func relinked"
+        );
+
+        // Heap continuity: the SAME heap object survived the reload.
+        let live = drv
+            .current_shared
+            .as_ref()
+            .expect("shared")
+            .state
+            .lock()
+            .expect("shared state lock")
+            .heap
+            .get(r)
+            .is_some();
+        assert!(live, "carried closure resolves in the new heap");
+
+        // Callability, closed world: the OLD closure runs with OLD
+        // captures through the OLD tables — adder(2), helper `a*2`:
+        // helper(2 + 3) = 10. Dispatched through the NEW tables the
+        // same call would observe helper `a*100` = 1000.
+        assert_eq!(drv.retired.len(), 1, "one retired module");
+        assert_eq!(call_retained_closure(&drv, 0, r, 3), 10, "old captures");
+
+        // Release: drop every handle, reload again with no carry.
+        // The next check reclaims gen 1 (the stated bound: release
+        // at the next forced collection).
+        drop(carried);
+        let (ended, _) = rebuilt(&mut drv, GEN3, &[], "gen3");
+        assert_eq!(ended_stdout(&ended, "gen2"), b"1300\n2000\n");
+        wait_finished(&drv, "gen3");
+        assert!(drv.last_retire().retained.is_empty(), "nothing retained");
+        assert_eq!(drv.last_retire().dropped, vec![n1], "gen 1 reclaimed");
+        assert!(drv.retired.is_empty(), "retired set empty");
+        let refs = closure_refs_of(&drv);
+        assert!(!refs.is_empty(), "gen 3 allocated its own closure");
+        let table = drv.module_table.lock().expect("module table lock");
+        assert!(
+            table.iter().all(|(_, g)| *g != n1),
+            "no gen-1 entry remains: {table:?}"
+        );
+    }
+
+    const GEN1F: &str = "fn helper(a: int) -> int {\n    return a * 2;\n}\nfn main() -> int {\n    println(helper(21));\n    return 0;\n}\n";
+    const GEN2F: &str = "fn helper(a: int) -> int {\n    return a + 1;\n}\nfn main() -> int {\n    println(helper(21));\n    return 0;\n}\n";
+    const GEN3F: &str = "fn helper(a: int) -> int {\n    return a + 1;\n}\nfn main() -> int {\n    println(helper(20));\n    return 0;\n}\n";
+    const GEN2G: &str = "fn main() -> int {\n    println(0);\n    return 0;\n}\n";
+
+    /// Exit criterion (iii) positive + (iv) function side: a
+    /// carried `Func` keeps its module alive even though it pins
+    /// no heap object (the `force_retain` path — the heap holds no
+    /// closures at all here, so heap reachability alone would drop
+    /// it), the old entry stays callable, then release reclaims.
+    #[test]
+    fn func_retained_callable_then_reclaimed() {
+        let mut drv = test_driver();
+        spawn_first(&mut drv, GEN1F, "gen1f spawn");
+        let n1 = cur_number(&drv);
+        assert!(closure_refs_of(&drv).is_empty(), "no closures in play");
+        let helper_idx = func_idx(&drv, "helper");
+
+        // helper's body changes but its signature does not: the
+        // carried reference relinks and gen 1 is force-retained
+        // (the heap names nothing — without `force_retain` this
+        // collect would drop it).
+        let (ended, _) = rebuilt(&mut drv, GEN2F, &[RtVal::Func(helper_idx)], "gen2f");
+        assert_eq!(ended_stdout(&ended, "gen1f"), b"42\n");
+        wait_finished(&drv, "gen2f");
+        assert!(closure_refs_of(&drv).is_empty(), "still no closures");
+        assert_eq!(drv.last_retire().retained, vec![n1], "gen 1 force-retained");
+        let carried = drv.take_carried();
+        assert_eq!(carried.len(), 1, "func carried");
+        let new_helper = func_idx(&drv, "helper");
+        assert!(
+            matches!(carried[0], RtVal::Func(i) if i == new_helper),
+            "func relinked"
+        );
+
+        // The OLD entry runs the OLD body (a * 2, not a + 1).
+        assert_eq!(call_retained_func(&drv, 0, "helper", 21), 42, "old body");
+
+        // Release reclaims at the next check.
+        drop(carried);
+        let (ended, _) = rebuilt(&mut drv, GEN3F, &[], "gen3f");
+        assert_eq!(ended_stdout(&ended, "gen2f"), b"22\n");
+        assert_eq!(drv.last_retire().dropped, vec![n1], "gen 1 reclaimed");
+        assert!(drv.retired.is_empty(), "retired set empty");
+    }
+
+    /// Exit criterion (iii) negative: removing the named function
+    /// fails relink (`NameGone`) and routes to loud atomic restart
+    /// — fresh heap, clean table, nothing carried — never a guessed
+    /// index into the new generation.
+    #[test]
+    fn func_removed_routes_to_atomic_restart() {
+        let mut drv = test_driver();
+        spawn_first(&mut drv, GEN1F, "gen1f spawn");
+        let helper_idx = func_idx(&drv, "helper");
+
+        let (ended, settle) = rebuilt(&mut drv, GEN2G, &[RtVal::Func(helper_idx)], "gen2g");
+        assert_eq!(settle, Some(SettleOutcome::Drained), "old run drains first");
+        // The retired run still streams its own output (atomic
+        // restart preserves the drain, not the state).
+        assert_eq!(ended_stdout(&ended, "gen1f"), b"42\n");
+        wait_finished(&drv, "gen2g");
+        // Nothing preserved: loud, total.
+        assert!(drv.take_carried().is_empty(), "carry dropped");
+        assert!(drv.last_retire().retained.is_empty(), "nothing retained");
+        assert!(drv.last_retire().dropped.is_empty(), "nothing was retired");
+        assert!(drv.retired.is_empty(), "retired set empty");
+        let table = drv.module_table.lock().expect("module table lock");
+        assert!(table.is_empty(), "table clean");
+    }
+
+    /// The relink liveness gate: a table hit on a swept slot (or
+    /// any unknown handle) fails the whole carry → atomic restart,
+    /// never preservation of a dead reference. The swept-slot case
+    /// exercises the `heap.get` gate specifically (the entry is
+    /// still tabled — no hygiene has run — but the object is gone).
+    #[test]
+    fn stale_carry_fails_atomic() {
+        let mut drv = test_driver();
+        spawn_first(&mut drv, GEN1, "gen1 spawn");
+        let (r, _) = closure_refs_of(&drv)[0];
+
+        // Sweep the closure out from under its table entry.
+        let swept = drv
+            .current_shared
+            .as_ref()
+            .expect("shared")
+            .state
+            .lock()
+            .expect("shared state lock")
+            .heap
+            .collect(&[])
+            .collected;
+        assert!(swept >= 1, "the sweep reclaimed the closure");
+        {
+            let st = drv
+                .current_shared
+                .as_ref()
+                .expect("shared")
+                .state
+                .lock()
+                .expect("shared state lock");
+            assert!(st.heap.get(r).is_none(), "slot is gone");
+            assert!(!st.heap.is_live(r), "swept object must not resolve");
+        }
+
+        // Table hit + dead slot → atomic restart, loudly.
+        let (ended, _) = rebuilt(&mut drv, GEN2, &[RtVal::Heap(r)], "gen2 stale");
+        assert_eq!(ended_stdout(&ended, "gen1"), b"10\n42\n");
+        wait_finished(&drv, "gen2 stale");
+        let n2 = cur_number(&drv);
+        assert!(drv.take_carried().is_empty(), "carry dropped");
+        assert!(drv.last_retire().retained.is_empty(), "nothing retained");
+        {
+            let table = drv.module_table.lock().expect("module table lock");
+            assert!(!table.is_empty(), "gen 2 stamped its own closure");
+            assert!(
+                table.iter().all(|(_, g)| *g == n2),
+                "no gen-1 entry survives"
+            );
+        }
+
+        // Unknown handle (never tabled) → same loud outcome.
+        let bogus = GcRef::from_parts(424242, 424242);
+        let (ended, _) = rebuilt(&mut drv, GEN3, &[RtVal::Heap(bogus)], "gen3 bogus");
+        assert_eq!(ended_stdout(&ended, "gen2"), b"1300\n2000\n");
+        wait_finished(&drv, "gen3 bogus");
+        assert!(drv.take_carried().is_empty(), "bogus carry dropped");
+    }
 }

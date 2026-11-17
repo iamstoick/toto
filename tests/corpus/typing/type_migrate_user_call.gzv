@@ -1,0 +1,16 @@
+struct S {
+    v: int,
+}
+
+fn bump(x: int) -> int {
+    return x + 1;
+}
+
+migrate fn S(old: S) -> S {
+    return S { v: bump(old.v) };
+}
+
+fn main() -> int {
+    println(0);
+    return 0;
+}

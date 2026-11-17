@@ -15,7 +15,7 @@
 
 use toto_runtime::heap::{GcRef, Heap, Payload};
 use toto_runtime::roots::ShadowStack;
-use toto_runtime::value::RtVal;
+use toto_runtime::value::{RtVal, heap_refs_of};
 
 /// Numeric Toto codes as `u64` (`202` = `E0202`, `201` = `E0201`,
 /// `209` = `E0209`, `204` = `E0204`, `203` = `E0203`, `212` = `E0212`).
@@ -96,6 +96,10 @@ pub struct JitRt {
     /// `extern_index` order). Set by the harness from the checked
     /// program; empty when the program declares no externs.
     pub externs: Vec<(String, toto_compiler::hir::HExternFn)>,
+    /// Declared-state cells by slot (spec amendment, Phase 6).
+    /// Traced at every gate collection (see `allocation_safepoint`
+    /// and `toto_gc_collect`).
+    pub state: Vec<RtVal>,
 }
 
 impl JitRt {
@@ -114,6 +118,7 @@ impl JitRt {
             func_names: Vec::new(),
             bodies: std::collections::HashMap::new(),
             externs: Vec::new(),
+            state: Vec::new(),
         }
     }
 
@@ -184,7 +189,13 @@ fn rt<'r>(ctx: *mut JitRt) -> &'r mut JitRt {
 /// published — the publish-before-safepoint rule, unchanged.
 fn allocation_safepoint(rt: &mut JitRt) {
     if rt.heap.bytes_since_gc() >= rt.threshold {
-        let roots: Vec<GcRef> = rt.shadow.iter().collect();
+        let mut roots: Vec<GcRef> = rt.shadow.iter().collect();
+        // Declared state (spec amendment, Phase 6): every cell is a
+        // root — a state-held object is live as long as its slot
+        // names it.
+        for v in &rt.state {
+            heap_refs_of(v, &mut roots);
+        }
         rt.heap.collect(&roots);
     }
 }
@@ -489,8 +500,82 @@ pub unsafe extern "C" fn toto_shadow_pop_to(ctx: *mut JitRt, len: u64) {
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn toto_gc_collect(ctx: *mut JitRt) -> u64 {
     let rt = rt(ctx);
-    let roots: Vec<GcRef> = rt.shadow.iter().collect();
+    let mut roots: Vec<GcRef> = rt.shadow.iter().collect();
+    for v in &rt.state {
+        heap_refs_of(v, &mut roots);
+    }
     rt.heap.collect(&roots).live as u64
+}
+
+/// Declared-state read (spec amendment, Phase 6): the word for the
+/// cell's value. An unset slot or an untrafficable value is a loud
+/// internal panic — both unreachable in checked programs (init
+/// writes every slot; JIT-built heaps hold trafficable values).
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn toto_state_get(ctx: *mut JitRt, slot: u64, start: u64, end: u64) -> u64 {
+    let rt = rt(ctx);
+    match rt.state.get(slot as usize).cloned() {
+        Some(v) => match encode_val(&v) {
+            Some(w) => w,
+            None => do_panic(
+                rt,
+                E_INTERNAL,
+                start,
+                end,
+                String::from("state value is not JIT-trafficable (unreachable in JIT-built heaps)"),
+            ),
+        },
+        None => do_panic(
+            rt,
+            E_INTERNAL,
+            start,
+            end,
+            format!("state slot {slot} was never initialized (unreachable in checked programs)"),
+        ),
+    }
+}
+
+/// Declared-state write: validate liveness fail-fast (a stale
+/// handle records loudly here, not later at the read), then store.
+/// The cell joins the root set at the next collection, so no
+/// publish is needed.
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn toto_state_set(
+    ctx: *mut JitRt,
+    slot: u64,
+    tag: u64,
+    value: u64,
+    start: u64,
+    end: u64,
+) -> u64 {
+    let rt = rt(ctx);
+    let v = match decode_tagged(tag, value) {
+        Ok(v) => v,
+        Err(()) => do_panic(
+            rt,
+            E_INTERNAL,
+            start,
+            end,
+            format!("state value has unknown tag {tag} (unreachable in checked programs)"),
+        ),
+    };
+    if let RtVal::Heap(r) = &v
+        && rt.heap.get(*r).is_none()
+    {
+        do_panic(
+            rt,
+            E_INTERNAL,
+            start,
+            end,
+            String::from("stale handle in state_set (unreachable in checked programs)"),
+        );
+    }
+    let slot = slot as usize;
+    if rt.state.len() <= slot {
+        rt.state.resize(slot + 1, RtVal::Unit);
+    }
+    rt.state[slot] = v;
+    0
 }
 
 /// Explicit-check failure: record the Toto panic and diverge through

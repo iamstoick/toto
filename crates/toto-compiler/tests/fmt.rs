@@ -176,12 +176,14 @@ fn fmt_idempotent_and_semantics_preserving() {
         }
     }
     // Exact pins (Phase 6 flag b): any corpus addition that parses,
-    // refuses, or runs changes these, loudly. The 15 refused are all
+    // refuses, or runs changes these, loudly. The 17 refused are all
     // lex/parse-level failures — E0001 (4: diag01, diag02, diag03,
-    // lex05), E0101, E0102 (3: diag04, parse02 + the missing-semi
-    // shape), E0103, E0104, E0106 (2: diag12, parse09), E0107,
-    // E0154, E0156, E0158 — never check-time (type) errors, which
-    // all parse and therefore format.
+    // lex05), E0101 (incl. the parse10/parse11 state/migrate
+    // placement errors), E0102 (3: diag04,
+    // parse02 + the missing-semi shape), E0103, E0104, E0106 (2:
+    // diag12, parse09), E0107, E0154, E0156, E0158 — never
+    // check-time (type) errors, which all parse and therefore
+    // format.
     const EXPECTED_REFUSED: &[&str] = &[
         "diag01_single_quote.gzv",
         "diag02_hash_comment.gzv",
@@ -198,6 +200,8 @@ fn fmt_idempotent_and_semantics_preserving() {
         "parse07_reject_match_mod.gzv",
         "parse08_method_call.gzv",
         "parse09_suggest_eq_unclosed.gzv",
+        "parse10_state_in_fn.gzv",
+        "parse11_migrate_in_fn.gzv",
     ];
     let mut refused_names: Vec<String> = failures
         .iter()
@@ -208,9 +212,9 @@ fn fmt_idempotent_and_semantics_preserving() {
     let mut expected: Vec<String> = EXPECTED_REFUSED.iter().map(|s| s.to_string()).collect();
     expected.sort();
     assert_eq!(refused_names, expected, "refused set changed");
-    assert_eq!(formatted, 113, "formatted count changed");
-    assert_eq!(refused, 15, "refused count changed");
-    assert_eq!(ran, 40, "executed count changed");
+    assert_eq!(formatted, 140, "formatted count changed");
+    assert_eq!(refused, 17, "refused count changed");
+    assert_eq!(ran, 45, "executed count changed");
     assert!(
         failures.iter().all(|f| f.starts_with("refused:")),
         "{} fmt failure(s):\n{}",

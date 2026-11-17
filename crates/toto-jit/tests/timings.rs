@@ -132,11 +132,13 @@ fn jit_compile_timings() {
             }
         }
     }
-    // Exact census (128 cases: 41 sequential checking incl. diag10,
-    // 19 concurrent (conc19_chan_eq joined in Phase 5), 68 static
-    // (type37_index_range + diag13-15 FFI joined in Phase 5)).
-    assert_eq!(gate_compiled, 41, "gate-compiled count changed");
-    assert_eq!(task_compiled, 60, "task-compiled count changed");
+    // Exact census (157 cases: 46 sequential checking incl. diag10
+    // (state01-05 joined in Phase 6), 21 concurrent (conc19_chan_eq
+    // joined in Phase 5; state06-07 joined in Phase 6), 90 static
+    // (type37_index_range + diag13-15 FFI joined in Phase 5;
+    // 22 Phase-6 negatives joined in Phase 6)).
+    assert_eq!(gate_compiled, 46, "gate-compiled count changed");
+    assert_eq!(task_compiled, 67, "task-compiled count changed");
     assert!(
         failures.is_empty(),
         "{} timing/compile failure(s):\n{}",

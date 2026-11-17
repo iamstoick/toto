@@ -1,0 +1,5 @@
+error[E0322]: migrate `N` parameter must be a struct type, found int
+ --> type_migrate_param_not_struct.gzv:1:14
+  |
+1 | migrate fn N(old: int) -> int {
+  |              ^^^

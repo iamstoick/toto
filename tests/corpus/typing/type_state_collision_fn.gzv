@@ -1,0 +1,12 @@
+fn helper() -> int {
+    return 1;
+}
+
+state {
+    helper: int = 2;
+}
+
+fn main() -> int {
+    println(helper);
+    return 0;
+}

@@ -1,0 +1,5 @@
+error[E0319]: state binding `x` is used before its declaration
+ --> type_state_forward_ref.gzv:2:14
+  |
+2 |     y: int = x + 1;
+  |              ^ help: state initializers run in declaration order; move the binding earlier

@@ -1,0 +1,14 @@
+state {
+    ch: chan<int>;
+}
+
+fn main() -> int {
+    go {
+        let v = <-ch;
+        ch <- v + 1
+    }
+    ch <- 41;
+    let w = <-ch;
+    println(w);
+    return 0;
+}

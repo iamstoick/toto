@@ -324,3 +324,91 @@ race attribution (Enterprise); LLVM AOT / production AOT
 linter, doc generator, coverage (Enterprise Wave 5); user
 generics/traits; general optimization; benchmarks; anything
 from the Part 3 Enterprise Track.
+
+## Stage 2 — single-generation declared state (slices 2a–2b)
+
+Reload-time enforcement (migration invocation, matrix, queued-value
+validation) is Stage 3. Stage 2 lands execution + checking of
+declared state within one generation through every executor,
+with retention proven by real GC reachability. Each slice gated
+on the previous; gate green throughout.
+
+### Slice 2a — retention/relink proof (exit criteria i–iv, §2.12)
+
+- `Heap::is_live` + `closure_refs` (`crates/toto-runtime/src/heap.rs`,
+  `sched.rs`): no under-retention proven by
+  `gc.rs::is_live_never_under_retains`; over-retention bounded to
+  one collection by `is_live_over_retains_at_most_one_collection`;
+  watermark semantics pinned by
+  `is_live_rejects_stale_generations_on_reuse` and
+  `is_live_covers_post_collection_allocations`. gc suite 11/11.
+- Retention with REAL GC reachability in generated code
+  (`crates/toto-jit/src/dev.rs`, `retain_proofs`): a carried
+  closure keeps its module callable across a reload
+  (`closure_retained_callable_then_reclaimed`), likewise a carried
+  function (`func_retained_callable_then_reclaimed`); removal routes
+  to atomic restart; a stale carry fails atomic (4 tests green).
+  No acquire/release stand-ins: the collect roots ARE the carried
+  values. Ownership Arc-only (no shared-state `Rc`); closed worlds
+  (new→old calls only, through retained tables); JIT reads payloads
+  only via the `toto_*` helper boundary. Verdict: 2a PASS — §2.12
+  (i)–(iv) all evidenced; proceeding to syntax/checker.
+
+### Slice 2b — syntax/checker + corpus + pins + conformance
+
+- Syntax/checker: `state {}` + `migrate` items (contextual keywords —
+  corpus check 2026-11-17: zero existing programs use either as an
+  identifier in item position), one-block + placement rules, binding
+  rules (mutable, declaration-order init, `E0319` forward/self,
+  bare-channel `E0318`), migrate rules (one param, struct in = struct
+  out, one per struct, `E0325` determinism incl. deferred user calls
+  as user calls, `E0326` totality), `E0311` flat-namespace collisions,
+  `E0316`/`E0317`, `E0321`–`E0324`. `?` unbanned (`E0308` covers —
+  verified live: `?` in init fails as `E0308`, never reaches `E0320`).
+- Executors: MIR `StateGet`/`StateSet` (+ `ChanNew` in init, entry
+  block opens with `safepoint entry`, init allocs carry per-op guards
+  — Tier-1 fix, see below), tree-walker ordered init, `mir_interp`
+  state vec, runtime `state_vars` + root-set extension, JIT
+  `toto_state_get/set` + task variants. Slots = declaration order on
+  all five paths.
+- Corpus: 29 new programs, all goldens generated from actual output
+  and reviewed before blessing (never blind): 7 positives
+  (`interp/state01-05`, `concurrent/state06-07`), 20 typing negatives
+  (`type_state_*`, `type_migrate_*`), 2 parsing placement negatives
+  (`parse10-11`, multi-error recovery preserved). 4 cascade cleanups
+  re-verified single-error (init-spawn `go` shape, missing-init,
+  second-block, migrate-call-direct).
+- Pins moved loudly, all zero-divergence: fmt 113/15/40 → 140/17/45;
+  gate differential ran 36→41; task 40→45; concurrent 19→21; timings
+  41/60 → 46/67; opt 36/40 → 41/45; runtime sequential 40→45 +
+  `state06-07` join the hardcoded concurrent list (both deterministic
+  rendezvous chains). The 5 sequential state positives match
+  tree-walker ≡ mir-interp ≡ runtime-executor ≡ gate JIT ≡ task JIT
+  (stdout + exit exact; the concurrent two match runtime-executor ≡
+  task JIT ≡ opt-JIT against goldens) — a genuine cross-executor
+  proof of the slot contract and first-load init order.
+- Real conformance gap found + fixed (not a pin): state programs
+  failed Tier-1 (`main` entry not first after init prepend; init
+  `ChanNew` lacked the alloc guard). Fixed in `mir.rs` (entry
+  safepoint first, guard on init `ChanNew`) — same convention as
+  ordinary code, no frozen-rule change. MIR dump case
+  `dump_state` added + hand-verified before blessing (entry-first,
+  slot order, guards).
+- Spec corrections (spec-text only; implementation + goldens were
+  already right): §14.1 chan-init code `E0322` → `E0318` (matched
+  §14.4, the `E0318` emission, and the golden); §14.4 `E0320` row
+  drops `` `?` `` (verified `E0308`). E0314 state-send verified live
+  (arrays E0314, deeply-immutable ints send normally); nested channel
+  construction in a data init accepted (routes to runtime executor).
+- Gate: `./scripts/check.sh` EXIT=0 on two consecutive runs (58 ok
+  lines, 0 failures).
+
+### Exact counts (after slice 2b)
+
+- Corpus: 157 entry cases in the differential census (41 status-0 +
+  4 status-1 runnable, 21 concurrent, 90 static, diag10 excluded);
+  `.gzv` files 148 + 29 = 177 (9 support unchanged).
+- Cargo: full gate green ×2 (fmt, `clippy -D warnings`, all suites
+  incl. 39 spike + 11 gc + 4 retain_proofs); `toto test` stdlib +
+  wordfreq unchanged (not re-run this slice — no stdlib surface
+  touched).

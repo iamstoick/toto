@@ -1,0 +1,5 @@
+error[E0326]: migrate `S` never reads field `b`
+ --> type_migrate_non_total.gzv:6:27
+  |
+6 | migrate fn S(old: S) -> S {
+  |                           ^ help: totality: read every field of the old value, or return it directly

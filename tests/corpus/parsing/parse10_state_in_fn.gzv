@@ -1,0 +1,7 @@
+fn main() -> int {
+    state {
+        let x = 1;
+    }
+    println(x);
+    return 0;
+}

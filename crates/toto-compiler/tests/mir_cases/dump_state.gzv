@@ -1,0 +1,16 @@
+state {
+    count: int = 0;
+    ch: chan<int>;
+}
+
+fn bump(by: int) -> int {
+    count = count + by;
+    return count;
+}
+
+fn main() -> int {
+    ch <- 41;
+    let v = <-ch;
+    println(bump(v));
+    return 0;
+}

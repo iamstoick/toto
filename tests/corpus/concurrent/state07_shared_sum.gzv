@@ -1,0 +1,16 @@
+state {
+    total: int = 0;
+    c1: chan<int>;
+    c2: chan<int>;
+}
+
+fn main() -> int {
+    go {
+        let v = <-c1;
+        total = total + v;
+        c2 <- total
+    }
+    c1 <- 10;
+    println(<-c2);
+    return 0;
+}

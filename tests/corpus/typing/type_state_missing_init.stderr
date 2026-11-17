@@ -1,0 +1,5 @@
+error[E0317]: state binding `bare` needs an initializer
+ --> type_state_missing_init.gzv:2:5
+  |
+2 |     bare: int;
+  |     ^^^^ help: add `= <expr>;`, or declare a channel binding

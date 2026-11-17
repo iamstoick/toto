@@ -221,6 +221,20 @@ impl Parser<'_> {
                 _ => break,
             }
         }
+        // Contextual keywords (spec amendment, Phase 6): `state` and
+        // `migrate` are ordinary identifiers everywhere except here —
+        // `state` followed by `{`, and `migrate` followed by `fn`,
+        // at top level. Anything else falls through to the arms
+        // below (and to `E0101` for a bare identifier, as before).
+        if let TokenKind::Ident(name) = self.peek().kind.clone() {
+            let next = self.toks.get(self.pos + 1).map(|t| t.kind.clone());
+            if name == "state" && matches!(next, Some(TokenKind::LBrace)) {
+                return self.parse_state_item(start, annotations);
+            }
+            if name == "migrate" && matches!(next, Some(TokenKind::Fn)) {
+                return self.parse_migrate_item(start, annotations);
+            }
+        }
         match self.peek().kind.clone() {
             TokenKind::Import => {
                 self.bump();
@@ -320,7 +334,7 @@ impl Parser<'_> {
                 self.error(
                     "E0101",
                     format!(
-                        "expected `fn`, `struct`, `import`, or `unsafe extern` item, found {}",
+                        "expected `fn`, `struct`, `state`, `migrate`, `import`, or `unsafe extern` item, found {}",
                         self.peek().kind.name()
                     ),
                     span,
@@ -689,6 +703,77 @@ impl Parser<'_> {
         })
     }
 
+    /// Parse a top-level `state { ... }` block after the `state`
+    /// identifier: `name: Ty = init;` (data) or `name: chan<T>;`
+    /// (channel, bare). Shapes are not distinguished here — the
+    /// checker enforces data-requires-init and chan-forbids-init
+    /// (`E0317`/`E0318`), so both parse uniformly.
+    fn parse_state_item(&mut self, start: Span, annotations: Vec<Annotation>) -> PResult<Item> {
+        self.bump(); // state
+        let open = self.expect(|k| matches!(k, TokenKind::LBrace), "`{`")?.span;
+        let mut bindings = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace) {
+            if self.at_eof() {
+                let span = self.peek().span;
+                self.error(
+                    "E0102",
+                    "unclosed `state` block, expected `}`".to_string(),
+                    span,
+                    None,
+                );
+                return Err(());
+            }
+            let (name, name_span) = self.parse_ident("state binding name")?;
+            self.expect(|k| matches!(k, TokenKind::Colon), "`:`")?;
+            let ty = self.parse_type()?;
+            let init = if matches!(self.peek().kind, TokenKind::Eq) {
+                self.bump();
+                Some(self.parse_expr(false, false, false)?)
+            } else {
+                None
+            };
+            self.expect_semi("after `state` binding")?;
+            let end = self.prev_span();
+            bindings.push(StateBinding {
+                name,
+                name_span,
+                ty,
+                init,
+                span: name_span.merge(end),
+            });
+        }
+        self.expect_close(open, &TokenKind::RBrace, "{")?;
+        let span = start.merge(self.prev_span());
+        Ok(Item {
+            kind: ItemKind::State(StateDecl {
+                bindings,
+                span,
+                annotations,
+            }),
+            span,
+            file: None,
+        })
+    }
+
+    /// Parse a top-level `migrate fn ...` item after the `migrate`
+    /// identifier. The migration target comes from the parameter
+    /// type (checked later); the name rides along for diagnostics.
+    fn parse_migrate_item(&mut self, start: Span, annotations: Vec<Annotation>) -> PResult<Item> {
+        self.bump(); // migrate
+        let mut func = self.parse_fn()?;
+        func.annotations = annotations;
+        let span = start.merge(self.prev_span());
+        Ok(Item {
+            kind: ItemKind::Migrate(MigrateDecl {
+                annotations: func.annotations.clone(),
+                func,
+                span,
+            }),
+            span,
+            file: None,
+        })
+    }
+
     fn parse_type(&mut self) -> PResult<Type> {
         let start = self.peek().span;
         // C pointer type `*T` (Phase 5, Stage 3): right-associative, so
@@ -963,6 +1048,45 @@ impl Parser<'_> {
     /// unless it is immediately followed by `}`, when it is the tail.
     fn parse_stmt(&mut self) -> PResult<StmtOut> {
         let start = self.peek().span;
+        // Placement errors (spec amendment, Phase 6): `state {` and
+        // `migrate fn` inside a function body are never valid items.
+        // A struct literal named `state` still parses as an
+        // expression, so the `state` error only fires when the brace
+        // cannot open one (`{}` and `{ Ident :` shapes are left to
+        // expression parsing, mirroring `parse_primary`).
+        if let TokenKind::Ident(name) = self.peek().kind.clone() {
+            let next = self.toks.get(self.pos + 1).map(|t| t.kind.clone());
+            if name == "state" && matches!(next, Some(TokenKind::LBrace)) {
+                let after = self.toks.get(self.pos + 2).map(|t| t.kind.clone());
+                let after2 = self.toks.get(self.pos + 3).map(|t| t.kind.clone());
+                let struct_shaped = matches!(after, Some(TokenKind::RBrace))
+                    || matches!(
+                        (after, after2),
+                        (Some(TokenKind::Ident(_)), Some(TokenKind::Colon))
+                    );
+                if !struct_shaped {
+                    self.error(
+                        "E0101",
+                        "`state` blocks are top-level items only (this one is inside a function body)".to_string(),
+                        start,
+                        Some("move the `state { ... }` block to the top level".to_string()),
+                    );
+                    self.sync_stmt();
+                    return Err(());
+                }
+            }
+            if name == "migrate" && matches!(next, Some(TokenKind::Fn)) {
+                self.error(
+                    "E0101",
+                    "`migrate` items are top-level only (this one is inside a function body)"
+                        .to_string(),
+                    start,
+                    Some("move the `migrate fn ...` item to the top level".to_string()),
+                );
+                self.sync_stmt();
+                return Err(());
+            }
+        }
         match self.peek().kind.clone() {
             TokenKind::Let => {
                 self.bump();

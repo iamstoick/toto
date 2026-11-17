@@ -2,13 +2,14 @@
 //! enforces the spec's type rules, and emits typed HIR. `toto run` checks
 //! before interpreting; a program with type errors never executes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinOp, Block, Expr, ExternFn, Program, Stmt, Type, TypeKind, UnOp};
 use crate::diag::Diag;
 use crate::hir::{
     CheckedProgram, FnSig, HAssignTarget, HBlock, HExpr, HExprKind, HExternBlock, HExternFn, HFn,
-    HItem, HItemKind, HProgram, HSelectCase, HStmt, HStmtKind, HStructDecl, Ty, VarRef,
+    HItem, HItemKind, HMigrate, HProgram, HSelectCase, HStateBinding, HStmt, HStmtKind,
+    HStructDecl, Ty, VarRef,
 };
 use crate::span::Span;
 
@@ -45,6 +46,27 @@ pub struct Checker {
     /// Origin file of the item currently being checked (multi-file
     /// programs); stamped onto every diagnostic. `None` for single file.
     current_file: Option<String>,
+    /// Declared program state, in source order (spec amendment,
+    /// Phase 6). Slots are assigned in this order everywhere.
+    state: Vec<HStateBinding>,
+    /// State binding name → slot (declaration order). Grows as
+    /// initializers check, so a forward reference is simply absent.
+    state_index: HashMap<String, usize>,
+    /// Migration functions by target struct (at most one per struct).
+    migrates: Vec<HMigrate>,
+    /// Target structs with a migrate item (duplicate = E0324).
+    migrate_for: HashSet<String>,
+    /// Migrate function names (value namespace, never callable:
+    /// any reference is E0325). Pre-scanned before state binding
+    /// registration so order never matters.
+    migrate_names: HashSet<String>,
+    /// A `state {}` block was already accepted (a second is E0316).
+    saw_state_block: bool,
+    /// Inside a state initializer: an otherwise-unresolvable name
+    /// that names a later state binding is E0319, not E0301.
+    in_state_init: bool,
+    /// All binding names of the block being initialized (E0319 set).
+    state_init_names: HashSet<String>,
 }
 
 impl Checker {
@@ -60,6 +82,14 @@ impl Checker {
             go_stack: Vec::new(),
             uses_concurrency: false,
             current_file: None,
+            state: Vec::new(),
+            state_index: HashMap::new(),
+            migrates: Vec::new(),
+            migrate_for: HashSet::new(),
+            migrate_names: HashSet::new(),
+            saw_state_block: false,
+            in_state_init: false,
+            state_init_names: HashSet::new(),
         }
     }
 
@@ -502,6 +532,20 @@ impl Checker {
                 // Named functions are immutable code: safe to share.
                 Ok(())
             }
+            HExprKind::Var(name, VarRef::State { .. }) => {
+                // Reads alias the shared cell, exactly like a
+                // field/index read on shared state: only deeply
+                // immutable values may cross.
+                self.error(
+                    "E0314",
+                    format!(
+                        "cannot send shared mutable state `{name}`; only deeply immutable values can be sent"
+                    ),
+                    span,
+                    None,
+                );
+                Err(())
+            }
             HExprKind::Call { .. }
             | HExprKind::CallBuiltin { .. }
             | HExprKind::StructLit { .. }
@@ -534,6 +578,8 @@ impl Checker {
     }
 
     fn lookup(&self, name: &str) -> Option<(Ty, VarRef)> {
+        // Lexical bindings first: a local shadows state of the same
+        // name (spec §3.2), exactly like any other shadowing.
         for scope in self.scopes.iter().rev() {
             if let Some(b) = scope.get(name) {
                 return Some((
@@ -545,6 +591,16 @@ impl Checker {
                     },
                 ));
             }
+        }
+        // Then declared state (spec amendment, Phase 6): shared
+        // mutable cells, never captures.
+        if let Some(&slot) = self.state_index.get(name) {
+            return Some((
+                self.state[slot].ty.clone(),
+                VarRef::State {
+                    name: name.to_string(),
+                },
+            ));
         }
         None
     }
@@ -862,6 +918,114 @@ pub fn check_with_files(
             }
         }
     }
+    // Pass 1d: migrate names first (value namespace, order-free),
+    // then declared state (spec amendment, Phase 6).
+    for item in &program.items {
+        c.current_file = item.file.clone();
+        if let crate::ast::ItemKind::Migrate(decl) = &item.kind {
+            if c.fn_index.contains_key(&decl.func.name)
+                || c.externs.contains_key(&decl.func.name)
+                || c.migrate_names.contains(&decl.func.name)
+            {
+                c.error(
+                    "E0311",
+                    format!("duplicate definition of function `{}`", decl.func.name),
+                    decl.func.name_span,
+                    None,
+                );
+            } else {
+                c.migrate_names.insert(decl.func.name.clone());
+            }
+        }
+    }
+    for item in &program.items {
+        c.current_file = item.file.clone();
+        if let crate::ast::ItemKind::State(decl) = &item.kind {
+            if c.saw_state_block {
+                c.error(
+                    "E0316",
+                    "only one `state {}` block is allowed per program".to_string(),
+                    decl.span,
+                    Some("merge the bindings into a single block".to_string()),
+                );
+                continue;
+            }
+            c.saw_state_block = true;
+            for b in &decl.bindings {
+                if c.fn_index.contains_key(&b.name)
+                    || c.externs.contains_key(&b.name)
+                    || c.state_index.contains_key(&b.name)
+                    || c.migrate_names.contains(&b.name)
+                {
+                    c.error(
+                        "E0311",
+                        format!("duplicate definition of state `{}`", b.name),
+                        b.name_span,
+                        None,
+                    );
+                    continue;
+                }
+                let ty = match c.resolve_ty(&b.ty) {
+                    Ok(ty) => ty,
+                    Err(()) => continue,
+                };
+                let is_chan = matches!(ty, Ty::Chan(_));
+                match (&b.init, is_chan) {
+                    (None, false) => {
+                        c.error(
+                            "E0317",
+                            format!("state binding `{}` needs an initializer", b.name),
+                            b.name_span,
+                            Some("add `= <expr>;`, or declare a channel binding".to_string()),
+                        );
+                        continue;
+                    }
+                    (Some(_), true) => {
+                        c.error(
+                            "E0318",
+                            format!(
+                                "channel state binding `{}` must be bare (`{}: chan<T>;`)",
+                                b.name, b.name
+                            ),
+                            b.name_span,
+                            None,
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
+                if is_chan {
+                    c.uses_concurrency = true;
+                }
+                // Initializers check here (not in pass 2), BEFORE the
+                // binding registers: the index grows binding-by-binding,
+                // so only earlier bindings resolve — a forward or
+                // self reference is simply absent (E0319). Function
+                // bodies check later, when all slots exist.
+                let mut init = None;
+                if let Some(init_ast) = &b.init {
+                    c.state_init_names = decl.bindings.iter().map(|x| x.name.clone()).collect();
+                    c.in_state_init = true;
+                    let checked = c.check_expr(init_ast, Some(&ty), &Ty::Unit);
+                    c.in_state_init = false;
+                    if let Ok(h) = checked
+                        && c.reject_banned_init(&h, &b.name)
+                    {
+                        init = Some(h);
+                    }
+                    c.state_init_names.clear();
+                }
+                let slot = c.state.len();
+                c.state_index.insert(b.name.clone(), slot);
+                c.state.push(HStateBinding {
+                    name: b.name.clone(),
+                    ty,
+                    init,
+                    span: b.span,
+                });
+            }
+        }
+    }
     // Pass 2: bodies.
     let mut hitems = Vec::new();
     for item in &program.items {
@@ -916,6 +1080,14 @@ pub fn check_with_files(
                     None,
                 );
             }
+            crate::ast::ItemKind::State(_) => {
+                // Fully checked in pass 1d (namespace, shapes, and
+                // initializers in declaration order). Nothing per-body
+                // remains: state has no bodies.
+            }
+            crate::ast::ItemKind::Migrate(decl) => {
+                c.check_migrate(decl);
+            }
         }
     }
     // Entry point checks. (Cloned: the checks below borrow `c` mutably.)
@@ -958,6 +1130,8 @@ pub fn check_with_files(
             structs: c.structs,
             externs: c.externs,
             uses_concurrency: c.uses_concurrency,
+            state: c.state,
+            migrates: c.migrates,
         };
         (Some(checked), Vec::new())
     } else {
@@ -1003,6 +1177,596 @@ impl Checker {
             body,
             span: decl.name_span,
         })
+    }
+
+    /// Check a `migrate fn` item (spec amendment, Phase 6): exactly one
+    /// parameter of struct type `S`, return type `S`, at most one
+    /// migrate per struct, then the determinism and totality rules.
+    /// The body checks like an ordinary function body (state is
+    /// visible, so the determinism walk must reject it explicitly).
+    fn check_migrate(&mut self, decl: &crate::ast::MigrateDecl) {
+        let func = &decl.func;
+        if func.params.len() != 1 {
+            self.error(
+                "E0321",
+                format!(
+                    "migrate `{}` must declare exactly one parameter, found {}",
+                    func.name,
+                    func.params.len()
+                ),
+                decl.span,
+                Some("write `migrate fn S(old: S) -> S { ... }`".to_string()),
+            );
+            return;
+        }
+        let p = &func.params[0];
+        let pty = match self.resolve_ty(&p.ty) {
+            Ok(t) => t,
+            Err(()) => return,
+        };
+        let target = match &pty {
+            Ty::Struct(s) => s.clone(),
+            _ => {
+                self.error(
+                    "E0322",
+                    format!(
+                        "migrate `{}` parameter must be a struct type, found {}",
+                        func.name, pty
+                    ),
+                    p.name_span,
+                    None,
+                );
+                return;
+            }
+        };
+        let ret = match self.resolve_ty(&func.ret) {
+            Ok(t) => t,
+            Err(()) => return,
+        };
+        if ret != pty {
+            self.error(
+                "E0323",
+                format!("migrate `{target}` must return `{target}`, found {ret}"),
+                decl.span,
+                None,
+            );
+            return;
+        }
+        if self.migrate_for.contains(&target) {
+            self.error(
+                "E0324",
+                format!("duplicate migrate for struct `{target}`"),
+                decl.span,
+                Some("at most one migrate function per struct".to_string()),
+            );
+            return;
+        }
+        let sig = FnSig {
+            name: func.name.clone(),
+            params: vec![(p.name.clone(), pty, p.is_mut)],
+            ret,
+            // Never called by index: migrate functions run at reload,
+            // never through dispatch. No table owns this slot.
+            idx: usize::MAX,
+        };
+        let hfun = match self.check_fn(func, &sig) {
+            Ok(h) => h,
+            Err(()) => return,
+        };
+        if !self.check_migrate_determinism(&hfun.body, &target) {
+            return;
+        }
+        if !self.check_migrate_totality(&hfun.body, &target, &p.name) {
+            return;
+        }
+        self.migrate_for.insert(target.clone());
+        self.migrates.push(HMigrate {
+            target,
+            param: p.name.clone(),
+            body: hfun.body,
+            span: decl.span,
+        });
+    }
+
+    /// Determinism rules for migrate bodies (spec amendment, Phase 6):
+    /// no user calls, no IO builtins, no foreign calls, no channels,
+    /// no tasks, no state access. (`?` needs no ban: with a struct
+    /// return type it already fails as E0308.) Returns false after
+    /// the first violation (one error per body).
+    fn check_migrate_determinism(&mut self, body: &HBlock, target: &str) -> bool {
+        // Free recursion below (borrows the checker only for the
+        // final error, so no self-borrow through a walker struct).
+        fn banned(
+            c: &mut Checker,
+            body: &HBlock,
+            target: &str,
+            what: &mut Option<(String, Span, Option<String>)>,
+        ) -> bool {
+            for stmt in &body.stmts {
+                if !banned_stmt(c, stmt, target, what) {
+                    return false;
+                }
+            }
+            if let Some(tail) = &body.tail {
+                return banned_expr(c, tail, target, what);
+            }
+            true
+        }
+        fn banned_stmt(
+            c: &mut Checker,
+            stmt: &HStmt,
+            target: &str,
+            what: &mut Option<(String, Span, Option<String>)>,
+        ) -> bool {
+            match &stmt.kind {
+                HStmtKind::Let { value, .. } => banned_expr(c, value, target, what),
+                HStmtKind::Assign {
+                    target: place,
+                    value,
+                } => {
+                    if let HAssignTarget::Var(name, VarRef::State { .. }, _) = place {
+                        *what = Some((
+                            format!("migrate `{target}` cannot assign declared state `{name}`"),
+                            stmt.span,
+                            Some("migration input is only the old struct value".to_string()),
+                        ));
+                        return false;
+                    }
+                    banned_expr(c, value, target, what)
+                }
+                HStmtKind::Expr(e) | HStmtKind::Return(e) => banned_expr(c, e, target, what),
+                HStmtKind::Break | HStmtKind::Continue => true,
+                HStmtKind::While { cond, body } => {
+                    banned_expr(c, cond, target, what) && banned(c, body, target, what)
+                }
+                HStmtKind::For { iter, body, .. } => {
+                    banned_expr(c, iter, target, what) && banned(c, body, target, what)
+                }
+                HStmtKind::Go { .. } => {
+                    *what = Some((
+                        format!("migrate `{target}` cannot spawn tasks"),
+                        stmt.span,
+                        None,
+                    ));
+                    false
+                }
+                HStmtKind::Select { .. } => {
+                    *what = Some((
+                        format!("migrate `{target}` cannot use `select`"),
+                        stmt.span,
+                        None,
+                    ));
+                    false
+                }
+            }
+        }
+        fn banned_expr(
+            c: &mut Checker,
+            e: &HExpr,
+            target: &str,
+            what: &mut Option<(String, Span, Option<String>)>,
+        ) -> bool {
+            match &e.kind {
+                HExprKind::Call { .. } => {
+                    *what = Some((
+                        format!("migrate `{target}` cannot call user functions"),
+                        e.span,
+                        Some(
+                            "migrations must be closed expressions over the old value".to_string(),
+                        ),
+                    ));
+                    false
+                }
+                HExprKind::CallBuiltin { name, args } => {
+                    const IO: &[&str] = &[
+                        "print",
+                        "println",
+                        "read_file",
+                        "write_file",
+                        "file_exists",
+                        "chan",
+                        "close",
+                        "closed",
+                    ];
+                    if IO.contains(&name.as_str()) {
+                        *what = Some((
+                            format!("migrate `{target}` cannot call `{name}`"),
+                            e.span,
+                            Some("migrations must be pure: no IO, no channels".to_string()),
+                        ));
+                        return false;
+                    }
+                    args.iter().all(|a| banned_expr(c, a, target, what))
+                }
+                HExprKind::CallForeign { name, .. } => {
+                    *what = Some((
+                        format!("migrate `{target}` cannot call foreign function `{name}`"),
+                        e.span,
+                        None,
+                    ));
+                    false
+                }
+                HExprKind::Send { .. } | HExprKind::Recv { .. } | HExprKind::ChanNew { .. } => {
+                    *what = Some((
+                        format!("migrate `{target}` cannot use channels"),
+                        e.span,
+                        None,
+                    ));
+                    false
+                }
+                HExprKind::Var(name, VarRef::State { .. }) => {
+                    *what = Some((
+                        format!("migrate `{target}` cannot reference declared state `{name}`"),
+                        e.span,
+                        Some("migration input is only the old struct value".to_string()),
+                    ));
+                    false
+                }
+                // Backstop: `?` already fails type checking here
+                // (E0308 — struct return, nothing to propagate into),
+                // so HIR cannot contain it; ban loudly if it ever does.
+                HExprKind::Question { .. } => {
+                    *what = Some((
+                        format!("migrate `{target}` cannot use `?`"),
+                        e.span,
+                        Some("nothing to propagate into: return the struct".to_string()),
+                    ));
+                    false
+                }
+                HExprKind::If {
+                    cond,
+                    then_b,
+                    else_b,
+                } => {
+                    banned_expr(c, cond, target, what)
+                        && banned(c, then_b, target, what)
+                        && else_b.as_ref().is_none_or(|b| banned(c, b, target, what))
+                }
+                HExprKind::Closure { body, .. } => banned(c, body, target, what),
+                HExprKind::StructLit { fields, .. } => fields
+                    .iter()
+                    .all(|(_, v, _)| banned_expr(c, v, target, what)),
+                HExprKind::Array(es) => es.iter().all(|v| banned_expr(c, v, target, what)),
+                HExprKind::Range(a, b) => {
+                    banned_expr(c, a, target, what) && banned_expr(c, b, target, what)
+                }
+                HExprKind::Binary { left, right, .. } => {
+                    banned_expr(c, left, target, what) && banned_expr(c, right, target, what)
+                }
+                HExprKind::Unary { expr, .. } => banned_expr(c, expr, target, what),
+                HExprKind::Field { base, .. } => banned_expr(c, base, target, what),
+                HExprKind::Index { base, index, .. } => {
+                    banned_expr(c, base, target, what) && banned_expr(c, index, target, what)
+                }
+                HExprKind::Ok(e) | HExprKind::Err(e) | HExprKind::Some(e) => {
+                    banned_expr(c, e, target, what)
+                }
+                HExprKind::Var(..)
+                | HExprKind::Int(..)
+                | HExprKind::Float(..)
+                | HExprKind::Str(..)
+                | HExprKind::Bool(..)
+                | HExprKind::Unit
+                | HExprKind::None => true,
+            }
+        }
+        let mut what = None;
+        let ok = banned(self, body, target, &mut what);
+        if let Some((message, span, help)) = what {
+            self.error("E0325", message, span, help);
+        }
+        ok
+    }
+
+    /// Totality over the target's CURRENT field set (spec amendment,
+    /// Phase 6): every field of `S` must be read from the parameter
+    /// (reload time re-checks against the old generation). Returning
+    /// the parameter itself is trivially total.
+    fn check_migrate_totality(&mut self, body: &HBlock, target: &str, param: &str) -> bool {
+        fn is_param(e: &HExpr, param: &str) -> bool {
+            matches!(&e.kind, HExprKind::Var(n, VarRef::Local { depth: 0, .. }) if n == param)
+        }
+        // Identity: the body is exactly `return old;` or a trailing
+        // `old` expression.
+        if body.stmts.len() == 1
+            && body.tail.is_none()
+            && let HStmtKind::Return(e) = &body.stmts[0].kind
+            && is_param(e, param)
+        {
+            return true;
+        }
+        if body.stmts.is_empty()
+            && let Some(tail) = &body.tail
+            && is_param(tail, param)
+        {
+            return true;
+        }
+        fn collect(e: &HExpr, param: &str, read: &mut HashSet<String>) {
+            match &e.kind {
+                HExprKind::Field { base, name } => {
+                    if is_param(base, param) {
+                        read.insert(name.clone());
+                    }
+                    collect(base, param, read);
+                }
+                HExprKind::If {
+                    cond,
+                    then_b,
+                    else_b,
+                } => {
+                    collect(cond, param, read);
+                    collect_block(then_b, param, read);
+                    if let Some(b) = else_b {
+                        collect_block(b, param, read);
+                    }
+                }
+                HExprKind::Closure { body, .. } => collect_block(body, param, read),
+                HExprKind::StructLit { fields, .. } => {
+                    for (_, v, _) in fields {
+                        collect(v, param, read);
+                    }
+                }
+                HExprKind::Array(es) => {
+                    for v in es {
+                        collect(v, param, read);
+                    }
+                }
+                HExprKind::Range(a, b) => {
+                    collect(a, param, read);
+                    collect(b, param, read);
+                }
+                HExprKind::Binary { left, right, .. } => {
+                    collect(left, param, read);
+                    collect(right, param, read);
+                }
+                HExprKind::Unary { expr, .. } => collect(expr, param, read),
+                HExprKind::Index { base, index, .. } => {
+                    collect(base, param, read);
+                    collect(index, param, read);
+                }
+                HExprKind::Call { callee, args } => {
+                    collect(callee, param, read);
+                    for a in args {
+                        collect(a, param, read);
+                    }
+                }
+                HExprKind::CallBuiltin { args, .. } | HExprKind::CallForeign { args, .. } => {
+                    for a in args {
+                        collect(a, param, read);
+                    }
+                }
+                HExprKind::Ok(e) | HExprKind::Err(e) | HExprKind::Some(e) => {
+                    collect(e, param, read)
+                }
+                HExprKind::Var(..)
+                | HExprKind::Int(..)
+                | HExprKind::Float(..)
+                | HExprKind::Str(..)
+                | HExprKind::Bool(..)
+                | HExprKind::Unit
+                | HExprKind::None
+                | HExprKind::Send { .. }
+                | HExprKind::Recv { .. }
+                | HExprKind::ChanNew { .. }
+                | HExprKind::Question { .. } => {}
+            }
+        }
+        fn collect_block(b: &HBlock, param: &str, read: &mut HashSet<String>) {
+            for stmt in &b.stmts {
+                match &stmt.kind {
+                    HStmtKind::Let { value, .. } => collect(value, param, read),
+                    HStmtKind::Assign { target, value } => {
+                        match target {
+                            HAssignTarget::Field(base, _, _) | HAssignTarget::Index(base, _, _) => {
+                                collect(base, param, read)
+                            }
+                            HAssignTarget::Var(..) => {}
+                        }
+                        collect(value, param, read);
+                    }
+                    HStmtKind::Expr(e) | HStmtKind::Return(e) => collect(e, param, read),
+                    HStmtKind::Break | HStmtKind::Continue => {}
+                    HStmtKind::While { cond, body } => {
+                        collect(cond, param, read);
+                        collect_block(body, param, read);
+                    }
+                    HStmtKind::For { iter, body, .. } => {
+                        collect(iter, param, read);
+                        collect_block(body, param, read);
+                    }
+                    HStmtKind::Go { body, .. } => collect_block(body, param, read),
+                    HStmtKind::Select { cases, default } => {
+                        for case in cases {
+                            match case {
+                                HSelectCase::Recv { chan, body, .. } => {
+                                    collect(chan, param, read);
+                                    collect_block(body, param, read);
+                                }
+                                HSelectCase::Send { chan, value, body } => {
+                                    collect(chan, param, read);
+                                    collect(value, param, read);
+                                    collect_block(body, param, read);
+                                }
+                            }
+                        }
+                        if let Some(b) = default {
+                            collect_block(b, param, read);
+                        }
+                    }
+                }
+            }
+            if let Some(tail) = &b.tail {
+                collect(tail, param, read);
+            }
+        }
+        let mut read = HashSet::new();
+        collect_block(body, param, &mut read);
+        let Some(decl) = self.structs.get(target) else {
+            // Unreachable: the parameter type resolved to this struct.
+            return true;
+        };
+        let decl = decl.clone();
+        for (field, _) in &decl.fields {
+            if !read.contains(field) {
+                self.error(
+                    "E0326",
+                    format!("migrate `{target}` never reads field `{field}`"),
+                    body.span,
+                    Some(
+                        "totality: read every field of the old value, or return it directly"
+                            .to_string(),
+                    ),
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Reject banned constructs in a state initializer (spec amendment,
+    /// Phase 6): user-function calls (the callee's view of state is
+    /// unordered at load) and anything that can block before `main`
+    /// runs (`<-`, `ch <- v`, task spawn). (`?` needs no ban: with no
+    /// enclosing function it already fails as E0308.) Channel
+    /// construction is allowed but routes the program to the runtime
+    /// executor. Returns false after emitting the diagnostic.
+    fn reject_banned_init(&mut self, h: &HExpr, binding: &str) -> bool {
+        fn walk(
+            c: &mut Checker,
+            e: &HExpr,
+            binding: &str,
+            what: &mut Option<(String, Span)>,
+        ) -> bool {
+            match &e.kind {
+                HExprKind::Call { .. } => {
+                    *what = Some((
+                        format!("state initializer for `{binding}` cannot call user functions"),
+                        e.span,
+                    ));
+                    false
+                }
+                HExprKind::Send { .. } | HExprKind::Recv { .. } => {
+                    *what = Some((
+                        format!("state initializer for `{binding}` cannot block on channels"),
+                        e.span,
+                    ));
+                    false
+                }
+                HExprKind::ChanNew { .. } => {
+                    c.uses_concurrency = true;
+                    true
+                }
+                // Backstop: `?` already fails type checking here
+                // (E0308 — no enclosing function), so HIR cannot
+                // contain it; ban loudly if it ever does.
+                HExprKind::Question { .. } => {
+                    *what = Some((
+                        format!("state initializer for `{binding}` cannot use `?`"),
+                        e.span,
+                    ));
+                    false
+                }
+                HExprKind::If {
+                    cond,
+                    then_b,
+                    else_b,
+                } => {
+                    walk(c, cond, binding, what)
+                        && walk_block(c, then_b, binding, what)
+                        && else_b
+                            .as_ref()
+                            .is_none_or(|b| walk_block(c, b, binding, what))
+                }
+                HExprKind::Closure { body, .. } => walk_block(c, body, binding, what),
+                HExprKind::StructLit { fields, .. } => {
+                    fields.iter().all(|(_, v, _)| walk(c, v, binding, what))
+                }
+                HExprKind::Array(es) => es.iter().all(|v| walk(c, v, binding, what)),
+                HExprKind::Range(a, b) => walk(c, a, binding, what) && walk(c, b, binding, what),
+                HExprKind::Binary { left, right, .. } => {
+                    walk(c, left, binding, what) && walk(c, right, binding, what)
+                }
+                HExprKind::Unary { expr, .. } => walk(c, expr, binding, what),
+                HExprKind::Field { base, .. } => walk(c, base, binding, what),
+                HExprKind::Index { base, index, .. } => {
+                    walk(c, base, binding, what) && walk(c, index, binding, what)
+                }
+                HExprKind::CallBuiltin { args, .. } | HExprKind::CallForeign { args, .. } => {
+                    args.iter().all(|a| walk(c, a, binding, what))
+                }
+                HExprKind::Ok(e) | HExprKind::Err(e) | HExprKind::Some(e) => {
+                    walk(c, e, binding, what)
+                }
+                HExprKind::Var(..)
+                | HExprKind::Int(..)
+                | HExprKind::Float(..)
+                | HExprKind::Str(..)
+                | HExprKind::Bool(..)
+                | HExprKind::Unit
+                | HExprKind::None => true,
+            }
+        }
+        fn walk_block(
+            c: &mut Checker,
+            b: &HBlock,
+            binding: &str,
+            what: &mut Option<(String, Span)>,
+        ) -> bool {
+            for stmt in &b.stmts {
+                let ok = match &stmt.kind {
+                    HStmtKind::Let { value, .. } => walk(c, value, binding, what),
+                    HStmtKind::Assign { target, value } => {
+                        let base_ok = match target {
+                            HAssignTarget::Field(base, _, _) | HAssignTarget::Index(base, _, _) => {
+                                walk(c, base, binding, what)
+                            }
+                            HAssignTarget::Var(..) => true,
+                        };
+                        base_ok && walk(c, value, binding, what)
+                    }
+                    HStmtKind::Expr(e) | HStmtKind::Return(e) => walk(c, e, binding, what),
+                    HStmtKind::Break | HStmtKind::Continue => true,
+                    HStmtKind::While { cond, body } => {
+                        walk(c, cond, binding, what) && walk_block(c, body, binding, what)
+                    }
+                    HStmtKind::For { iter, body, .. } => {
+                        walk(c, iter, binding, what) && walk_block(c, body, binding, what)
+                    }
+                    HStmtKind::Go { .. } => {
+                        *what = Some((
+                            format!("state initializer for `{binding}` cannot spawn tasks"),
+                            stmt.span,
+                        ));
+                        false
+                    }
+                    HStmtKind::Select { .. } => {
+                        *what = Some((
+                            format!("state initializer for `{binding}` cannot use `select`"),
+                            stmt.span,
+                        ));
+                        false
+                    }
+                };
+                if !ok {
+                    return false;
+                }
+            }
+            if let Some(tail) = &b.tail {
+                return walk(c, tail, binding, what);
+            }
+            true
+        }
+        let mut what = None;
+        let ok = walk(self, h, binding, &mut what);
+        if let Some((message, span)) = what {
+            self.error(
+                "E0320",
+                message,
+                span,
+                Some("initializers run once at load, before `main`".to_string()),
+            );
+        }
+        ok
     }
 
     fn push_scope(&mut self) {
@@ -1818,6 +2582,17 @@ impl Checker {
         if let Some((ty, varref)) = self.lookup(name) {
             return Ok((ty, varref));
         }
+        // Migrate functions are reload-time only: referencing one as a
+        // value or calling it is never valid (spec amendment, Phase 6).
+        if self.migrate_names.contains(name) {
+            self.error(
+                "E0325",
+                format!("migrate function `{name}` cannot be referenced or called directly"),
+                span,
+                Some("migrate functions run at reload, never as ordinary calls".to_string()),
+            );
+            return Err(());
+        }
         if let Some(&idx) = self.fn_index.get(name) {
             let sig = &self.fns[idx];
             return Ok((
@@ -1837,6 +2612,21 @@ impl Checker {
                 format!("builtin `{name}` is not a first-class value (call it directly)"),
                 span,
                 None,
+            );
+            return Err(());
+        }
+        // In a state initializer, a name bound later in the same block
+        // is a forward reference (initializers run in declaration
+        // order), not an undefined variable.
+        if self.in_state_init && self.state_init_names.contains(name) {
+            self.error(
+                "E0319",
+                format!("state binding `{name}` is used before its declaration"),
+                span,
+                Some(
+                    "state initializers run in declaration order; move the binding earlier"
+                        .to_string(),
+                ),
             );
             return Err(());
         }
@@ -2466,7 +3256,8 @@ impl Checker {
         }
     }
 
-    /// Resolve an assignment place: must be a mutable local or parameter.
+    /// Resolve an assignment place: must be a mutable local, parameter,
+    /// or declared-state cell (state is implicitly mutable).
     fn resolve_place(&mut self, name: &str, span: Span) -> CResult<(Ty, VarRef)> {
         for scope in self.scopes.iter().rev() {
             if let Some(b) = scope.get(name) {
@@ -2488,6 +3279,15 @@ impl Checker {
                     },
                 ));
             }
+        }
+        // Declared state is always a valid (mutable) place.
+        if let Some(&slot) = self.state_index.get(name) {
+            return Ok((
+                self.state[slot].ty.clone(),
+                VarRef::State {
+                    name: name.to_string(),
+                },
+            ));
         }
         // Parameters live in the outermost scope and are covered above.
         // Functions and builtins are not assignable places.

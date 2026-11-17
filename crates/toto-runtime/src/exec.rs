@@ -1080,6 +1080,37 @@ impl<'a> Executor<'a> {
             MInstr::Safepoint { .. } => {
                 self.maybe_collect();
             }
+            MInstr::StateGet { dst, slot, span } => {
+                // Declared-state read (spec amendment, Phase 6): the
+                // cell vector lives in shared state (one per run, all
+                // tasks see the same cells). Initialization is
+                // ordinary MIR in `main`, so an unset slot is a
+                // compiler bug, never a user error.
+                let v = match self
+                    .shared
+                    .state
+                    .lock()
+                    .expect("shared state lock")
+                    .state_vars
+                    .get(slot as usize)
+                    .cloned()
+                {
+                    Some(v) => v,
+                    None => {
+                        return Err(self.internal("state slot never initialized", span));
+                    }
+                };
+                self.frames[top].locals[dst] = v;
+            }
+            MInstr::StateSet { slot, src, span } => {
+                let _ = span;
+                let v = self.frames[top].locals[src].clone();
+                let mut st = self.shared.state.lock().expect("shared state lock");
+                if st.state_vars.len() <= slot as usize {
+                    st.state_vars.resize(slot as usize + 1, RtVal::Unit);
+                }
+                st.state_vars[slot as usize] = v;
+            }
             MInstr::ChanNew {
                 dst,
                 elem,

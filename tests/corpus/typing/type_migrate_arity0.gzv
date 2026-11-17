@@ -1,0 +1,12 @@
+struct S {
+    v: int,
+}
+
+migrate fn S() -> S {
+    return S { v: 0 };
+}
+
+fn main() -> int {
+    println(0);
+    return 0;
+}

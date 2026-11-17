@@ -1,0 +1,8 @@
+migrate fn N(old: int) -> int {
+    return old;
+}
+
+fn main() -> int {
+    println(0);
+    return 0;
+}

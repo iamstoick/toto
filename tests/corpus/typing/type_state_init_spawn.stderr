@@ -1,0 +1,5 @@
+error[E0320]: state initializer for `run` cannot spawn tasks
+ --> type_state_init_spawn.gzv:3:38
+  |
+3 |     run: fn() -> int = fn() -> int { go { started = 1; } return 0; };
+  |                                      ^^^^^^^^^^^^^^^^^^^ help: initializers run once at load, before `main`

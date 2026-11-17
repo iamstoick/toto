@@ -1,0 +1,5 @@
+error[E0323]: migrate `S` must return `S`, found int
+ --> type_migrate_ret_mismatch.gzv:5:1
+  |
+5 | migrate fn S(old: S) -> int {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,9 @@
+state {
+    started: int = 0;
+    run: fn() -> int = fn() -> int { go { started = 1; } return 0; };
+}
+
+fn main() -> int {
+    println(started);
+    return 0;
+}

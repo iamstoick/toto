@@ -1,0 +1,5 @@
+error[E0321]: migrate `S` must declare exactly one parameter, found 2
+ --> type_migrate_arity2.gzv:5:1
+  |
+5 | migrate fn S(a: S, b: S) -> S {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: write `migrate fn S(old: S) -> S { ... }`

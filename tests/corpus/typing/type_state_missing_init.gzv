@@ -1,0 +1,8 @@
+state {
+    bare: int;
+}
+
+fn main() -> int {
+    println(0);
+    return 0;
+}

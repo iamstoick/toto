@@ -710,6 +710,9 @@ enum Target {
     /// Foreign function: signature text (extern blocks have no
     /// per-name spans worth jumping to beyond the block).
     Extern(String, Span),
+    /// Declared-state binding (spec amendment, Phase 6): file
+    /// display path + binding name span.
+    State(String, Span),
     /// Frozen builtin: static documentation.
     Builtin,
 }
@@ -794,6 +797,25 @@ fn resolve_at(doc: &OpenDoc, line: u64, character: u64) -> Option<Resolved> {
             }
         }
         ItemKind::Import(_) => {}
+        ItemKind::State(decl) => {
+            for b in &decl.bindings {
+                if span_contains(&b.name_span, off) {
+                    return Some(Resolved {
+                        hover: format!("state {}: {}", b.name, ty_text(&b.ty)),
+                        target: Some(Target::State(doc_display(cx.doc), b.name_span)),
+                    });
+                }
+            }
+        }
+        ItemKind::Migrate(decl) => {
+            if span_contains(&decl.func.name_span, off) {
+                let sig = fn_sig_text(&decl.func.name, &decl.func.params, &decl.func.ret);
+                return Some(Resolved {
+                    hover: format!("migrate {sig}"),
+                    target: Some(Target::Func(doc_display(cx.doc), fn_name_span(&decl.func))),
+                });
+            }
+        }
     }
     None
 }
@@ -1160,6 +1182,23 @@ fn resolve_global(program: &Program, name: &str, cx: &Cx) -> Option<Resolved> {
                     }
                 }
             }
+            ItemKind::State(decl) => {
+                for b in &decl.bindings {
+                    if b.name == name {
+                        return Some(Resolved {
+                            hover: format!("state {}: {}", b.name, ty_text(&b.ty)),
+                            target: Some(Target::State(doc_display(cx.doc), b.name_span)),
+                        });
+                    }
+                }
+            }
+            ItemKind::Migrate(decl) if decl.func.name == name => {
+                let sig = fn_sig_text(&decl.func.name, &decl.func.params, &decl.func.ret);
+                return Some(Resolved {
+                    hover: format!("migrate {sig}"),
+                    target: Some(Target::Func(doc_display(cx.doc), fn_name_span(&decl.func))),
+                });
+            }
             _ => {}
         }
     }
@@ -1181,6 +1220,23 @@ fn resolve_global(program: &Program, name: &str, cx: &Cx) -> Option<Resolved> {
                     return Some(Resolved {
                         hover: format!("struct {}", d.name),
                         target: Some(Target::Struct(path.clone(), d.name_span)),
+                    });
+                }
+                ItemKind::State(decl) => {
+                    for b in &decl.bindings {
+                        if b.name == name {
+                            return Some(Resolved {
+                                hover: format!("state {}: {}", b.name, ty_text(&b.ty)),
+                                target: Some(Target::State(path.clone(), b.name_span)),
+                            });
+                        }
+                    }
+                }
+                ItemKind::Migrate(decl) if decl.func.name == name => {
+                    let sig = fn_sig_text(&decl.func.name, &decl.func.params, &decl.func.ret);
+                    return Some(Resolved {
+                        hover: format!("migrate {sig}"),
+                        target: Some(Target::Func(path.clone(), fn_name_span(&decl.func))),
                     });
                 }
                 _ => {}
@@ -1466,6 +1522,7 @@ fn definition_at(docs: &HashMap<String, OpenDoc>, params: &J) -> J {
         Target::Func(path, span) | Target::Struct(path, span) | Target::Field(path, span) => {
             (path, span)
         }
+        Target::State(path, span) => (path, span),
         Target::Extern(path, span) => (path, span),
         Target::Builtin => return J::Null,
     };

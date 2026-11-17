@@ -1,0 +1,5 @@
+error[E0325]: migrate `S` cannot call `println`
+ --> type_migrate_io.gzv:6:5
+  |
+6 |     println(old.v);
+  |     ^^^^^^^^^^^^^^ help: migrations must be pure: no IO, no channels

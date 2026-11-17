@@ -25,7 +25,7 @@
 //! first; see `exec.rs`). A future `Rc` in any migrated type breaks the
 //! compile asserts, not silently.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
 use corosensei::stack::{DefaultStack, Stack as _};
@@ -37,6 +37,7 @@ use toto_compiler::interp::TraceFrame;
 use toto_compiler::mir::{MProgram, MirBody};
 use toto_compiler::span::Span;
 
+use crate::RuntimeConfig;
 use crate::channel::{Channel, ChannelId, ChannelTable, RecvWaiter, SendWaiter, TaskId};
 use crate::exec::{Executor, Initial, TaskResult};
 use crate::heap::{GcRef, Heap};
@@ -350,6 +351,12 @@ pub struct State {
     pub channels: ChannelTable,
     pub shadows: Vec<ShadowStack>,
     pub select_waiters: VecDeque<SelectWaiter>,
+    /// Declared-state cells by slot (spec amendment, Phase 6):
+    /// written by `StateSet`, read by `StateGet`, initialized by
+    /// `main`'s prepended MIR. Shared across tasks (that is the
+    /// point) and traced at every collection — a state-held object
+    /// is live as long as its slot names it.
+    pub state_vars: Vec<RtVal>,
 }
 
 /// A suspended coroutine that may resume on ANY worker thread. See the
@@ -385,8 +392,33 @@ fn _migration_asserts() {
     _assert_sync::<Shared>();
 }
 
+/// Code-version identity for heap-retained closures (Phase 6,
+/// Stage 2a): which generation's module each live closure handle
+/// was compiled into. Owned cross-generation by the dev driver and
+/// cloned into every spawned run; entries are pruned when their
+/// handle dies (see `Heap::is_live`). Arc-based shared state per
+/// the Phase 3 ownership rule — no `Rc`/`RefCell` anywhere near
+/// shared state (see the `_assert_send_sync` tripwires below).
+pub type ClosureModules = Arc<Mutex<HashMap<GcRef, u64>>>;
+
+/// A fresh, empty closure→module table for single-run paths
+/// (interpreter, AOT products, JIT probe, non-dev `run_jit`):
+/// nothing is ever retained through these.
+pub fn fresh_closure_modules() -> ClosureModules {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 pub struct Shared {
     pub state: Mutex<State>,
+    /// Generating code version that allocates into this run
+    /// (Phase 6, Stage 2a): stamped into `closure_modules` by
+    /// `task_alloc_closure` alongside each new closure handle.
+    /// `0` means "no version" (single-run paths: interpreter,
+    /// AOT products, JIT probe) — retention only consults it
+    /// under the dev driver, which always stamps real numbers.
+    pub codegen: u64,
+    /// Cross-generation closure→module table (see above).
+    pub closure_modules: ClosureModules,
     pub scopes: Mutex<ScopeTable>,
     pub output: Mutex<Vec<u8>>,
     pub threshold: u64,
@@ -513,6 +545,12 @@ pub fn gather_roots(state: &State) -> Vec<GcRef> {
     }
     for v in state.channels.roots() {
         heap_refs_of(&v, &mut out);
+    }
+    // Declared state (spec amendment, Phase 6): every cell is a
+    // root. Slots are plain indices (never stale), so no
+    // generation check applies — presence in the vector is life.
+    for v in &state.state_vars {
+        heap_refs_of(v, &mut out);
     }
     for w in &state.select_waiters {
         for case in &w.cases {
@@ -663,23 +701,35 @@ pub struct SchedOutcome {
 }
 
 impl Scheduler {
+    /// The six scheduler knobs travel as `RuntimeConfig` (one
+    /// call-site struct, no ten-argument constructor); the
+    /// code-version pair (`codegen` + `closure_modules`) and the
+    /// incoming `heap` stay explicit — they differ per generation,
+    /// unlike the config.
     pub fn new(
         code: Arc<ExecCode>,
-        threshold: u64,
-        seed: u64,
-        stack_bytes: usize,
-        force_collect_for_test: bool,
-        workers: usize,
-        pool_threads: usize,
+        heap: Heap,
+        codegen: u64,
+        closure_modules: ClosureModules,
+        config: &RuntimeConfig,
     ) -> Self {
-        assert!(workers >= 1, "at least one worker");
+        assert!(config.workers >= 1, "at least one worker");
+        let threshold = config.gc_threshold_bytes;
+        let seed = config.rng_seed;
+        let stack_bytes = config.stack_bytes;
+        let force_collect_for_test = config.collect_at_every_safepoint_for_test;
+        let workers = config.workers;
+        let pool_threads = config.blocking_pool_threads;
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                heap: Heap::new(),
+                heap,
                 channels: ChannelTable::new(),
                 shadows: Vec::new(),
                 select_waiters: VecDeque::new(),
+                state_vars: Vec::new(),
             }),
+            codegen,
+            closure_modules,
             scopes: Mutex::new(ScopeTable::new()),
             output: Mutex::new(Vec::new()),
             threshold,
