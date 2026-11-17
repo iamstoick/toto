@@ -3107,7 +3107,7 @@ pub fn jit_task_entry(
     result
 }
 
-fn zero_stats() -> RunStats {
+pub(crate) fn zero_stats() -> RunStats {
     RunStats {
         tasks_spawned: 0,
         switches: 0,
@@ -3184,6 +3184,10 @@ impl JitRun {
 /// `task_alloc_closure` alongside each new closure handle.
 /// Single-run paths pass `0` + a fresh table.
 #[allow(clippy::result_large_err)]
+/// The seed is the eighth parameter (over the lint default): it
+/// travels with the per-generation heap/modules because seeding must
+/// land atomically with construction, before any task starts.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_jit_run(
     program: &Program,
     checked: &CheckedProgram,
@@ -3192,8 +3196,15 @@ pub fn spawn_jit_run(
     heap: toto_runtime::heap::Heap,
     codegen: u64,
     closure_modules: toto_runtime::sched::ClosureModules,
+    preserving: Option<crate::preserve::PreservingSeed>,
 ) -> Result<JitRun, toto_runtime::RtOutcome> {
-    let prog = toto_compiler::mir::lower(checked);
+    // Preserving reloads lower without state init (every slot is
+    // seeded from carried values instead); all other paths run the
+    // prepended initializers exactly once at load.
+    let prog = match &preserving {
+        Some(_) => toto_compiler::mir::lower_without_init(checked),
+        None => toto_compiler::mir::lower(checked),
+    };
     let mut structs: HashMap<String, HStructDecl> = HashMap::new();
     for (name, decl) in &checked.structs {
         structs.insert(name.clone(), decl.clone());
@@ -3259,6 +3270,15 @@ pub fn spawn_jit_run(
         closure_modules,
         &config,
     ));
+    // Preserving seed (Phase 6, Stage 3): carried state values plus
+    // the moved channel table land BEFORE any task starts — no race
+    // (the main task spawns below), no init to clobber them (the
+    // ExecCode above lowered without the prepend).
+    if let Some(seed) = preserving {
+        let mut st = sched.shared().state.lock().expect("scheduler state lock");
+        st.state_vars = seed.state_vars;
+        st.channels = seed.channels;
+    }
     let entries = Arc::clone(&session.entries);
     let bodies = Arc::clone(&session.bodies);
     let func_names = Arc::clone(&session.func_names);
@@ -3318,6 +3338,7 @@ pub fn run_jit(
         toto_runtime::heap::Heap::new(),
         0,
         toto_runtime::sched::fresh_closure_modules(),
+        None,
     ) {
         Ok(run) => run.join(),
         Err(outcome) => outcome,

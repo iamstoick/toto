@@ -11,7 +11,7 @@
 //! are one-shot), so respawn starts clean by construction and the
 //! reconnect-hooks row is vacuous (documented, not built).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +27,7 @@ use toto_runtime::value::RtVal;
 use toto_runtime::{RtOutcome, RuntimeConfig};
 
 use crate::compile::{Jit, OptLevel};
+use crate::preserve::{PreservingSeed, plan_carry};
 use crate::task::{JitRun, JitSession, spawn_jit_run};
 
 /// What changed between two checked revisions (reloadability matrix).
@@ -161,6 +162,35 @@ impl RestartPolicy for ReexecRestart {
     }
 }
 
+/// Test-only restart policy: records the restart reason instead of
+/// re-executing the process. `ReexecRestart` re-spawns the current
+/// binary with identical arguments — under `cargo test` that
+/// re-runs the whole test binary (which re-triggers the abandonment,
+/// an unbounded re-exec chain holding the harness pipe open), so no
+/// test may use it on a path that can abandon a run.
+#[cfg(test)]
+#[derive(Clone, Default, Debug)]
+pub(super) struct RecordRestart {
+    fired: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[cfg(test)]
+impl RestartPolicy for RecordRestart {
+    fn restart(&self, reason: &str) {
+        self.fired
+            .lock()
+            .expect("restart record lock")
+            .push(reason.to_string());
+    }
+}
+
+#[cfg(test)]
+impl RecordRestart {
+    pub(super) fn fired(&self) -> Vec<String> {
+        self.fired.lock().expect("restart record lock").clone()
+    }
+}
+
 fn hash_bytes(bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -264,6 +294,9 @@ pub struct Generation {
     #[allow(dead_code)]
     jit: Jit,
     session: JitSession,
+    /// True when compiled without the state-init prepend (preserving
+    /// reload): `spawn` requires `Some(seed)` exactly then.
+    without_init: bool,
 }
 
 impl Generation {
@@ -279,7 +312,39 @@ impl Generation {
         checked: CheckedProgram,
         opt: OptLevel,
     ) -> Result<Self, String> {
-        let mir = toto_compiler::mir::lower(&checked);
+        Self::compile_inner(number, src, filename, program, checked, opt, false)
+    }
+
+    /// Lower and compile for a preserving reload (Phase 6, Stage 3):
+    /// `main` is compiled WITHOUT the state-init prepend — the
+    /// driver seeds every slot from carried values instead. Paired
+    /// with `spawn` carrying `Some(seed)`; the pairing is checked
+    /// loudly in `spawn` (a mismatch is a driver bug, never silent).
+    pub fn compile_preserving(
+        number: u64,
+        src: String,
+        filename: String,
+        program: Program,
+        checked: CheckedProgram,
+        opt: OptLevel,
+    ) -> Result<Self, String> {
+        Self::compile_inner(number, src, filename, program, checked, opt, true)
+    }
+
+    fn compile_inner(
+        number: u64,
+        src: String,
+        filename: String,
+        program: Program,
+        checked: CheckedProgram,
+        opt: OptLevel,
+        without_init: bool,
+    ) -> Result<Self, String> {
+        let mir = if without_init {
+            toto_compiler::mir::lower_without_init(&checked)
+        } else {
+            toto_compiler::mir::lower(&checked)
+        };
         let mut jit = Jit::new_task_with_opt(opt).map_err(|e| e.to_string())?;
         let session = jit.compile_task(&mir).map_err(|e| e.to_string())?;
         Ok(Self {
@@ -290,6 +355,7 @@ impl Generation {
             checked,
             jit,
             session,
+            without_init,
         })
     }
 
@@ -298,13 +364,33 @@ impl Generation {
     /// generation alive until the run is joined (the driver does).
     /// `Err` carries the immediate outcome when no run starts (same
     /// shape as `spawn_jit_run`; kept unboxed for call-site ergonomics).
+    /// A `Some(seed)` spawn on a normally-compiled generation (or the
+    /// reverse) is a driver bug: it fails loudly here, never by
+    /// silently clobbering or skipping initialization.
     #[allow(clippy::result_large_err)]
     pub fn spawn(
         &self,
         config: RuntimeConfig,
         heap: Heap,
         modules: ClosureModules,
+        seed: Option<PreservingSeed>,
     ) -> Result<(Box<dyn LiveRun>, Arc<Shared>), RtOutcome> {
+        if seed.is_some() != self.without_init {
+            return Err(RtOutcome {
+                result: Err((
+                    toto_compiler::diag::Diag::new(
+                        "E_INTERNAL",
+                        "preserving/compile mismatch: seed without init-strip or vice versa"
+                            .to_string(),
+                        toto_compiler::span::Span::new(0, 0),
+                        None,
+                    ),
+                    Vec::new(),
+                )),
+                stdout: Vec::new(),
+                stats: crate::task::zero_stats(),
+            });
+        }
         match spawn_jit_run(
             &self.program,
             &self.checked,
@@ -313,6 +399,7 @@ impl Generation {
             heap,
             self.number,
             modules,
+            seed,
         ) {
             Ok(run) => {
                 let shared = Arc::clone(run.shared());
@@ -469,10 +556,13 @@ pub fn relink_func(
 
 /// What the last retire check decided, per retired generation
 /// number (observability for tests and the Stage 4 soak).
+/// `carry_abort` names the loud reason when a preserving reload
+/// fell back to atomic restart (None on every other path).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RetireReport {
     pub retained: Vec<u64>,
     pub dropped: Vec<u64>,
+    pub carry_abort: Option<String>,
 }
 
 /// The `toto dev` state machine: generations, drain-vs-cancel
@@ -608,13 +698,78 @@ impl<R: RestartPolicy> DevDriver<R> {
                                 // run (safe: settle joined every
                                 // task, and this clone is the sole
                                 // remaining owner of the old Shared).
-                                let mut heap = match self.current_shared.take() {
-                                    Some(shared) => std::mem::replace(
-                                        &mut shared.state.lock().expect("shared state lock").heap,
-                                        Heap::new(),
-                                    ),
-                                    None => Heap::new(),
-                                };
+                                // Declared-state slots and the
+                                // channel table travel with it: the
+                                // preserving path below seeds the
+                                // next generation from them.
+                                let (mut heap, old_state_vars, old_channels) =
+                                    match self.current_shared.take() {
+                                        Some(shared) => {
+                                            let mut st =
+                                                shared.state.lock().expect("shared state lock");
+                                            let h = std::mem::replace(&mut st.heap, Heap::new());
+                                            let v = st.state_vars.clone();
+                                            let c = std::mem::replace(
+                                                &mut st.channels,
+                                                toto_runtime::channel::ChannelTable::new(),
+                                            );
+                                            (h, v, c)
+                                        }
+                                        None => (
+                                            Heap::new(),
+                                            Vec::new(),
+                                            toto_runtime::channel::ChannelTable::new(),
+                                        ),
+                                    };
+                                // Declared-state preserving path
+                                // (Phase 6, Stage 3): with no
+                                // explicit 2a carry and state on
+                                // either side, plan the carry from
+                                // the settled run's slots. Success
+                                // recompiles without init and seeds
+                                // the next generation; ANY failure
+                                // falls through to the loud atomic
+                                // restart below (fresh heap,
+                                // initializers run once).
+                                let old_checked = &active.compiled.checked;
+                                if carry.is_empty()
+                                    && (!old_checked.state.is_empty()
+                                        || !next.checked.state.is_empty())
+                                {
+                                    match plan_carry(
+                                        old_checked,
+                                        &old_state_vars,
+                                        &mut heap,
+                                        &old_channels,
+                                        &next.checked,
+                                    ) {
+                                        Ok(carried_values) => {
+                                            // `active.run` moved into
+                                            // settle above; only the
+                                            // compiled remainder
+                                            // travels from here.
+                                            return self.spawn_preserving(
+                                                active.compiled,
+                                                next,
+                                                ended,
+                                                drained_or_cancelled,
+                                                heap,
+                                                old_channels,
+                                                number,
+                                                carried_values,
+                                            );
+                                        }
+                                        Err(abort) => {
+                                            return self.atomic_restart(
+                                                next,
+                                                ended,
+                                                drained_or_cancelled,
+                                                number,
+                                                Some(abort.reason),
+                                            );
+                                        }
+                                    }
+                                }
                                 // Validate + relink carried values
                                 // against old→new. ANY failure routes
                                 // to loud atomic restart: nothing is
@@ -630,29 +785,13 @@ impl<R: RestartPolicy> DevDriver<R> {
                                 ) {
                                     Ok(values) => values,
                                     Err(_) => {
-                                        let dropped = self
-                                            .retired
-                                            .iter()
-                                            .map(|c| c.number)
-                                            .collect::<Vec<_>>();
-                                        self.retired.clear();
-                                        self.module_table
-                                            .lock()
-                                            .expect("module table lock")
-                                            .clear();
-                                        self.last_retire = RetireReport {
-                                            retained: Vec::new(),
-                                            dropped,
-                                        };
-                                        let outcome = self.spawn_next(
+                                        return self.atomic_restart(
                                             next,
                                             ended,
-                                            Some(drained_or_cancelled),
-                                            Heap::new(),
+                                            drained_or_cancelled,
                                             number,
+                                            None,
                                         );
-                                        self.carried = Vec::new();
-                                        return outcome;
                                     }
                                 };
                                 // The drained generation's number
@@ -697,6 +836,7 @@ impl<R: RestartPolicy> DevDriver<R> {
                                     Some(drained_or_cancelled),
                                     heap,
                                     number,
+                                    None,
                                 );
                                 self.carried = carried;
                                 outcome
@@ -728,13 +868,111 @@ impl<R: RestartPolicy> DevDriver<R> {
         ) {
             Err(e) => RebuildOutcome::CompileRefused(format!("generation {number}: {e}")),
             Ok(built) => {
-                let outcome = self.spawn_next(built, None, None, Heap::new(), number);
+                let outcome = self.spawn_next(built, None, None, Heap::new(), number, None);
                 // Fresh heaps never retain: make that explicit so a
                 // stale `last_retire` can never be misread later.
                 self.last_retire = RetireReport::default();
                 outcome
             }
         }
+    }
+
+    /// Loud atomic restart (Phase 6, Stage 3): drop every retired
+    /// module, clear the retention table, and respawn the new
+    /// generation on a fresh heap (initializers run once, from
+    /// scratch). `carry_abort` names the preserving failure when
+    /// this fallback follows one (None on the pre-Stage-3 paths).
+    fn atomic_restart(
+        &mut self,
+        next: Generation,
+        ended: Option<EndedRun>,
+        settle: SettleOutcome,
+        number: u64,
+        carry_abort: Option<String>,
+    ) -> RebuildOutcome {
+        let dropped = self.retired.iter().map(|c| c.number).collect::<Vec<_>>();
+        self.retired.clear();
+        self.module_table.lock().expect("module table lock").clear();
+        self.last_retire = RetireReport {
+            retained: Vec::new(),
+            dropped,
+            carry_abort,
+        };
+        let outcome = self.spawn_next(next, ended, Some(settle), Heap::new(), number, None);
+        self.carried = Vec::new();
+        outcome
+    }
+
+    /// Preserving respawn (Phase 6, Stage 3): recompile the settled
+    /// replacement without the state-init prepend, retain the
+    /// drained module while carried values name it, and seed the
+    /// next generation's slots + channel table. Retention is by
+    /// real GC reachability over the moved heap (`prune_retired`
+    /// with the carried roots); a carried `Func` anywhere (top
+    /// level or nested — deep scan, unlike the 2a top-level rule)
+    /// force-retains the drained generation for exactly this span.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_preserving(
+        &mut self,
+        compiled: Generation,
+        next: Generation,
+        ended: Option<EndedRun>,
+        settle: SettleOutcome,
+        mut heap: Heap,
+        channels: toto_runtime::channel::ChannelTable,
+        number: u64,
+        carried: Vec<RtVal>,
+    ) -> RebuildOutcome {
+        // The with-init `next` stays intact for the fallback below:
+        // the preserving compile works from clones (checked
+        // programs are cheap to clone — Arcs underneath).
+        let pres = match Generation::compile_preserving(
+            number,
+            next.src.clone(),
+            next.filename.clone(),
+            next.program.clone(),
+            next.checked.clone(),
+            self.opt,
+        ) {
+            Err(e) => {
+                return self.atomic_restart(
+                    next,
+                    ended,
+                    settle,
+                    number,
+                    Some(format!("preserving recompile failed: {e}")),
+                );
+            }
+            Ok(built) => built,
+        };
+        let drained_no = compiled.number;
+        self.retired.push(compiled);
+        let mut held = Vec::new();
+        for v in &carried {
+            toto_runtime::value::heap_refs_of(v, &mut held);
+        }
+        // Deep `Func` scan (nested included): indices are valid by
+        // the planner's stability rule, and the drained module must
+        // outlive every reference to them.
+        let mut seen = HashSet::new();
+        let force_retain = carried
+            .iter()
+            .any(|v| crate::preserve::contains_func(v, &heap, &mut seen))
+            .then_some(drained_no);
+        self.last_retire = self.prune_retired(&mut heap, &held, force_retain);
+        // Cheap table hygiene every rebuild (no collect): drop
+        // entries whose slots were swept since.
+        self.module_table
+            .lock()
+            .expect("module table lock")
+            .retain(|r, _| heap.is_live(*r));
+        let seed = PreservingSeed {
+            state_vars: carried.clone(),
+            channels,
+        };
+        let outcome = self.spawn_next(pres, ended, Some(settle), heap, number, Some(seed));
+        self.carried = carried;
+        outcome
     }
 
     /// Spawn `next` as the current generation on `heap`, recording
@@ -748,8 +986,9 @@ impl<R: RestartPolicy> DevDriver<R> {
         settle: Option<SettleOutcome>,
         heap: Heap,
         number: u64,
+        seed: Option<PreservingSeed>,
     ) -> RebuildOutcome {
-        match next.spawn(self.config, heap, self.module_table.clone()) {
+        match next.spawn(self.config, heap, self.module_table.clone(), seed) {
             Ok((run, shared)) => {
                 self.current_shared = Some(shared);
                 self.current = Some(ActiveGeneration {
@@ -853,7 +1092,11 @@ impl<R: RestartPolicy> DevDriver<R> {
             .lock()
             .expect("module table lock")
             .retain(|r, _| heap.is_live(*r));
-        RetireReport { retained, dropped }
+        RetireReport {
+            retained,
+            dropped,
+            carry_abort: None,
+        }
     }
 
     /// Drain the last successful carry (Stage 3 consumes these into
@@ -925,7 +1168,7 @@ mod retain_proofs {
     use crate::runtime::encode;
     use crate::task::{JitTaskCtx, sorted_externs};
 
-    fn test_config() -> RuntimeConfig {
+    pub(super) fn test_config() -> RuntimeConfig {
         RuntimeConfig {
             gc_threshold_bytes: u64::MAX,
             rng_seed: 0x9E37_79B9_7F4A_7C15,
@@ -936,7 +1179,7 @@ mod retain_proofs {
         }
     }
 
-    fn test_driver() -> DevDriver<ReexecRestart> {
+    pub(super) fn test_driver() -> DevDriver<ReexecRestart> {
         DevDriver::new(
             DrainPolicy {
                 drain_timeout: Duration::from_millis(300),
@@ -948,7 +1191,7 @@ mod retain_proofs {
         )
     }
 
-    fn wait_finished(drv: &DevDriver<ReexecRestart>, what: &str) {
+    pub(super) fn wait_finished<R: RestartPolicy>(drv: &DevDriver<R>, what: &str) {
         let t0 = Instant::now();
         loop {
             let done = drv
@@ -967,11 +1210,11 @@ mod retain_proofs {
         }
     }
 
-    fn cur_number(drv: &DevDriver<ReexecRestart>) -> u64 {
+    pub(super) fn cur_number<R: RestartPolicy>(drv: &DevDriver<R>) -> u64 {
         drv.current.as_ref().expect("current").compiled.number
     }
 
-    fn func_idx(drv: &DevDriver<ReexecRestart>, name: &str) -> usize {
+    fn func_idx<R: RestartPolicy>(drv: &DevDriver<R>, name: &str) -> usize {
         drv.current
             .as_ref()
             .expect("current")
@@ -983,8 +1226,8 @@ mod retain_proofs {
             .expect("function present")
     }
 
-    fn rebuilt(
-        drv: &mut DevDriver<ReexecRestart>,
+    pub(super) fn rebuilt<R: RestartPolicy>(
+        drv: &mut DevDriver<R>,
         src: &str,
         carry: &[RtVal],
         what: &str,
@@ -1002,7 +1245,7 @@ mod retain_proofs {
         }
     }
 
-    fn ended_stdout(ended: &Option<EndedRun>, what: &str) -> Vec<u8> {
+    pub(super) fn ended_stdout(ended: &Option<EndedRun>, what: &str) -> Vec<u8> {
         let e = ended
             .as_ref()
             .unwrap_or_else(|| panic!("{what}: no ended run"));
@@ -1014,7 +1257,7 @@ mod retain_proofs {
     /// nothing to settle and nothing streamed (`(None, None)`).
     /// The new run's own output surfaces via the NEXT rebuild's
     /// `ended` (stream-on-retire).
-    fn spawn_first(drv: &mut DevDriver<ReexecRestart>, src: &str, what: &str) {
+    pub(super) fn spawn_first<R: RestartPolicy>(drv: &mut DevDriver<R>, src: &str, what: &str) {
         let (ended, settle) = rebuilt(drv, src, &[], what);
         assert!(ended.is_none(), "{what}: fresh spawn streams nothing");
         assert!(settle.is_none(), "{what}: fresh spawn settles nothing");
@@ -1391,5 +1634,334 @@ mod retain_proofs {
         assert_eq!(ended_stdout(&ended, "gen2"), b"1300\n2000\n");
         wait_finished(&drv, "gen3 bogus");
         assert!(drv.take_carried().is_empty(), "bogus carry dropped");
+    }
+}
+
+/// End-to-end preserving-reload proofs (Phase 6, Stage 3): drive
+/// `rebuild` through the real driver and assert the next
+/// generation's OBSERVED output. Stream-on-retire means each
+/// generation's stdout surfaces at the NEXT rebuild; every test
+/// below is spawn → reload-under-test → flush, asserting the middle
+/// generation's exact bytes.
+#[cfg(test)]
+mod preserve_proofs {
+    use super::retain_proofs::{
+        ended_stdout, rebuilt, spawn_first, test_config, test_driver, wait_finished,
+    };
+    use super::*;
+    use std::time::Duration;
+
+    /// Body-only change preserves state (matrix row 1): the new
+    /// generation prints the CARRIED value, never a re-initialized
+    /// one — initializers run once, on fresh load.
+    #[test]
+    fn body_change_preserves_state_e2e() {
+        let mut drv = test_driver();
+        let gen1 = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    count = 41;\n    println(count);\n    return 0;\n}\n";
+        // Same state, different body.
+        let gen2 = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    println(count);\n    return 0;\n}\n";
+        // Trivial body tweak to flush gen2's output.
+        let gen3 = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    println(count + 0);\n    return 0;\n}\n";
+        spawn_first(&mut drv, gen1, "gen1 body");
+        let (ended, _) = rebuilt(&mut drv, gen2, &[], "gen2 body");
+        assert_eq!(ended_stdout(&ended, "gen1"), b"41\n");
+        wait_finished(&drv, "gen2 body");
+        // Declared carry is observable through the driver handoff.
+        assert_eq!(drv.take_carried(), vec![RtVal::Int(41)]);
+        let (ended, _) = rebuilt(&mut drv, gen3, &[], "gen3 body");
+        // Carried 41, NOT re-initialized 0.
+        assert_eq!(ended_stdout(&ended, "gen2"), b"41\n");
+        wait_finished(&drv, "gen3 body");
+        assert!(drv.last_retire().carry_abort.is_none());
+    }
+
+    /// State-initializer change (matrix row 5): same names and
+    /// types, new init code — the OLD value carries; initializers
+    /// never rerun on the preserving path.
+    #[test]
+    fn init_change_carries_old_value_e2e() {
+        let mut drv = test_driver();
+        let gen1 = "state {\n    count: int = 7;\n}\nfn main() -> int {\n    println(count);\n    return 0;\n}\n";
+        let gen2 = "state {\n    count: int = 999;\n}\nfn main() -> int {\n    println(count);\n    return 0;\n}\n";
+        let gen3 = "state {\n    count: int = 999;\n}\nfn main() -> int {\n    println(count + 0);\n    return 0;\n}\n";
+        spawn_first(&mut drv, gen1, "gen1 init");
+        let (ended, _) = rebuilt(&mut drv, gen2, &[], "gen2 init");
+        assert_eq!(ended_stdout(&ended, "gen1"), b"7\n");
+        wait_finished(&drv, "gen2 init");
+        let (ended, _) = rebuilt(&mut drv, gen3, &[], "gen3 init");
+        // Carried 7, NOT the new initializer's 999.
+        assert_eq!(ended_stdout(&ended, "gen2"), b"7\n");
+        wait_finished(&drv, "gen3 init");
+    }
+
+    /// Struct layout change WITH migrate (matrix row 3): the new
+    /// generation observes migrated values end to end.
+    #[test]
+    fn migrate_end_to_end() {
+        let mut drv = test_driver();
+        let gen1 = "struct Cfg {\n    host: string,\n    port: int,\n}\nstate {\n    cfg: Cfg = Cfg { host: \"x\", port: 1 };\n}\nfn main() -> int {\n    println(cfg.port);\n    cfg = Cfg { host: \"y\", port: 21 };\n    return 0;\n}\n";
+        let gen2 = "struct Cfg {\n    host: string,\n    port: int,\n    tls: bool,\n}\nmigrate fn Cfg(old: Cfg) -> Cfg {\n    let probe = if false { old.tls } else { false };\n    return Cfg { host: old.host, port: old.port + (if probe { 1 } else { 0 }), tls: old.port > 20 };\n}\nstate {\n    cfg: Cfg = Cfg { host: \"z\", port: 2, tls: false };\n}\nfn main() -> int {\n    println(cfg.port);\n    println(if cfg.tls { 1 } else { 0 });\n    return 0;\n}\n";
+        let gen3 = "struct Cfg {\n    host: string,\n    port: int,\n    tls: bool,\n}\nmigrate fn Cfg(old: Cfg) -> Cfg {\n    let probe = if false { old.tls } else { false };\n    return Cfg { host: old.host, port: old.port + (if probe { 1 } else { 0 }), tls: old.port > 20 };\n}\nstate {\n    cfg: Cfg = Cfg { host: \"z\", port: 2, tls: false };\n}\nfn main() -> int {\n    println(cfg.port + 0);\n    println(if cfg.tls { 1 } else { 0 });\n    return 0;\n}\n";
+        spawn_first(&mut drv, gen1, "gen1 mig");
+        let (ended, _) = rebuilt(&mut drv, gen2, &[], "gen2 mig");
+        assert_eq!(ended_stdout(&ended, "gen1"), b"1\n");
+        wait_finished(&drv, "gen2 mig");
+        let (ended, _) = rebuilt(&mut drv, gen3, &[], "gen3 mig");
+        // Migrated: port 21 (carried, not re-init 2), tls true.
+        assert_eq!(ended_stdout(&ended, "gen2"), b"21\n1\n");
+        wait_finished(&drv, "gen3 mig");
+        assert!(drv.last_retire().carry_abort.is_none());
+    }
+
+    /// Struct layout change WITHOUT migrate (matrix row 3): loud
+    /// atomic restart — fresh initializers run, the abort reason is
+    /// recorded, nothing is carried.
+    #[test]
+    fn missing_migrate_aborts_to_fresh_init_e2e() {
+        let mut drv = test_driver();
+        let gen1 = "struct Cfg {\n    host: string,\n    port: int,\n}\nstate {\n    cfg: Cfg = Cfg { host: \"x\", port: 1 };\n}\nfn main() -> int {\n    println(cfg.port);\n    cfg = Cfg { host: \"y\", port: 21 };\n    return 0;\n}\n";
+        let gen2 = "struct Cfg {\n    host: string,\n    port: int,\n    tls: bool,\n}\nstate {\n    cfg: Cfg = Cfg { host: \"z\", port: 2, tls: true };\n}\nfn main() -> int {\n    println(cfg.port);\n    println(if cfg.tls { 1 } else { 0 });\n    return 0;\n}\n";
+        let gen3 = "struct Cfg {\n    host: string,\n    port: int,\n    tls: bool,\n}\nstate {\n    cfg: Cfg = Cfg { host: \"z\", port: 2, tls: true };\n}\nfn main() -> int {\n    println(cfg.port + 0);\n    return 0;\n}\n";
+        spawn_first(&mut drv, gen1, "gen1 abort");
+        let (ended, _) = rebuilt(&mut drv, gen2, &[], "gen2 abort");
+        assert_eq!(ended_stdout(&ended, "gen1"), b"1\n");
+        wait_finished(&drv, "gen2 abort");
+        // Loud fallback: reason recorded, nothing carried, fresh
+        // init values observed (2/true, not carried 21).
+        let abort = drv.last_retire().carry_abort.clone();
+        assert!(abort.is_some(), "abort reason recorded");
+        assert!(abort.unwrap().contains("no migrate"));
+        assert!(drv.take_carried().is_empty());
+        let (ended, _) = rebuilt(&mut drv, gen3, &[], "gen3 abort");
+        assert_eq!(ended_stdout(&ended, "gen2"), b"2\n1\n");
+        wait_finished(&drv, "gen3 abort");
+    }
+
+    /// Function-signature change (matrix row 2): code restarts on
+    /// the new tables while plain state carries (`migrate` plays
+    /// no role in signature changes — pinned by amendment).
+    #[test]
+    fn signature_change_preserves_state_e2e() {
+        let mut drv = test_driver();
+        let gen1 = "state {\n    count: int = 0;\n}\nfn bump(x: int) -> int {\n    return x + 1;\n}\nfn main() -> int {\n    count = bump(41);\n    println(count);\n    return 0;\n}\n";
+        let gen2 = "state {\n    count: int = 0;\n}\nfn bump(x: int, y: int) -> int {\n    return x + y;\n}\nfn main() -> int {\n    println(count);\n    count = bump(1, 2);\n    return 0;\n}\n";
+        let gen3 = "state {\n    count: int = 0;\n}\nfn bump(x: int, y: int) -> int {\n    return x + y;\n}\nfn main() -> int {\n    println(count + 0);\n    count = bump(1, 2);\n    return 0;\n}\n";
+        spawn_first(&mut drv, gen1, "gen1 sig");
+        let (ended, _) = rebuilt(&mut drv, gen2, &[], "gen2 sig");
+        assert_eq!(ended_stdout(&ended, "gen1"), b"42\n");
+        wait_finished(&drv, "gen2 sig");
+        let (ended, _) = rebuilt(&mut drv, gen3, &[], "gen3 sig");
+        // Carried 42 across the signature change (not re-init 0).
+        assert_eq!(ended_stdout(&ended, "gen2"), b"42\n");
+        wait_finished(&drv, "gen3 sig");
+        assert!(drv.last_retire().carry_abort.is_none());
+    }
+
+    /// Drained and cancelled runs share the carry arm (matrix
+    /// rows 1-2): cancellation lands on a suspension boundary,
+    /// where state is statement-consistent, so the plan runs
+    /// identically from the settled snapshot. A parked-Cancelled
+    /// e2e is deliberately absent: a lone parked task trips the
+    /// deadlock detector (E0216) before the drain timeout, and any
+    /// live companion that suppresses it either completes (Drained)
+    /// or ignores cancel (Restarted) — there is no deterministic
+    /// single-threaded shape that settles Cancelled out of a park.
+    /// The Drained e2e above exercises the shared arm; settle's
+    /// Cancelled path is Phase-4-tested.
+    #[test]
+    fn drained_and_cancelled_share_the_carry_arm() {
+        // Minimal carry through the shared arm (the Drained side;
+        // Cancelled joins the same block after settle — see doc).
+        let mut drv = test_driver();
+        let gen1 = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    count = 13;\n    println(count);\n    return 0;\n}\n";
+        let gen2 = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    println(count);\n    return 0;\n}\n";
+        spawn_first(&mut drv, gen1, "gen1 shared-arm");
+        // Fast drain: settles Drained through the shared arm.
+        let (ended, _) = rebuilt(&mut drv, gen2, &[], "gen2 shared-arm");
+        assert_eq!(ended_stdout(&ended, "gen1"), b"13\n");
+        wait_finished(&drv, "gen2 shared-arm");
+        assert_eq!(drv.take_carried(), vec![RtVal::Int(13)]);
+    }
+
+    /// Declared channels survive the reload (matrix row 4): the
+    /// table moves whole, so the new generation rendezvous on the
+    /// SAME channel object. Counters alongside prove plain carry.
+    #[test]
+    fn channel_state_moves_whole_e2e() {
+        let mut drv = test_driver();
+        let gen1 = "state {\n    ch: chan<int>;\n    count: int = 0;\n}\nfn main() -> int {\n    go {\n        ch <- 1;\n    }\n    count = <-ch;\n    println(count);\n    return 0;\n}\n";
+        let gen2 = "state {\n    ch: chan<int>;\n    count: int = 0;\n}\nfn main() -> int {\n    go {\n        ch <- 2;\n    }\n    count = <-ch;\n    println(count);\n    return 0;\n}\n";
+        let gen3 = "state {\n    ch: chan<int>;\n    count: int = 0;\n}\nfn main() -> int {\n    go {\n        ch <- 3;\n    }\n    count = <-ch;\n    println(count + 0);\n    return 0;\n}\n";
+        spawn_first(&mut drv, gen1, "gen1 chan");
+        let (ended, _) = rebuilt(&mut drv, gen2, &[], "gen2 chan");
+        assert_eq!(ended_stdout(&ended, "gen1"), b"1\n");
+        wait_finished(&drv, "gen2 chan");
+        // Carried count was 1 at the boundary (observed through the
+        // handoff); the new run overwrote it through the moved
+        // channel — the table moved whole or this rendezvous dies.
+        assert_eq!(drv.take_carried()[1], RtVal::Int(1));
+        let (ended, _) = rebuilt(&mut drv, gen3, &[], "gen3 chan");
+        assert_eq!(ended_stdout(&ended, "gen2"), b"2\n");
+        wait_finished(&drv, "gen3 chan");
+        assert!(drv.last_retire().carry_abort.is_none());
+    }
+
+    /// Timeout abandonment never carries (fallback integrity): the
+    /// abandoned run's tasks may still touch its state, so reading
+    /// it would race. Only drain and cancel preserve.
+    #[test]
+    fn timeout_abandonment_carries_nothing() {
+        // `RecordRestart`, never `ReexecRestart`: the production
+        // policy re-spawns the current binary, which under test
+        // re-runs the suite into an unbounded re-exec chain.
+        let restart = super::RecordRestart::default();
+        let mut drv = DevDriver::new(
+            super::DrainPolicy {
+                drain_timeout: Duration::from_millis(50),
+                cancel_grace: Duration::from_millis(50),
+            },
+            restart.clone(),
+            test_config(),
+            super::OptLevel::Off,
+        );
+        // Ignores cancellation (no suspension point in the loop):
+        // settle abandons it to restart. Abandoned output is
+        // dropped with the run — only fresh behavior is observed.
+        let gen1 = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    count = 5;\n    println(count);\n    while true {\n        count = count;\n    }\n    return 0;\n}\n";
+        let gen2 = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    println(count);\n    return 0;\n}\n";
+        let gen3 = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    println(count + 0);\n    return 0;\n}\n";
+        // No waiting: gen1 never finishes by design.
+        match drv.rebuild_with(gen1, "t.gzv", &[]) {
+            super::RebuildOutcome::Rebuilt { ended, settle } => {
+                assert!(ended.is_none());
+                assert!(settle.is_none());
+            }
+            other => panic!("gen1 stuck: unexpected {other:?}"),
+        }
+        match drv.rebuild_with(gen2, "t.gzv", &[]) {
+            super::RebuildOutcome::Restarted => {}
+            other => panic!("gen2 stuck: expected abandonment, got {other:?}"),
+        }
+        // The restart policy fired exactly once (recorded, not
+        // executed — the process stays in the test).
+        assert_eq!(restart.fired().len(), 1, "one recorded restart");
+        // Post-abandon rebuilds spawn fresh from a clean table.
+        let (ended, settle) = rebuilt(&mut drv, gen3, &[], "gen3 stuck");
+        assert!(settle.is_none(), "fresh spawn settles nothing");
+        assert!(ended.is_none(), "fresh spawn streams nothing");
+        wait_finished(&drv, "gen3 stuck");
+        assert!(drv.take_carried().is_empty());
+        let gen4 = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    println(count + 1 - 1);\n    return 0;\n}\n";
+        let (ended, _) = rebuilt(&mut drv, gen4, &[], "gen4 stuck");
+        // Fresh init (0), never the abandoned run's 5.
+        assert_eq!(ended_stdout(&ended, "gen3"), b"0\n");
+        wait_finished(&drv, "gen4 stuck");
+    }
+
+    /// No declared state behaves exactly as Phase 4 (pure
+    /// drain-and-restart): new behavior on the next generation,
+    /// nothing carried, no abort recorded.
+    #[test]
+    fn stateless_body_change_drains_like_phase4() {
+        let mut drv = test_driver();
+        let gen1 = "fn main() -> int {\n    println(1);\n    return 0;\n}\n";
+        let gen2 = "fn main() -> int {\n    println(2);\n    return 0;\n}\n";
+        let gen3 = "fn main() -> int {\n    println(2 + 0);\n    return 0;\n}\n";
+        spawn_first(&mut drv, gen1, "gen1 stateless");
+        let (ended, _) = rebuilt(&mut drv, gen2, &[], "gen2 stateless");
+        assert_eq!(ended_stdout(&ended, "gen1"), b"1\n");
+        wait_finished(&drv, "gen2 stateless");
+        assert!(drv.take_carried().is_empty(), "stateless: nothing carried");
+        assert!(drv.last_retire().carry_abort.is_none());
+        let (ended, _) = rebuilt(&mut drv, gen3, &[], "gen3 stateless");
+        assert_eq!(ended_stdout(&ended, "gen2"), b"2\n");
+        wait_finished(&drv, "gen3 stateless");
+        assert!(drv.take_carried().is_empty(), "stateless: nothing carried");
+        assert!(drv.last_retire().carry_abort.is_none());
+    }
+
+    /// Stage 4 soak: ten consecutive preserving reloads over string
+    /// state with heap accounting. Every generation prints the
+    /// carried value (exact bytes, stream-on-retire) before extending
+    /// it; a forced collect at the end reclaims all churn (bounded
+    /// live, large reclaimed) while the carried value stays intact —
+    /// no leaks, no corruption.
+    #[test]
+    fn soak_many_preserving_reloads_bounded_heap() {
+        const N: usize = 10;
+        let mut drv = test_driver();
+        // A generation storing length `s` prints the length-(`s`-1)
+        // tag it was seeded with. Distinct literals ⇒ body change ⇒
+        // the preserving path (never `NoChange`).
+        let gen_src = |store: usize| {
+            let tag = "a".repeat(store);
+            format!(
+                "state {{\n    tag: string = \"a\";\n}}\nfn main() -> int {{\n    println(tag);\n    tag = \"{tag}\";\n    return 0;\n}}\n"
+            )
+        };
+        // Per-generation heap accounting: `prune_retired` collects
+        // the moved heap with exactly the carried roots on every
+        // preserving rebuild, so live must stay flat while the
+        // allocation counter proves churn happened (no accumulation
+        // = no leak; exact outputs = no corruption).
+        fn heap_live<R: RestartPolicy>(drv: &DevDriver<R>) -> (usize, u64) {
+            let shared = drv.current_shared.as_ref().expect("shared");
+            let st = shared.state.lock().expect("shared state lock");
+            let stats = st.heap.stats();
+            (stats.objects_live, stats.allocated_total)
+        }
+        spawn_first(&mut drv, &gen_src(2), "soak gen0");
+        let mut max_live = 0usize;
+        for i in 1..=N {
+            let want = format!("{}\n", "a".repeat(i));
+            let (ended, _) = rebuilt(&mut drv, &gen_src(i + 2), &[], "soak reload");
+            assert_eq!(
+                ended_stdout(&ended, "soak"),
+                want.as_bytes(),
+                "reload {i} streams the carried tag"
+            );
+            wait_finished(&drv, "soak reload");
+            assert!(
+                drv.last_retire().carry_abort.is_none(),
+                "soak reload {i} preserves"
+            );
+            let (live, _) = heap_live(&drv);
+            max_live = max_live.max(live);
+        }
+        // Flush the last generation's own output with one more body
+        // tweak, then wait: the heap must be quiescent before reading.
+        let want = format!("{}\n", "a".repeat(N + 1));
+        let (ended, _) = rebuilt(&mut drv, &gen_src(N + 3), &[], "soak flush");
+        assert_eq!(ended_stdout(&ended, "soak"), want.as_bytes());
+        wait_finished(&drv, "soak flush");
+        let (live, allocated_total) = heap_live(&drv);
+        max_live = max_live.max(live);
+        // The flush generation was seeded with the length-(N+1) tag.
+        let carried = drv.take_carried();
+        assert_eq!(carried.len(), 1, "one declared binding carried");
+        let live_ref = match &carried[0] {
+            RtVal::Heap(r) => *r,
+            other => panic!("soak: tag carried as heap value, got {other:?}"),
+        };
+        {
+            let shared = drv.current_shared.as_ref().expect("shared");
+            let st = shared.state.lock().expect("shared state lock");
+            match st.heap.get(live_ref) {
+                Some(toto_runtime::heap::Payload::Str(s)) => {
+                    // Seeded from the store=12 generation (the flush
+                    // generation stores length N+3 but prints its seed).
+                    assert_eq!(s, &"a".repeat(N + 2), "carried tag intact")
+                }
+                other => panic!("soak: carried tag corrupted: {other:?}"),
+            }
+        }
+        assert!(
+            max_live <= 4,
+            "soak: heap live stays bounded over {N} reloads (max {max_live})"
+        );
+        assert!(
+            allocated_total >= (N + 2) as u64,
+            "soak: churn actually happened (allocated {allocated_total})"
+        );
     }
 }

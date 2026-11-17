@@ -12,6 +12,7 @@
 pub mod aot;
 pub mod compile;
 pub mod dev;
+pub mod preserve;
 pub mod runtime;
 pub mod task;
 

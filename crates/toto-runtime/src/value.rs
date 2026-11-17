@@ -17,7 +17,10 @@ use crate::heap::{GcRef, Heap};
 
 /// A runtime value. `Clone` is cheap (references are copied, payloads
 /// shared) — the GC keeps referents alive, never moved (non-moving).
-#[derive(Clone, Debug)]
+/// `PartialEq` is structural; tests use it for carried-value
+/// assertions (NaN compares unequal, as usual — use the executor
+/// equality for NaN-sensitive checks).
+#[derive(Clone, Debug, PartialEq)]
 pub enum RtVal {
     Int(i64),
     Float(f64),
@@ -43,7 +46,7 @@ pub enum RtVal {
     Ptr(u64),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RtClosure {
     pub body: Arc<MirBody>,
     /// Block graph shared with executor frames (precomputed at creation

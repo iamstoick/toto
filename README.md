@@ -1,11 +1,11 @@
 # Toto (.gzv) — language implementation in Rust
 
-> Phase 5 (tooling, stdlib, FFI) complete — v1 core complete:
-> modules + `toto init`/`build`/`test`, `toto fmt`, basic LSP,
-> nine `gzv.std` modules with docs, end-to-end C FFI proof on
-> real libc/libm/libpthread, and the `apps/wordfreq` sample app.
-> Gate green (58 suites, 154 tests + stdlib 8/8 + wordfreq).
-> See [Phase 5 report](docs/phases/phase-5-tooling-stdlib-ffi.md).
+> Phase 6 (state-preserving hot reload) complete — `toto dev`
+> preserves declared `state {}` across reloads with `migrate`
+> functions, loud atomic fallback to drain-and-restart, 10-reload
+> soak with bounded heap, 7-program build-equivalence sample.
+> Gate green (58 suites, 188 tests + stdlib 8/8 + wordfreq).
+> See [Phase 6 report](docs/phases/phase-6-state-preserving-reload.md).
 > Roadmap: [Implementation Roadmap v2.4](docs/) (D1–D8 + ratified decisions; title page verified at Phase 4 kickoff).
 
 ## Layout

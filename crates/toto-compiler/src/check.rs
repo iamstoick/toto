@@ -1139,6 +1139,153 @@ pub fn check_with_files(
     }
 }
 
+/// Fields of the migrate parameter read anywhere in the body
+/// (direct `old.field` reads, including inside nested closures;
+/// shadowing the parameter name breaks the chain), plus whether the
+/// body returns the parameter itself (`return old;` or a trailing
+/// `old` — trivially total). Shared by the checker's `E0326` and
+/// reload-time totality against the OLD generation's fields
+/// (Phase 6, Stage 3): one walk, no drift.
+pub fn migrate_param_reads(body: &HBlock, param: &str) -> (HashSet<String>, bool) {
+    fn is_param(e: &HExpr, param: &str) -> bool {
+        matches!(&e.kind, HExprKind::Var(n, VarRef::Local { depth: 0, .. }) if n == param)
+    }
+    // Identity: the body is exactly `return old;` or a trailing
+    // `old` expression.
+    if body.stmts.len() == 1
+        && body.tail.is_none()
+        && let HStmtKind::Return(e) = &body.stmts[0].kind
+        && is_param(e, param)
+    {
+        return (HashSet::new(), true);
+    }
+    if body.stmts.is_empty()
+        && let Some(tail) = &body.tail
+        && is_param(tail, param)
+    {
+        return (HashSet::new(), true);
+    }
+    fn collect(e: &HExpr, param: &str, read: &mut HashSet<String>) {
+        match &e.kind {
+            HExprKind::Field { base, name } => {
+                if is_param(base, param) {
+                    read.insert(name.clone());
+                }
+                collect(base, param, read);
+            }
+            HExprKind::If {
+                cond,
+                then_b,
+                else_b,
+            } => {
+                collect(cond, param, read);
+                collect_block(then_b, param, read);
+                if let Some(b) = else_b {
+                    collect_block(b, param, read);
+                }
+            }
+            HExprKind::Closure { body, .. } => collect_block(body, param, read),
+            HExprKind::StructLit { fields, .. } => {
+                for (_, v, _) in fields {
+                    collect(v, param, read);
+                }
+            }
+            HExprKind::Array(es) => {
+                for v in es {
+                    collect(v, param, read);
+                }
+            }
+            HExprKind::Range(a, b) => {
+                collect(a, param, read);
+                collect(b, param, read);
+            }
+            HExprKind::Binary { left, right, .. } => {
+                collect(left, param, read);
+                collect(right, param, read);
+            }
+            HExprKind::Unary { expr, .. } => collect(expr, param, read),
+            HExprKind::Index { base, index, .. } => {
+                collect(base, param, read);
+                collect(index, param, read);
+            }
+            HExprKind::Call { callee, args } => {
+                collect(callee, param, read);
+                for a in args {
+                    collect(a, param, read);
+                }
+            }
+            HExprKind::CallBuiltin { args, .. } | HExprKind::CallForeign { args, .. } => {
+                for a in args {
+                    collect(a, param, read);
+                }
+            }
+            HExprKind::Ok(e) | HExprKind::Err(e) | HExprKind::Some(e) => collect(e, param, read),
+            HExprKind::Var(..)
+            | HExprKind::Int(..)
+            | HExprKind::Float(..)
+            | HExprKind::Str(..)
+            | HExprKind::Bool(..)
+            | HExprKind::Unit
+            | HExprKind::None
+            | HExprKind::Send { .. }
+            | HExprKind::Recv { .. }
+            | HExprKind::ChanNew { .. }
+            | HExprKind::Question { .. } => {}
+        }
+    }
+    fn collect_block(b: &HBlock, param: &str, read: &mut HashSet<String>) {
+        for stmt in &b.stmts {
+            match &stmt.kind {
+                HStmtKind::Let { value, .. } => collect(value, param, read),
+                HStmtKind::Assign { target, value } => {
+                    match target {
+                        HAssignTarget::Field(base, _, _) | HAssignTarget::Index(base, _, _) => {
+                            collect(base, param, read)
+                        }
+                        HAssignTarget::Var(..) => {}
+                    }
+                    collect(value, param, read);
+                }
+                HStmtKind::Expr(e) | HStmtKind::Return(e) => collect(e, param, read),
+                HStmtKind::Break | HStmtKind::Continue => {}
+                HStmtKind::While { cond, body } => {
+                    collect(cond, param, read);
+                    collect_block(body, param, read);
+                }
+                HStmtKind::For { iter, body, .. } => {
+                    collect(iter, param, read);
+                    collect_block(body, param, read);
+                }
+                HStmtKind::Go { body, .. } => collect_block(body, param, read),
+                HStmtKind::Select { cases, default } => {
+                    for case in cases {
+                        match case {
+                            HSelectCase::Recv { chan, body, .. } => {
+                                collect(chan, param, read);
+                                collect_block(body, param, read);
+                            }
+                            HSelectCase::Send { chan, value, body } => {
+                                collect(chan, param, read);
+                                collect(value, param, read);
+                                collect_block(body, param, read);
+                            }
+                        }
+                    }
+                    if let Some(b) = default {
+                        collect_block(b, param, read);
+                    }
+                }
+            }
+        }
+        if let Some(tail) = &b.tail {
+            collect(tail, param, read);
+        }
+    }
+    let mut read = HashSet::new();
+    collect_block(body, param, &mut read);
+    (read, false)
+}
+
 fn item_span_for(program: &Program, name: &str) -> (Span, Option<String>) {
     for item in &program.items {
         if let crate::ast::ItemKind::Fn(decl) = &item.kind
@@ -1463,144 +1610,10 @@ impl Checker {
     /// (reload time re-checks against the old generation). Returning
     /// the parameter itself is trivially total.
     fn check_migrate_totality(&mut self, body: &HBlock, target: &str, param: &str) -> bool {
-        fn is_param(e: &HExpr, param: &str) -> bool {
-            matches!(&e.kind, HExprKind::Var(n, VarRef::Local { depth: 0, .. }) if n == param)
-        }
-        // Identity: the body is exactly `return old;` or a trailing
-        // `old` expression.
-        if body.stmts.len() == 1
-            && body.tail.is_none()
-            && let HStmtKind::Return(e) = &body.stmts[0].kind
-            && is_param(e, param)
-        {
+        let (read, identical) = migrate_param_reads(body, param);
+        if identical {
             return true;
         }
-        if body.stmts.is_empty()
-            && let Some(tail) = &body.tail
-            && is_param(tail, param)
-        {
-            return true;
-        }
-        fn collect(e: &HExpr, param: &str, read: &mut HashSet<String>) {
-            match &e.kind {
-                HExprKind::Field { base, name } => {
-                    if is_param(base, param) {
-                        read.insert(name.clone());
-                    }
-                    collect(base, param, read);
-                }
-                HExprKind::If {
-                    cond,
-                    then_b,
-                    else_b,
-                } => {
-                    collect(cond, param, read);
-                    collect_block(then_b, param, read);
-                    if let Some(b) = else_b {
-                        collect_block(b, param, read);
-                    }
-                }
-                HExprKind::Closure { body, .. } => collect_block(body, param, read),
-                HExprKind::StructLit { fields, .. } => {
-                    for (_, v, _) in fields {
-                        collect(v, param, read);
-                    }
-                }
-                HExprKind::Array(es) => {
-                    for v in es {
-                        collect(v, param, read);
-                    }
-                }
-                HExprKind::Range(a, b) => {
-                    collect(a, param, read);
-                    collect(b, param, read);
-                }
-                HExprKind::Binary { left, right, .. } => {
-                    collect(left, param, read);
-                    collect(right, param, read);
-                }
-                HExprKind::Unary { expr, .. } => collect(expr, param, read),
-                HExprKind::Index { base, index, .. } => {
-                    collect(base, param, read);
-                    collect(index, param, read);
-                }
-                HExprKind::Call { callee, args } => {
-                    collect(callee, param, read);
-                    for a in args {
-                        collect(a, param, read);
-                    }
-                }
-                HExprKind::CallBuiltin { args, .. } | HExprKind::CallForeign { args, .. } => {
-                    for a in args {
-                        collect(a, param, read);
-                    }
-                }
-                HExprKind::Ok(e) | HExprKind::Err(e) | HExprKind::Some(e) => {
-                    collect(e, param, read)
-                }
-                HExprKind::Var(..)
-                | HExprKind::Int(..)
-                | HExprKind::Float(..)
-                | HExprKind::Str(..)
-                | HExprKind::Bool(..)
-                | HExprKind::Unit
-                | HExprKind::None
-                | HExprKind::Send { .. }
-                | HExprKind::Recv { .. }
-                | HExprKind::ChanNew { .. }
-                | HExprKind::Question { .. } => {}
-            }
-        }
-        fn collect_block(b: &HBlock, param: &str, read: &mut HashSet<String>) {
-            for stmt in &b.stmts {
-                match &stmt.kind {
-                    HStmtKind::Let { value, .. } => collect(value, param, read),
-                    HStmtKind::Assign { target, value } => {
-                        match target {
-                            HAssignTarget::Field(base, _, _) | HAssignTarget::Index(base, _, _) => {
-                                collect(base, param, read)
-                            }
-                            HAssignTarget::Var(..) => {}
-                        }
-                        collect(value, param, read);
-                    }
-                    HStmtKind::Expr(e) | HStmtKind::Return(e) => collect(e, param, read),
-                    HStmtKind::Break | HStmtKind::Continue => {}
-                    HStmtKind::While { cond, body } => {
-                        collect(cond, param, read);
-                        collect_block(body, param, read);
-                    }
-                    HStmtKind::For { iter, body, .. } => {
-                        collect(iter, param, read);
-                        collect_block(body, param, read);
-                    }
-                    HStmtKind::Go { body, .. } => collect_block(body, param, read),
-                    HStmtKind::Select { cases, default } => {
-                        for case in cases {
-                            match case {
-                                HSelectCase::Recv { chan, body, .. } => {
-                                    collect(chan, param, read);
-                                    collect_block(body, param, read);
-                                }
-                                HSelectCase::Send { chan, value, body } => {
-                                    collect(chan, param, read);
-                                    collect(value, param, read);
-                                    collect_block(body, param, read);
-                                }
-                            }
-                        }
-                        if let Some(b) = default {
-                            collect_block(b, param, read);
-                        }
-                    }
-                }
-            }
-            if let Some(tail) = &b.tail {
-                collect(tail, param, read);
-            }
-        }
-        let mut read = HashSet::new();
-        collect_block(body, param, &mut read);
         let Some(decl) = self.structs.get(target) else {
             // Unreachable: the parameter type resolved to this struct.
             return true;

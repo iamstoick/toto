@@ -369,6 +369,18 @@ pub enum MConst {
 /// resolution, types, and arities hold; the builder still never panics —
 /// any violated invariant becomes a well-formed `FallOff` in dead code.
 pub fn lower(checked: &CheckedProgram) -> MProgram {
+    lower_with_init(checked, true)
+}
+
+/// Lower without the state-init prepend in `main` (Phase 6,
+/// Stage 3): the preserving-reload path seeds every slot from
+/// carried values instead of running initializers. Everything else
+/// (safepoints, checks, migrates) lowers identically.
+pub fn lower_without_init(checked: &CheckedProgram) -> MProgram {
+    lower_with_init(checked, false)
+}
+
+fn lower_with_init(checked: &CheckedProgram, with_init: bool) -> MProgram {
     let mut fns = Vec::new();
     let mut fn_index = HashMap::new();
     let mut main_span = Span::new(0, 0);
@@ -388,7 +400,7 @@ pub fn lower(checked: &CheckedProgram) -> MProgram {
             main_span = hfn.span;
             saw_main = true;
         }
-        fns.push(lower_fn(checked, hfn));
+        fns.push(lower_fn_inner(checked, hfn, with_init));
     }
     // State without `main` lowers nothing: `main` is mandatory
     // (E0312), so a checked program with state always has it.
@@ -396,7 +408,7 @@ pub fn lower(checked: &CheckedProgram) -> MProgram {
     let mut migrates = Vec::new();
     for m in &checked.migrates {
         let sty = Ty::Struct(m.target.clone());
-        migrates.push(lower_fn(
+        migrates.push(lower_fn_inner(
             checked,
             &crate::hir::HFn {
                 name: format!("migrate {}", m.target),
@@ -405,6 +417,7 @@ pub fn lower(checked: &CheckedProgram) -> MProgram {
                 body: m.body.clone(),
                 span: m.span,
             },
+            with_init,
         ));
     }
     MProgram {
@@ -416,7 +429,11 @@ pub fn lower(checked: &CheckedProgram) -> MProgram {
     }
 }
 
-fn lower_fn(checked: &CheckedProgram, hfn: &HFn) -> MFn {
+/// Lower one function with optional state-init prepend (Phase 6,
+/// Stage 3): the preserving-reload compile uses `false` for `main`,
+/// since carried values seed every slot and re-running initializers
+/// would clobber them (and repeat IO side effects).
+fn lower_fn_inner(checked: &CheckedProgram, hfn: &HFn, with_init: bool) -> MFn {
     let mut b = FnBuilder::new(checked);
     for (name, ty, _) in &hfn.params {
         let l = b.fresh(format!("{name} (param)"), ty.clone());
@@ -433,7 +450,7 @@ fn lower_fn(checked: &CheckedProgram, hfn: &HFn) -> MFn {
     // entry safepoint stays first: init code allocates and carries
     // the same per-op guards as ordinary code.
     b.entry_safepoint();
-    if hfn.name == "main" {
+    if with_init && hfn.name == "main" {
         b.lower_state_init();
     }
     b.lower_stmts(&hfn.body.stmts, &hfn.ret);

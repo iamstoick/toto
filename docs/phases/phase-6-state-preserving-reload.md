@@ -412,3 +412,199 @@ on the previous; gate green throughout.
   incl. 39 spike + 11 gc + 4 retain_proofs); `toto test` stdlib +
   wordfreq unchanged (not re-run this slice — no stdlib surface
   touched).
+
+## Stage 3 — declared state + migration (carry planner, evaluator, driver, e2e matrix)
+
+Reload-time enforcement is this stage: migration invocation,
+reload-time totality, the matrix, and queued-value validation.
+First-load checking was slice 2b; nothing there changed.
+
+- Carry planner (`crates/toto-jit/src/preserve.rs`, `plan_carry`):
+  same names + same types with no layout change carry verbatim;
+  added/removed bindings abort loudly (fresh init on the atomic
+  path, initializers never rerun); struct layout change runs the new
+  program's `migrate` for that struct (missing migrate, failed
+  reload-time totality against the OLD field set, or a migrate panic
+  all abort loudly — no implicit defaults, §2.2); channel type
+  change carries on an empty queue, aborts on a non-empty one;
+  `Func` stability is by MIR table order/signature match (a shifted
+  index would silently call the wrong function, so any mismatch
+  aborts); fn-signature changes play no role for `migrate`
+  (per-struct only, §2.1). Migration evaluates on a snapshot: the
+  old heap is never mutated, channels/closures/functions pass
+  through by handle.
+- Migrate evaluator: the pure subset over the old value (no user
+  calls, no IO builtins, no foreign calls, no channels/tasks/state,
+  `?` already impossible via `E0308`); output validated field by
+  field against the NEW types before anything is touched
+  (a mistyped field aborts instead of reinterpreting).
+- Unit matrix (`preserve_tests`, 14 tests green): verbatim carry,
+  init-change carry, added/removed aborts, layout-with-migrate
+  (incl. mistyped-field validation abort), identity-removal carry,
+  no-migrate abort, migrate-panic abort, reload-time old-field
+  totality, closure-in-migrate abort, channel type change with empty
+  queue carries, with queued values aborts, func-table reorder with
+  func state aborts, pure-subset exercise.
+- Driver wiring (`crates/toto-jit/src/dev.rs`, `rebuild_with`):
+  init-strip (the preserving compile drops state initializers —
+  they run once, on fresh load), `PreservingSeed` (carried slots in
+  declaration order + the moved channel table; the old heap moves
+  whole so handles stay valid), loud atomic abort on ANY planner or
+  recompile failure (fresh heap, initializers run, nothing carried).
+  `prune_retired` collects the moved heap with exactly the carried
+  roots on every preserving rebuild — retention stays GC-reachable
+  end to end, never an acquire/release stand-in.
+- E2e matrix (`preserve_proofs`, 10 tests green): body change
+  preserves (row 1); init change carries old value (row 5);
+  layout change with migrate end to end (row 3, port 21 carried
+  then tls derived); layout change without migrate aborts to fresh
+  init with the reason recorded (row 3 negative); signature change
+  preserves state while code restarts (row 2, §2.1 correction);
+  declared channel moves whole with counter proof (row 4);
+  drained/cancelled share the carry arm; timeout abandonment
+  carries nothing (fallback integrity); stateless body change
+  drains exactly like Phase 4 (no carry, no abort — the fallback
+  pin); 10-reload soak with heap accounting (Stage 4).
+- Q4 classification (§2.15), written down: REACHABLE — empty-queue
+  channel type change (e2e `channel_state_moves_whole_e2e`),
+  verbatim/validated value carry (every e2e), fn/closure values in
+  carried state under a stable table (unit `func_table_...`, e2e
+  retain proofs). DEFENSE-ONLY (unreachable by construction, still
+  asserted) — non-empty queue at settle (state channels are always
+  unbuffered with no waiters post-settle; unit
+  `chan_type_change_queued_values_abort` pins the abort), fn value
+  under a reordered table (unit `func_table_reorder_...`). The
+  atomic commit holds either way.
+- Fixture fix (this stage): `migrate_end_to_end`'s gen2/gen3
+  migrate bodies added `bool` to `int` (`old.port + probe`).
+  Cascade noted honestly: after the `E0303`, best-effort HIR drops
+  the struct-literal reads, so the walker also reported `E0326`
+  (first unread field). Multi-error recovery reporting both is
+  accepted behavior — the fixture was wrong, not the checker.
+  Fixed as `old.port + (if probe { 1 } else { 0 })` (probe stays a
+  syntactic `old.tls` read inside a dead branch, never evaluated at
+  reload); asserted output unchanged (`21\n1\n`).
+- Harness fix (this stage, load-bearing): `timeout_abandonment_...`
+  used the production `ReexecRestart`, which re-spawns the test
+  binary — under `cargo test` that re-runs the suite into an
+  unbounded re-exec chain holding the harness pipe open (the
+  earlier 30-minute hang: PIDs churning, `tail` never seeing EOF).
+  Fix: `RecordRestart` test stub (records, never exits) + the
+  shared helpers generalized over `R: RestartPolicy`; the timeout
+  test now asserts exactly one recorded restart and completes
+  in-process. Precedent: the integration suite already uses its own
+  `MockRestart` (`crates/toto-jit/tests/dev.rs`). No test may use
+  `ReexecRestart` on a path that can abandon a run (recorded on the
+  stub). Known leak: the abandoned infinite-loop thread keeps
+  spinning in-process after the test (its worker is dropped with
+  the run); production is safe via re-exec. The other nine tests
+  keep `ReexecRestart` — none can abandon, so no chain is possible.
+
+## Stage 4 — scenario matrix, soak, fallback, gates
+
+- Scenario matrix: every matrix row has the correct outcome
+  asserted at two levels — unit (`preserve_tests`: carry, abort,
+  migrate-run, validation, queued-value, func-stability) and
+  observed-output e2e (`preserve_proofs`: rows 1, 2, 3±, 4, 5,
+  shared arm, abandonment, stateless fallback). Incompatible
+  changes fail loudly with the reason recorded
+  (`carry_abort` contains "no migrate" in the e2e) and fall back to
+  drain-and-restart safely; never silent reinterpretation, never a
+  silent skip or silent drop (removal with a non-identity migrate
+  cannot name the dropped field — `E0310` — and restarts loudly).
+- Soak (`soak_many_preserving_reloads_bounded_heap`): ten
+  consecutive preserving reloads over string state plus a flush
+  generation — twelve generations, every streamed output asserted
+  exact (`a` … `a`×11), `carry_abort` none throughout. Heap
+  accounting per generation: `objects_live` asserted bounded
+  (≤ 4, every generation) while `allocated_total` grows (churn
+  happened); the final carried tag verified intact by heap read.
+  No leaks (live flat over 12 reloads), no corruption (exact bytes
+  + intact tag). Broken-edit survival is covered by the 100-edit
+  `scripts/devloop_soak.sh` harness (80 good + 20 broken, manual
+  per release) and the missing-migrate e2e.
+- Drain-and-restart fallback intact: `stateless_body_change_...`
+  proves a program with NO declared state behaves exactly as in
+  Phase 4 (new output, nothing carried, no abort); the Phase 4
+  `dev` integration tests (classifier, settle, still-broken,
+  no-change, ordering, parked-cancel) stay green in the full gate;
+  a program with no declared state never enters the carry arm
+  (`plan_carry` is skipped when both sides are stateless).
+- Gates: `./scripts/check.sh` EXIT=0 on two consecutive full runs
+  (fmt `--check`, `clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace`, stdlib 8/8, wordfreq project tests +
+  interpreter-vs-built byte equivalence); `cargo fmt --all` applied
+  to touched files (no other files changed by fmt).
+
+## Corrections (authorization §2.13–§2.15, dated 2026-11-17)
+
+- §2.13 reconciliation, re-derived from a fresh `cargo test
+  --workspace` (58 `test result` lines, every line accounted for
+  exactly once, all `ok`, 0 failed). The old 154/155/166 figures
+  are superseded — do not copy them. Non-zero suites:
+  - Spikes 39: ffi int 7 + spike-1 lib 1 + spike-1 int 7 +
+    stack-1b int 6 + reload int 10 + jit-3 int 8.
+    (Zero-count spike bins — demo/overflow/trapprobe/jit_probe/
+    panic_probe/spike1_demo — are build-only harnesses, plus 5
+    zero-count spike lib targets; the 8 `Doc-tests` lines are 0.)
+  - Compiler 57: cli lib 3 + cli int 15 + corpus runner 1 + lsp 3 +
+    differential 1 + fmt 2 + interp 8 + lexer 7 + mir 1 +
+    mir_conform 1 + parser 5 + project 10.
+  - Runtime 26: blocking 4 + concurrent 3 + fmt_equiv 1 + gc 11
+    (incl. the 5 `is_live` proofs) + mn 5 + sequential 1 +
+    stack 1 (lib target 0).
+  - JIT 66: lib 28 (4 retain_proofs + 10 preserve_proofs + 14
+    preserve_tests) + dev int 11 + differential 1 + concurrent 1 +
+    task 1 + gate 8 + mn_jit 6 + opt 3 + panics 1 + race 2 +
+    stack_jit 2 + timings 1 + yield_jit 1 (probe bins 0).
+  - Total: 39 + 57 + 26 + 66 = **188 passed, 0 failed**.
+    Gate extras outside `cargo test`: stdlib 8/8 via `toto test`,
+    wordfreq project tests + interpreter-vs-built `cmp` clean.
+  - The old breakdown's errors (subtotals summing to 166; toto-jit
+    components to 39 not 53; dev tests missing from the toto-jit
+    list) came from mixing per-file counts with per-suite lines
+    and omitting the integration suites. The table above counts
+    result lines only — one line, one suite, no overlap by
+    construction (the dev-11 ARE the toto-jit integration tests;
+    the spike-bins 0-lines are separate build-only targets).
+- §2.14 build-sample reproducibility: `scripts/buildsample.sh`
+  (committed this stage; was `/tmp` scratch) re-runs the 7-program
+  sample with repo-relative paths:
+  `tests/corpus/interp/int01_arith.gzv` (arith),
+  `interp/clo04_higher_order.gzv` (closure),
+  `interp/struct01_basic.gzv` (structs),
+  `interp/loop02_for_range.gzv` (loops),
+  `interp/int03_divzero.gzv` (divzero),
+  `tests/corpus/concurrent/conc01_pingpong.gzv` (pingpong),
+  `tests/corpus/project/proj09_stdlib` (stdlibproj).
+  Command: `./scripts/buildsample.sh` (optional toto-binary arg;
+  ~10 min cold — one full AOT build per program — so manual per
+  release, like `devloop_soak.sh`, not in `check.sh`). Observed
+  2026-11-17: 7/7 — arith/closure/structs/loops exit 0 with golden
+  stdout; divzero exit 1 with `panic[E0202]: division by zero`;
+  pingpong exit 0 `42`; stdlibproj exit 0
+  `Ok(00720|1d 2h|9|6)`. All match the interpreter goldens.
+- §2.1–§2.7/2.15 spec pins: verified present in `docs/spec.md`
+  §14–§14.4 + the 2026-11-17 amendment record (one `state {}`
+  block, `E0311` collisions, contextual keywords with the 2026-11-17
+  corpus check, mutable declaration-order bindings with `E0318`/
+  `E0319`, one-parameter struct-in=struct-out migrate with `E0325`
+  determinism + `E0326` totality, channel revalidation incl. the
+  undeclared-only drop rule, no-implicit-defaults, signature-row
+  correction, whitelist channels+plain-data, Q4
+  reachable/defense-only split, call directionality, helper
+  boundary). No new builtins (27 frozen); production builds do not
+  hot-reload.
+
+## Exact counts (end of Phase 6)
+
+- Corpus: unchanged since slice 2b — 157 differential-census entry
+  cases; 177 `.gzv` files (9 support). No program added, removed,
+  or re-goldened in Stages 3–4 (the e2e matrix is Rust tests, and
+  the migrate-fixture fix touched no corpus file).
+- Cargo: 188 passed / 0 failed over 58 result lines (table above);
+  fmt pins 140/17/45 hold (no formatter-relevant corpus change);
+  stdlib 8/8 + wordfreq green via `check.sh`.
+- New tests this phase: 14 `preserve_tests` + 10 `preserve_proofs`
+  (7 matrix + abandonment + stateless fallback + soak) +
+  `RecordRestart` stub; 4 `retain_proofs` unchanged and green.
