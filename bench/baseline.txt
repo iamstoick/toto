@@ -1,0 +1,41 @@
+# bench/baseline.txt — release-benchmark medians (ms) for regression
+# flagging (`scripts/bench.sh --baseline`). Sources: benchmark rows are
+# the Stage 1 published medians (n=5, methodology in the Phase 7 report
+# §Stage 1); `aot*-wf-*` and `start-*` rows were measured locally on
+# 2026-11-17 (Ryzen 5 5600G, 27 GB RAM, Linux, rustc 1.100.0, n=5 for
+# wordfreq Off, n=3 for the rest). CI compares `--runs 3` medians
+# against these; any median above 5x its baseline prints FLAG and fails
+# the suite (exit 1). The 5x rule absorbs machine variance (CI runners
+# differ from the recording machines) while catching order-of-magnitude
+# regressions (the wordfreq 75s anomaly was ~500x its fixed time).
+interp-compute 1874
+jit-compute 16
+aot-compute 96
+aotrel-compute 16
+interp-conc 3115
+jit-conc 117
+aot-conc 96
+aotrel-conc 16
+interp-stdlib 1761
+aot-stdlib 201
+aotrel-stdlib 48
+interp-wordfreq 1189
+aot-wordfreq 515
+aotrel-wordfreq 145
+interp-wf-6 16
+aot-wf-6 15
+aotrel-wf-6 8
+interp-wf-600 75
+aot-wf-600 36
+aotrel-wf-600 15
+interp-wf-6000 601
+aot-wf-6000 250
+aotrel-wf-6000 78
+interp-wf-12000 1189
+aot-wf-12000 515
+aotrel-wf-12000 152
+start-interp 5
+start-jit 6
+start-aot 4
+start-aotrel 4
+start-aotrel-wordfreq 9

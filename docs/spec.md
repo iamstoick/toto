@@ -576,7 +576,8 @@ Every diagnostic carries: stable code, `error`/`panic` kind, message,
 `help:` suggestion. Codes: `E00xx` lexer, `E01xx` parser, `E02xx` runtime
 (panics), `E03xx` static type errors (Phase 2, §12), `E04xx`
 project/module errors (Phase 5: `E0401` unresolved import, `E0402`
-circular import, §3.1). The code list lives
+circular import, §3.1), `E06xx` package resolution (Phase 7,
+Stage 3, §16). The code list lives
 with the implementation and is appended to
 this spec when new codes are added (spec amendment, not silent drift).
 
@@ -747,9 +748,11 @@ confirms or corrects — never silent).
 - Type `chan<T>` (§4). Values are created by builtins: `chan<T>()`
   (unbuffered) and `chan<T>(n)` (bounded, capacity `n`). `n` must be an
   `int`; a negative capacity panics (`E0204`) **[Proposal]**.
-- The builtin catalog grows 25 → 28: `chan`, `close`, `closed` are added
+- The builtin catalog grows 25 → 27: `chan`, `close`, `closed` are added
   (mandated by this section; §7's freeze is otherwise unchanged). No
   other channel builtins exist in v1 (`len` does not apply to channels).
+  (Correction 2026-11-17: 27, not 28 — the old total double-counted
+  `len`; verified against `BUILTIN_NAMES`.)
 - Send is `ch <- v`, receive is `<-ch` (§2.3). Send blocks when a bounded
   channel is full, and on an unbuffered channel until a receiver takes
   the value; receive blocks when the channel is empty. `select` with
@@ -890,6 +893,14 @@ reinterpreted. Production builds (`toto build`) never hot-reload.
   Reads/writes lower to `StateGet`/`StateSet`. State-held heap objects
   join every GC root set (threshold, explicit, and rendezvous
   collections), so live state is never swept under a running program.
+- Concurrency (as implemented; recorded 2026-11-17): each
+  `StateGet`/`StateSet` is atomic with respect to other state
+  accesses — single-threaded executors serialize everything, and
+  task mode clones/stores one slot under the shared-state mutex, so
+  no torn slots. Compound sequences are NOT atomic: concurrent
+  read-modify-write from multiple workers races (last-writer-wins).
+  Coordinate through channels (both concurrent corpus programs are
+  single-writer rendezvous chains).
 - Reloads (until Stage 3): declared state re-initializes from scratch
   in the new generation. This is drain-and-restart for state —
   visible and total, consistent with all other program state — and
@@ -901,7 +912,9 @@ reinterpreted. Production builds (`toto build`) never hot-reload.
   naming no new namespace: the migrate NAME shares the flat value
   namespace (`E0311` on collision) but is never callable — any
   reference or call is `E0325` (migrate functions run at reload,
-  never as ordinary calls).
+  never as ordinary calls). The declared name is not required to
+  equal `S` (lookup is by parameter type; verified against
+  `HMigrate`/reload lookup, recorded 2026-11-17).
 - Exactly one parameter (`E0321` otherwise); its type must be a
   struct `S` (`E0322` otherwise); the return type must equal `S`
   (`E0323` otherwise — no implicit conversion, no implicit field
@@ -1004,6 +1017,129 @@ reinterpreted. Production builds (`toto build`) never hot-reload.
   reference-counted containers) and must not touch the Spike 1 GC heap,
   the Spike 1b scheduler, or Cranelift.
 
+## 16. Package manager (Phase 7, Stage 3; amendment record 2026-11-17)
+
+No module-model change: flat namespace, path imports, `gzv.std/`
+prefix, `pub` accepted with no effect, duplicates `E0311`,
+circular imports `E0402` — all unchanged. This section adds
+dependency management on top of that model.
+
+### 16.1 Manifest
+
+`toto.toml` keeps `[project]` (name/version/entry) exactly. An
+optional `[dependencies]` table maps package names (ascii
+alphanumeric/`_`/`-`) to one of:
+
+- `"1.2.3"` — bare version (caret): source-less, always an
+  error at resolve time (`E0606`). There is no registry.
+- `{ path = "DIR" [, version = "REQ"] }` — directory holding
+  `toto.toml` + `.gzv` files (or a `.gzv-pkg` file, unpacked
+  into the package cache at resolve time).
+- `{ git = "URL", rev = "R" | tag = "T" [, version = "REQ"] }`
+  — pinned revision. Branches, HEAD, and unpinned sources are
+  rejected (`E0605`).
+
+`REQ` is `^x.y.z` (compatible; bare `x.y.z` means caret),
+`~x.y.z` (patch-level), or `=x.y.z` (exact). Versions are
+SemVer `MAJOR.MINOR.PATCH` numerics: no prerelease, no build
+metadata, and `0.x` is NOT special-cased (ordinary
+caret/tilde semantics, already restrictive for `0.x`). No
+`[dependencies]` table means exactly today's behavior: no
+packages, `toto.lock` ignored when absent.
+
+### 16.2 Resolution (incl. Amendment 1)
+
+First segment rule: `import "<dep>/rest"` loads
+`<package-dir>/<rest>` when `<dep>` names a declared
+dependency (remainder required; `./` and `../` imports never
+match; a bare `import "<dep>"` resolves plainly). `gzv.std/`
+is checked first and reserved — no dependency can shadow it.
+
+**Amendment 1 (owner ruling 2026-11-17):** when the literal
+import path also resolves from the project root AND the
+package file exists, that is an error, loud (`E0601`, naming
+the dependency and the root path) — never a silent shadow in
+either direction. When only one side exists, it wins (so
+adding a dependency never silently rebinds an existing
+import). When neither exists, the existing `E0401` applies.
+A package dir whose `toto.toml` name differs from the
+required name, or a package with the project's own name, is
+an error (`E0608`).
+
+Transitive dependencies (Amendment 2a, full resolution): every
+selected package's own `[dependencies]` is honored
+recursively. One version per package per project
+(single-version rule): the highest version satisfying every
+requirement (root + transitive, each with provenance);
+conflicts name every requirement with its requirer
+(`E0602`). Dependency cycles are an error (`E0607`).
+Deterministic: same inputs → byte-identical `toto.lock`.
+
+### 16.3 Lockfile
+
+`toto.lock` (checked in) records every selected package
+(direct + transitive): name, exact version, source (path |
+git URL + pinned rev | pkg file + content hash), and a
+content hash over the package's `.gzv` files. It is the ONLY
+source of versions at build time. Missing lockfile: resolve
++ write loudly. Lockfile↔manifest disagreement: error
+(`E0603`), never a silent re-resolve. Changed content at a
+matching selection: error (`E0604`); `toto update` accepts.
+Pin behavior (`toto update <pkg>`): packages outside the
+updated subtree keep exactly their locked version+source
+while satisfiable; an unsatisfiable pin (source moved)
+rejoins selection with every requirement still enforced and
+every move reported.
+
+### 16.4 Sources and cache; no network at build time
+
+Path sources read live. Git and `.gzv-pkg` sources
+materialize into the package cache (`$TOTO_PKG_CACHE`, else
+`~/.cache/toto/pkgs`): git clones + checks out the pinned rev
+(fetching happens at add/update time only — never at build
+time); pkg files unpack by content hash. A locked git rev
+missing from the cache fails loudly naming the rev (`E0604`).
+Path dependencies do not survive `publish` as paths (machine-
+local); republish or re-point them as git/pkg sources.
+
+### 16.5 `add` / `update` / `publish`
+
+- `toto add <name> --path DIR | --git URL (--rev R | --tag T)
+  [--version REQ]`, or `toto add <file>.gzv-pkg` (name from
+  the packed manifest). Edits `[dependencies]`, resolves,
+  writes `toto.lock`. Sourceless names and unpinned git are
+  add-time errors.
+- `toto update`: re-resolves all requirements, rewrites the
+  lock, reports added/changed/removed (or "already up to
+  date"). `toto update <pkg>`: pkg + its transitive subtree;
+  unknown names are an error (`E0609`).
+- `toto publish`: packs `toto.toml` + shipped `.gzv` files
+  (no `tests/`, no `target/`, no lockfile) into
+  `<name>-<version>.gzv-pkg`, local only. No upload, no
+  registry, no auth. `toto add` of a `.gzv-pkg` file treats it
+  as a path source (unpacked into the cache).
+
+### 16.6 New error codes (fresh `E0601`–`E0609` block)
+
+- `E0601` ambiguous import: first segment matches a declared
+  dependency AND the project-root path (names both).
+- `E0602` version conflict (names every requirement + provenance).
+- `E0603` lockfile/manifest disagreement.
+- `E0604` locked content unavailable or changed (missing
+  cached git rev, tampered cache, edited sources).
+- `E0605` unpinned git source (no `rev`/`tag`).
+- `E0606` source-less requirement.
+- `E0607` dependency cycle (names the chain).
+- `E0608` cannot load package source (missing manifest, name
+  mismatch, git failure, corrupt pkg file, self-named package).
+- `E0609` unknown package in `toto update <pkg>`.
+
+Rendered `E0601` attaches to the importing file (existing
+diagnostic pipeline); project-level failures (`E0602`–`E0609`)
+are CLI errors (exit 3) carrying the code. `E0401`
+(unresolvable) and `E0311` (cross-package duplicates) reused
+unchanged.
+
 ## Appendix A. Spec decisions (choices beyond the PDF)
 
 Every **[Proposal]** above is a judgment call the PDF did not fix. For the
@@ -1060,7 +1196,9 @@ sub-details in §13 (negative capacity, `E0213`/`E0214`, the zero-value
 table, `E0315`, first-panic-wins/settle-then-propagate, deadlock panic,
 default-last, `let v = <-ch` binding surface) are flagged for owner
 review: confirm or correct, per this appendix's process. The builtin
-catalog grows 25 → 28 (`chan`, `close`, `closed`); otherwise frozen.
+catalog grows 25 → 27 (`chan`, `close`, `closed`); otherwise frozen.
+(Correction 2026-11-17: 27, not 28 — the old total double-counted
+`len`; verified against `BUILTIN_NAMES`.)
 
 Phase 5 amendment record (2026-11-16): the owner chose the module model
 (path imports over `mod`-trees, flat namespace, meaningless `pub`,

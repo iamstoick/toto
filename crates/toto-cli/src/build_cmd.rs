@@ -16,11 +16,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use super::manifest::{Manifest, find_root, read_manifest};
+use super::packages::{Cache, ensure};
+use toto_compiler::project::DepEntry;
 
 /// Resolve the project root from the working directory.
 fn project_root() -> Result<(PathBuf, Manifest), ExitCode> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let manifest_path = find_root(&cwd).ok_or_else(|| {
+    project_root_for(&cwd)
+}
+
+pub(crate) fn project_root_for(dir: &Path) -> Result<(PathBuf, Manifest), ExitCode> {
+    let manifest_path = find_root(dir).ok_or_else(|| {
         eprintln!("toto: no toto.toml found (run from inside a project)");
         ExitCode::from(3)
     })?;
@@ -46,6 +52,52 @@ pub(crate) fn read_source(root: &Path, p: &str) -> Option<String> {
     std::fs::read_to_string(root.join(p)).ok()
 }
 
+/// Resolve declared dependencies (empty when the manifest has no
+/// `[dependencies]` — exactly today's behavior). Failures are
+/// already printed; the process exit is returned.
+pub(crate) fn resolve_deps(root: &Path, manifest: &Manifest) -> Result<Vec<DepEntry>, ExitCode> {
+    if manifest.dependencies.is_empty() {
+        return Ok(Vec::new());
+    }
+    match ensure(root, manifest, &Cache::from_env()) {
+        Ok(dirs) => Ok(dirs
+            .into_iter()
+            .map(|(name, dir)| DepEntry {
+                name,
+                dir: dir.to_string_lossy().into_owned(),
+            })
+            .collect()),
+        Err(e) => {
+            eprintln!("{e}");
+            Err(ExitCode::from(3))
+        }
+    }
+}
+
+/// Dependency map for `toto run <file>`: the manifest found by
+/// walking up from `cwd` (the same anchor reads use); empty when
+/// there is no manifest or no `[dependencies]`.
+pub(crate) fn run_deps(cwd: &Path) -> Result<Vec<DepEntry>, ExitCode> {
+    let Some(manifest_path) = find_root(cwd) else {
+        return Ok(Vec::new());
+    };
+    let manifest = match read_manifest(&manifest_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{}", e.message);
+            return Err(ExitCode::from(3));
+        }
+    };
+    if manifest.dependencies.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = manifest_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    resolve_deps(&root, &manifest)
+}
+
 /// Load + check the project entry; on failure the diagnostics are
 /// already printed and the process exit is returned.
 fn load_project(
@@ -55,6 +107,7 @@ fn load_project(
     (
         toto_compiler::project::Project,
         toto_compiler::hir::CheckedProgram,
+        Vec<DepEntry>,
     ),
     ExitCode,
 > {
@@ -64,10 +117,16 @@ fn load_project(
         eprintln!("toto: couldn't read `{}`: {e}", entry_path.display());
         ExitCode::from(3)
     })?;
+    let dep_entries = resolve_deps(root, manifest)?;
     // Reads anchor at the project root so `toto build` works from any
     // working directory; displays stay root-relative and stable.
-    match toto_compiler::project::load_and_check(&entry_display, &src, &|p| read_source(root, p)) {
-        Ok(loaded) => Ok(loaded),
+    match toto_compiler::project::load_and_check(
+        &entry_display,
+        &src,
+        &|p| read_source(root, p),
+        &dep_entries,
+    ) {
+        Ok((project, checked)) => Ok((project, checked, dep_entries)),
         Err(failed) => {
             for fd in &failed.errors {
                 let f = &failed.files[fd.file];
@@ -100,15 +159,29 @@ fn workspace_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-pub fn build(release: bool) -> ExitCode {
+pub fn build(release: bool, offline: bool) -> ExitCode {
     let (root, manifest) = match project_root() {
         Ok(ok) => ok,
         Err(code) => return code,
     };
-    let (project, checked) = match load_project(&root, &manifest) {
+    let (project, checked, dep_entries) = match load_project(&root, &manifest) {
         Ok(ok) => ok,
         Err(code) => return code,
     };
+    // Fingerprinted rebuilds (Phase 7, Stage 3 caching rule): the
+    // key covers every input byte codegen and linking consume
+    // (sources incl. dependency files, manifest, lockfile, opt
+    // level, toto version). Identical key + present binary ⇒ the
+    // output would be identical ⇒ skip. Any change ⇒ rebuild.
+    let fingerprint = build_fingerprint(&root, release, &project);
+    let finger_path = root.join("target").join(".toto-fingerprint");
+    let out_path = root.join("target").join(&manifest.name);
+    if out_path.is_file()
+        && std::fs::read_to_string(&finger_path).ok().as_deref() == Some(&fingerprint)
+    {
+        println!("toto: {} is fresh, skipping rebuild", manifest.name);
+        return ExitCode::from(0);
+    }
     // Foreign calls lower to `toto_foreign` (Phase 5, Stage 5):
     // non-callback FFI builds and runs from generated code;
     // callback-taking externs still refuse at compile time with the
@@ -150,16 +223,29 @@ pub fn build(release: bool) -> ExitCode {
         eprintln!("toto: couldn't write shim manifest: {e}");
         return ExitCode::from(3);
     }
-    let main_rs = gen_shim_main(&project, &artifact);
+    let main_rs = gen_shim_main(&project, &dep_entries, &artifact);
     if let Err(e) = std::fs::write(shim_dir.join("src").join("main.rs"), main_rs) {
         eprintln!("toto: couldn't write shim sources: {e}");
         return ExitCode::from(3);
+    }
+    // Pin dependency resolution to the workspace lockfile so production
+    // builds link exactly the dependency versions the repo was tested
+    // with (two builds at different times otherwise resolve different
+    // registry versions). The shim is an isolated workspace, so cargo
+    // adapts the copied lock (adds the shim root) without refetching
+    // when the versions are satisfiable from the local cache.
+    let ws_lock = workspace_dir().join("Cargo.lock");
+    if let Ok(bytes) = std::fs::read(&ws_lock) {
+        let _ = std::fs::write(shim_dir.join("Cargo.lock"), bytes);
     }
     let obj_abs = build_dir.join(format!("{}.o", manifest.name));
     let mut cmd = std::process::Command::new("cargo");
     cmd.arg("build").current_dir(&shim_dir);
     if release {
         cmd.arg("--release");
+    }
+    if offline {
+        cmd.arg("--offline");
     }
     // The object links in through a rustc link arg (absolute path):
     // the shim crate itself stays backend-agnostic. Any user RUSTFLAGS
@@ -187,7 +273,14 @@ pub fn build(release: bool) -> ExitCode {
         }
     }
     let profile = if release { "release" } else { "debug" };
-    let built = shim_dir.join("target").join(profile).join("toto-app-shim");
+    // The inner link honors the standard CARGO_TARGET_DIR knob
+    // (suites point it at a shared warm cache; production builds
+    // default to the shim dir) — the same rule cargo applies, so
+    // the binary is found wherever cargo put it.
+    let link_target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| shim_dir.join("target"));
+    let built = link_target.join(profile).join("toto-app-shim");
     let out_path = root.join("target").join(&manifest.name);
     if let Err(e) = std::fs::copy(&built, &out_path) {
         eprintln!("toto: couldn't install binary: {e}");
@@ -198,8 +291,50 @@ pub fn build(release: bool) -> ExitCode {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o755));
     }
+    // Record the fingerprint only after a successful install: a
+    // failed or interrupted build must never look fresh.
+    if let Some(parent) = finger_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&finger_path, &fingerprint) {
+        eprintln!("toto: couldn't write fingerprint: {e}");
+        return ExitCode::from(3);
+    }
     println!("toto: built {}", out_path.display());
     ExitCode::from(0)
+}
+
+/// Fingerprint key: every input byte codegen and linking consume.
+/// Sources (entry + imports + dependency files, in loader order),
+/// manifest text, lockfile text when present, opt level, and the
+/// toto version. FNV-1a/64, hex (integrity, not crypto).
+fn build_fingerprint(
+    root: &Path,
+    release: bool,
+    project: &toto_compiler::project::Project,
+) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+    for f in &project.files {
+        mix(f.path.as_bytes());
+        mix(f.src.as_bytes());
+    }
+    if let Ok(t) = std::fs::read(root.join("toto.toml")) {
+        mix(&t);
+    }
+    if let Ok(t) = std::fs::read(root.join("toto.lock")) {
+        mix(&t);
+    }
+    mix(if release { b"speed" } else { b"none" });
+    mix(env!("CARGO_PKG_VERSION").as_bytes());
+    format!("{h:016x}")
 }
 
 /// Rust-safe alias for a closure-body link symbol (see above).
@@ -211,6 +346,7 @@ fn body_alias(id: u32) -> String {
 /// tables from the build, and the `run_aot` hosting call.
 fn gen_shim_main(
     project: &toto_compiler::project::Project,
+    dep_entries: &[DepEntry],
     artifact: &toto_jit::aot::AotArtifact,
 ) -> String {
     let mut src = String::new();
@@ -222,6 +358,19 @@ fn gen_shim_main(
             "    ({}, {}),\n",
             raw_str(&f.path),
             raw_str(&f.src)
+        ));
+    }
+    src.push_str("];\n");
+    // Dependency map: name → package directory display string. The
+    // strings are table keys only (never touched on disk at
+    // runtime), baked at build time so startup resolution is
+    // byte-identical to build-time resolution on any cwd.
+    src.push_str("static DEPS: &[(&str, &str)] = &[\n");
+    for d in dep_entries {
+        src.push_str(&format!(
+            "    ({}, {}),\n",
+            raw_str(&d.name),
+            raw_str(&d.dir)
         ));
     }
     src.push_str("];\n");
@@ -263,7 +412,8 @@ fn gen_shim_main(
     src.push_str("    }\n");
     src.push_str("    let entry_src = SOURCES.iter().find(|(p, _)| *p == ENTRY).map(|(_, s)| *s).unwrap_or(\"\");\n");
     src.push_str("    let table: HashMap<&str, &str> = SOURCES.iter().copied().collect();\n");
-    src.push_str("    let (project, checked) = match toto_compiler::project::load_and_check(ENTRY, entry_src, &|p| table.get(p).map(|s| s.to_string())) {\n");
+    src.push_str("    let deps: Vec<toto_compiler::project::DepEntry> = DEPS.iter().map(|(n, d)| toto_compiler::project::DepEntry { name: n.to_string(), dir: d.to_string() }).collect();\n");
+    src.push_str("    let (project, checked) = match toto_compiler::project::load_and_check(ENTRY, entry_src, &|p| table.get(p).map(|s| s.to_string()), &deps) {\n");
     src.push_str("        Ok(ok) => ok,\n");
     src.push_str("        Err(failed) => {\n");
     src.push_str("            for fd in &failed.errors {\n");
@@ -320,8 +470,12 @@ fn gen_shim_main(
 
 /// Run every `tests/*.gzv` through the `toto run` path and report.
 pub fn test_all() -> ExitCode {
-    let (root, _manifest) = match project_root() {
+    let (root, manifest) = match project_root() {
         Ok(ok) => ok,
+        Err(code) => return code,
+    };
+    let dep_entries = match resolve_deps(&root, &manifest) {
+        Ok(d) => d,
         Err(code) => return code,
     };
     let tests_dir = root.join("tests");
@@ -361,8 +515,12 @@ pub fn test_all() -> ExitCode {
             .unwrap_or(case.as_path())
             .to_string_lossy()
             .into_owned();
-        let loaded =
-            toto_compiler::project::load_and_check(&display, &src, &|p| read_source(&root, p));
+        let loaded = toto_compiler::project::load_and_check(
+            &display,
+            &src,
+            &|p| read_source(&root, p),
+            &dep_entries,
+        );
         let (project, checked) = match loaded {
             Ok(ok) => ok,
             Err(failed_load) => {

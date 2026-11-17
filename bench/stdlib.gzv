@@ -1,0 +1,40 @@
+// bench/stdlib.gzv — stdlib-heavy workload (math + collections).
+// Every path must print exactly this checksum (asserted by
+// scripts/bench.sh before timing).
+import "gzv.std/math.gzv";
+import "gzv.std/collections.gzv";
+
+fn square(x: int) -> int {
+    return x * x;
+}
+
+fn is_odd(x: int) -> bool {
+    return x - (x / 2) * 2 == 1;
+}
+
+fn main() -> int {
+    let mut a: Array<int> = [];
+    let mut i = 0;
+    while i < 1000 {
+        push(a, 1000 - i);
+        i = i + 1;
+    }
+    let sorted: Array<int> = sort_ints(a);
+    let sq: Array<int> = map_ints(sorted, square);
+    let kept: Array<int> = filter_ints(sq, is_odd);
+    let folded: int = fold_ints(kept, 0, add);
+    let mut primes = 0;
+    let mut j = 2;
+    while j < 1000 {
+        if is_prime(j) {
+            primes = primes + 1;
+        }
+        j = j + 1;
+    }
+    println(folded + primes);
+    return 0;
+}
+
+fn add(x: int, y: int) -> int {
+    return x + y;
+}

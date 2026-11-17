@@ -252,8 +252,12 @@ fn fmt_drops_pub_without_changing_meaning() {
     }
     assert!(saw_pub, "fixture lost its `pub` items");
     let entry = formatted.remove("main.gzv").expect("main formatted");
-    let loaded =
-        toto_compiler::project::load_and_check("main.gzv", &entry, &|p| formatted.get(p).cloned());
+    let loaded = toto_compiler::project::load_and_check(
+        "main.gzv",
+        &entry,
+        &|p| formatted.get(p).cloned(),
+        &[],
+    );
     assert!(
         loaded.is_ok(),
         "formatted pub-using project no longer checks"

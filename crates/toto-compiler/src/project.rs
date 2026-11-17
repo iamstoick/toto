@@ -45,6 +45,18 @@ pub struct Project {
     pub fn_files: HashMap<String, usize>,
 }
 
+/// One declared dependency for import resolution: `import
+/// "<name>/rest"` loads `<dir>/<rest>` (Phase 7, Stage 3).
+/// `dir` is an absolute package directory (display path); dep
+/// files are stored under their resolution string (never
+/// relativized), so embedded table loads (AOT binaries) resolve
+/// identically at build and at runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DepEntry {
+    pub name: String,
+    pub dir: String,
+}
+
 impl Project {
     /// File index owning Toto function `name` (entry fallback for
     /// synthetic frames).
@@ -75,13 +87,16 @@ pub struct ProjectErrors {
 /// diagnostic). `read` loads any other resolved path and returns `None`
 /// when it does not exist (disk: `std::fs::read_to_string().ok()`;
 /// embedded: table lookup). The entry display path is `entry_path`
-/// exactly as given.
+/// exactly as given. `deps` maps dependency names to package
+/// directories; an empty slice is exactly today's behavior (no
+/// package can match, so every import resolves as before).
 pub fn load_and_check(
     entry_path: &str,
     entry_src: &str,
     read: &dyn Fn(&str) -> Option<String>,
+    deps: &[DepEntry],
 ) -> Result<(Project, CheckedProgram), ProjectErrors> {
-    let mut loader = Loader::new(read);
+    let mut loader = Loader::new(read, deps);
     loader.load_entry(entry_path, entry_src);
     if loader.diags.iter().any(|d| !d.is_empty()) {
         let mut errors = Vec::new();
@@ -187,6 +202,13 @@ fn normalize(path: &str) -> String {
     s
 }
 
+/// A resolved import: either a plain path (today's behavior) or a
+/// dependency file (first segment names a declared dependency).
+enum Resolution {
+    Plain(String),
+    Dep { dir: String, rest: String },
+}
+
 /// Resolve an import path against the importing file's display path.
 /// Both display paths stay in the same (relative or absolute) space.
 ///
@@ -194,10 +216,33 @@ fn normalize(path: &str) -> String {
 /// resolves canonically (no directory join), so stdlib imports work
 /// from any file in any directory. The read callback serves these
 /// from the embedded `stdlib` table (disk fallback for development).
-fn resolve(importer_display: &str, import: &str) -> String {
+/// `gzv.std/` is checked FIRST and is reserved: no dependency can
+/// shadow it (dep names cannot contain `/` or `.`).
+///
+/// Otherwise, when the import's first segment names a declared
+/// dependency (and a remainder follows), the import resolves into
+/// the package directory. Relative `./` and `../` imports never
+/// match (their first segment is `.`/`..`, never a dep name), and
+/// a bare `import "<dep>"` with no remainder resolves plainly.
+fn resolve(importer_display: &str, import: &str, deps: &[DepEntry]) -> Resolution {
     if import.starts_with("gzv.std/") {
-        return normalize(import);
+        return Resolution::Plain(normalize(import));
     }
+    if let Some((first, rest)) = import.split_once('/')
+        && !rest.is_empty()
+        && let Some(dep) = deps.iter().find(|d| d.name == first)
+    {
+        return Resolution::Dep {
+            dir: dep.dir.clone(),
+            rest: rest.to_string(),
+        };
+    }
+    Resolution::Plain(plain_resolve(importer_display, import))
+}
+
+/// Today's joining resolution (importing-file-relative), shared
+/// by the plain path and the dep-miss fallback.
+fn plain_resolve(importer_display: &str, import: &str) -> String {
     let dir = Path::new(importer_display)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
@@ -237,6 +282,7 @@ fn display(resolved: &str) -> String {
 
 struct Loader<'a> {
     read: &'a dyn Fn(&str) -> Option<String>,
+    deps: Vec<DepEntry>,
     files: Vec<ProjectFile>,
     programs: Vec<Program>,
     /// Resolved-path identity → file index (deduplicates diamonds).
@@ -248,9 +294,10 @@ struct Loader<'a> {
 }
 
 impl<'a> Loader<'a> {
-    fn new(read: &'a dyn Fn(&str) -> Option<String>) -> Self {
+    fn new(read: &'a dyn Fn(&str) -> Option<String>, deps: &[DepEntry]) -> Self {
         Self {
             read,
+            deps: deps.to_vec(),
             files: Vec::new(),
             programs: Vec::new(),
             index: HashMap::new(),
@@ -301,38 +348,110 @@ impl<'a> Loader<'a> {
 
     fn load_imports(&mut self, importer: usize, imports: &[(String, Span)]) {
         for (path, path_span) in imports {
-            let resolved = resolve(&self.files[importer].path, path);
-            if self.stack.contains(&resolved) {
-                self.diags[importer].push(Diag::new(
-                    "E0402",
-                    format!("circular import of `{path}`"),
-                    *path_span,
-                    None,
-                ));
-                continue;
+            match resolve(&self.files[importer].path, path, &self.deps) {
+                Resolution::Dep { dir, rest } => {
+                    self.load_dep_import(importer, path, *path_span, &dir, &rest)
+                }
+                Resolution::Plain(resolved) => {
+                    self.load_plain_import(importer, path, *path_span, &resolved)
+                }
             }
-            if self.index.contains_key(&resolved) {
-                continue;
-            }
-            let Some(src) = (self.read)(&resolved) else {
-                self.diags[importer].push(Diag::new(
-                    "E0401",
-                    format!("cannot resolve `import \"{path}\"`: file not found"),
-                    *path_span,
-                    None,
-                ));
-                continue;
-            };
-            let disp = display(&resolved);
-            self.push_file(disp, src);
-            let idx = self.files.len() - 1;
-            self.index.insert(resolved.clone(), idx);
-            self.stack.push(resolved);
-            self.parse_current(idx);
-            let nested = import_paths(&self.programs[idx]);
-            self.load_imports(idx, &nested);
-            self.stack.pop();
         }
+    }
+
+    /// Dependency import (Amendment 1 enforced here): the dep file
+    /// wins only when the same literal path does NOT also exist
+    /// from the project root. Both existing is a loud E0601 naming
+    /// the dependency and the root path — never a silent shadow in
+    /// either direction. A missing dep file falls back to the plain
+    /// path (today's E0401 behavior when nothing exists).
+    fn load_dep_import(
+        &mut self,
+        importer: usize,
+        path: &str,
+        path_span: Span,
+        dir: &str,
+        rest: &str,
+    ) {
+        let dep_path = normalize(&format!("{dir}/{rest}"));
+        let Some(src) = (self.read)(&dep_path) else {
+            // No such file in the package: plain importer-relative
+            // resolution (the import may still work, or E0401).
+            let plain = plain_resolve(&self.files[importer].path, path);
+            self.load_plain_import(importer, path, path_span, &plain);
+            return;
+        };
+        // Amendment 1: does the literal path also resolve from the
+        // project root (the caller's read anchors root-relative
+        // loads, so probing the literal path is the root check)?
+        if (self.read)(&normalize(path)).is_some() {
+            let dep_name = path.split('/').next().unwrap_or(path);
+            self.diags[importer].push(Diag::new(
+                "E0601",
+                format!(
+                    "ambiguous import `{path}`: matches both dependency `{dep_name}` and the project-root path `{}`; rename one"
+                    ,normalize(path)),
+                path_span,
+                None,
+            ));
+            return;
+        }
+        // Dep files keep their resolution string as identity (never
+        // relativized): build-time table keys match runtime
+        // resolution exactly, on any working directory.
+        if self.stack.contains(&dep_path) {
+            self.diags[importer].push(Diag::new(
+                "E0402",
+                format!("circular import of `{path}`"),
+                path_span,
+                None,
+            ));
+            return;
+        }
+        if self.index.contains_key(&dep_path) {
+            return;
+        }
+        self.push_file(dep_path.clone(), src);
+        let idx = self.files.len() - 1;
+        self.index.insert(dep_path.clone(), idx);
+        self.stack.push(dep_path);
+        self.parse_current(idx);
+        let nested = import_paths(&self.programs[idx]);
+        self.load_imports(idx, &nested);
+        self.stack.pop();
+    }
+
+    fn load_plain_import(&mut self, importer: usize, path: &str, path_span: Span, resolved: &str) {
+        if self.stack.contains(&resolved.to_string()) {
+            self.diags[importer].push(Diag::new(
+                "E0402",
+                format!("circular import of `{path}`"),
+                path_span,
+                None,
+            ));
+            return;
+        }
+        if self.index.contains_key(resolved) {
+            return;
+        }
+        let Some(src) = (self.read)(resolved) else {
+            self.diags[importer].push(Diag::new(
+                "E0401",
+                format!("cannot resolve `import \"{path}\"`: file not found"),
+                path_span,
+                None,
+            ));
+            return;
+        };
+        let disp = display(resolved);
+        self.push_file(disp, src);
+        let idx = self.files.len() - 1;
+        self.index.insert(resolved.to_string(), idx);
+        self.stack.push(resolved.to_string());
+        self.parse_current(idx);
+        let nested = import_paths(&self.programs[idx]);
+        self.load_imports(idx, &nested);
+        self.stack.pop();
     }
 }
 

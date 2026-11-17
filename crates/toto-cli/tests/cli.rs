@@ -179,6 +179,46 @@ fn build_produces_equivalent_executable() {
 }
 
 #[test]
+fn build_offline_needs_no_network() {
+    // Production requirement (Phase 7, Stage 2): `toto build --offline`
+    // performs no network fetch — cargo's own offline gate hard-errors
+    // on any network attempt, so exit 0 here proves zero dependence.
+    // Runs after `build_produces_equivalent_executable` warms the cache
+    // in the same test process; a cold cache fails loudly (documented
+    // in --help), it never silently fetches.
+    let dir = scratch_project("buildoffline");
+    let out = toto()
+        .arg("init")
+        .arg(dir.join("calc"))
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let root = dir.join("calc");
+    std::fs::write(root.join("main.gzv"), BUILD_PROG).expect("write main");
+    let out = toto()
+        .arg("build")
+        .arg("--offline")
+        .current_dir(&root)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0), "offline build failed");
+    let bin = root.join("target").join("calc");
+    assert!(bin.is_file(), "no binary at {}", bin.display());
+    let built = std::process::Command::new(&bin)
+        .output()
+        .expect("built binary runs");
+    let run = toto()
+        .arg("run")
+        .arg(root.join("main.gzv"))
+        .output()
+        .expect("runs");
+    assert_eq!(built.status.code(), run.status.code());
+    assert_eq!(built.stdout, run.stdout);
+    assert_eq!(built.stderr, run.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn build_runs_ffi_programs() {
     // Non-callback FFI lowers to `toto_foreign` and builds: the
     // built binary must match `run` byte-for-byte.

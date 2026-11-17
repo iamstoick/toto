@@ -74,11 +74,16 @@ fn check_formatted(
     std::env::set_current_dir(dir).expect("set case cwd");
     // Embedded `gzv.std` first, then disk (the CLI's resolution
     // order for project loads).
-    let loaded = project::load_and_check("main.gzv", formatted, &|p| {
-        toto_compiler::stdlib::get(p)
-            .map(str::to_string)
-            .or_else(|| std::fs::read_to_string(p).ok())
-    });
+    let loaded = project::load_and_check(
+        "main.gzv",
+        formatted,
+        &|p| {
+            toto_compiler::stdlib::get(p)
+                .map(str::to_string)
+                .or_else(|| std::fs::read_to_string(p).ok())
+        },
+        &[],
+    );
     let outcome = loaded.map(|(project, checked)| {
         let outcome = run_checked(&project.program, &checked, pressure_config());
         (project, outcome)

@@ -584,17 +584,22 @@ impl OpenDoc {
         // The open buffer overrides disk; `gzv.std` resolves
         // embedded; anything else reads from disk (relative to the
         // open file's directory, like the CLI).
-        let loaded = toto_compiler::project::load_and_check(&open_path, &text, &|p| {
-            if same_file(p, &open_path) {
-                return Some(text.clone());
-            }
-            if let Some(src) = toto_compiler::stdlib::get(p) {
-                return Some(src.to_string());
-            }
-            std::fs::read_to_string(p)
-                .ok()
-                .or_else(|| std::fs::read_to_string(parent.join(p)).ok())
-        });
+        let loaded = toto_compiler::project::load_and_check(
+            &open_path,
+            &text,
+            &|p| {
+                if same_file(p, &open_path) {
+                    return Some(text.clone());
+                }
+                if let Some(src) = toto_compiler::stdlib::get(p) {
+                    return Some(src.to_string());
+                }
+                std::fs::read_to_string(p)
+                    .ok()
+                    .or_else(|| std::fs::read_to_string(parent.join(p)).ok())
+            },
+            &[],
+        );
         let mut notes = Vec::new();
         match loaded {
             Ok((project, checked)) => {

@@ -21,3 +21,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: release stack + timings gates
         run: cargo test --release -p toto-jit --test stack_jit --test timings -- --nocapture
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build bench drivers
+        run: cargo build -p toto-cli -p toto-jit
+      - name: benchmark suite with regression flagging
+        run: ./scripts/bench.sh --runs 3 --baseline bench/baseline.txt

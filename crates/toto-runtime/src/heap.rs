@@ -120,6 +120,15 @@ pub struct Heap {
     allocated_total: u64,
     reclaimed_total: u64,
     collections: u64,
+    /// Live-slot count, maintained incrementally so `stats()` stays
+    /// O(1). Safepoint helpers call `stats()` on hot paths (every
+    /// loop/call/entry safepoint in task mode); scanning all slots
+    /// there turned per-safepoint cost O(live heap) and made
+    /// FFI-heavy task runs super-linear (Phase 7 Stage 2 finding).
+    /// Invariant: exactly the number of slots with `cell.is_some()`
+    /// — `insert` is the only `None → Some` transition, the
+    /// `collect` sweep recounts from scratch.
+    live: usize,
 }
 
 impl Heap {
@@ -131,12 +140,13 @@ impl Heap {
             allocated_total: 0,
             reclaimed_total: 0,
             collections: 0,
+            live: 0,
         }
     }
 
     pub fn stats(&self) -> HeapStats {
         HeapStats {
-            objects_live: self.slots.iter().filter(|s| s.cell.is_some()).count(),
+            objects_live: self.live,
             bytes_since_gc: self.bytes_since_gc,
             allocated_total: self.allocated_total,
             reclaimed_total: self.reclaimed_total,
@@ -172,6 +182,7 @@ impl Heap {
         ));
         self.bytes_since_gc += bytes;
         self.allocated_total += 1;
+        self.live += 1;
         GcRef { index, generation }
     }
 
@@ -365,6 +376,7 @@ impl Heap {
         self.bytes_since_gc = 0;
         self.reclaimed_total += collected as u64;
         self.collections += 1;
+        self.live = live;
         GcReport { collected, live }
     }
 }
