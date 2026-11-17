@@ -1,0 +1,32 @@
+// bench/conc.gzv — channel fan-out/fan-in workload (no imports).
+// Four workers sum disjoint ranges; main sums the partials.
+// Deterministic: the same checksum on every path and worker count
+// (asserted by scripts/bench.sh before timing).
+fn part(lo: int, hi: int) -> int {
+    let mut total = 0;
+    let mut i = lo;
+    while i < hi {
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main() -> int {
+    let ch = chan<int>();
+    go {
+        ch <- part(0, 250000)
+    }
+    go {
+        ch <- part(250000, 500000)
+    }
+    go {
+        ch <- part(500000, 750000)
+    }
+    go {
+        ch <- part(750000, 1000000)
+    }
+    let total = <-ch + <-ch + <-ch + <-ch;
+    println(total);
+    return 0;
+}
