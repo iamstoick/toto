@@ -87,6 +87,9 @@ fn fmt_idempotent_and_semantics_preserving() {
                     .to_string();
                 if status != "2" {
                     failures.push(format!("{name}: unparseable but status is {status}"));
+                } else {
+                    // Tracked for the exact refused-set pin below.
+                    failures.push(format!("refused:{name}"));
                 }
                 refused += 1;
                 continue;
@@ -172,13 +175,83 @@ fn fmt_idempotent_and_semantics_preserving() {
             ran += 1;
         }
     }
-    assert!(formatted > 100, "only {formatted} files formatted");
-    assert!(refused > 0, "no broken files refused");
+    // Exact pins (Phase 6 flag b): any corpus addition that parses,
+    // refuses, or runs changes these, loudly. The 15 refused are all
+    // lex/parse-level failures — E0001 (4: diag01, diag02, diag03,
+    // lex05), E0101, E0102 (3: diag04, parse02 + the missing-semi
+    // shape), E0103, E0104, E0106 (2: diag12, parse09), E0107,
+    // E0154, E0156, E0158 — never check-time (type) errors, which
+    // all parse and therefore format.
+    const EXPECTED_REFUSED: &[&str] = &[
+        "diag01_single_quote.gzv",
+        "diag02_hash_comment.gzv",
+        "diag03_and_suggest.gzv",
+        "diag04_missing_semi.gzv",
+        "diag05_bad_assign.gzv",
+        "diag06_bare_if.gzv",
+        "diag11_unclosed_eof.gzv",
+        "diag12_multierror3.gzv",
+        "lex05_bad_char.gzv",
+        "parse02_multierror.gzv",
+        "parse05_bare_select.gzv",
+        "parse06_reject_generics_extern.gzv",
+        "parse07_reject_match_mod.gzv",
+        "parse08_method_call.gzv",
+        "parse09_suggest_eq_unclosed.gzv",
+    ];
+    let mut refused_names: Vec<String> = failures
+        .iter()
+        .filter_map(|f| f.strip_prefix("refused:"))
+        .map(str::to_string)
+        .collect();
+    refused_names.sort();
+    let mut expected: Vec<String> = EXPECTED_REFUSED.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    assert_eq!(refused_names, expected, "refused set changed");
+    assert_eq!(formatted, 113, "formatted count changed");
+    assert_eq!(refused, 15, "refused count changed");
+    assert_eq!(ran, 40, "executed count changed");
     assert!(
-        failures.is_empty(),
+        failures.iter().all(|f| f.starts_with("refused:")),
         "{} fmt failure(s):\n{}",
         failures.len(),
         failures.join("\n")
     );
     eprintln!("fmt: {formatted} formatted, {refused} refused, {ran} executed");
+}
+
+// Phase 6 flag (a): `pub` drops on re-emit, and that is safe because
+// the parser discards top-level `pub` before the AST exists
+// (`parse_item`: "accepted on top-level items and has no effect
+// (flat namespace)"). Nothing downstream — checker, MIR, runtime,
+// JIT — can observe it, so a formatted tree checks exactly like the
+// original. Pin: format every file of the `pub`-using transitive
+// project, assert `pub` is gone from all outputs, and the formatted
+// tree still loads and checks clean.
+#[test]
+fn fmt_drops_pub_without_changing_meaning() {
+    use std::collections::HashMap;
+    let root = corpus_root().join("project").join("proj02_transitive");
+    let rels = ["main.gzv", "lib/a.gzv", "lib/b.gzv", "lib/shared.gzv"];
+    let mut formatted: HashMap<String, String> = HashMap::new();
+    let mut saw_pub = false;
+    for rel in rels {
+        let src = std::fs::read_to_string(root.join(rel)).expect("read project file");
+        saw_pub |= src.lines().any(|l| l.starts_with("pub "));
+        let program = parse(&src).unwrap_or_else(|| panic!("{rel} parses"));
+        let once = toto_compiler::fmt::format_program(&program);
+        assert!(
+            !once.lines().any(|l| l.starts_with("pub ")),
+            "{rel}: formatted output keeps `pub`"
+        );
+        formatted.insert(rel.to_string(), once);
+    }
+    assert!(saw_pub, "fixture lost its `pub` items");
+    let entry = formatted.remove("main.gzv").expect("main formatted");
+    let loaded =
+        toto_compiler::project::load_and_check("main.gzv", &entry, &|p| formatted.get(p).cloned());
+    assert!(
+        loaded.is_ok(),
+        "formatted pub-using project no longer checks"
+    );
 }

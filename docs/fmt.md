@@ -36,7 +36,16 @@ not resolved. `--check` lists the files that would change and exits
 
 - **Comments vanish** (the lexer drops them; there is no comment
   attachment yet).
-- **`pub` drops** (meaningless in the flat namespace).
+- **`pub` drops** — and that is semantics-safe, not just
+  convenient. The parser accepts `pub` on top-level items and
+  discards it before the AST exists (`parse_item`: "no effect
+  (flat namespace)"), so no checker, MIR, runtime, or JIT pass
+  can observe whether it was written. A formatted file therefore
+  re-parses to the identical AST, including across files: the
+  `fmt_drops_pub_without_changing_meaning` test formats every
+  file of the `pub`-using `proj02_transitive` project, asserts
+  `pub` is gone from all outputs, and the formatted tree still
+  loads and checks clean.
 - **Literals normalize:** hex ints become decimal, `1.` is not a
   float (spec), floats print shortest-round-trip (`1e300` stays
   exponential). String escapes canonicalize to the five valid ones;
