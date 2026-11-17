@@ -1,0 +1,12 @@
+state {
+    a: int = 1;
+}
+
+state {
+    b: int = 2;
+}
+
+fn main() -> int {
+    println(a);
+    return 0;
+}

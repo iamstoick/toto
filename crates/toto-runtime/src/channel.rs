@@ -108,6 +108,17 @@ impl ChannelTable {
         self.channels.iter().map(Channel::parked_count).sum()
     }
 
+    /// Queued (buffered + in-flight waiter-held) values on one channel
+    /// (Phase 6, Stage 3): the Q4 revalidation count. Post-settle runs
+    /// hold no parked waiters (every task joined), so a nonzero count
+    /// means buffered values — reachable only on bounded channels,
+    /// never on state-declared (always unbuffered) ones.
+    pub fn queued_len(&self, id: ChannelId) -> Option<usize> {
+        self.channels
+            .get(id.0)
+            .map(|ch| ch.buf.len() + ch.send_waiters.len())
+    }
+
     /// Drop every waiter entry belonging to `released` (scope-failure
     /// release sweep): stale entries would keep send values rooted
     /// forever and could consume channel values for dead waits.

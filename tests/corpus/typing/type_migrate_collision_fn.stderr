@@ -1,0 +1,5 @@
+error[E0311]: duplicate definition of function `S`
+ --> type_migrate_collision_fn.gzv:9:12
+  |
+9 | migrate fn S(old: S) -> S {
+  |            ^

@@ -109,9 +109,10 @@ fn opt_gate_sequential_equivalent() {
             }
         }
     }
-    // Exact census: the 36 status-0 plus the 4 status-1 runnable
-    // sequential programs, same as the gate differential.
-    assert_eq!(ran_ok, 36, "gate opt coverage (status-0) changed");
+    // Exact census: the 41 status-0 (state01-05 joined in Phase 6)
+    // plus the 4 status-1 runnable sequential programs, same as
+    // the gate differential.
+    assert_eq!(ran_ok, 41, "gate opt coverage (status-0) changed");
     assert_eq!(ran_panic, 4, "gate opt coverage (status-1) changed");
     // cli01 exercises file IO in its case directory; mirror the
     // differential's cleanup so no tmp file escapes the suite.
@@ -210,8 +211,8 @@ fn opt_task_sequential_equivalent() {
             ran += 1;
         }
     }
-    // 36 status-0 + 4 status-1, same census as the task differential.
-    assert_eq!(ran, 40, "task opt coverage changed");
+    // 41 status-0 + 4 status-1, same census as the task differential.
+    assert_eq!(ran, 45, "task opt coverage changed");
     assert!(
         failures.is_empty(),
         "opt divergences:\n{}",

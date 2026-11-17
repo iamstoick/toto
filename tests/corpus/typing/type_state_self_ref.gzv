@@ -1,0 +1,8 @@
+state {
+    x: int = x + 1;
+}
+
+fn main() -> int {
+    println(x);
+    return 0;
+}

@@ -1,0 +1,5 @@
+error[E0318]: channel state binding `ch` must be bare (`ch: chan<T>;`)
+ --> type_state_chan_init.gzv:2:5
+  |
+2 |     ch: chan<int> = chan<int>();
+  |     ^^

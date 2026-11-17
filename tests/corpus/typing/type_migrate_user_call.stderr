@@ -1,0 +1,5 @@
+error[E0325]: migrate `S` cannot call user functions
+ --> type_migrate_user_call.gzv:10:19
+   |
+10 |     return S { v: bump(old.v) };
+   |                   ^^^^^^^^^^^ help: migrations must be closed expressions over the old value

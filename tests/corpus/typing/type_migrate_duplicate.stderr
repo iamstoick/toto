@@ -1,0 +1,5 @@
+error[E0324]: duplicate migrate for struct `S`
+ --> type_migrate_duplicate.gzv:9:1
+  |
+9 | migrate fn S2(old: S) -> S {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: at most one migrate function per struct

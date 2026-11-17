@@ -24,7 +24,8 @@ use toto_compiler::hir::{CheckedProgram, HStructDecl};
 use toto_compiler::interp::TraceFrame;
 use toto_compiler::span::Span;
 
-use sched::{ExecCode, RunStats, SchedOutcome, Scheduler};
+use heap::Heap;
+use sched::{ExecCode, RunStats, SchedOutcome, Scheduler, fresh_closure_modules};
 
 /// Runtime configuration. Defaults are documented in the Phase 3
 /// report; tests use tiny thresholds to force frequent collections.
@@ -142,15 +143,7 @@ pub fn run_checked(
         .name("toto-runtime".to_string())
         .stack_size(256 << 20)
         .spawn(move || {
-            let sched = Scheduler::new(
-                code,
-                config.gc_threshold_bytes,
-                config.rng_seed,
-                config.stack_bytes,
-                config.collect_at_every_safepoint_for_test,
-                config.workers,
-                config.blocking_pool_threads,
-            );
+            let sched = Scheduler::new(code, Heap::new(), 0, fresh_closure_modules(), &config);
             sched.spawn_main(main_idx, main_span);
             sched.run()
         })

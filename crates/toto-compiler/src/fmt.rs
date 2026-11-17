@@ -102,7 +102,64 @@ impl F {
                 self.line(&format!("import \"{}\";", escape(&d.path)));
             }
             ItemKind::Extern(b) => self.emit_extern(b),
+            ItemKind::State(d) => self.emit_state(d),
+            ItemKind::Migrate(d) => self.emit_migrate(d),
         }
+    }
+
+    /// Format a `state { ... }` block (spec amendment, Phase 6):
+    /// bindings in declaration order, initializers inline. `pub` is
+    /// accepted by the parser but has no effect, so it is dropped
+    /// here like everywhere else (see the `fmt` pub-drop rule).
+    fn emit_state(&mut self, d: &StateDecl) {
+        self.emit_annotations(&d.annotations);
+        self.line("state {");
+        self.indent += 1;
+        for b in &d.bindings {
+            let mut h = String::new();
+            h.push_str(&b.name);
+            h.push_str(": ");
+            h.push_str(&emit_ty(&b.ty));
+            match &b.init {
+                Some(init) => {
+                    h.push_str(" = ");
+                    self.pad();
+                    self.out.push_str(&h);
+                    self.emit_expr(init, 0, false);
+                    self.out.push_str(";\n");
+                }
+                None => {
+                    h.push(';');
+                    self.line(&h);
+                }
+            }
+        }
+        self.indent -= 1;
+        self.line("}");
+    }
+
+    /// Format a `migrate fn ...` item: the `migrate` keyword plus an
+    /// ordinary function rendering.
+    fn emit_migrate(&mut self, d: &MigrateDecl) {
+        self.emit_annotations(&d.annotations);
+        // `emit_fn` renders the annotations itself; the migrate item
+        // holds a clone, so render the body manually to avoid
+        // duplicating them.
+        let mut head = String::from("migrate fn ");
+        head.push_str(&d.func.name);
+        head.push('(');
+        for (i, p) in d.func.params.iter().enumerate() {
+            if i > 0 {
+                head.push_str(", ");
+            }
+            head.push_str(&emit_param(p));
+        }
+        head.push_str(") -> ");
+        head.push_str(&emit_ty(&d.func.ret));
+        head.push_str(" {");
+        self.line(&head);
+        self.emit_block_body(&d.func.body);
+        self.line("}");
     }
 
     fn emit_annotations(&mut self, anns: &[Annotation]) {

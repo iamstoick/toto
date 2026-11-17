@@ -1,0 +1,9 @@
+state {
+    y: int = x + 1;
+    x: int = 1;
+}
+
+fn main() -> int {
+    println(y);
+    return 0;
+}

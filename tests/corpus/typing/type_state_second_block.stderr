@@ -1,0 +1,5 @@
+error[E0316]: only one `state {}` block is allowed per program
+ --> type_state_second_block.gzv:5:1
+  |
+5 | state {
+  | ^^^^^^^ help: merge the bindings into a single block

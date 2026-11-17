@@ -1,0 +1,11 @@
+pub state {
+    base: int = 3;
+    doubled: int = base * 2;
+}
+
+fn main() -> int {
+    let base: int = 100;
+    println(base);
+    println(doubled);
+    return 0;
+}

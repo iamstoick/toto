@@ -1,0 +1,5 @@
+error[E0325]: migrate function `S` cannot be referenced or called directly
+ --> type_migrate_call_direct.gzv:11:5
+   |
+11 |     S(fresh);
+   |     ^ help: migrate functions run at reload, never as ordinary calls

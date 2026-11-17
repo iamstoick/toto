@@ -1,0 +1,31 @@
+struct Config {
+    host: string,
+    port: int,
+}
+
+struct Wrap {
+    v: int,
+}
+
+migrate fn Config(old: Config) -> Config {
+    return Config { host: old.host, port: old.port };
+}
+
+migrate fn Wrap(old: Wrap) -> Wrap {
+    return old;
+}
+
+state {
+    cfg: Config = Config { host: "x", port: 1 };
+    w: Wrap = Wrap { v: 7 };
+}
+
+fn main() -> int {
+    println(cfg.host);
+    println(cfg.port);
+    println(w.v);
+    cfg = Config { host: "y", port: cfg.port + 1 };
+    println(cfg.host);
+    println(cfg.port);
+    return 0;
+}

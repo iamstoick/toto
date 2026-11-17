@@ -1,0 +1,19 @@
+state {
+    counter: int = 0;
+    greeting: string = "hi";
+}
+
+fn bump() -> int {
+    counter = counter + 1;
+    return counter;
+}
+
+fn main() -> int {
+    println(counter);
+    println(bump());
+    println(bump());
+    println(greeting);
+    counter = 41;
+    println(bump());
+    return 0;
+}

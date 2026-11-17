@@ -1,0 +1,5 @@
+error[E0320]: state initializer for `y` cannot block on channels
+ --> type_state_init_recv.gzv:3:14
+  |
+3 |     y: int = <-ch;
+  |              ^^^^ help: initializers run once at load, before `main`

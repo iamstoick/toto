@@ -239,6 +239,8 @@ pub(crate) fn declare_runtime_imports(sess: &mut impl Session, task: bool) {
     sess.import("toto_body_entry", 3, true);
     sess.import("toto_shadow_push", 1, false);
     sess.import("toto_shadow_len", 0, true);
+    sess.import("toto_state_get", 3, true);
+    sess.import("toto_state_set", 5, true);
     sess.import("toto_shadow_pop_to", 1, false);
     sess.import("toto_gc_collect", 0, true);
     sess.import("toto_panic", 5, task);
@@ -334,6 +336,8 @@ impl Jit {
                 jb.symbol("toto_shadow_len", rt::toto_shadow_len as *const u8);
                 jb.symbol("toto_shadow_pop_to", rt::toto_shadow_pop_to as *const u8);
                 jb.symbol("toto_gc_collect", rt::toto_gc_collect as *const u8);
+                jb.symbol("toto_state_get", rt::toto_state_get as *const u8);
+                jb.symbol("toto_state_set", rt::toto_state_set as *const u8);
                 jb.symbol("toto_panic", rt::toto_panic as *const u8);
             }
             CodegenMode::Task => {
@@ -368,6 +372,8 @@ impl Jit {
                 jb.symbol("toto_shadow_len", rt::task_shadow_len as *const u8);
                 jb.symbol("toto_shadow_pop_to", rt::task_shadow_pop_to as *const u8);
                 jb.symbol("toto_gc_collect", rt::task_gc_collect as *const u8);
+                jb.symbol("toto_state_get", rt::task_state_get as *const u8);
+                jb.symbol("toto_state_set", rt::task_state_set as *const u8);
                 jb.symbol("toto_panic", rt::task_panic as *const u8);
                 jb.symbol("toto_yield", rt::task_yield as *const u8);
                 jb.symbol("toto_spawn", rt::task_spawn as *const u8);
@@ -1037,6 +1043,7 @@ impl<'a> FnCx<'a> {
             | MInstr::SatIncr { dst, .. }
             | MInstr::MakeClosure { dst, .. }
             | MInstr::ChanNew { dst, .. }
+            | MInstr::StateGet { dst, .. }
             | MInstr::Recv { dst, .. } => vec![*dst],
             MInstr::Call { dst, .. } | MInstr::CallBuiltin { dst, .. } => {
                 dst.iter().copied().collect()
@@ -1057,6 +1064,7 @@ impl<'a> FnCx<'a> {
             | MInstr::Spawn { .. }
             | MInstr::StoreField { .. }
             | MInstr::StoreIndex { .. }
+            | MInstr::StateSet { .. }
             | MInstr::Safepoint { .. } => Vec::new(),
         }
     }
@@ -1111,7 +1119,11 @@ impl<'a> FnCx<'a> {
                 }
                 out
             }
-            MInstr::Const { .. } | MInstr::FuncRef { .. } | MInstr::Safepoint { .. } => Vec::new(),
+            MInstr::StateSet { src, .. } => vec![*src],
+            MInstr::Const { .. }
+            | MInstr::FuncRef { .. }
+            | MInstr::StateGet { .. }
+            | MInstr::Safepoint { .. } => Vec::new(),
         }
     }
 
@@ -2580,6 +2592,45 @@ impl<'a> FnCx<'a> {
                     self.call_value(sess, b, "toto_len", &[self.ctx, lbase, ltag, lstart, lend])?;
                 self.check_silent(sess, b, *span)?;
                 self.define(b, *dst, v)?;
+            }
+            MInstr::StateGet { dst, slot, span } => {
+                // Declared-state read (spec amendment, Phase 6): pure
+                // read through the helper (no collection inside, so no
+                // publish needed — same discipline as `Len`). The word
+                // is opaque here; the caller interprets it by the
+                // slot's static type. The slot index is a
+                // compile-time constant.
+                let lslot = Self::iconst(b, *slot as i64);
+                let lstart = Self::iconst(b, span.start as i64);
+                let lend = Self::iconst(b, span.end as i64);
+                let v =
+                    self.call_value(sess, b, "toto_state_get", &[self.ctx, lslot, lstart, lend])?;
+                self.check_silent(sess, b, *span)?;
+                self.define(b, *dst, v)?;
+            }
+            MInstr::StateSet { slot, src, span } => {
+                // Declared-state write: the value crosses by (tag,
+                // word) like every other heap traffic; the helper
+                // validates liveness and records loudly on failure.
+                // No publish needed (no collection inside); the stored
+                // cell is traced at the next collection by the root
+                // extension (`gather_roots` + gate collects).
+                let tag = Self::tag_of(&self.local_ty(*src)?.clone()).map_err(|e| SubsetError {
+                    func: self.func.clone(),
+                    message: format!("state_set: {e}"),
+                })?;
+                let lslot = Self::iconst(b, *slot as i64);
+                let ltag = Self::iconst(b, tag as i64);
+                let lsrc = self.operand(b, *src)?;
+                let lstart = Self::iconst(b, span.start as i64);
+                let lend = Self::iconst(b, span.end as i64);
+                let _ = self.call_value(
+                    sess,
+                    b,
+                    "toto_state_set",
+                    &[self.ctx, lslot, ltag, lsrc, lstart, lend],
+                )?;
+                self.check_silent(sess, b, *span)?;
             }
             MInstr::Safepoint { kind } => {
                 use toto_compiler::mir::SpKind as K;

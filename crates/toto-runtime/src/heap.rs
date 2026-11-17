@@ -250,6 +250,45 @@ impl Heap {
         self.slots[i].cell.as_ref().map(|(h, _)| h.desc)
     }
 
+    /// Liveness query for code-version retention (Phase 6, Stage 2a):
+    /// true iff the slot still holds this generation's object.
+    ///
+    /// Exactness property (pinned by `gc.rs`): NO under-retention —
+    /// every object reachable at the last collection resolves, and
+    /// every allocated-but-uncollected object resolves. The only
+    /// imprecision is bounded OVER-retention: unreachable objects
+    /// resolve until the next collection sweeps them (released at
+    /// the next forced collection). Retire checks force-collect
+    /// first, so decisions are exact; between checks a dead
+    /// closure may retain its module for at most one collection.
+    pub fn is_live(&self, r: GcRef) -> bool {
+        self.resolve(r).is_some()
+    }
+
+    /// Every resident closure payload as `(handle, body)`: handles
+    /// are generation-checked (stale copies excluded), bodies are
+    /// the compiled-function ids meaningful to the owning module.
+    /// Liveness is NOT decided here — filter with `is_live` after
+    /// a collection for exact liveness (see its bound above).
+    /// Used by the version-retention check: a module is retained
+    /// while any resident closure names it.
+    pub fn closure_refs(&self) -> Vec<(GcRef, u32)> {
+        let mut out = Vec::new();
+        for (i, slot) in self.slots.iter().enumerate() {
+            let Some((_, Payload::Closure { body, .. })) = &slot.cell else {
+                continue;
+            };
+            let r = GcRef::from_parts(i as u32, slot.generation);
+            // Generation always matches here (same slot just read),
+            // but route through `resolve` so the invariant has one
+            // home.
+            if self.resolve(r).is_some() {
+                out.push((r, *body));
+            }
+        }
+        out
+    }
+
     /// Stop-the-world collection over `roots`. Single-threaded in Stage
     /// 1; M:N coordinates at safepoints (Stage 2). Returns exact
     /// reclaimed/live counts (spike practice: tests assert these).

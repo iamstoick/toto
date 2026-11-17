@@ -1,0 +1,13 @@
+state {
+    n: int = 1;
+}
+
+fn main() -> int {
+    let get = fn() -> int { return n; };
+    println(get());
+    n = 10;
+    println(get());
+    n = n + 5;
+    println(get());
+    return 0;
+}

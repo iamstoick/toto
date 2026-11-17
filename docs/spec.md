@@ -822,7 +822,168 @@ confirms or corrects — never silent).
   sibling delays failure propagation until it suspends or completes
   (documented cooperative limitation).
 
-## 14. Reserved for later phases (syntax acknowledgment)
+## 14. Declared state + migration (Phase 6)
+
+Amendment record (2026-11-17, Phase 6 authorization): the rules below
+pin authorization amendments §2.1–2.7 and §2.15. Single-generation
+semantics (init, read, write through all executors) land with this
+amendment; reload-time enforcement (migration invocation, matrix,
+queued-value validation) is Stage 3. Until Stage 3, a reload
+re-initializes declared state exactly like all other program state
+(drain-and-restart, §14.1) — never silently preserved, never silently
+reinterpreted. Production builds (`toto build`) never hot-reload.
+
+### 14.1 The `state {}` block
+
+- Syntax: `state { name: Ty = init; ... name: chan<T>; ... }` — a
+  top-level item, at most ONE per program across all files (the flat
+  namespace makes the program the unit). A second block is static
+  error `E0316` (merge the bindings into one block). A `state {}`
+  block in any non-top-level position is error `E0101` (top-level
+  items only); a struct literal named `state` still parses as an
+  expression (the placement error fires only when the brace cannot
+  open a struct literal).
+- `state` and `migrate` are CONTEXTUAL keywords: `state` is special
+  only as a top-level item followed by `{`; `migrate` only
+  immediately before `fn` at top level. Everywhere else both are
+  ordinary identifiers. Corpus check (2026-11-17): no existing program
+  uses either as an identifier in those positions — zero breakage.
+- Each binding is implicitly mutable program state (no `mut`
+  keyword; `mut` is implied). Reassignment follows ordinary
+  assignment rules; a local shadowing a state name uses the local
+  (§3.2), and `go` blocks may freely read and write state (shared
+  cells, not `mut` captures — D3's capture rule is untouched).
+- State names share the flat value namespace: a collision with any
+  other top-level value name (`fn`, `extern`, another state binding,
+  a migrate name) is `E0311` — the existing duplicate-name error, no
+  new code. A state name may match a STRUCT name (values and types
+  are separate namespaces, as for locals).
+- Initializers evaluate in declaration order at load, before `main`.
+  An initializer sees only builtins and EARLIER state bindings; a use
+  of a later binding (or of itself, including inside a closure in the
+  initializer) is `E0319` (run order is declaration order). This
+  includes deferred code — the Rust parallel (declaration-before-use
+  holds inside closures).
+- Data bindings require an initializer (`E0317` without one).
+  Initializers are checked as ordinary expressions with no lexical
+  bindings in scope. Banned in initializers (`E0320`): user-function
+  calls (the callee's view of state is unordered at load) and channel
+  operations that can block (`<-`, `ch <- v`, task spawn). (`?` needs
+  no ban: with no enclosing function it already fails as E0308.) IO
+  builtins are allowed (they
+  run once at load, deterministically for a fixed environment).
+  Channel construction nested in an initializer routes the program to
+  the runtime executor (`uses_concurrency`).
+- Channel bindings MUST be bare (`name: chan<T>;`); an initializer
+  on one is `E0318`. Any `chan` element type is accepted at
+  declaration; channel capacity at declaration is always unbuffered
+  (bounded channels arise only from explicit `chan<T>(n)` calls).
+- Any type may be held (including `fn` values); the reload whitelist
+  (channels + plain data, §14.3) governs preservation, not
+  declaration. Sending a non-deeply-immutable state binding over a
+  channel is `E0314` (reads alias the shared cell, like field/index
+  reads); deeply immutable state sends normally.
+- Execution: slots are assigned in declaration order — the order IS
+  the cross-executor contract (tree-walker, MIR executor, JIT agree
+  slot-for-slot). Initialization is prepended to `main`'s entry
+  (`StateSet` per binding, `ChanNew` + `StateSet` for channels).
+  Reads/writes lower to `StateGet`/`StateSet`. State-held heap objects
+  join every GC root set (threshold, explicit, and rendezvous
+  collections), so live state is never swept under a running program.
+- Reloads (until Stage 3): declared state re-initializes from scratch
+  in the new generation. This is drain-and-restart for state —
+  visible and total, consistent with all other program state — and
+  Stage 3 upgrades it to preservation-through-migration per §14.3.
+
+### 14.2 `migrate` functions
+
+- Syntax: `migrate fn S(old: S) -> S { ... }` — a top-level item
+  naming no new namespace: the migrate NAME shares the flat value
+  namespace (`E0311` on collision) but is never callable — any
+  reference or call is `E0325` (migrate functions run at reload,
+  never as ordinary calls).
+- Exactly one parameter (`E0321` otherwise); its type must be a
+  struct `S` (`E0322` otherwise); the return type must equal `S`
+  (`E0323` otherwise — no implicit conversion, no implicit field
+  defaults: there is NO implicit-default mechanism in v1, so any
+  added/removed/renamed field or field-type change needs a migrate,
+  and without one the reload is an atomic restart, loudly).
+- At most one migrate per struct (`E0324` on the second).
+- Determinism (`E0325`): the body must be a closed pure expression
+  over the old value. Banned: user-function calls (including deferred
+  calls inside closures — strict, relaxable), IO and channel builtins
+  (`print`, `println`, `read_file`, `write_file`, `file_exists`,
+  `chan`, `close`, `closed`), foreign calls, channel operations,
+  task spawn, `select`, and references to declared state (input is
+  only the old struct). (`?` needs no ban: with a struct return type
+  it already fails as E0308.) Pure builtins (`len`, string/math/array
+  ops, struct construction, field reads) are allowed.
+- Totality (`E0326`): every field of `S` must be read from the
+  parameter (direct `old.field` reads, anywhere in the body including
+  nested closures; shadowing the parameter name breaks the chain and
+  fails totality). Returning the parameter itself (`return old;` or a
+  trailing `old`) is trivially total. Rationale: migration must
+  never silently drop data; dropping a field intentionally is not
+  expressible — the reload then restarts instead (loud, §14.3).
+- First-load checking validates well-formedness plus totality against
+  the CURRENT definition of `S`. Reload time re-checks totality
+  against the OLD generation's `S` and runs the function (Stage 3).
+  The body is lowered with the program but never executed during
+  single-generation runs.
+
+### 14.3 Reload contract (enforced in Stage 3; stated here)
+
+- Retention is by GC reachability (`Heap::is_live` + the
+  reference→module side table), NOT epoch tags — within D7's
+  "epoch or reference-based reclamation". Reference-based
+  reclamation plus name-relink plus generational-handle staleness
+  plus name-based struct snapshots cover every stale vector (Stage 2a
+  proof, `docs/phases/phase-6-state-preserving-reload.md`).
+- Struct snapshots are name-based; layout comparison is a
+  tag-mismatch discipline applied BEFORE any field is touched: a
+  struct whose layout changed without a migrate (or whose migrate
+  fails reload-time checks or panics) routes to loud atomic restart —
+  never silent reinterpretation, never a silent skip.
+- Channel-type revalidation: an empty queue with a changed element
+  type carries with the new type; a NON-empty queue with a changed
+  element type is an atomic restart, loudly. State-declared channels
+  are always carried when validation passes (undeclared channels die
+  with their generation — the "dropped with its generation" rule).
+  A preserved channel whose tasks vanished is still carried; blocking
+  semantics are the program's concern.
+- Queued-value validation cases split (Stage 3 classifies each):
+  REACHABLE cases (a `fn`/closure value actually queued in a
+  whitelist-valid channel) migrate or restart by rule; DEFENSE-ONLY
+  cases (unreachable by construction) are still asserted — the atomic
+  commit holds either way.
+- Whitelist: channels + plain data only. No timer API exists in v1,
+  so none is whitelisted (no timer API is invented to fill it).
+  Everything else restarts or refuses loudly. The commit is atomic:
+  all-or-validated-carry or full restart.
+- Call directionality: retained modules are closed worlds — new code
+  may call retained old closures/functions, old code can never call
+  new code (old tables reference only old code; preserved `Func`
+  values are relinked, never dangling). Production cross-generation
+  calls enter through the RETAINED session's tables.
+
+### 14.4 New error codes (fresh `E0316`–`E0326` block)
+
+- `E0316` second `state {}` block in one program.
+- `E0317` data state binding without an initializer.
+- `E0318` initializer on a channel state binding.
+- `E0319` forward (or self) reference in a state initializer.
+- `E0320` banned construct in a state initializer (user calls,
+  blocking channel ops, task spawn). (`?` needs no E0320 ban: with
+  no enclosing function it already fails as E0308, §14.1.)
+- `E0321` `migrate` without exactly one parameter.
+- `E0322` `migrate` parameter not of struct type `S`.
+- `E0323` `migrate` return type not equal to `S`.
+- `E0324` duplicate `migrate` for struct `S`.
+- `E0325` `migrate` determinism violation (or any direct
+  reference/call to a migrate function).
+- `E0326` `migrate` not total over `S` (names the first unread field).
+
+## 15. Reserved for later phases (syntax acknowledgment)
 
 - Concurrency: specified in §13 (Phase 3). The `<-` lexical rule (§2.3)
   and the rejection diagnostics (§3.3) were the Phase 1 deliverables.
@@ -905,6 +1066,24 @@ is ordinary Toto on the frozen builtins; the time module is pure
 (durations over int milliseconds, no wall clock) with the clock
 deferred to Stage 3 FFI per owner decision. Full API in
 `docs/stdlib.md`; execution paths in the Phase 5 report.
+
+Phase 6 amendment record (2026-11-17): declared state and migration
+(§14), pinning authorization amendments §2.1–2.7 and §2.15 — the
+fn-signature matrix correction (migrate plays no role in signature
+changes), no implicit field defaults (any layout change needs a
+migrate or the reload restarts loudly), contextual `state`/`migrate`
+with a zero-breakage corpus check, one top-level `state {}` block
+(`E0316`) with flat-namespace `E0311`, mutable bindings with
+declaration-order initializers (forward refs `E0319`, Rust-TDZ
+parallel), the `migrate` rules (one param, struct in/out, one per
+struct, determinism `E0325`, totality `E0326`), the channel-type row
+(empty-queue carries, non-empty changed-type restarts), the
+`Heap::is_live` no-under-retention property with a one-collection
+over-retention bound, Arc-only retention ownership, new→old-only
+call directionality through retained tables, the `toto_*` helper
+boundary for generated code, and the reachable/defense-only Q4 split.
+Single-generation execution lands with this amendment; reload-time
+enforcement is Stage 3.
 
 ## Appendix B. Review questions and answers (2026-11-14 review)
 

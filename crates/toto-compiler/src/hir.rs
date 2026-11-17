@@ -96,6 +96,10 @@ pub enum VarRef {
     },
     /// Top-level function (index into the program function table).
     GlobalFn { name: String, idx: usize },
+    /// Declared program state (spec amendment, Phase 6): a shared
+    /// mutable cell. Never a capture — closures observe the cell,
+    /// not a copy (`captured_vars` skips these deliberately).
+    State { name: String },
 }
 
 #[derive(Clone, Debug)]
@@ -346,4 +350,35 @@ pub struct CheckedProgram {
     /// The CLI routes such programs to the runtime executor; sequential
     /// programs keep running on the tree-walking interpreter.
     pub uses_concurrency: bool,
+    /// Declared program state (spec amendment, Phase 6), in source
+    /// declaration order. Slots are assigned in this order; every
+    /// lowering and executor must agree (the order is the contract).
+    pub state: Vec<HStateBinding>,
+    /// Migration functions by target struct (at most one per struct,
+    /// enforced by the checker). Lowered with the program but never
+    /// called during single-generation execution.
+    pub migrates: Vec<HMigrate>,
+}
+
+/// One checked `state` binding: `init` is `Some` for data, `None`
+/// for a bare channel binding (whose `ty` is always `Ty::Chan` —
+/// enforced by the checker, not re-checked downstream).
+#[derive(Clone, Debug)]
+pub struct HStateBinding {
+    pub name: String,
+    pub ty: Ty,
+    pub init: Option<HExpr>,
+    pub span: Span,
+}
+
+/// One checked `migrate` item: `param` names the single parameter
+/// (of struct type `target`), `ret` repeats `target`. The body is
+/// checked under the determinism rules plus totality over the
+/// target's field set.
+#[derive(Clone, Debug)]
+pub struct HMigrate {
+    pub target: String,
+    pub param: String,
+    pub body: HBlock,
+    pub span: Span,
 }

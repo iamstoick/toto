@@ -1,0 +1,11 @@
+error[E0101]: `state` blocks are top-level items only (this one is inside a function body)
+ --> parse10_state_in_fn.gzv:2:5
+  |
+2 |     state {
+  |     ^^^^^ help: move the `state { ... }` block to the top level
+
+error[E0101]: expected `fn`, `struct`, `state`, `migrate`, `import`, or `unsafe extern` item, found identifier
+ --> parse10_state_in_fn.gzv:5:5
+  |
+5 |     println(x);
+  |     ^^^^^^^

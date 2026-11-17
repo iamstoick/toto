@@ -460,7 +460,22 @@ pub unsafe extern "C" fn task_alloc_closure(
     }
     maybe_collect(ctx);
     let mut st = ctx.shared.state.lock().expect("shared state lock");
-    encode(st.heap.alloc_closure(body as u32, captures))
+    let r = st.heap.alloc_closure(body as u32, captures);
+    let out = encode(r);
+    // Phase 6, Stage 2a: stamp the creating code version alongside
+    // the new handle (the retention table's only write path — real
+    // generated-code allocations, no stand-ins). The state lock is
+    // released first: the two locks never nest (see the audit on
+    // `Shared::closure_modules`).
+    drop(st);
+    if ctx.shared.codegen != 0 {
+        ctx.shared
+            .closure_modules
+            .lock()
+            .expect("closure modules lock")
+            .insert(r, ctx.shared.codegen);
+    }
+    out
 }
 
 /// Type name of a tagged word for `E0209` messages (mirrors
@@ -897,6 +912,96 @@ pub unsafe extern "C" fn task_struct_set(
             0
         }
     }
+}
+
+/// Declared-state read (spec amendment, Phase 6): the word for the
+/// cell's value. An unset slot or an untrafficable value records a
+/// loud internal error — both unreachable in checked programs (init
+/// writes every slot; JIT-built heaps hold trafficable values).
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn task_state_get(
+    ctx: *mut JitTaskCtx,
+    slot: u64,
+    start: u64,
+    end: u64,
+) -> u64 {
+    let ctx = tctx(ctx);
+    let span = Span::new(start as u32, end as u32);
+    // Clone under the lock, then release it: `internal` below needs
+    // `ctx` mutably, and the two borrows must never overlap.
+    let got = ctx
+        .shared
+        .state
+        .lock()
+        .expect("shared state lock")
+        .state_vars
+        .get(slot as usize)
+        .cloned();
+    match got {
+        Some(v) => match encode_val(&v) {
+            Some(w) => w,
+            None => {
+                internal(
+                    ctx,
+                    String::from("state value is not JIT-trafficable"),
+                    span,
+                );
+                0
+            }
+        },
+        None => {
+            internal(
+                ctx,
+                format!("state slot {slot} was never initialized"),
+                span,
+            );
+            0
+        }
+    }
+}
+
+/// Declared-state write: validate liveness fail-fast (a stale
+/// handle records loudly here, not later at the read), then store.
+/// The cell joins the root set at the next collection
+/// (`gather_roots`), so no publish is needed.
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn task_state_set(
+    ctx: *mut JitTaskCtx,
+    slot: u64,
+    tag: u64,
+    value: u64,
+    start: u64,
+    end: u64,
+) -> u64 {
+    let ctx = tctx(ctx);
+    let span = Span::new(start as u32, end as u32);
+    let v = match decode_inner(ctx, "state_set", tag, value, span) {
+        Some(v) => v,
+        None => return 0,
+    };
+    if let RtVal::Heap(r) = &v {
+        let live = ctx
+            .shared
+            .state
+            .lock()
+            .expect("shared state lock")
+            .heap
+            .get(*r)
+            .is_some();
+        if !live {
+            internal(ctx, String::from("stale handle in state_set"), span);
+            return 0;
+        }
+    }
+    let mut st = ctx.shared.state.lock().expect("shared state lock");
+    let slot = slot as usize;
+    if st.state_vars.len() <= slot {
+        st.state_vars.resize(slot + 1, RtVal::Unit);
+    }
+    st.state_vars[slot] = v;
+    0
 }
 
 /// Array length for `MInstr::Len` (arrays only, `E0209` — unlike the
@@ -3002,7 +3107,7 @@ pub fn jit_task_entry(
     result
 }
 
-fn zero_stats() -> RunStats {
+pub(crate) fn zero_stats() -> RunStats {
     RunStats {
         tasks_spawned: 0,
         switches: 0,
@@ -3028,6 +3133,13 @@ pub struct JitRun {
 impl JitRun {
     pub fn live_tasks(&self) -> usize {
         self.sched.live_tasks()
+    }
+
+    /// Shared run state (Phase 6, Stage 2a): lets the dev driver
+    /// move the heap across generations and stamp code versions.
+    /// Crate-internal: external callers go through the driver.
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        self.sched.shared()
     }
 
     pub fn cancel(&self) {
@@ -3064,14 +3176,35 @@ impl JitRun {
 /// returns the live handle immediately. `Err` carries an immediate
 /// outcome when no run starts (missing main/entry — unreachable in
 /// checked programs). The blocking `run_jit` is spawn-plus-join.
+///
+/// `heap` is moved into the new run (Phase 6: the dev driver
+/// carries one heap across generations so preserved values keep
+/// their handles; single-run paths pass a fresh heap). `gen` is
+/// this run's code version, stamped into `closure_modules` by
+/// `task_alloc_closure` alongside each new closure handle.
+/// Single-run paths pass `0` + a fresh table.
 #[allow(clippy::result_large_err)]
+/// The seed is the eighth parameter (over the lint default): it
+/// travels with the per-generation heap/modules because seeding must
+/// land atomically with construction, before any task starts.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_jit_run(
     program: &Program,
     checked: &CheckedProgram,
     config: toto_runtime::RuntimeConfig,
     session: &JitSession,
+    heap: toto_runtime::heap::Heap,
+    codegen: u64,
+    closure_modules: toto_runtime::sched::ClosureModules,
+    preserving: Option<crate::preserve::PreservingSeed>,
 ) -> Result<JitRun, toto_runtime::RtOutcome> {
-    let prog = toto_compiler::mir::lower(checked);
+    // Preserving reloads lower without state init (every slot is
+    // seeded from carried values instead); all other paths run the
+    // prepended initializers exactly once at load.
+    let prog = match &preserving {
+        Some(_) => toto_compiler::mir::lower_without_init(checked),
+        None => toto_compiler::mir::lower(checked),
+    };
     let mut structs: HashMap<String, HStructDecl> = HashMap::new();
     for (name, decl) in &checked.structs {
         structs.insert(name.clone(), decl.clone());
@@ -3132,13 +3265,20 @@ pub fn spawn_jit_run(
     });
     let sched = Arc::new(Scheduler::new(
         code,
-        config.gc_threshold_bytes,
-        config.rng_seed,
-        config.stack_bytes,
-        config.collect_at_every_safepoint_for_test,
-        config.workers,
-        config.blocking_pool_threads,
+        heap,
+        codegen,
+        closure_modules,
+        &config,
     ));
+    // Preserving seed (Phase 6, Stage 3): carried state values plus
+    // the moved channel table land BEFORE any task starts — no race
+    // (the main task spawns below), no init to clobber them (the
+    // ExecCode above lowered without the prepend).
+    if let Some(seed) = preserving {
+        let mut st = sched.shared().state.lock().expect("scheduler state lock");
+        st.state_vars = seed.state_vars;
+        st.channels = seed.channels;
+    }
     let entries = Arc::clone(&session.entries);
     let bodies = Arc::clone(&session.bodies);
     let func_names = Arc::clone(&session.func_names);
@@ -3190,7 +3330,16 @@ pub fn run_jit(
     config: toto_runtime::RuntimeConfig,
     session: &JitSession,
 ) -> toto_runtime::RtOutcome {
-    match spawn_jit_run(program, checked, config, session) {
+    match spawn_jit_run(
+        program,
+        checked,
+        config,
+        session,
+        toto_runtime::heap::Heap::new(),
+        0,
+        toto_runtime::sched::fresh_closure_modules(),
+        None,
+    ) {
         Ok(run) => run.join(),
         Err(outcome) => outcome,
     }
@@ -3274,12 +3423,10 @@ pub fn spawn_aot_run(
     });
     let sched = Arc::new(Scheduler::new(
         code,
-        config.gc_threshold_bytes,
-        config.rng_seed,
-        config.stack_bytes,
-        config.collect_at_every_safepoint_for_test,
-        config.workers,
-        config.blocking_pool_threads,
+        toto_runtime::heap::Heap::new(),
+        0,
+        toto_runtime::sched::fresh_closure_modules(),
+        &config,
     ));
     let entries = Arc::new(entries);
     let bodies = Arc::new(bodies);

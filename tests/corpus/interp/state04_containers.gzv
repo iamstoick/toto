@@ -1,0 +1,26 @@
+struct Point {
+    x: int,
+    y: int,
+}
+
+state {
+    origin: Point = Point { x: 0, y: 0 };
+    tags: Array<string> = ["a"];
+    count: int = 0;
+}
+
+fn move_origin(dx: int) -> int {
+    origin = Point { x: origin.x + dx, y: origin.y };
+    return origin.x;
+}
+
+fn main() -> int {
+    println(move_origin(5));
+    println(origin.y);
+    push(tags, "b");
+    println(len(tags));
+    println(tags[1]);
+    count = count + 1;
+    println(count);
+    return 0;
+}

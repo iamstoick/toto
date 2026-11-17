@@ -40,6 +40,11 @@ pub struct MirInterp<'a> {
     callbacks: std::collections::HashMap<u64, Value>,
     call_depth: usize,
     trace: Vec<TraceFrame>,
+    /// Declared-state cells by slot (spec amendment, Phase 6).
+    /// Initialization is ordinary MIR (prepended to `main`), so this
+    /// only stores what `StateSet` writes. Slots are assigned in
+    /// declaration order — the cross-executor contract.
+    state: Vec<Value>,
 }
 
 impl<'a> MirInterp<'a> {
@@ -55,6 +60,7 @@ impl<'a> MirInterp<'a> {
             callbacks: std::collections::HashMap::new(),
             call_depth: 0,
             trace: Vec::new(),
+            state: Vec::new(),
         }
     }
 
@@ -696,6 +702,21 @@ impl<'a> MirInterp<'a> {
             // Routing tripwire: the sequential MIR interpreter cannot
             // execute channels. Concurrent programs run on the runtime
             // executor; reaching one of these here is a routing bug.
+            MInstr::StateGet { dst, slot, .. } => {
+                let v = self
+                    .state
+                    .get(*slot as usize)
+                    .cloned()
+                    .expect("checked programs initialize every state slot before reading");
+                slots[*dst] = v;
+            }
+            MInstr::StateSet { slot, src, .. } => {
+                let v = slots[*src].clone();
+                if self.state.len() <= *slot as usize {
+                    self.state.resize(*slot as usize + 1, Value::Unit);
+                }
+                self.state[*slot as usize] = v;
+            }
             MInstr::ChanNew { span, .. }
             | MInstr::Send { span, .. }
             | MInstr::Recv { span, .. }

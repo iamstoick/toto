@@ -1,0 +1,5 @@
+error[E0325]: migrate `S` cannot reference declared state `bias`
+ --> type_migrate_state_ref.gzv:10:27
+   |
+10 |     return S { v: old.v + bias };
+   |                           ^^^^ help: migration input is only the old struct value

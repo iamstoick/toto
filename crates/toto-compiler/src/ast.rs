@@ -39,6 +39,44 @@ pub enum ItemKind {
     Struct(StructDecl),
     Import(ImportDecl),
     Extern(ExternBlock),
+    State(StateDecl),
+    Migrate(MigrateDecl),
+}
+
+/// A top-level `state { ... }` block (Phase 6): at most one per
+/// program. Each binding is implicitly mutable program state,
+/// initialized once at load in declaration order. Data bindings
+/// carry an initializer; channel bindings are bare
+/// (`name: chan<T>;`) — the checker enforces both shapes.
+#[derive(Clone, Debug)]
+pub struct StateDecl {
+    pub bindings: Vec<StateBinding>,
+    pub span: Span,
+    pub annotations: Vec<Annotation>,
+}
+
+/// One `state` binding: `name: Ty = init;` (data) or
+/// `name: chan<T>;` (channel). The keyword-less shape is
+/// deliberate: `mut` is implied (spec amendment, Phase 6).
+#[derive(Clone, Debug)]
+pub struct StateBinding {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: Type,
+    pub init: Option<Expr>,
+    pub span: Span,
+}
+
+/// A top-level `migrate fn S(old: S) -> S { ... }` item (Phase 6):
+/// the migration function for struct `S`, run at reload when `S`
+/// changes layout. Checked like a function body plus the
+/// determinism and totality rules; never called during
+/// single-generation execution.
+#[derive(Clone, Debug)]
+pub struct MigrateDecl {
+    pub func: FnDecl,
+    pub span: Span,
+    pub annotations: Vec<Annotation>,
 }
 
 /// A top-level `unsafe extern "C" { ... };` block (Phase 5, Stage 3):

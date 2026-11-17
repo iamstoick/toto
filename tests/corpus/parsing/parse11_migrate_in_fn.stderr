@@ -1,0 +1,17 @@
+error[E0101]: `migrate` items are top-level only (this one is inside a function body)
+ --> parse11_migrate_in_fn.gzv:6:5
+  |
+6 |     migrate fn S(old: S) -> S {
+  |     ^^^^^^^ help: move the `migrate fn ...` item to the top level
+
+error[E0101]: expected `(`, found identifier
+ --> parse11_migrate_in_fn.gzv:6:16
+  |
+6 |     migrate fn S(old: S) -> S {
+  |                ^
+
+error[E0101]: expected `fn`, `struct`, `state`, `migrate`, `import`, or `unsafe extern` item, found identifier
+ --> parse11_migrate_in_fn.gzv:9:5
+  |
+9 |     println(0);
+  |     ^^^^^^^

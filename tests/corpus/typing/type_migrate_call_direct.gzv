@@ -1,0 +1,13 @@
+struct S {
+    v: int,
+}
+
+migrate fn S(old: S) -> S {
+    return old;
+}
+
+fn main() -> int {
+    let fresh = S { v: 1 };
+    S(fresh);
+    return 0;
+}

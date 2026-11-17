@@ -241,6 +241,12 @@ pub struct Interp {
     pub output: Vec<u8>,
     /// Enclosing function return kinds (for `?`); pushed per call.
     ret_stack: Vec<RetKind>,
+    /// Declared program state, in source order (spec amendment,
+    /// Phase 6): shared mutable cells, never captured by closures.
+    state: HashMap<String, Value>,
+    /// State declarations for load-time initialization (evaluated in
+    /// `run`, in order, before `main`).
+    state_decls: Vec<StateDecl>,
 }
 
 impl Interp {
@@ -248,6 +254,7 @@ impl Interp {
         let mut fns = Vec::new();
         let mut fn_index = HashMap::new();
         let mut structs = HashMap::new();
+        let mut state_decls = Vec::new();
         for item in &program.items {
             match &item.kind {
                 ItemKind::Fn(decl) => {
@@ -268,6 +275,15 @@ impl Interp {
                     // the checker rejects surviving imports (E0401), so there is
                     // nothing to register here.
                 }
+                ItemKind::State(decl) => {
+                    // Values initialize in `run`, in order; only the
+                    // declarations register here.
+                    state_decls.push(decl.clone());
+                }
+                ItemKind::Migrate(_) => {
+                    // Migration functions run at reload (Stage 3);
+                    // never registered, never called here.
+                }
             }
         }
         Self {
@@ -280,6 +296,8 @@ impl Interp {
             call_depth: 0,
             output: Vec::new(),
             ret_stack: Vec::new(),
+            state: HashMap::new(),
+            state_decls,
         }
     }
 
@@ -334,6 +352,53 @@ impl Interp {
                 Vec::new(),
             ));
         }
+        // Declared-state initialization (spec amendment, Phase 6):
+        // initializers run in declaration order before `main`.
+        // A bare channel binding cannot execute here — the sequential
+        // tree-walker holds no channels, so reaching one is a routing
+        // error (checked programs route through `uses_concurrency`).
+        let decls = std::mem::take(&mut self.state_decls);
+        for state in &decls {
+            for b in &state.bindings {
+                match &b.init {
+                    Some(init) => {
+                        let mut scopes = Vec::new();
+                        match self.eval_expr(init, &mut scopes) {
+                            Ok(v) => {
+                                self.state.insert(b.name.clone(), v);
+                            }
+                            Err(Signal::Panic(d, t)) => return Err((d, t)),
+                            Err(_) => {
+                                return Err((
+                                    Diag::new(
+                                        "E0204",
+                                        format!("state initializer for `{}` diverged", b.name),
+                                        b.name_span,
+                                        None,
+                                    ),
+                                    Vec::new(),
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        return Err((
+                            Diag::new(
+                                "E0215",
+                                format!(
+                                    "channel state binding `{}` reached the sequential interpreter (internal routing error)",
+                                    b.name
+                                ),
+                                b.name_span,
+                                Some("concurrent programs run on the runtime executor".to_string()),
+                            ),
+                            Vec::new(),
+                        ));
+                    }
+                }
+            }
+        }
+        self.state_decls = decls;
         let value = self.call_fn(main, Vec::new(), decl.name_span)?;
         match value {
             Value::Int(n) if (0..=255).contains(&n) => Ok(n as i32),
@@ -774,6 +839,11 @@ impl Interp {
                         return Ok(());
                     }
                 }
+                // Declared state is always a valid (mutable) place.
+                if self.state.contains_key(name) {
+                    self.state.insert(name.clone(), value);
+                    return Ok(());
+                }
                 Err(panic(
                     "E0208",
                     format!("undefined variable `{name}`"),
@@ -840,15 +910,20 @@ impl Interp {
             }
             ExprKind::Var(name) => match self.lookup(scopes, name) {
                 Some(v) => Ok(v),
-                // Named functions are first-class values.
-                None => match self.fn_index.get(name) {
-                    Some(&idx) => Ok(Value::Func(idx)),
-                    None => Err(panic(
-                        "E0208",
-                        format!("undefined variable `{name}`"),
-                        expr.span,
-                        None,
-                    )),
+                // Declared state: shared cells, read by value here
+                // (containers still share, per spec §5.7).
+                None => match self.state.get(name) {
+                    Some(v) => Ok(v.clone()),
+                    // Named functions are first-class values.
+                    None => match self.fn_index.get(name) {
+                        Some(&idx) => Ok(Value::Func(idx)),
+                        None => Err(panic(
+                            "E0208",
+                            format!("undefined variable `{name}`"),
+                            expr.span,
+                            None,
+                        )),
+                    },
                 },
             },
             ExprKind::If {

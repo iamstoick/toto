@@ -1,0 +1,9 @@
+state {
+    ch: chan<int>;
+    y: int = <-ch;
+}
+
+fn main() -> int {
+    println(y);
+    return 0;
+}
