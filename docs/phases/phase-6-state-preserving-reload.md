@@ -602,6 +602,89 @@ First-load checking was slice 2b; nothing there changed.
 - Cargo: 188 passed / 0 failed over 58 result lines (table above);
   fmt pins 140/17/45 hold (no formatter-relevant corpus change);
   stdlib 8/8 + wordfreq green via `check.sh`.
-- New tests this phase: 14 `preserve_tests` + 10 `preserve_proofs`
-  (7 matrix + abandonment + stateless fallback + soak) +
+- New tests this phase: 14 `preserve_tests` + 11 `preserve_proofs`
+  (7 matrix + abandonment + stateless fallback + soak + mixed) +
   `RecordRestart` stub; 4 `retain_proofs` unchanged and green.
+  (Mixed test added in Phase 7 Stage 0; see addendum below.)
+
+## Stage 0 flag close-outs (Phase 7, dated 2026-11-17; append-only)
+
+- (a) Spec §13 "28" → 27 (both occurrences, §13.1 and the appendix
+  model summary, each with a dated note). The old total
+  double-counted `len`; verified 27 names in `BUILTIN_NAMES`.
+- (b) Shared-cell concurrency semantics recorded in spec §14.1
+  (per-op atomicity under the shared-state mutex / single-threaded
+  serialization; no compound atomicity — last-writer-wins; channel
+  coordination is the rule, as both concurrent corpus programs
+  demonstrate). As implemented — `task_state_get/set`
+  (`crates/toto-jit/src/task.rs`), same shape in the gate-mode
+  `toto_state_get/set` (`runtime.rs`); no implementation change.
+- (c) Clarity items, one sentence each:
+  - Migrate name: NOT required to equal `S` — lookup is by
+    parameter type (`HMigrate` carries target/param/body, no name;
+    reload lookup matches `m.target`; recorded in spec §14.2).
+    The name obeys only flat-namespace rules (`E0311`).
+  - Watermark: no separate watermark field exists. The Stage 1
+    "allocation watermark" is provided by the generational-slot
+    check in `Heap::resolve` (`heap.rs`: cell occupied AND
+    slot.generation == ref.generation) — proven, not stored — by
+    `is_live_rejects_stale_generations_on_reuse` (stale generations
+    never resolve on slot reuse) and
+    `is_live_covers_post_collection_allocations` (objects born after
+    the last GC count as live).
+  - Census: 157 = top-level area `.gzv` files (21 concurrent + 14
+    diagnostics + 30 interp + 5 lexing + 9 parsing + 13 results +
+    65 typing); `diag10_recursion_limit` is present but skipped in
+    every harness, so 156 execute (45 runnable + 21 concurrent +
+    90 static — the breakdown sums correctly). 20 more `.gzv` live
+    in `tests/corpus/project/` subdirs (project tests, not the
+    differential). 168/166 are golden-FILE counts
+    (status/stderr/stdout), not program counts — 168 is not a valid
+    program census.
+  - LSP: Phase 6 added 57 lines to `crates/toto-cli/src/lsp.rs`
+    (commit `9b92d42`): new `Target::State` variant + hover and
+    go-to-definition for `state {}` bindings (shows `state name:
+    type`) and `migrate` items (shows the signature; jumps to the
+    function target).
+- (d) Mixed soak: added, not deferred —
+  `broken_edit_keeps_run_then_next_good_preserves`
+  (`preserve_proofs`, green): `StillBroken` leaves the preserving
+  run undisturbed (nothing carried, no abort), and the next good
+  edit still preserves across the broken one. Runs in CI with the
+  suite. Fresh total with this test: 189 passed / 0 failed over the
+  same 58 result lines (`toto_jit` lib 28 → 29).
+- Flake note (2026-11-17): `rebuild_cancels_parked_generation`
+  failed once in a loaded full-gate run (E0216 deadlock-detector won
+  over the E0214 scope-failure release), then passed 3/3 isolated
+  and in the re-run gate. Timing race, pre-existing shape (Phase 4
+  recorded the same transient class); test-only Stage 0 changes
+  cannot affect the integration binary. No action.
+
+## Acceptance-criteria checklist (brief §6, all ten)
+
+1. Stage 0 complete; README at Phase 5 complete / v1-core complete;
+   flag close-outs recorded — YES (§Stage 0; this addendum).
+2. Evaluation delivered with evidence review, architecture answers,
+   design proposal, GO verdict; STOP observed — YES (§Stage 1;
+   authorization followed in a separate turn).
+3. (GO) Epoch tags + retain-until-quiescent with real GC
+   reachability, incl. closure/fn-pointer case — YES, reference
+   (not epoch) based: §Stage 2 slice 2a + §Stage 3 planner.
+4. (GO) Declared state + migration per approved design; whitelist
+   enforced; undeclared restarts — YES (§Stage 3; §2.1–§2.7/2.15
+   pins in spec §14).
+5. (GO) Reloadability matrix green, all five rows, loud failure +
+   safe fallback — YES (§Stage 4 scenario matrix; unit + e2e).
+6. (GO) Soak green, continuous reloads, no leaks/corruption — YES
+   (§Stage 4 soak: 10 reloads + flush, bounded live, intact tag;
+   100-edit `devloop_soak.sh` for the drain path).
+7. (GO) Drain-and-restart fallback intact; undeclared programs
+   behave as Phase 4 — YES (stateless e2e + Phase 4 dev suite
+   green in the gate).
+8. No frozen decision changed; no ADR-008 change; production builds
+   do not hot-reload — YES (gate green throughout; helper-boundary
+   inspection recorded in slice 2a).
+9. `check.sh` green; CI green — YES (EXIT 0 ×2 on the branch;
+   both CI jobs success).
+10. Report with verdict, evaluation, design, exact counts,
+    measurements, carry-forwards — YES (this file).

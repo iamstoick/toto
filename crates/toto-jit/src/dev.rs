@@ -1858,6 +1858,37 @@ mod preserve_proofs {
         wait_finished(&drv, "gen4 stuck");
     }
 
+    /// Broken edit on the preserving path (Stage 0 mixed soak): a
+    /// `StillBroken` rebuild leaves the running generation
+    /// undisturbed, and the next GOOD edit still preserves — the
+    /// broken source never touches state, and preservation does not
+    /// require an unbroken history.
+    #[test]
+    fn broken_edit_keeps_run_then_next_good_preserves() {
+        let mut drv = test_driver();
+        let gen1 = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    count = 5;\n    println(count);\n    return 0;\n}\n";
+        let broken = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    let x = ;\n    return 0;\n}\n";
+        let gen2 = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    println(count);\n    return 0;\n}\n";
+        let gen3 = "state {\n    count: int = 0;\n}\nfn main() -> int {\n    println(count + 0);\n    return 0;\n}\n";
+        spawn_first(&mut drv, gen1, "gen1 mixed");
+        // Broken edit: loud, nothing carried, old run undisturbed.
+        match drv.rebuild_with(broken, "t.gzv", &[]) {
+            super::RebuildOutcome::StillBroken(_) => {}
+            other => panic!("mixed: expected StillBroken, got {other:?}"),
+        }
+        assert!(drv.take_carried().is_empty(), "broken: nothing carried");
+        assert!(drv.last_retire().carry_abort.is_none());
+        // Next good edit preserves across the broken one.
+        let (ended, _) = rebuilt(&mut drv, gen2, &[], "gen2 mixed");
+        assert_eq!(ended_stdout(&ended, "gen1"), b"5\n");
+        wait_finished(&drv, "gen2 mixed");
+        assert_eq!(drv.take_carried(), vec![RtVal::Int(5)]);
+        let (ended, _) = rebuilt(&mut drv, gen3, &[], "gen3 mixed");
+        assert_eq!(ended_stdout(&ended, "gen2"), b"5\n");
+        wait_finished(&drv, "gen3 mixed");
+        assert!(drv.last_retire().carry_abort.is_none());
+    }
+
     /// No declared state behaves exactly as Phase 4 (pure
     /// drain-and-restart): new behavior on the next generation,
     /// nothing carried, no abort recorded.

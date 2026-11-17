@@ -747,9 +747,11 @@ confirms or corrects — never silent).
 - Type `chan<T>` (§4). Values are created by builtins: `chan<T>()`
   (unbuffered) and `chan<T>(n)` (bounded, capacity `n`). `n` must be an
   `int`; a negative capacity panics (`E0204`) **[Proposal]**.
-- The builtin catalog grows 25 → 28: `chan`, `close`, `closed` are added
+- The builtin catalog grows 25 → 27: `chan`, `close`, `closed` are added
   (mandated by this section; §7's freeze is otherwise unchanged). No
   other channel builtins exist in v1 (`len` does not apply to channels).
+  (Correction 2026-11-17: 27, not 28 — the old total double-counted
+  `len`; verified against `BUILTIN_NAMES`.)
 - Send is `ch <- v`, receive is `<-ch` (§2.3). Send blocks when a bounded
   channel is full, and on an unbuffered channel until a receiver takes
   the value; receive blocks when the channel is empty. `select` with
@@ -890,6 +892,14 @@ reinterpreted. Production builds (`toto build`) never hot-reload.
   Reads/writes lower to `StateGet`/`StateSet`. State-held heap objects
   join every GC root set (threshold, explicit, and rendezvous
   collections), so live state is never swept under a running program.
+- Concurrency (as implemented; recorded 2026-11-17): each
+  `StateGet`/`StateSet` is atomic with respect to other state
+  accesses — single-threaded executors serialize everything, and
+  task mode clones/stores one slot under the shared-state mutex, so
+  no torn slots. Compound sequences are NOT atomic: concurrent
+  read-modify-write from multiple workers races (last-writer-wins).
+  Coordinate through channels (both concurrent corpus programs are
+  single-writer rendezvous chains).
 - Reloads (until Stage 3): declared state re-initializes from scratch
   in the new generation. This is drain-and-restart for state —
   visible and total, consistent with all other program state — and
@@ -901,7 +911,9 @@ reinterpreted. Production builds (`toto build`) never hot-reload.
   naming no new namespace: the migrate NAME shares the flat value
   namespace (`E0311` on collision) but is never callable — any
   reference or call is `E0325` (migrate functions run at reload,
-  never as ordinary calls).
+  never as ordinary calls). The declared name is not required to
+  equal `S` (lookup is by parameter type; verified against
+  `HMigrate`/reload lookup, recorded 2026-11-17).
 - Exactly one parameter (`E0321` otherwise); its type must be a
   struct `S` (`E0322` otherwise); the return type must equal `S`
   (`E0323` otherwise — no implicit conversion, no implicit field
@@ -1060,7 +1072,9 @@ sub-details in §13 (negative capacity, `E0213`/`E0214`, the zero-value
 table, `E0315`, first-panic-wins/settle-then-propagate, deadlock panic,
 default-last, `let v = <-ch` binding surface) are flagged for owner
 review: confirm or correct, per this appendix's process. The builtin
-catalog grows 25 → 28 (`chan`, `close`, `closed`); otherwise frozen.
+catalog grows 25 → 27 (`chan`, `close`, `closed`); otherwise frozen.
+(Correction 2026-11-17: 27, not 28 — the old total double-counted
+`len`; verified against `BUILTIN_NAMES`.)
 
 Phase 5 amendment record (2026-11-16): the owner chose the module model
 (path imports over `mod`-trees, flat namespace, meaningless `pub`,
