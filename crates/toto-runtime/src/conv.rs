@@ -132,6 +132,7 @@ pub fn to_value_memo(
         RtVal::Ok(inner) => Ok(Value::Ok(Box::new(to_value_memo(inner, heap, memo)?))),
         RtVal::Err(inner) => Ok(Value::Err(Box::new(to_value_memo(inner, heap, memo)?))),
         RtVal::Some(inner) => Ok(Value::Some(Box::new(to_value_memo(inner, heap, memo)?))),
+        RtVal::Ptr(p) => Ok(Value::Ptr(*p)),
     }
 }
 
@@ -193,6 +194,7 @@ pub fn from_value_memo(
         Value::Ok(inner) => Ok(RtVal::Ok(Box::new(from_value_memo(inner, heap, memo)?))),
         Value::Err(inner) => Ok(RtVal::Err(Box::new(from_value_memo(inner, heap, memo)?))),
         Value::Some(inner) => Ok(RtVal::Some(Box::new(from_value_memo(inner, heap, memo)?))),
+        Value::Ptr(p) => Ok(RtVal::Ptr(*p)),
         Value::Closure(_) | Value::Func(_) => Err(ConvError::Function),
     }
 }

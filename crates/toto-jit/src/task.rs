@@ -27,20 +27,20 @@ use std::sync::Arc;
 use corosensei::Yielder;
 use toto_compiler::ast::{FnDecl, ItemKind, Program};
 use toto_compiler::diag::Diag;
-use toto_compiler::hir::{CheckedProgram, HStructDecl, Ty};
+use toto_compiler::hir::{CheckedProgram, HExternFn, HStructDecl, Ty};
 use toto_compiler::interp::TraceFrame;
 use toto_compiler::span::Span;
 use toto_runtime::channel::{ChannelId, TaskId};
 use toto_runtime::exec::TaskResult;
 use toto_runtime::heap::{Heap, Payload};
 use toto_runtime::sched::{
-    BlockingOp, ExecCode, RunStats, Scheduler, ScopeId, SelReq, Shared, ToSched, ToTask,
+    BlockingOp, ExecCode, ForeignArg, RunStats, Scheduler, ScopeId, SelReq, Shared, ToSched, ToTask,
 };
 use toto_runtime::value::RtVal;
 
 use crate::runtime::{
-    TAG_BOOL, TAG_CHAN, TAG_FLOAT, TAG_FN_ANY, TAG_FUNC, TAG_HANDLE, TAG_INT, TAG_NONE, TAG_UNIT,
-    decode, encode,
+    TAG_BOOL, TAG_CHAN, TAG_FLOAT, TAG_FN_ANY, TAG_FUNC, TAG_HANDLE, TAG_INT, TAG_NONE, TAG_PTR,
+    TAG_UNIT, decode, encode,
 };
 
 /// Per-task production context. Owned by a `Box` whose pointer
@@ -89,6 +89,22 @@ pub struct JitTaskCtx {
     pub bodies: Arc<HashMap<u32, usize>>,
     pub func_names: Arc<Vec<String>>,
     pub chan_types: Arc<Vec<toto_compiler::hir::Ty>>,
+    /// Checked foreign signatures, name-sorted (codegen's
+    /// `extern_index` order). Shared by the whole run; empty when
+    /// the program declares no externs.
+    pub externs: Arc<Vec<(String, HExternFn)>>,
+}
+
+/// Sorted extern table (codegen `extern_index` order) from a
+/// checked program. Built once per run and shared by every task.
+pub fn sorted_externs(checked: &CheckedProgram) -> Vec<(String, HExternFn)> {
+    let mut v: Vec<(String, HExternFn)> = checked
+        .externs
+        .iter()
+        .map(|(k, sig)| (k.clone(), sig.clone()))
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
 }
 
 fn tctx<'a>(ctx: *mut JitTaskCtx) -> &'a mut JitTaskCtx {
@@ -190,6 +206,7 @@ fn decode_inner(
         TAG_FUNC => RtVal::Func(value as usize),
         TAG_FN_ANY if value < 0x1_0000_0000 => RtVal::Func(value as usize),
         TAG_FN_ANY => RtVal::Heap(decode(value)),
+        TAG_PTR => RtVal::Ptr(value),
         _ => {
             internal(ctx, format!("{who} with unknown value tag {tag}"), span);
             return None;
@@ -227,6 +244,7 @@ fn encode_val(v: &RtVal) -> Option<u64> {
         RtVal::Heap(r) => Some(encode(*r)),
         RtVal::Chan(c) => Some(c.0 as u64),
         RtVal::Func(i) => Some(*i as u64),
+        RtVal::Ptr(p) => Some(*p),
         _ => None,
     }
 }
@@ -234,6 +252,7 @@ fn encode_val(v: &RtVal) -> Option<u64> {
 /// Publish one live handle to this task's shadow slot (missing slot
 /// is silently skipped, like the executor's publish).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_shadow_push(ctx: *mut JitTaskCtx, r: u64) {
     let ctx = tctx(ctx);
     let mut st = ctx.shared.state.lock().expect("shared state lock");
@@ -244,6 +263,7 @@ pub unsafe extern "C" fn task_shadow_push(ctx: *mut JitTaskCtx, r: u64) {
 
 /// Current shadow depth of this task's slot.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_shadow_len(ctx: *mut JitTaskCtx) -> u64 {
     let ctx = tctx(ctx);
     let st = ctx.shared.state.lock().expect("shared state lock");
@@ -252,6 +272,7 @@ pub unsafe extern "C" fn task_shadow_len(ctx: *mut JitTaskCtx) -> u64 {
 
 /// Release roots pushed after `len` in this task's slot.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_shadow_pop_to(ctx: *mut JitTaskCtx, len: u64) {
     let ctx = tctx(ctx);
     let mut st = ctx.shared.state.lock().expect("shared state lock");
@@ -264,6 +285,7 @@ pub unsafe extern "C" fn task_shadow_pop_to(ctx: *mut JitTaskCtx, len: u64) {
 /// generated code (publish-before precondition, as in the gate).
 /// Returns the live object count.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_gc_collect(ctx: *mut JitTaskCtx) -> u64 {
     let ctx = tctx(ctx);
     maybe_collect(ctx);
@@ -275,6 +297,7 @@ pub unsafe extern "C" fn task_gc_collect(ctx: *mut JitTaskCtx) -> u64 {
 /// by-construction initialization argument). Threshold checked
 /// BEFORE inserting (frozen rule).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_alloc_array(
     ctx: *mut JitTaskCtx,
     len: u64,
@@ -299,6 +322,7 @@ pub unsafe extern "C" fn task_alloc_array(
 /// Allocate a string by copying `(ptr, len)` bytes (see the gate's
 /// `toto_alloc_str`). Threshold checked BEFORE inserting.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_alloc_str(
     ctx: *mut JitTaskCtx,
     ptr: u64,
@@ -336,6 +360,7 @@ fn read_name(ctx: &mut JitTaskCtx, who: &str, ptr: u64, len: u64, span: Span) ->
 /// Allocate an empty struct (see the gate's `toto_alloc_struct`).
 /// Threshold checked BEFORE inserting.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_alloc_struct(
     ctx: *mut JitTaskCtx,
     name_ptr: u64,
@@ -357,6 +382,7 @@ pub unsafe extern "C" fn task_alloc_struct(
 /// Allocate a `Range` value (frozen family name). Total.
 /// Threshold checked BEFORE inserting.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_alloc_range(ctx: *mut JitTaskCtx, lo: u64, hi: u64) -> u64 {
     let ctx = tctx(ctx);
     maybe_collect(ctx);
@@ -367,6 +393,7 @@ pub unsafe extern "C" fn task_alloc_range(ctx: *mut JitTaskCtx, lo: u64, hi: u64
 /// Allocate an `Ok`/`Err` value (frozen family name). Threshold
 /// checked BEFORE inserting.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_alloc_result(
     ctx: *mut JitTaskCtx,
     is_ok: u64,
@@ -389,6 +416,7 @@ pub unsafe extern "C" fn task_alloc_result(
 /// Allocate a `Some` value (frozen family name). Threshold checked
 /// BEFORE inserting.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_alloc_some(
     ctx: *mut JitTaskCtx,
     tag: u64,
@@ -410,6 +438,7 @@ pub unsafe extern "C" fn task_alloc_some(
 /// Allocate a closure value (frozen family name). Threshold checked
 /// BEFORE inserting.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_alloc_closure(
     ctx: *mut JitTaskCtx,
     body: u64,
@@ -445,6 +474,7 @@ fn index_operand_name(ctx: &JitTaskCtx, tag: u64, word: u64) -> &'static str {
         TAG_NONE => "Option",
         TAG_CHAN => "chan",
         TAG_FUNC => "function",
+        TAG_PTR => "pointer",
         TAG_HANDLE => {
             let st = ctx.shared.state.lock().expect("shared state lock");
             RtVal::Heap(decode(word)).type_name(&st.heap)
@@ -457,6 +487,7 @@ fn index_operand_name(ctx: &JitTaskCtx, tag: u64, word: u64) -> &'static str {
 /// (`ops::index_read`): out-of-bounds at `span`, non-int index at
 /// `ispan`, non-array base at `span`. Stale objects record `E0204`.
 #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_index_read(
     ctx: *mut JitTaskCtx,
     obj: u64,
@@ -547,6 +578,7 @@ pub unsafe extern "C" fn task_index_read(
 /// Store one array element with the exact interpreter messages
 /// (`ops::index_write`). Stale objects record `E0204`.
 #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_index_write(
     ctx: *mut JitTaskCtx,
     obj: u64,
@@ -648,6 +680,7 @@ fn struct_snapshot(heap: &Heap, obj: u64) -> Result<(String, Vec<(String, RtVal)
 /// Install one literal field during `StructLit` construction (see
 /// the gate's `toto_struct_init`).
 #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_struct_init(
     ctx: *mut JitTaskCtx,
     obj: u64,
@@ -709,6 +742,7 @@ pub unsafe extern "C" fn task_struct_init(
 /// Read one field by name with the exact interpreter messages
 /// (`ops::field_read`).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_struct_get(
     ctx: *mut JitTaskCtx,
     obj: u64,
@@ -783,6 +817,7 @@ pub unsafe extern "C" fn task_struct_get(
 /// Store one field by name with the exact interpreter messages
 /// (`ops::field_write`).
 #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_struct_set(
     ctx: *mut JitTaskCtx,
     obj: u64,
@@ -868,6 +903,7 @@ pub unsafe extern "C" fn task_struct_set(
 /// `E0210` builtin `len`, which also takes strings). Stale objects
 /// record `E0204`.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_len(
     ctx: *mut JitTaskCtx,
     obj: u64,
@@ -886,6 +922,7 @@ pub unsafe extern "C" fn task_len(
             TAG_NONE => "Option",
             TAG_CHAN => "chan",
             TAG_FUNC => "function",
+            TAG_PTR => "pointer",
             _ => "unknown",
         };
         record(
@@ -935,6 +972,7 @@ pub unsafe extern "C" fn task_len(
 /// Concatenate two strings (see the gate's `toto_str_concat`).
 /// Threshold checked BEFORE inserting.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_str_concat(
     ctx: *mut JitTaskCtx,
     a: u64,
@@ -978,6 +1016,7 @@ pub unsafe extern "C" fn task_str_concat(
 
 /// Lower range bound (see the gate's `toto_range_lo`).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_range_lo(
     ctx: *mut JitTaskCtx,
     obj: u64,
@@ -1009,6 +1048,7 @@ pub unsafe extern "C" fn task_range_lo(
 
 /// Upper range bound (see the gate's `toto_range_hi`).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_range_hi(
     ctx: *mut JitTaskCtx,
     obj: u64,
@@ -1040,6 +1080,7 @@ pub unsafe extern "C" fn task_range_hi(
 
 /// `1` for `Ok`, `0` for `Err` (see the gate's `toto_result_is_ok`).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_result_is_ok(
     ctx: *mut JitTaskCtx,
     obj: u64,
@@ -1072,6 +1113,7 @@ pub unsafe extern "C" fn task_result_is_ok(
 /// Inner word of an `Ok`/`Err`/`Some` value (see the gate's
 /// `toto_wrap_inner`).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_wrap_inner(
     ctx: *mut JitTaskCtx,
     obj: u64,
@@ -1115,6 +1157,7 @@ pub unsafe extern "C" fn task_wrap_inner(
 /// Compiled-body id of a closure value (see the gate's
 /// `toto_closure_body`).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_closure_body(
     ctx: *mut JitTaskCtx,
     obj: u64,
@@ -1147,6 +1190,7 @@ pub unsafe extern "C" fn task_closure_body(
 /// One capture word of a closure value by static index (see the
 /// gate's `toto_closure_cap`).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_closure_cap(
     ctx: *mut JitTaskCtx,
     obj: u64,
@@ -1223,6 +1267,7 @@ enum EqKind {
     Err,
     Some,
     None,
+    Ptr,
     Other,
 }
 
@@ -1250,6 +1295,7 @@ fn eq_snapshot(
         // words are function indices, the rest are closure handles
         // (same 2^32 discrimination as the task `decode`; frozen D8).
         TAG_FN_ANY if word < 0x1_0000_0000 => Some(plain(EqKind::Func)),
+        TAG_PTR => Some(plain(EqKind::Ptr)),
         TAG_HANDLE | TAG_FN_ANY => {
             let snap = {
                 let st = ctx.shared.state.lock().expect("shared state lock");
@@ -1300,6 +1346,7 @@ fn eq_name(kind: EqKind) -> &'static str {
         EqKind::Struct => "struct",
         EqKind::Ok | EqKind::Err => "Result",
         EqKind::Some | EqKind::None => "Option",
+        EqKind::Ptr => "pointer",
         EqKind::Other => "unknown",
     }
 }
@@ -1311,6 +1358,7 @@ fn eq_same_type(a: &EqOperand, b: &EqOperand) -> bool {
         (EqKind::Closure, EqKind::Func) | (EqKind::Func, EqKind::Closure) => false,
         (EqKind::Ok | EqKind::Err, EqKind::Ok | EqKind::Err) => true,
         (EqKind::Some | EqKind::None, EqKind::Some | EqKind::None) => true,
+        (EqKind::Ptr, EqKind::None) | (EqKind::None, EqKind::Ptr) => true,
         _ => a.kind == b.kind,
     }
 }
@@ -1402,6 +1450,13 @@ fn operand_of_rtval(ctx: &JitTaskCtx, v: &RtVal) -> EqOperand {
                 None => plain(EqKind::Other),
             }
         }
+        RtVal::Ptr(p) => EqOperand {
+            kind: EqKind::Ptr,
+            word: *p,
+            struct_name: None,
+        },
+        // Untrafficked immediates never reach JIT equality;
+        // `Other` compares false, never crashes.
         RtVal::Range(..) | RtVal::Ok(_) | RtVal::Err(_) | RtVal::Some(_) | RtVal::Closure(_) => {
             plain(EqKind::Other)
         }
@@ -1459,6 +1514,15 @@ fn jit_values_equal(ctx: &JitTaskCtx, a: &EqOperand, b: &EqOperand, depth: usize
             _ => false,
         },
         (EqKind::None, EqKind::None) => true,
+        (EqKind::Ptr, EqKind::Ptr) => a.word == b.word,
+        (EqKind::Ptr, EqKind::None) | (EqKind::None, EqKind::Ptr) => {
+            let p = if a.kind == EqKind::Ptr {
+                a.word
+            } else {
+                b.word
+            };
+            p == 0
+        }
         (EqKind::Some, EqKind::None) | (EqKind::None, EqKind::Some) => false,
         (EqKind::Array, EqKind::Array) => {
             if a.word == b.word {
@@ -1511,6 +1575,7 @@ fn jit_values_equal(ctx: &JitTaskCtx, a: &EqOperand, b: &EqOperand, depth: usize
 /// `==`/`!=` with the exact interpreter rule (`ops::equality`),
 /// help included.
 #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_values_eq(
     ctx: *mut JitTaskCtx,
     tag_a: u64,
@@ -1553,6 +1618,7 @@ pub unsafe extern "C" fn task_values_eq(
 /// (`ops::ordering`), help included. `op` is 0/1/2/3 for
 /// `Lt`/`LtEq`/`Gt`/`GtEq`.
 #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_values_order(
     ctx: *mut JitTaskCtx,
     op: u64,
@@ -1992,6 +2058,7 @@ fn builtin_conv(ctx: &mut JitTaskCtx, name: &'static str, decoded: Vec<RtVal>, s
 /// argument layout). File builtins park on the blocking pool;
 /// everything else runs inline.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_builtin(
     ctx: *mut JitTaskCtx,
     name_id: u64,
@@ -2032,6 +2099,177 @@ pub unsafe extern "C" fn task_builtin(
         "pop" => builtin_pop(ctx, &decoded, span),
         "read_file" | "write_file" | "file_exists" => builtin_blocking(ctx, name, &decoded, span),
         _ => builtin_conv(ctx, name, decoded, span),
+    }
+}
+
+/// Dispatch one foreign call: `name_idx` is the `extern_index`
+/// position in the installed table, `args_ptr` addresses `(tag,
+/// word)` pairs in generated-code stack memory. Values convert to
+/// pool-owned `ForeignArg`s exactly like the executor's
+/// `foreign_arg` (range checks and coercions happen in `ffi.rs` on
+/// the pool thread); the call suspends on the dedicated blocking
+/// pool, so other tasks keep running. Callbacks cannot arrive
+/// (codegen refuses fn-typed params); drained queue entries are
+/// stale hygiene and are released, never invoked.
+#[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn task_foreign(
+    ctx: *mut JitTaskCtx,
+    name_idx: u64,
+    args_ptr: u64,
+    nargs: u64,
+    start: u64,
+    end: u64,
+) -> u64 {
+    let ctx = tctx(ctx);
+    let span = Span::new(start as u32, end as u32);
+    let entry = ctx
+        .externs
+        .get(name_idx as usize)
+        .map(|(n, s)| (n.clone(), s.clone()));
+    let (name, sig) = match entry {
+        Some(ok) => ok,
+        None => {
+            internal(
+                ctx,
+                format!("foreign index {name_idx} out of range (unreachable: checked code)"),
+                span,
+            );
+            return 0;
+        }
+    };
+    // Callback-typed parameters are refused at compile time; a
+    // signature reaching here with one is a refusal hole.
+    if sig.params.iter().any(|(_, ty)| matches!(ty, Ty::Fn(..))) {
+        internal(
+            ctx,
+            format!("foreign `{name}` takes a callback (unreachable: codegen refuses callbacks)"),
+            span,
+        );
+        return 0;
+    }
+    let n = nargs as usize;
+    let words = unsafe { std::slice::from_raw_parts(args_ptr as *const u64, n.saturating_mul(2)) };
+    let mut fargs = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = match decode_inner(ctx, "foreign", words[2 * i], words[2 * i + 1], span) {
+            Some(v) => v,
+            None => return 0,
+        };
+        match foreign_arg(ctx, &v, &name, span) {
+            Some(a) => fargs.push(a),
+            None => return 0,
+        }
+    }
+    if scope_failed(ctx) {
+        record(
+            ctx,
+            "E0214",
+            String::from("task cancelled at `blocking`: scope failed (released by cancellation)"),
+            span,
+            None,
+        );
+        return 0;
+    }
+    maybe_collect(ctx);
+    let yielder = match ctx.yielder {
+        Some(y) => y,
+        None => {
+            internal(
+                ctx,
+                String::from("foreign suspend with no yielder installed"),
+                span,
+            );
+            return 0;
+        }
+    };
+    let op = BlockingOp::Foreign {
+        name,
+        sig,
+        args: fargs,
+        slots: Vec::new(),
+    };
+    // SAFETY: the yielder points into this task's own coroutine stack
+    // (see the struct docs); suspending here parks the task with JIT
+    // frames live, resuming with the pool completion.
+    match unsafe { &*yielder }.suspend(ToSched::Blocking { op, span }) {
+        ToTask::Value(v) => {
+            // Stale-entry hygiene (same-process reruns): release,
+            // never invoke — this task claims no slots.
+            for (slot, _) in toto_compiler::ffi::drain_queue() {
+                toto_compiler::ffi::release_slot(slot);
+            }
+            match encode_val(&v) {
+                Some(w) => w,
+                None => {
+                    internal(
+                        ctx,
+                        String::from("foreign result is not JIT-trafficable"),
+                        span,
+                    );
+                    0
+                }
+            }
+        }
+        ToTask::OpPanic { diag } => {
+            record(ctx, diag.code, diag.message, diag.span, diag.help);
+            0
+        }
+        ToTask::Cancelled { op } => {
+            ctx.skip_frame = true;
+            record(
+                ctx,
+                "E0214",
+                format!("task cancelled at `{op}`: scope failed (released by cancellation)"),
+                span,
+                None,
+            );
+            0
+        }
+        _ => {
+            internal(ctx, String::from("blocking response"), span);
+            0
+        }
+    }
+}
+
+/// One runtime value to owned plain pool data, mirroring the
+/// executor's `foreign_arg` exactly (the pool-side `ffi.rs` enforces
+/// widths and coercions). Callback values are refused at compile
+/// time, so any function here is a refusal hole.
+fn foreign_arg(ctx: &mut JitTaskCtx, v: &RtVal, name: &str, span: Span) -> Option<ForeignArg> {
+    match v {
+        RtVal::Int(n) => Some(ForeignArg::Int(*n)),
+        RtVal::Float(f) => Some(ForeignArg::Float(*f)),
+        RtVal::Heap(r) => {
+            let st = ctx.shared.state.lock().expect("shared state lock");
+            match st.heap.get(*r) {
+                Some(Payload::Str(s)) => Some(ForeignArg::Str(s.clone().into_bytes())),
+                _ => {
+                    let tn = v.type_name(&st.heap);
+                    drop(st);
+                    internal(
+                        ctx,
+                        format!("cannot pass {tn} to foreign `{name}` (unreachable: checked code)"),
+                        span,
+                    );
+                    None
+                }
+            }
+        }
+        RtVal::None => Some(ForeignArg::Null),
+        RtVal::Ptr(p) => Some(ForeignArg::Ptr(*p)),
+        other => {
+            let st = ctx.shared.state.lock().expect("shared state lock");
+            let tn = other.type_name(&st.heap);
+            drop(st);
+            internal(
+                ctx,
+                format!("cannot pass {tn} to foreign `{name}` (unreachable: checked code)"),
+                span,
+            );
+            None
+        }
     }
 }
 
@@ -2140,6 +2378,7 @@ fn response_value(ctx: &mut JitTaskCtx, v: RtVal, span: Span) -> Option<u64> {
 /// `toto_check_failed` after the call and unwinds explicitly).
 /// `msg_ptr`/`msg_len` address JIT-owned static message bytes.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_panic(
     ctx: *mut JitTaskCtx,
     code: u64,
@@ -2168,6 +2407,7 @@ pub unsafe extern "C" fn task_panic(
 /// code to return a dummy word immediately. Honors `skip_frame`
 /// (blocking-`Cancelled` only).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_check_failed(
     ctx: *mut JitTaskCtx,
     name_ptr: u64,
@@ -2204,6 +2444,7 @@ pub unsafe extern "C" fn task_check_failed(
 /// Never blocks (`yield_now` semantics: no fail-fast, safepoint,
 /// suspend). Failures mirror the executor exactly.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_chan_make(
     ctx: *mut JitTaskCtx,
     has_cap: u64,
@@ -2267,6 +2508,7 @@ pub unsafe extern "C" fn task_chan_make(
 /// for the run's lifetime (conservative; precise spawn-root handoff
 /// is a carry-forward).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_spawn(
     ctx: *mut JitTaskCtx,
     body: u64,
@@ -2329,6 +2571,7 @@ pub unsafe extern "C" fn task_spawn(
         bodies: Arc::clone(&ctx.bodies),
         func_names: Arc::clone(&ctx.func_names),
         chan_types: Arc::clone(&ctx.chan_types),
+        externs: Arc::clone(&ctx.externs),
     });
     let child_u64 = Box::into_raw(child) as u64;
     let scope = ctx.scope;
@@ -2586,6 +2829,7 @@ fn yield_closed(ctx: &mut JitTaskCtx, chan_w: u64, span: Span) -> u64 {
 /// operands (see each arm). May park the task: roots are already
 /// published (a `Park` safepoint precedes every suspending op).
 #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_yield(
     ctx: *mut JitTaskCtx,
     op: u64,
@@ -2614,6 +2858,7 @@ pub unsafe extern "C" fn task_yield(
 
 /// Fetch one go-body capture word by static index.
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_capture(ctx: *mut JitTaskCtx, idx: u64, start: u64, end: u64) -> u64 {
     let ctx = tctx(ctx);
     let span = Span::new(start as u32, end as u32);
@@ -2630,6 +2875,7 @@ pub unsafe extern "C" fn task_capture(ctx: *mut JitTaskCtx, idx: u64, start: u64
 /// Resolve a top-level function index to its compiled entry address
 /// (indirect calls through `Func` values).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_func_entry(
     ctx: *mut JitTaskCtx,
     idx: u64,
@@ -2663,6 +2909,7 @@ pub unsafe extern "C" fn task_func_entry(
 /// Resolve a compiled-body id to its entry address (indirect calls
 /// through closure values).
 #[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn task_body_entry(
     ctx: *mut JitTaskCtx,
     body: u64,
@@ -2881,6 +3128,7 @@ pub fn spawn_jit_run(
         structs,
         fns: fns.clone(),
         fn_blocks,
+        externs: checked.externs.clone(),
     });
     let sched = Arc::new(Scheduler::new(
         code,
@@ -2895,6 +3143,7 @@ pub fn spawn_jit_run(
     let bodies = Arc::clone(&session.bodies);
     let func_names = Arc::clone(&session.func_names);
     let chan_types = Arc::clone(&session.chan_types);
+    let externs = Arc::new(sorted_externs(checked));
     let fns = Arc::new(fns);
     let ctx = Box::new(JitTaskCtx {
         shared: Arc::clone(sched.shared()),
@@ -2915,6 +3164,7 @@ pub fn spawn_jit_run(
         bodies,
         func_names,
         chan_types,
+        externs,
     });
     let ctx_u64 = Box::into_raw(ctx) as u64;
     sched.spawn_native_main(jit_task_entry, ctx_u64, main_span);
@@ -2944,4 +3194,131 @@ pub fn run_jit(
         Ok(run) => run.join(),
         Err(outcome) => outcome,
     }
+}
+
+/// Run a checked program with AOT-compiled code on scheduler tasks
+/// (the `toto build` production path). Mirrors `spawn_jit_run`, but
+/// the compiled entry points come from the linked object (supplied as
+/// addresses) instead of an in-memory JIT session. `program`/`checked`
+/// come from re-resolving the embedded sources at startup, so structs,
+/// display names, and panic sources are the real ones; only machine
+/// code is ahead-of-time.
+pub fn run_aot(
+    program: &Program,
+    checked: &CheckedProgram,
+    config: toto_runtime::RuntimeConfig,
+    main_entry: usize,
+    entries: HashMap<String, usize>,
+    bodies: HashMap<u32, usize>,
+    chan_types: Vec<toto_compiler::hir::Ty>,
+) -> toto_runtime::RtOutcome {
+    match spawn_aot_run(
+        program, checked, config, main_entry, entries, bodies, chan_types,
+    ) {
+        Ok(run) => run.join(),
+        Err(outcome) => outcome,
+    }
+}
+
+/// Spawn an AOT-compiled run (see `run_aot`). The scheduler, context,
+/// and settle protocol are identical to `spawn_jit_run`.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub fn spawn_aot_run(
+    program: &Program,
+    checked: &CheckedProgram,
+    config: toto_runtime::RuntimeConfig,
+    main_entry: usize,
+    entries: HashMap<String, usize>,
+    bodies: HashMap<u32, usize>,
+    chan_types: Vec<toto_compiler::hir::Ty>,
+) -> Result<JitRun, toto_runtime::RtOutcome> {
+    let prog = toto_compiler::mir::lower(checked);
+    let mut structs: HashMap<String, HStructDecl> = HashMap::new();
+    for (name, decl) in &checked.structs {
+        structs.insert(name.clone(), decl.clone());
+    }
+    let mut fns: Vec<FnDecl> = Vec::new();
+    for item in &program.items {
+        if let ItemKind::Fn(decl) = &item.kind {
+            fns.push(decl.clone());
+        }
+    }
+    let fn_blocks: Vec<Arc<[toto_compiler::mir::MBlock]>> = prog
+        .fns
+        .iter()
+        .map(|f| Arc::from(f.blocks.as_slice()))
+        .collect();
+    if !prog.fn_index.contains_key("main") {
+        return Err(toto_runtime::RtOutcome {
+            result: Err((
+                Diag::new(
+                    "E0204",
+                    "program has no `fn main() -> int`".to_string(),
+                    Span::new(0, 0),
+                    None,
+                ),
+                Vec::new(),
+            )),
+            stdout: Vec::new(),
+            stats: zero_stats(),
+        });
+    }
+    let main_span = prog.main_span;
+    let func_names_vec: Vec<String> = prog.fns.iter().map(|f| f.name.clone()).collect();
+    let code = Arc::new(ExecCode {
+        prog,
+        structs,
+        fns: fns.clone(),
+        fn_blocks,
+        externs: checked.externs.clone(),
+    });
+    let sched = Arc::new(Scheduler::new(
+        code,
+        config.gc_threshold_bytes,
+        config.rng_seed,
+        config.stack_bytes,
+        config.collect_at_every_safepoint_for_test,
+        config.workers,
+        config.blocking_pool_threads,
+    ));
+    let entries = Arc::new(entries);
+    let bodies = Arc::new(bodies);
+    let func_names = Arc::new(func_names_vec);
+    let chan_types = Arc::new(chan_types);
+    let externs = Arc::new(sorted_externs(checked));
+    let fns = Arc::new(fns);
+    let ctx = Box::new(JitTaskCtx {
+        shared: Arc::clone(sched.shared()),
+        task: TaskId(usize::MAX),
+        scope: ScopeId(usize::MAX),
+        yielder: None,
+        entry: main_entry,
+        captures: Vec::new(),
+        root_name: String::from("main"),
+        root_span: main_span,
+        is_main: true,
+        failed: false,
+        diag: None,
+        skip_frame: false,
+        trace: Vec::new(),
+        fns,
+        entries,
+        bodies,
+        func_names,
+        chan_types,
+        externs,
+    });
+    let ctx_u64 = Box::into_raw(ctx) as u64;
+    sched.spawn_native_main(jit_task_entry, ctx_u64, main_span);
+    let sched2 = Arc::clone(&sched);
+    let join = std::thread::Builder::new()
+        .name("toto-jit".to_string())
+        .stack_size(256 << 20)
+        .spawn(move || sched2.run())
+        .expect("failed to spawn jit thread");
+    Ok(JitRun {
+        sched,
+        join,
+        main_span,
+    })
 }

@@ -9,6 +9,7 @@
 //! concurrent ones) on scheduler tasks with sentinel panics and
 //! suspension. The 8 gate tests pin the gate contract throughout.
 
+pub mod aot;
 pub mod compile;
 pub mod dev;
 pub mod runtime;

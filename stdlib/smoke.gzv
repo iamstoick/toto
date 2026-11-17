@@ -1,0 +1,18 @@
+// stdlib smoke: imports every module so `toto run`/`toto build` prove
+// the whole library loads, merges, and checks as one program.
+import "gzv.std/io.gzv";
+import "gzv.std/fs.gzv";
+import "gzv.std/strings.gzv";
+import "gzv.std/collections.gzv";
+import "gzv.std/math.gzv";
+import "gzv.std/time.gzv";
+import "gzv.std/json.gzv";
+
+fn main() -> int {
+    println(join(["stdlib"], " ") + " smoke");
+    println(sum_ints([gcd(12, 18), factorial(3)]));
+    println(format_duration(duration_from_mins(90)));
+    println(basename(path_join("a", "b.gzv")));
+    println(json_stringify(json_int(42)));
+    return 0;
+}

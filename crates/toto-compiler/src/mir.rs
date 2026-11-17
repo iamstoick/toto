@@ -38,6 +38,10 @@ pub struct MProgram {
     pub fn_index: HashMap<String, usize>,
     /// Name span of `main` for exit-code diagnostics (tree-walker parity).
     pub main_span: Span,
+    /// Checked foreign signatures, kept out of the text dump (which
+    /// prints functions only): the JIT/AOT backend needs them to
+    /// marshal `CallForeign` arguments and refuse callback params.
+    pub externs: HashMap<String, crate::hir::HExternFn>,
 }
 
 /// One function body: locals plus a block graph.
@@ -115,6 +119,15 @@ pub enum MInstr {
         display: String,
     },
     CallBuiltin {
+        dst: Option<Local>,
+        name: String,
+        args: Vec<Local>,
+        span: Span,
+    },
+    /// Direct call to a declared foreign function (executed by the
+    /// interpreter inline and by the runtime executor on the blocking
+    /// pool; the JIT refuses these programs cleanly).
+    CallForeign {
         dst: Option<Local>,
         name: String,
         args: Vec<Local>,
@@ -358,6 +371,7 @@ pub fn lower(checked: &CheckedProgram) -> MProgram {
         fns,
         fn_index,
         main_span,
+        externs: checked.externs.clone(),
     }
 }
 
@@ -1192,6 +1206,21 @@ impl<'a> FnBuilder<'a> {
                 });
                 dst
             }
+            HExprKind::CallForeign { name, args } => {
+                let mut vs = Vec::with_capacity(args.len());
+                for a in args {
+                    vs.push(self.lower_expr(a, ret));
+                }
+                let dst = self.fresh(format!("{name}()"), expr.ty.clone());
+                self.emit(MInstr::Safepoint { kind: SpKind::Call });
+                self.emit(MInstr::CallForeign {
+                    dst: Some(dst),
+                    name: name.clone(),
+                    args: vs,
+                    span: expr.span,
+                });
+                dst
+            }
             HExprKind::Field { base, name } => {
                 let b = self.lower_expr(base, ret);
                 let dst = self.fresh(format!("field {name}"), expr.ty.clone());
@@ -1638,6 +1667,22 @@ impl fmt::Display for MInstr {
                 write!(
                     f,
                     "{} = builtin {name}(",
+                    dst.map(local).unwrap_or_else(|| "_".to_string())
+                )?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", local(*a))?;
+                }
+                write!(f, ")")
+            }
+            MInstr::CallForeign {
+                dst, name, args, ..
+            } => {
+                write!(
+                    f,
+                    "{} = foreign {name}(",
                     dst.map(local).unwrap_or_else(|| "_".to_string())
                 )?;
                 for (i, a) in args.iter().enumerate() {

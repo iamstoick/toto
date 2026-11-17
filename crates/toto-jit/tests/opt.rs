@@ -232,6 +232,7 @@ const CONCURRENT: &[&str] = &[
     "conc10_select_send",
     "conc11_chan_of_chan",
     "conc18_fneq",
+    "conc19_chan_eq",
     "conc_neg_child_panic",
     "conc_neg_deadlock",
     "conc_neg_double_close",

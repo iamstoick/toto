@@ -1,0 +1,5 @@
+error[E0311]: duplicate definition of function `helper`
+ --> lib/dup.gzv:1:4
+  |
+1 | fn helper(x: int) -> int {
+  |    ^^^^^^

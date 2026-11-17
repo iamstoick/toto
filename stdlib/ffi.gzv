@@ -1,0 +1,191 @@
+// `gzv.std/ffi` — C ABI surface (Phase 5, Stage 3).
+//
+// Safe Toto wrappers over the 18 linked foreign symbols (real libc /
+// libm plus the `toto_rt_*` runtime helpers; see `docs/ffi.md` for the
+// per-binding contract). Every wrapper documents who owns what:
+//
+// - Strings cross as fresh NUL-copies, rooted for exactly the call.
+//   The C side never retains them; the copy dies on return.
+// - Pointers are opaque `*T` addresses (never printed: ASLR-unstable).
+//   Memory from `c_malloc` is yours: every allocation needs its
+//   `c_free`, including on error paths.
+// - Callbacks run on the worker that drains them (after the foreign
+//   call completes, or after `pthread_join`); they must not touch
+//   scheduler/GC state — only plain memory through the pointer arg.
+// - File descriptors from `c_open` are yours: close them... except
+//   `close(2)` cannot be named in an `unsafe extern` block (`close`
+//   is the channel builtin), so this module cannot offer `c_close`
+//   (see `docs/ffi.md`). Prefer short-lived opens you can leave to
+//   process exit in examples, and real lifecycle management once the
+//   naming restriction is lifted.
+
+unsafe extern "C" {
+    fn strlen(s: *c_char) -> c_long;
+    fn strcmp(a: *c_char, b: *c_char) -> c_int;
+    fn strtod(s: *c_char, end: *c_void) -> c_double;
+    fn open(path: *c_char, flags: c_int) -> c_int;
+    fn strerror(e: c_int) -> string;
+    fn __errno_location() -> *c_void;
+    fn malloc(n: c_long) -> *c_void;
+    fn free(p: *c_void) -> unit;
+    fn memset(s: *c_void, c: c_int, n: c_long) -> *c_void;
+    fn memcmp(a: *c_void, b: *c_void, n: c_long) -> c_int;
+    fn pow(x: c_double, y: c_double) -> c_double;
+    fn sleep(secs: c_int) -> c_int;
+    fn pthread_create(t: *c_void, attr: *c_void, f: fn(*c_void) -> *c_void, arg: *c_void) -> c_int;
+    fn pthread_join(t: c_long, ret: *c_void) -> c_int;
+    fn toto_rt_read_i32(p: *c_void) -> c_int;
+    fn toto_rt_read_i64(p: *c_void) -> c_long;
+    fn toto_rt_write_i64(p: *c_void, v: c_long) -> unit;
+    fn toto_rt_close(fd: c_int) -> c_int;
+    fn toto_rt_read_str(p: *c_void, n: c_long) -> string;
+    fn read(fd: c_int, buf: *c_void, n: c_long) -> c_long;
+}
+
+// Byte length of the NUL-copy (== the string length; interior NUL
+// bytes fail with E0210 rather than truncating).
+fn c_strlen(s: string) -> int {
+    return strlen(s);
+}
+
+// Negative/zero/positive like C: sign only, not distance.
+fn c_strcmp(a: string, b: string) -> int {
+    return strcmp(a, b);
+}
+
+// Parse with `strtod`; the end pointer is dropped (`None`), so
+// trailing garbage is ignored — check the span yourself when that
+// matters.
+fn c_strtod(s: string) -> float {
+    return strtod(s, None);
+}
+
+fn c_pow(x: float, y: float) -> float {
+    return pow(x, y);
+}
+
+fn c_sleep(secs: int) -> int {
+    return sleep(secs);
+}
+
+// Current `errno` as an int (0 when the last call succeeded).
+fn errno_value() -> int {
+    return toto_rt_read_i32(__errno_location());
+}
+
+// `strerror` message for an error number. The `-> string` return
+// copies the C message into a Toto string on return (invalid UTF-8
+// is E0210, NULL is E0308); nothing is retained.
+fn errno_message(e: int) -> string {
+    return strerror(e);
+}
+
+// Open for reading (`O_RDONLY`). Success is `Ok(fd)` — the fd is
+// yours (see the `c_close` note above). Failure is `Err(message)`
+// with the `errno` text, never a bare -1.
+fn c_open_read(path: string) -> Result<int, string> {
+    // `open` reports failure in-band as `-errno` (never bare -1):
+    // `errno` is thread-local and FFI runs on a thread pool, so a
+    // later `errno_value()` call could read another thread's
+    // `errno`. Negate back and feed the number to `strerror`, which
+    // needs no `errno` state. `errno_value()` remains for exotic
+    // uses on the single-threaded interpreter path.
+    let fd = open(path, 0);
+    if fd < 0 {
+        return Err(errno_message(-fd));
+    }
+    return Ok(fd);
+}
+
+// Allocate `n` bytes (uninitialized, like C). Pair every success
+// with `c_free`, including on early returns.
+fn c_malloc(n: int) -> *c_void {
+    return malloc(n);
+}
+
+fn c_free(p: *c_void) -> unit {
+    free(p);
+    return ();
+}
+
+// Fill `n` bytes with zero. Returns the pointer for chaining.
+fn c_memzero(p: *c_void, n: int) -> *c_void {
+    return memset(p, 0, n);
+}
+
+// Compare `n` bytes. Returns 0 when equal (sign only otherwise).
+fn c_memcmp(a: *c_void, b: *c_void, n: int) -> int {
+    return memcmp(a, b, n);
+}
+
+fn c_read_i64(p: *c_void) -> int {
+    return toto_rt_read_i64(p);
+}
+
+fn c_write_i64(p: *c_void, v: int) -> unit {
+    toto_rt_write_i64(p, v);
+    return ();
+}
+
+// Foreign threads live in `gzv.std/ffi_thread`: `c_thread_spawn`
+// hands a callback to `pthread_create`, which generated code cannot
+// drain, so that module is run/test-only. This module stays
+// buildable: unused callback *declarations* never poison a build,
+// only called callback sites refuse at compile time.
+
+// Raw `read(2)`: byte count (0 is EOF) or `-errno` in-band, like
+// `open`. The buffer must hold at least `n` bytes.
+fn c_read(fd: int, buf: *c_void, n: int) -> int {
+    return read(fd, buf, n);
+}
+
+// Close an `open` fd. `close(2)` cannot be named in an `unsafe
+// extern` block (`close` is the reserved channel builtin), so this
+// alias is the sanctioned spelling. Success is `Ok(0)`.
+fn c_close(fd: int) -> Result<int, string> {
+    let rc = toto_rt_close(fd);
+    if rc < 0 {
+        return Err(errno_message(-rc));
+    }
+    return Ok(0);
+}
+
+// Copy `n` foreign bytes into a Toto string (UTF-8 validated:
+// misuse panics E0210, NULL panics E0308).
+fn c_read_str(p: *c_void, n: int) -> string {
+    return toto_rt_read_str(p, n);
+}
+
+// Whole-file read through FFI only: open, chunked `read`, close.
+// Missing/unreadable paths and mid-read I/O errors are `Err` with
+// the `errno` text; the fd and buffer release on every path.
+fn c_read_file(path: string) -> Result<string, string> {
+    let fd = open(path, 0);
+    if fd < 0 {
+        return Err(errno_message(-fd));
+    }
+    let buf: *c_void = malloc(4096);
+    let mut acc = "";
+    let mut failed = "";
+    while true {
+        let r = read(fd, buf, 4096);
+        if r < 0 {
+            failed = errno_message(-r);
+            break;
+        }
+        if r == 0 {
+            break;
+        }
+        acc = acc + toto_rt_read_str(buf, r);
+    }
+    free(buf);
+    let close_rc: Result<int, string> = c_close(fd);
+    if failed != "" {
+        return Err(failed);
+    }
+    let ok0: Result<int, string> = Ok(0);
+    if close_rc != ok0 {
+        return Err("close failed");
+    }
+    return Ok(acc);
+}

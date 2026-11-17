@@ -122,6 +122,30 @@ fn as_float(v: &Value, span: Span, name: &str, pos: usize) -> Result<f64, (Diag,
 
 type BResult = Result<Value, (Diag, Vec<TraceFrame>)>;
 
+/// Canonical `print`/`println` implementation (single home for the
+/// semantics; both `call_builtin`'s arm and the runtime executor's
+/// fast path delegate here, so traces, arity errors, and output bytes
+/// stay identical by construction). Split out because `call_builtin`'s
+/// 40-arm match reserves ~24 KiB of debug frame; routing the hottest
+/// builtin around the match keeps executor tasks inside the ratified
+/// 64 KiB stacks.
+pub fn call_print(
+    args: Vec<Value>,
+    newline: bool,
+    span: Span,
+    fns: &[FnDecl],
+    output: &mut Vec<u8>,
+) -> BResult {
+    arity(if newline { "println" } else { "print" }, &args, 1, span)?;
+    let mut text = format_value(&args[0], fns);
+    if newline {
+        text.push('\n');
+    }
+    let bytes = text.len() as i64;
+    output.extend_from_slice(text.as_bytes());
+    Ok(Value::Int(bytes))
+}
+
 /// Call a builtin. The caller owns `output`; print appends there.
 /// `fns` supplies top-level function declarations for value display
 /// (`<fn name>`). Decoupled from `Interp` so the runtime executor
@@ -134,16 +158,7 @@ pub fn call_builtin(
     output: &mut Vec<u8>,
 ) -> BResult {
     match name {
-        "print" | "println" => {
-            arity(name, &args, 1, span)?;
-            let mut text = format_value(&args[0], fns);
-            if name == "println" {
-                text.push('\n');
-            }
-            let bytes = text.len() as i64;
-            output.extend_from_slice(text.as_bytes());
-            Ok(Value::Int(bytes))
-        }
+        "print" | "println" => call_print(args, name == "println", span, fns, output),
         "len" => {
             arity(name, &args, 1, span)?;
             match &args[0] {

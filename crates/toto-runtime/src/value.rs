@@ -38,6 +38,9 @@ pub enum RtVal {
     Ok(Box<RtVal>),
     Err(Box<RtVal>),
     Some(Box<RtVal>),
+    /// Opaque foreign pointer (Phase 5, Stage 3). An address with no
+    /// Toto-visible pointee; never printed (ASLR-unstable).
+    Ptr(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +77,7 @@ impl RtVal {
             RtVal::Func(_) | RtVal::Closure(_) => "function",
             RtVal::Ok(_) | RtVal::Err(_) => "Result",
             RtVal::Some(_) => "Option",
+            RtVal::Ptr(_) => "pointer",
         }
     }
 }
@@ -126,5 +130,11 @@ pub fn zero_value(
             Some(RtVal::Heap(heap.alloc_struct(name, fields)))
         }
         Ty::Chan(_) | Ty::Fn(..) | Ty::Map(..) => None,
+        // C scalars zero like their Toto views; a null pointer is the
+        // zero of `*T`; bare `c_void` has no value.
+        Ty::CChar | Ty::CInt | Ty::CLong => Some(RtVal::Int(0)),
+        Ty::CDouble => Some(RtVal::Float(0.0)),
+        Ty::CPtr(_) => Some(RtVal::Ptr(0)),
+        Ty::CVoid => None,
     }
 }

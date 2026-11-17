@@ -1,0 +1,4 @@
+[project]
+name = "stdlib"
+version = "0.1.0"
+entry = "smoke.gzv"

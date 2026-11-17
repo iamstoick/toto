@@ -1,0 +1,56 @@
+import "gzv.std/ffi.gzv";
+import "gzv.std/ffi_thread.gzv";
+
+fn answer(arg: *c_void) -> *c_void {
+    c_write_i64(arg, 42);
+    return None;
+}
+
+fn check_open() -> Result<bool, string> {
+    let got: Result<int, string> = c_open_read("/nope-missing-ffi-test");
+    let want: Result<int, string> = Err(errno_message(2));
+    if got != want {
+        return Err("open");
+    }
+    return Ok(true);
+}
+
+fn run_thread() -> Result<int, string> {
+    let data: *c_void = c_malloc(8);
+    c_write_i64(data, 0);
+    let id: int = c_thread_spawn(answer, data)?;
+    let joined: Result<int, string> = c_thread_join(id);
+    let ok0: Result<int, string> = Ok(0);
+    if joined != ok0 {
+        c_free(data);
+        return Err("join");
+    }
+    let v: int = c_read_i64(data);
+    c_free(data);
+    return Ok(v);
+}
+
+fn main() -> int {
+    println(c_strlen("hello"));
+    println(c_strcmp("a", "b"));
+    println(c_pow(2.0, 10.0));
+    println(c_strtod("2.5"));
+    let a: *c_void = c_malloc(16);
+    let b: *c_void = c_malloc(16);
+    c_memzero(a, 16);
+    c_memzero(b, 16);
+    println(c_memcmp(a, b, 16));
+    c_write_i64(a, 7);
+    println(c_read_i64(a));
+    c_free(a);
+    c_free(b);
+    println(check_open());
+    println(run_thread());
+    let ch = chan<int>();
+    go {
+        ch <- 7;
+    }
+    println(c_sleep(1));
+    println(<-ch);
+    return 0;
+}

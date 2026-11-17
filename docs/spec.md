@@ -54,7 +54,8 @@ diagnostics, §3.5):
 | User-defined generics, traits, `impl` | not in v1 | "not supported in v1" |
 | `unsafe extern` blocks, FFI declarations | Phase 5 | Phase 5 |
 | `match`, pattern matching | Phase 2 (if in scope) | Phase 2 |
-| Module system, `import` / `mod` / `use` / `pub` | Phase 2 | Phase 2 |
+| Module system (`import "path"`, flat namespace; `pub` accepted, no effect) | Phase 5 | Phase 5 |
+| `mod` / `use` | not in v1 | "not supported in v1" |
 | `defer` / `close`, resource handling | later phase | "not in v1 core" |
 
 `Result<T, E>` / `Option<T>` **types** parse in annotations and signatures
@@ -248,6 +249,21 @@ allowed. Execution starts at `fn main() -> int`. Duplicate top-level names
 definition in Phase 1 (documented leniency; Phase 2 makes duplicates a
 static error).
 
+Multi-file programs (Phase 5) use path imports: a top-level
+`import "path";` statement pulls the other file's items into the single
+flat top-level namespace (no nested modules). Import paths resolve
+against the importing file's directory; an already-loaded file loads
+once (diamond imports are fine). `pub` may prefix any top-level item
+and has no effect — there are no private items. `mod` and `use` are not
+in v1. An `import` in statement or expression position is a parse error
+(`E0157`); an `import` that cannot be resolved is a static error
+(`E0401`: single-file mode, or the file is missing). Duplicate
+top-level names across imported files are static errors (`E0311`, as
+for duplicates in one file, reported at the later file); a file that
+imports itself, directly or through other files, is a static error
+(`E0402`, circular import, reported at the import that closes the
+cycle). Diagnostics name their origin file (`docs/project.md`).
+
 ### 3.2 Semicolons
 
 `;` terminates `let`, assignment, expression-statement, `return`, `break`,
@@ -271,8 +287,10 @@ name. Minimum required rejections (negative corpus, §9.4):
 - `unsafe` blocks / `extern` blocks or declarations → "FFI executes in
   Phase 5" (`E0155`).
 - `match` → "pattern matching is a Phase 2 concern" (`E0156`).
-- `import` / `mod` / `use` / `pub` → "modules and imports arrive in
-  Phase 2" (`E0157`).
+- `mod` / `use` → "not supported in v1 (multi-file programs use
+  `import "path"`)" (`E0157`). `import` in statement or expression
+  position → "`import` is only allowed at the top level" (`E0157`).
+  Top-level `import "path";` and `pub` are core (Phase 5, §3.1).
 - `Ok(…)`, `Err(…)`, `Some(…)`, `None(…)` → **retired in Phase 2**: these
   are value constructors that parse, check, and execute (§11, §12); the
   `E0206` runtime rejection no longer exists.
@@ -367,7 +385,11 @@ wants deep immutability for `let`.
   `string` by contents; `Range` by endpoints; `Array`/struct **structural
   (deep)** equality with cycle detection — cyclic structures fall back to
   identity comparison rather than recursing forever; functions/closures by
-  **identity** (same value, not same code).
+  **identity** (same value, not same code);
+  channels compare equal to every channel (`c == c` and `c1 == c2` are
+  both `true`; `!=` is `false`) — channel identity is not observable
+  through equality. Pinned by `conc19_chan_eq`; all executors agree
+  (recorded Phase 5, divergence disposition).
 - Ordering `< <= > >=`: `int`, `float` (NaN comparisons are `false`, per
   IEEE), and `string` (lexicographic byte order). Other types are a runtime
   panic.
@@ -552,7 +574,9 @@ error[E0102]: expected `;` after let statement
 Every diagnostic carries: stable code, `error`/`panic` kind, message,
 `file:line:col` span, source snippet with caret span, and optional
 `help:` suggestion. Codes: `E00xx` lexer, `E01xx` parser, `E02xx` runtime
-(panics), `E03xx` static type errors (Phase 2, §12). The code list lives
+(panics), `E03xx` static type errors (Phase 2, §12), `E04xx`
+project/module errors (Phase 5: `E0401` unresolved import, `E0402`
+circular import, §3.1). The code list lives
 with the implementation and is appended to
 this spec when new codes are added (spec amendment, not silent drift).
 
@@ -842,6 +866,10 @@ reviewer, the load-bearing ones:
     with `E0158`); plain field access stays core (review gap-close; §3.3).
 16. Statement termination is explicit `;` per §3.2 (confirmed present in
     review; no change needed).
+17. Module system (Phase 5): path imports (`import "path";`), flat
+    top-level namespace, `pub` accepted with no effect, `mod`/`use` not in
+    v1; duplicates across files are `E0311`, circular imports `E0402`,
+    unresolved single-file imports `E0401` (§3.1, §3.3, §9.1).
 
 Review record (2026-11-14): all items APPROVED — item 1 amended (unit type
 added), item 2 amended (else-required rule), items 15–16 added by the
@@ -864,6 +892,19 @@ table, `E0315`, first-panic-wins/settle-then-propagate, deadlock panic,
 default-last, `let v = <-ch` binding surface) are flagged for owner
 review: confirm or correct, per this appendix's process. The builtin
 catalog grows 25 → 28 (`chan`, `close`, `closed`); otherwise frozen.
+
+Phase 5 amendment record (2026-11-16): the owner chose the module model
+(path imports over `mod`-trees, flat namespace, meaningless `pub`,
+duplicates/circular as static errors). Recorded in §1, §3.1, §3.3, §9.1
+and item 17 above.
+
+Stage 2 amendment record (2026-11-16): the `gzv.std/` import prefix
+names embedded standard-library modules (`stdlib/*.gzv`, resolved
+canonically per §3.1, embedded-first with disk fallback). The stdlib
+is ordinary Toto on the frozen builtins; the time module is pure
+(durations over int milliseconds, no wall clock) with the clock
+deferred to Stage 3 FFI per owner decision. Full API in
+`docs/stdlib.md`; execution paths in the Phase 5 report.
 
 ## Appendix B. Review questions and answers (2026-11-14 review)
 

@@ -1,0 +1,4 @@
+import "b.gzv";
+fn main() -> int {
+    return 0;
+}

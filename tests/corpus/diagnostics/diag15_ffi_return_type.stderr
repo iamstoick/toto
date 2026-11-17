@@ -1,0 +1,5 @@
+error[E0302]: foreign return type must be a C type, `string`, or `unit`, found bool
+ --> diag15_ffi_return_type.gzv:2:30
+  |
+2 |     fn strlen(s: *c_char) -> bool;
+  |                              ^^^^

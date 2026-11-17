@@ -105,9 +105,57 @@ pub enum ToSched {
 /// tables, or any scheduler state (they only push completions).
 #[derive(Debug)]
 pub enum BlockingOp {
-    ReadFile { path: String },
-    WriteFile { path: String, contents: Vec<u8> },
-    FileExists { path: String },
+    ReadFile {
+        path: String,
+    },
+    WriteFile {
+        path: String,
+        contents: Vec<u8>,
+    },
+    FileExists {
+        path: String,
+    },
+    /// A foreign call (Phase 5, Stage 3). Arguments are owned plain
+    /// data converted on the worker; the pool thread rebuilds values
+    /// locally, calls, and returns a plain result. Callback slots are
+    /// claimed on the worker (the pool only passes trampoline
+    /// addresses); the worker maps slots to callables and drains after
+    /// the completion arrives.
+    Foreign {
+        name: String,
+        sig: toto_compiler::hir::HExternFn,
+        args: Vec<ForeignArg>,
+        slots: Vec<(usize, u64)>,
+    },
+}
+
+/// Owned plain data crossing to pool threads: no `Rc`, no heap refs,
+/// no scheduler handles — everything here is `Send` by construction.
+/// Strings cross as byte buffers; NUL termination happens on the pool
+/// thread inside the call frame (rooting for exactly the call).
+#[derive(Debug, Clone)]
+pub enum ForeignArg {
+    Int(i64),
+    Float(f64),
+    /// String content (not NUL-terminated; the pool frame copies).
+    Str(Vec<u8>),
+    Ptr(u64),
+    Null,
+    /// A claimed callback slot: the pool passes its trampoline
+    /// address as the C function pointer.
+    FnPtr(u64),
+}
+
+/// A foreign call result crossing back: plain data the worker converts
+/// to runtime values (heap-allocating strings there, where the heap
+/// is available).
+#[derive(Debug, Clone)]
+pub enum ForeignRet {
+    Int(i64),
+    Float(f64),
+    Str(Vec<u8>),
+    Ptr(u64),
+    Unit,
 }
 
 /// Pool result: bytes for reads, byte count for writes, flag for
@@ -119,6 +167,14 @@ pub enum BlockingResult {
     Count(i64),
     Exists(bool),
     Fail(String),
+    /// A foreign call result. Errors carry their code (rebuilt into a
+    /// `Diag` on the worker with the call span) because only the
+    /// worker has trace context.
+    ForeignOk(ForeignRet),
+    ForeignErr {
+        code: &'static str,
+        message: String,
+    },
 }
 
 /// A finished pool job awaiting pickup. The scheduler turns it into
@@ -545,6 +601,8 @@ pub struct ExecCode {
     /// Per-function block graphs, cloned once per run (frames share the
     /// `Arc`; calls never clone block vecs).
     pub fn_blocks: Vec<std::sync::Arc<[toto_compiler::mir::MBlock]>>,
+    /// Checked foreign signatures (Phase 5, Stage 3) for `CallForeign`.
+    pub externs: std::collections::HashMap<String, toto_compiler::hir::HExternFn>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -723,7 +781,7 @@ impl Scheduler {
                     // with the same yielder protocol, no executor.
                     Initial::Native { entry, ctx } => entry(y, ctx, id, scope),
                     other => {
-                        let exec = Executor::new(y, &code, &shared, scope, id);
+                        let mut exec = Executor::new(y, &code, &shared, scope, id);
                         exec.run_task(other, span)
                     }
                 }
@@ -1191,6 +1249,26 @@ impl Scheduler {
                 BlockingResult::Fail(msg) => ToTask::OpPanic {
                     diag: Diag::new("E0210", msg, c.span, None),
                 },
+                BlockingResult::ForeignOk(ret) => {
+                    let v = match ret {
+                        ForeignRet::Int(n) => RtVal::Int(n),
+                        ForeignRet::Float(f) => RtVal::Float(f),
+                        ForeignRet::Ptr(p) => RtVal::Ptr(p),
+                        ForeignRet::Unit => RtVal::Unit,
+                        ForeignRet::Str(bytes) => {
+                            let s = String::from_utf8_lossy(&bytes).into_owned();
+                            let r = {
+                                let mut st = self.shared.state.lock().expect("shared state lock");
+                                st.heap.alloc_str(&s)
+                            };
+                            RtVal::Heap(r)
+                        }
+                    };
+                    ToTask::Value(v)
+                }
+                BlockingResult::ForeignErr { code, message } => ToTask::OpPanic {
+                    diag: Diag::new(code, message, c.span, None),
+                },
             };
             // Stale-completion guard: only a task still parked on
             // `blocking` with the matching seq takes the response.
@@ -1204,6 +1282,70 @@ impl Scheduler {
             }
         }
         enqueued
+    }
+
+    /// Run one foreign call on a pool thread: rebuild values locally
+    /// (owned by this frame — rooting for exactly the call), call
+    /// with the worker-claimed slots, and return a plain result. The
+    /// pool never releases slots (single-owner rule: the worker
+    /// releases at drain or on call failure); failed calls report
+    /// `(code, message)` for the worker to rebuild into a `Diag`.
+    fn run_foreign(
+        name: &str,
+        sig: &toto_compiler::hir::HExternFn,
+        args: &[ForeignArg],
+        slots: &[(usize, u64)],
+    ) -> BlockingResult {
+        use toto_compiler::interp::Value;
+        let mut vs = Vec::with_capacity(args.len());
+        for a in args {
+            vs.push(match a {
+                ForeignArg::Int(n) => Value::Int(*n),
+                ForeignArg::Float(f) => Value::Float(*f),
+                ForeignArg::Str(b) => match String::from_utf8(b.clone()) {
+                    Ok(s) => Value::Str(std::rc::Rc::new(s)),
+                    Err(_) => {
+                        return BlockingResult::ForeignErr {
+                            code: "E0210",
+                            message: "foreign string argument is not valid UTF-8".to_string(),
+                        };
+                    }
+                },
+                ForeignArg::Ptr(p) => Value::Ptr(*p),
+                ForeignArg::Null => Value::None,
+                // A function-typed argument arrives as its trampoline
+                // slot; the pool passes the address without claiming.
+                // The value shape is irrelevant (only `fn_arg`'s slot
+                // lookup matters), so a unit placeholder suffices.
+                ForeignArg::FnPtr(_) => Value::Unit,
+            });
+        }
+        // The worker pre-claimed every callback slot and mapped it to
+        // its callable before submitting, so the completion carries no
+        // slot info back: the map is intact on wake, and drain resolves
+        // it. Slot release is worker-owned (drain, call failure, or
+        // task teardown).
+        let span = sig.span;
+        match toto_compiler::ffi::call_preclaimed(name, sig, &vs, slots, span) {
+            Ok(ret) => match ret {
+                Value::Int(n) => BlockingResult::ForeignOk(ForeignRet::Int(n)),
+                Value::Float(f) => BlockingResult::ForeignOk(ForeignRet::Float(f)),
+                Value::Str(s) => BlockingResult::ForeignOk(ForeignRet::Str(s.as_bytes().to_vec())),
+                Value::Ptr(p) => BlockingResult::ForeignOk(ForeignRet::Ptr(p)),
+                Value::Unit => BlockingResult::ForeignOk(ForeignRet::Unit),
+                other => BlockingResult::ForeignErr {
+                    code: "E0204",
+                    message: format!(
+                        "internal error: foreign function returned {}",
+                        other.type_name()
+                    ),
+                },
+            },
+            Err((diag, _)) => BlockingResult::ForeignErr {
+                code: diag.code,
+                message: diag.message,
+            },
+        }
     }
 
     /// Dedicated blocking-pool thread: run file-system jobs, post
@@ -1240,6 +1382,12 @@ impl Scheduler {
                 BlockingOp::FileExists { path } => {
                     BlockingResult::Exists(std::path::Path::new(&path).exists())
                 }
+                BlockingOp::Foreign {
+                    name,
+                    sig,
+                    args,
+                    slots,
+                } => Self::run_foreign(&name, &sig, &args, &slots),
             };
             {
                 let mut pool = shared.pool.lock().expect("pool lock");

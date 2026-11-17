@@ -1,0 +1,5 @@
+error[E0301]: foreign function `nosuchlib` is declared but not linked in this binary (linked: malloc, free, memset, memcmp, strlen, strcmp, strtod, open, close, strerror, __errno_location, pthread_create, pthread_join, sleep, pow, toto_rt_read_i32, toto_rt_read_i64, toto_rt_write_i64, toto_rt_close, toto_rt_read_str, read)
+ --> diag13_ffi_unlinked.gzv:6:13
+  |
+6 |     println(nosuchlib());
+  |             ^^^^^^^^^^^

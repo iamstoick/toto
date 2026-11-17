@@ -1,0 +1,6 @@
+toto is a language
+green threads run toto programs
+channels carry messages
+toto programs count words
+ffi calls c functions
+json reports results

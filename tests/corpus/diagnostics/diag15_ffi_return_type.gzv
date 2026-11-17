@@ -1,0 +1,7 @@
+unsafe extern "C" {
+    fn strlen(s: *c_char) -> bool;
+}
+
+fn main() -> int {
+    return 0;
+}

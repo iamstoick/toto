@@ -80,7 +80,7 @@ fn cyclic_display_terminates() {
     assert!(lex_errors.is_empty());
     let (program, parse_errors) = parser::parse(tokens, src);
     assert!(parse_errors.is_empty());
-    let mut interp = Interp::new(&program);
+    let mut interp = Interp::new(&program, std::collections::HashMap::new());
     match interp.run() {
         Ok(_) => {
             assert_eq!(interp.output, b"[<cycle>]\n");

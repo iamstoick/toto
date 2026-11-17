@@ -1,0 +1,8 @@
+fn main() -> int {
+    let a = chan<int>();
+    let b = chan<int>();
+    println(a == a);
+    println(a == b);
+    println(a != b);
+    return 0;
+}

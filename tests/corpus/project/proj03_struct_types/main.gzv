@@ -1,0 +1,7 @@
+import "lib/geo.gzv";
+fn main() -> int {
+    let p = Point { x: 1, y: 2 };
+    println(p.x + p.y);
+    println(origin());
+    return 0;
+}

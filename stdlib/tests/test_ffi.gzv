@@ -1,0 +1,185 @@
+// stdlib FFI tests: run with `toto test` from stdlib/.
+import "gzv.std/ffi.gzv";
+import "gzv.std/ffi_thread.gzv";
+import "gzv.std/strings.gzv";
+
+fn t_strings() -> Result<bool, string> {
+    if c_strlen("hello") != 5 {
+        return Err("c_strlen");
+    }
+    if c_strlen("") != 0 {
+        return Err("c_strlen empty");
+    }
+    if c_strcmp("a", "b") >= 0 {
+        return Err("c_strcmp order");
+    }
+    if c_strcmp("same", "same") != 0 {
+        return Err("c_strcmp equal");
+    }
+    if c_strtod("2.5") != 2.5 {
+        return Err("c_strtod");
+    }
+    return Ok(true);
+}
+
+fn t_math() -> Result<bool, string> {
+    if c_pow(2.0, 10.0) != 1024.0 {
+        return Err("c_pow");
+    }
+    return Ok(true);
+}
+
+fn t_err() -> Result<bool, string> {
+    // Missing file: must fail with the ENOENT message. The expected
+    // value is built dynamically (`strerror(2)`), so no libc text is
+    // pinned — only the consistency of errno capture is asserted.
+    let missing: Result<int, string> = c_open_read("/nope-missing-ffi-test");
+    let want: Result<int, string> = Err(errno_message(2));
+    if missing != want {
+        return Err("c_open_read missing should fail ENOENT");
+    }
+    return Ok(true);
+}
+
+fn t_memory() -> Result<bool, string> {
+    // Ownership: allocate, zero, compare, free. The second block is
+    // identical, so memcmp must report equality.
+    let a: *c_void = c_malloc(16);
+    let b: *c_void = c_malloc(16);
+    c_memzero(a, 16);
+    c_memzero(b, 16);
+    if c_memcmp(a, b, 16) != 0 {
+        c_free(a);
+        c_free(b);
+        return Err("c_memcmp zeroed");
+    }
+    c_write_i64(a, 99);
+    if c_read_i64(a) != 99 {
+        c_free(a);
+        c_free(b);
+        return Err("c_read_i64");
+    }
+    if c_memcmp(a, b, 16) == 0 {
+        c_free(a);
+        c_free(b);
+        return Err("c_memcmp differs");
+    }
+    c_free(a);
+    c_free(b);
+    return Ok(true);
+}
+
+fn t_fileio() -> Result<bool, string> {
+    // Whole-file read through FFI only: a 7500-byte file exercises
+    // the multi-chunk loop; the content must round-trip byte-exact.
+    let big = repeat("abcd\n", 1500);
+    write_file("test_ffi_tmp.txt", big);
+    let got: Result<string, string> = c_read_file("test_ffi_tmp.txt");
+    let want: Result<string, string> = Ok(big);
+    if got != want {
+        return Err("c_read_file round-trip");
+    }
+    // Missing file: ENOENT, dynamically built (no libc text pinned).
+    let missing: Result<string, string> = c_read_file("/nope-missing-ffi-test");
+    let enoent: Result<string, string> = Err(errno_message(2));
+    if missing != enoent {
+        return Err("c_read_file missing should fail ENOENT");
+    }
+    // Chunked primitives directly: open, partial read, string copy,
+    // close. `read` returns the byte count; `c_close` is `Ok(0)`.
+    // (Error paths close the fd too; a close failure there replaces
+    // the original error so no `Result` goes unexamined.)
+    let ok0: Result<int, string> = Ok(0);
+    let fd = open("test_ffi_tmp.txt", 0);
+    if fd < 0 {
+        return Err("open test_ffi_tmp");
+    }
+    let buf: *c_void = c_malloc(16);
+    let r = c_read(fd, buf, 10);
+    if r != 10 {
+        c_free(buf);
+        let drop1: Result<int, string> = c_close(fd);
+        if drop1 != ok0 {
+            return Err("c_close on c_read error path");
+        }
+        return Err("c_read count");
+    }
+    if c_read_str(buf, r) != "abcd\nabcd\n" {
+        c_free(buf);
+        let drop2: Result<int, string> = c_close(fd);
+        if drop2 != ok0 {
+            return Err("c_close on c_read_str error path");
+        }
+        return Err("c_read_str prefix");
+    }
+    c_free(buf);
+    let closed: Result<int, string> = c_close(fd);
+    if closed != ok0 {
+        return Err("c_close");
+    }
+    // Closing a bogus fd fails (EBADF) instead of corrupting.
+    let bogus: Result<int, string> = c_close(999999);
+    if bogus == ok0 {
+        return Err("c_close bogus should fail");
+    }
+    return Ok(true);
+}
+
+fn answer_fn(arg: *c_void) -> *c_void {
+    c_write_i64(arg, 42);
+    return None;
+}
+
+fn t_thread() -> Result<bool, string> {
+    // Data-carrying callback through a foreign thread: the thread
+    // writes through the data pointer; join drains the callback, so
+    // the write is visible after `c_thread_join` returns.
+    let data: *c_void = c_malloc(8);
+    c_write_i64(data, 0);
+    let id: int = c_thread_spawn(answer_fn, data)?;
+    let joined: Result<int, string> = c_thread_join(id);
+    let ok0: Result<int, string> = Ok(0);
+    if joined != ok0 {
+        c_free(data);
+        return Err("c_thread_join");
+    }
+    if c_read_i64(data) != 42 {
+        c_free(data);
+        return Err("callback data");
+    }
+    c_free(data);
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_strings() != yes {
+        println("FAIL t_strings");
+        failures = failures + 1;
+    }
+    if t_math() != yes {
+        println("FAIL t_math");
+        failures = failures + 1;
+    }
+    if t_err() != yes {
+        println("FAIL t_err");
+        failures = failures + 1;
+    }
+    if t_memory() != yes {
+        println("FAIL t_memory");
+        failures = failures + 1;
+    }
+    if t_fileio() != yes {
+        println("FAIL t_fileio");
+        failures = failures + 1;
+    }
+    if t_thread() != yes {
+        println("FAIL t_thread");
+        failures = failures + 1;
+    }
+    if failures != 0 {
+        println("FAIL test_ffi");
+    }
+    return failures;
+}

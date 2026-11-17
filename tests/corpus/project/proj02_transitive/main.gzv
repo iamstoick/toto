@@ -1,0 +1,7 @@
+import "lib/a.gzv";
+import "lib/b.gzv";
+fn main() -> int {
+    println(wrap(2));
+    println(other(2));
+    return 0;
+}

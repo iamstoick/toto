@@ -1,0 +1,80 @@
+// gzv.std/math — integer math helpers beyond the frozen builtins.
+//
+// The builtins already cover abs/min/max/sqrt/floor/ceil. This module
+// adds exact integer operations. All arithmetic is checked: overflow
+// panics per the ratified rule, so `pow_int`/`factorial` panic rather
+// than wrap.
+
+pub fn clamp_int(v: int, lo: int, hi: int) -> int {
+    if v < lo {
+        return lo;
+    }
+    if v > hi {
+        return hi;
+    }
+    return v;
+}
+
+pub fn clamp_float(v: float, lo: float, hi: float) -> float {
+    if v < lo {
+        return lo;
+    }
+    if v > hi {
+        return hi;
+    }
+    return v;
+}
+
+pub fn pow_int(base: int, exp: int) -> int {
+    let mut result: int = 1;
+    for i in 0..exp {
+        result = result * base;
+    }
+    return result;
+}
+
+pub fn gcd(a: int, b: int) -> int {
+    let mut x: int = abs(a);
+    let mut y: int = abs(b);
+    while y != 0 {
+        let t: int = y;
+        y = x - (x / y) * y;
+        x = t;
+    }
+    return x;
+}
+
+pub fn lcm(a: int, b: int) -> int {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    return abs(a / gcd(a, b) * b);
+}
+
+pub fn factorial(n: int) -> int {
+    let mut result: int = 1;
+    for i in 1..(n + 1) {
+        result = result * i;
+    }
+    return result;
+}
+
+pub fn is_prime(n: int) -> bool {
+    if n < 2 {
+        return false;
+    }
+    if n == 2 {
+        return true;
+    }
+    if n - (n / 2) * 2 == 0 {
+        return false;
+    }
+    let mut d: int = 3;
+    while d * d <= n {
+        if n - (n / d) * d == 0 {
+            return false;
+        }
+        d = d + 2;
+    }
+    return true;
+}

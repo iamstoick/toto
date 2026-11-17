@@ -33,6 +33,10 @@ pub enum Value {
     Err(Box<Value>),
     Some(Box<Value>),
     None,
+    /// Opaque foreign pointer (Phase 5, Stage 3): an address with no
+    /// Toto-visible pointee. Addresses never print (ASLR-unstable);
+    /// equality is by address.
+    Ptr(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +83,7 @@ impl Value {
             Value::Closure(_) | Value::Func(_) => "function",
             Value::Ok(_) | Value::Err(_) => "Result",
             Value::Some(_) | Value::None => "Option",
+            Value::Ptr(_) => "pointer",
         }
     }
 }
@@ -126,6 +131,8 @@ fn fmt_val(
             out.push(')');
         }
         Value::None => out.push_str("None"),
+        // Deliberately address-free: goldens must be ASLR-stable.
+        Value::Ptr(_) => out.push_str("ptr"),
         Value::Func(idx) => {
             let name = fns.get(*idx).map(|f| f.name.as_str()).unwrap_or("?");
             out.push_str(&format!("<fn {name}>"));
@@ -223,6 +230,12 @@ pub struct Interp {
     fns: Vec<FnDecl>,
     fn_index: HashMap<String, usize>,
     structs: HashMap<String, StructDecl>,
+    /// Checked foreign signatures (Phase 5, Stage 3): resolved by name
+    /// in `eval_call`, executed through `ffi::call`.
+    externs: HashMap<String, crate::hir::HExternFn>,
+    /// Fired-callback slots awaiting drain, mapped to their Toto
+    /// function (named function index or closure value).
+    callbacks: HashMap<u64, Value>,
     trace: Vec<TraceFrame>,
     call_depth: usize,
     pub output: Vec<u8>,
@@ -231,7 +244,7 @@ pub struct Interp {
 }
 
 impl Interp {
-    pub fn new(program: &Program) -> Self {
+    pub fn new(program: &Program, externs: HashMap<String, crate::hir::HExternFn>) -> Self {
         let mut fns = Vec::new();
         let mut fn_index = HashMap::new();
         let mut structs = HashMap::new();
@@ -245,12 +258,24 @@ impl Interp {
                 ItemKind::Struct(decl) => {
                     structs.insert(decl.name.clone(), decl.clone());
                 }
+                ItemKind::Extern(_) => {
+                    // Signatures come from the checked program (the
+                    // `externs` parameter); the AST items carry
+                    // unresolved types and register nothing here.
+                }
+                ItemKind::Import(_) => {
+                    // Resolved and stripped by the multi-file driver before execution;
+                    // the checker rejects surviving imports (E0401), so there is
+                    // nothing to register here.
+                }
             }
         }
         Self {
             fns,
             fn_index,
             structs,
+            externs,
+            callbacks: HashMap::new(),
             trace: Vec::new(),
             call_depth: 0,
             output: Vec::new(),
@@ -275,6 +300,13 @@ impl Interp {
     }
 
     pub fn run(&mut self) -> Result<i32, (Diag, Vec<TraceFrame>)> {
+        // Test-isolation hygiene: the callback queue is process-global,
+        // so a previous program in the same process could have left
+        // stale firings behind. No callback can legitimately be live
+        // before `main` runs, so discard them (and their slots).
+        for (slot, _) in crate::ffi::drain_queue() {
+            crate::ffi::release_slot(slot);
+        }
         let main = match self.fn_index.get("main") {
             Some(&i) => i,
             None => {
@@ -1064,6 +1096,18 @@ impl Interp {
                 }
                 return result;
             }
+            if let Some(sig) = self.externs.get(name).cloned() {
+                let name = name.clone();
+                self.trace.push(TraceFrame {
+                    name: format!("{name} (foreign)"),
+                    span,
+                });
+                let result = self.call_foreign(&sig, values, span);
+                if result.is_ok() {
+                    self.trace.pop();
+                }
+                return result;
+            }
             return Err(panic(
                 "E0208",
                 format!("undefined variable `{name}`"),
@@ -1099,6 +1143,48 @@ impl Interp {
                 None,
             )),
         }
+    }
+
+    /// Execute a foreign call, then drain fired callbacks. Claimed
+    /// slots map to their Toto function here (the evaluator owns
+    /// invocation); pool slots release in the drain after each
+    /// callback runs, or on call failure inside `ffi::call`.
+    #[allow(clippy::too_many_arguments)]
+    fn call_foreign(
+        &mut self,
+        sig: &crate::hir::HExternFn,
+        values: Vec<Value>,
+        span: Span,
+    ) -> Exec<Value> {
+        let name = sig.name.clone();
+        let (value, claimed) =
+            crate::ffi::call(&name, sig, &values, span).map_err(|(d, t)| Signal::Panic(d, t))?;
+        for (arg_idx, slot) in claimed {
+            if let Some(v) = values.get(arg_idx) {
+                self.callbacks.insert(slot, v.clone());
+            }
+        }
+        self.drain_callbacks(span)?;
+        Ok(value)
+    }
+
+    /// Invoke every fired callback with its raw pointer argument.
+    /// Returns are dropped (channels carry data outward); a panicking
+    /// callback fails the foreign call that drains it, with its own
+    /// span and trace.
+    fn drain_callbacks(&mut self, span: Span) -> Result<(), Signal> {
+        for (slot, ptr) in crate::ffi::drain_queue() {
+            // Unknown slots are stale entries from an earlier program
+            // in the same process (tests): the run entry point
+            // discards those, so this is defense in depth, not a path
+            // a single program can reach.
+            if let Some(target) = self.callbacks.remove(&slot) {
+                let target = target.clone();
+                self.call_value(&target, vec![Value::Ptr(ptr)], span, "callback")?;
+            }
+            crate::ffi::release_slot(slot);
+        }
+        Ok(())
     }
 
     fn eval_unary(&self, op: UnOp, v: Value, inner_span: Span, span: Span) -> Exec<Value> {

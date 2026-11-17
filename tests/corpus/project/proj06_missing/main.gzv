@@ -1,0 +1,4 @@
+import "nope.gzv";
+fn main() -> int {
+    return 0;
+}

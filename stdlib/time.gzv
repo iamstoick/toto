@@ -1,0 +1,115 @@
+// gzv.std/time — pure durations and timestamps (Phase 5, Stage 2).
+//
+// A duration is an int count of milliseconds; a timestamp is an int
+// count of milliseconds since an application-chosen epoch. There is
+// deliberately no wall clock here: the frozen builtins expose no
+// clock, and adding one would need a new builtin (frozen catalog).
+// Wall-clock constructors land with the Stage 3 FFI work; until
+// then, compare/arithmetic/formatting over int timestamps covers
+// timeouts, backoff math, and log rendering.
+
+pub fn millis_per_sec() -> int {
+    return 1000;
+}
+
+pub fn millis_per_min() -> int {
+    return 60 * 1000;
+}
+
+pub fn millis_per_hour() -> int {
+    return 60 * 60 * 1000;
+}
+
+pub fn millis_per_day() -> int {
+    return 24 * 60 * 60 * 1000;
+}
+
+pub fn duration_from_millis(ms: int) -> int {
+    return ms;
+}
+
+pub fn duration_from_secs(s: int) -> int {
+    return s * 1000;
+}
+
+pub fn duration_from_mins(m: int) -> int {
+    return m * 60 * 1000;
+}
+
+pub fn duration_from_hours(h: int) -> int {
+    return h * 60 * 60 * 1000;
+}
+
+pub fn duration_as_millis(d: int) -> int {
+    return d;
+}
+
+pub fn duration_as_secs(d: int) -> int {
+    return d / 1000;
+}
+
+pub fn duration_add(a: int, b: int) -> int {
+    return a + b;
+}
+
+pub fn duration_sub(a: int, b: int) -> int {
+    return a - b;
+}
+
+// -1 when a < b, 0 when equal, 1 when a > b.
+pub fn duration_compare(a: int, b: int) -> int {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    return 0;
+}
+
+// Shortest exact rendering: "500ms", "90s", "2m 5s", "3h 4m", "2d 1h".
+// Negative durations render with a leading "-".
+pub fn format_duration(ms: int) -> string {
+    if ms < 0 {
+        return "-" + format_duration(0 - ms);
+    }
+    if ms < 1000 {
+        return to_string(ms) + "ms";
+    }
+    let total_s: int = ms / 1000;
+    if total_s < 60 {
+        return to_string(total_s) + "s";
+    }
+    let total_m: int = total_s / 60;
+    let s: int = total_s - total_m * 60;
+    if total_m < 60 {
+        if s == 0 {
+            return to_string(total_m) + "m";
+        }
+        return to_string(total_m) + "m " + to_string(s) + "s";
+    }
+    let total_h: int = total_m / 60;
+    let m: int = total_m - total_h * 60;
+    if total_h < 24 {
+        if m == 0 {
+            return to_string(total_h) + "h";
+        }
+        return to_string(total_h) + "h " + to_string(m) + "m";
+    }
+    let d: int = total_h / 24;
+    let h: int = total_h - d * 24;
+    if h == 0 {
+        return to_string(d) + "d";
+    }
+    return to_string(d) + "d " + to_string(h) + "h";
+}
+
+// Timestamp arithmetic: timestamps are plain ints, so these read as
+// documentation of intent rather than doing anything clever.
+pub fn timestamp_add(ts: int, d: int) -> int {
+    return ts + d;
+}
+
+pub fn timestamp_diff(a: int, b: int) -> int {
+    return a - b;
+}

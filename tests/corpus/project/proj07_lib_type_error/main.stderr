@@ -1,0 +1,5 @@
+error[E0303]: mismatched types: expected int, found string
+ --> lib/bad.gzv:2:12
+  |
+2 |     return "nope";
+  |            ^^^^^^

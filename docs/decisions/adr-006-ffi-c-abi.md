@@ -64,3 +64,37 @@ reinterpretation), stop and re-examine D6 before Phase 5. The full
 end-to-end proof (real library, callbacks with data, blocking
 calls, foreign threads) is a Phase 5 exit criterion — the smoke
 test does not replace it.
+
+## Phase 5 end-to-end proof (Stage 3, 2026-11-16)
+
+Proven against real system libraries (libc, libm, libpthread) via
+`stdlib/ffi.gzv` + `stdlib/tests/test_ffi.gzv` + corpus
+`proj11_ffi`, all green in CI on Linux x86_64. Per-item
+dispositions (full text in `docs/ffi.md`): real library, floats,
+data-carrying callbacks, blocking calls on the dedicated pool, and
+foreign-thread confinement are proven; structs-by-value, `dlopen`,
+and binding generation are deferred with rationale and recorded
+consequence (inexpressible signatures stay `E0302`/`E0301`,
+hand-written declarations only); `panic = "abort"` is an
+untested, documented limitation (no graceful conversion claimed);
+foreign stacks are explicitly unscanned, with the no-heap-refs rule
+holding by construction. Two proof-driven fixes landed: `open`
+reports `-errno` in-band (`errno` is thread-local across the pool),
+and the runtime executor no longer ends a task when a drained
+(`dst == None`) callback frame finishes while caller frames remain.
+`close(2)` cannot be named in an `unsafe extern` block (`close` is
+the reserved channel builtin), so fd lifecycle ends at process
+exit in examples. Decision unchanged.
+
+## Refinement (Stage 5, 2026-11-16): `ffi` / `ffi_thread` split
+
+`stdlib/ffi.gzv` held both buildable wrappers and `c_thread_spawn`
+(whose body calls callback-taking `pthread_create`). Whole-program
+lowering refused any program importing it — dead code poisoned the
+build. Fix: `c_thread_spawn` + `c_thread_join` moved to
+`gzv.std/ffi_thread` (run/test-only, documented); `ffi.gzv` keeps
+the declarations plus all non-callback wrappers and stays
+buildable. Rule established: unused callback *declarations* never
+poison a build — only a *called* callback site refuses (exit 3).
+`apps/wordfreq` is the proof: per-line `c_strlen` through the
+buildable surface, `ffi_thread` untouched. Decision unchanged.

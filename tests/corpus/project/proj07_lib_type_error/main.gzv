@@ -1,0 +1,5 @@
+import "lib/bad.gzv";
+fn main() -> int {
+    println(bad(1));
+    return 0;
+}
