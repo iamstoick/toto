@@ -965,6 +965,14 @@ reinterpreted. Production builds (`toto build`) never hot-reload.
   new code (old tables reference only old code; preserved `Func`
   values are relinked, never dangling). Production cross-generation
   calls enter through the RETAINED session's tables.
+- Callable-valued state: a state binding may hold a `fn` value or a
+  closure. A `fn` value is preserved by name-relink against the new
+  program's function table and aborts loudly on any name/signature
+  mismatch. A closure value is preserved by retaining its module
+  while any live holder references it. A callable value that fails
+  relink or retention validation aborts the whole reload loudly
+  under the atomic-commit rule; it is never silently dropped or
+  reinterpreted.
 
 ### 14.4 New error codes (fresh `E0316`–`E0326` block)
 

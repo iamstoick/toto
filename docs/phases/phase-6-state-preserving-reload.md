@@ -1,12 +1,9 @@
-# Phase 6 — State-preserving hot reload (GATED; Stage 1 evaluation)
+# Phase 6 — State-preserving hot reload (GATED; complete)
 
 Branch `phase-6/state-preserving-reload` off `main` (post-merge
 `79797f9`). Gate green throughout (`scripts/check.sh` exit 0).
 
-> **Stage 1 verdict: GO — with the design below. Stages 2–4 NOT
-> started; implementation awaits explicit user authorization.**
-> A NO-GO would have ended the phase here; the evidence
-> justifies proceeding. Details in §Stage 1 evaluation.
+> **Phase 6 verdict: COMPLETE — Stages 2–4 implemented per the authorized design (Stage 1 GO with amendments).** Declared `state {}` with `migrate` functions, retention by GC reachability with no epoch tags, atomic commit with never-silent fallback. Gate green (58 result lines, 188 tests, 0 failed); CI green on run 44033960545; merged to main as 9752365. Details in §§Stage 2–Stage 4 below; the Stage 1 evaluation text is preserved verbatim in its section.
 
 Note on sources: no PDF accompanied the kickoff brief, so the
 v2.4/37-page verification could not be re-performed this turn. The
