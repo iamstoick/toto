@@ -583,3 +583,153 @@ beyond `init`/`build` needs).
 implementation without explicit user approval of this design
 (especially the §7 resolution rule). No registry work of any
 kind is proposed.**
+
+## Stage 3 — implementation (authorized 2026-11-17, as amended)
+
+### Step 0 — Stage 2 flag close-outs (dated 2026-11-17; no code)
+
+(a) Test-count correction. The §2.11 "undercount" sentence is
+withdrawn: there was NO undercount in the 189 figure.
+189 + `build_offline_needs_no_network`
++ `zz_ffidiag_threshold` (the second new test, called a
+"probe" in the Stage 2 section) = 191. The 189 baseline did
+not include the untracked Stage-1 probe file; both tests are
+counted in the 191. Do not change any test to fit numbers.
+
+(b) `bench/ffi.gzv` disposition: DROPPED + deleted. The file
+exists in this tree (22 lines, verified by full read before
+deletion, 2026-11-17): a synthetic 12000-iteration `strlen`
+loop whose header claims "Expected output asserted by
+scripts/bench.sh" — but nothing references it (`bench.sh`,
+docs, and report contain no mention; verified by search).
+Rationale for drop over wire-in: the FFI path is covered on
+real workloads at three levels (wordfreq 4-size series +
+task/gate probes); a fixed-count synthetic loop adds no
+verdict-relevant information, and wiring it would churn the
+fixed suite for no decision value. Outcome: file deleted,
+nothing referenced it, suite unchanged.
+
+(c) Wordfreq startup, measured separately (method: time to
+first output, not total run time). The release binary emits
+exactly one `write(1)` — the final summary line
+(`strace -tt -e trace=write` shows no earlier stdout write);
+teardown after that write measures 1.2 ms. Bench total on
+the 6-line stock input: 9 ms [8–9] (`start-aotrel-wordfreq`).
+First (only) output ≈ total − teardown ≈ **8 ms**; compute
+on 6 lines is negligible, so app-level init+IO ≈ 4 ms over
+the 4 ms pure-process baseline (`start-aotrel` trivial).
+Recorded alongside the trivial figures (§2.9), not replacing
+them.
+
+(d) Offline production-build story: documented in
+`docs/production-builds.md` (new, this stage: what must be
+warmed — the cargo package cache for the workspace
+dependency closure — how — one online `toto build` (or
+`cargo fetch` in the workspace) — and the exact cold-cache
+failure, captured verbatim: `toto: linking …` then cargo's
+`no matching package named 'corosensei' … location searched:
+crates.io index … note: offline mode … can sometimes cause
+surprising resolution failures`, exit 3 via `link failed`).
+The copied workspace `Cargo.lock` is honored even cold
+("locked to 0.1.0" in the error) — the missing piece is the
+`.crate` files, never the resolution. Vendoring deferral
+(vs `vendor/` or a prebuilt runtime link): the pin + `--offline`
+already makes production builds network-free (proven §2.5–2.6)
+without committing ~hundreds of MB of registry sources;
+hermetic cold-cache builds are deferred — no current
+requirement (CI images and builder machines warm once; dev
+flow keeps fetch-once-then-cached). Do NOT claim cold-cache
+offline builds work.
+
+### Amendment 2 choice (stated before implementation): (a) full transitive resolution
+
+Direct-only (b) would make packages non-composable (no package
+could depend on another package); the transitive cost is
+bounded (discovery runs at add/update time, where fetching is
+allowed; build time stays offline from lockfile + cache).
+Complete rule set, followed exactly:
+
+1. Discovery: at resolve time (add / update /
+   build-or-test-without-lockfile), read the root
+   `[dependencies]`; for each selected package version, read
+   that package's own `toto.toml` `[dependencies]` (path dir's
+   manifest; git dep's checked-out rev's manifest; pkg file's
+   packed manifest) and recurse BFS. Traversal order sorted by
+   (package name, requirement text); visited set on
+   (name, version, source-id).
+2. Provenance: every requirement carries (requirer, text) —
+   requirer = package name + version, or `<root>`.
+3. Selection: single-version rule over the UNION of all
+   requirements per package name: the highest version
+   satisfying every requirement (a requirement without a
+   version constraint accepts any). Candidates come from all
+   reachable sources; ties broken by source-display sort
+   (deterministic).
+4. Conflict: no version satisfies all → loud CLI error
+   (E06xx, exit 3) naming the package and EVERY requirement
+   with its provenance. Never a silent pick, never two
+   copies.
+5. Dependency cycles (a→b→a): loud E06xx error naming the
+   cycle (the flat namespace cannot represent cyclic package
+   deps).
+6. Lockfile records EVERY selected package (direct and
+   transitive): name, version, source (path | git URL + pinned
+   rev | pkg-file hash), content hash over the package's
+   `.gzv` file list. Directness is derivable (manifest ∩
+   lock); no extra flag.
+7. `toto update <pkg>`: re-resolve pkg to the highest
+   satisfying version from current sources and cascade its
+   transitive subtree; all other packages stay exactly
+   pinned. Full `toto update`: re-resolve everything.
+8. No direct-only refusal exists: a dependency's own
+   `[dependencies]` table is always honored.
+
+### Build-caching rule (stated before implementing)
+
+- Cached: the per-project build outputs (`target/<name>`
+  binary + `.o` + shim link artifacts) — keyed, not always
+  rebuilt.
+- Key: content hash of EVERY loaded source file (entry +
+  imports + dependency files, from the loader's file list) +
+  manifest text + lockfile text (when present) + OptLevel
+  (debug/release) + toto version (`CARGO_PKG_VERSION`).
+- Store: `target/.toto-fingerprint` beside the binary.
+- Invalidation: key differs, fingerprint missing, or binary
+  missing → full rebuild. Nothing else (mtime ignored: a
+  touch without content change stays fresh, correctly).
+- Stale-impossible argument: the key covers every input byte
+  codegen and linking consume; identical key ⇒ identical
+  inputs ⇒ identical output; any change ⇒ key change ⇒
+  rebuild. Dependency content flows through the loader file
+  list; versions and sources through the lockfile text.
+- Proof (test, with implementation): change a dependency
+  source file, rebuild, observe the new behavior; no-change
+  rebuild prints the fresh-skip message and leaves the binary
+  untouched.
+
+### `toto update` semantics (stated before implementing)
+
+- `toto update`: re-resolve ALL requirements against current
+  sources (path dirs re-read live; git tags re-fetched, revs
+  immutable — a moved tag resolves to its new hash loudly),
+  select max-satisfying per the Amendment 2 rules, rewrite
+  `toto.lock`, print added/changed/removed packages (or
+  "already up to date").
+- `toto update <pkg>`: pkg + its transitive subtree only
+  (§Amendment-2.7); unknown pkg → error naming it.
+- Lockfile↔manifest disagreement: `build` / `test` / `run`
+  → ERROR (E06xx, exit 3), never a silent re-resolve.
+  `update` ignores the lock (rebuilds it; that is its job)
+  and reports what it replaced. `add` edits the manifest
+  then runs full resolution (disagreement moot — lock
+  rewritten).
+- Missing lockfile at build/test/run: resolve + write it,
+  LOUDLY (stderr notice). Lock creation may use the network
+  (like add); lock-present builds never do (§pinned rule).
+
+### Implementation status
+
+Pending below (separate commits). Dev driver note (no code):
+`toto dev` stays single-file — a dependency import there
+fails through the existing loud single-file path; packaged
+programs are `build` / `run` / `test` scope.
