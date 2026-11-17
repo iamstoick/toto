@@ -104,10 +104,12 @@ fails loudly naming what is missing. See
 [production-builds](production-builds.md) for the full
 warm-cache workflow.
 
-## Failure modes (all loud, exit 3)
+## Failure modes (all loud)
 
-Ambiguous import, version conflict, lockfile disagreement,
+Ambiguous import renders through the existing diagnostic
+pipeline (exit 2); version conflict, lockfile disagreement,
 changed content at a locked version, unpinned git, missing
-cached revision, unknown package on update — every one names
-what failed and why. There is no silent fallback, no silent
-default, no silent re-resolve.
+cached revision, and unknown package on update are CLI
+errors (exit 3). Every one names what failed and why. There
+is no silent fallback, no silent default, no silent
+re-resolve.

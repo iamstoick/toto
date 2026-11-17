@@ -1,5 +1,7 @@
 # Phase 7 — Production AOT and ecosystem (GATED ON BENCHMARKS)
 
+> **Phase 7 verdict: COMPLETE — production Cranelift AOT (LLVM NO-GO re-confirmed) + package manager implemented per the approved design with both amendments.** Full transitive resolution, `toto.lock`, path/git/local-publish sources, first-segment import resolution with loud ambiguity errors. Gate green (60 result lines, 219 tests, 0 failed); CI green on run 44125326885 (check + release-gates + bench); merged to main as 4734b54. Details in §§Stage 1–Stage 4 below; earlier section text is preserved verbatim.
+
 Branch `phase-7/production-aot-packages` off `main` (`94fcdbe`).
 Gate green throughout (`scripts/check.sh` exit 0).
 
@@ -930,3 +932,27 @@ ratio start-aotrel 3.5x, "no regressions above 5x".
 10. This report covers all stages with benchmark tables,
     the LLVM verdict, the design as approved, and every
     deferral with rationale.
+
+## Merge-hygiene dated notes (2026-11-18, on `main`; append-only — existing section text above is preserved verbatim)
+
+- `docs/production-builds.md` provenance: the Stage 4 Docs
+  bullet above calls the file "extended". Correction: the
+  file was CREATED in Step 0 (`efd7e12`, 72 lines), which
+  already contained the warm-cache workflow (§1(d)
+  close-out). Stage 4 added no further content to it.
+- Full-gates "verified untouched" claim: the text above says
+  Stage 2 tests were "verified untouched by Stage 3, `git
+  diff 0f24f81` empty for those files". Correction:
+  `crates/toto-jit/tests/zz_ffidiag.rs` changed +3/−2 in
+  `2ea8868` (a call-site arity fix for the new
+  `load_and_check` `deps` parameter). The claim holds for
+  `tests/cli.rs` (16 at `0f24f81`, empty diff) and the
+  toto-jit lib count (29 at `0f24f81`); test counts are
+  unaffected by the `zz_ffidiag` arity fix.
+- Single deleted line in `2ea8868`'s report change (+198/−1):
+  the removed line is `Pending below (separate commits). Dev
+  driver note (no code):`, replaced by `Implemented as
+  committed below (separate commits).` plus the evidence
+  sections. Branch history is linear (`efd7e12` → `2ea8868`
+  → `f5c8c7f`, then merge `4734b54`); no commit was amended
+  and nothing was force-pushed — no history rewritten.

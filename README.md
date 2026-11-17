@@ -1,11 +1,11 @@
 # Toto (.gzv) — language implementation in Rust
 
-> Phase 6 (state-preserving hot reload) complete — `toto dev`
-> preserves declared `state {}` across reloads with `migrate`
-> functions, loud atomic fallback to drain-and-restart, 10-reload
-> soak with bounded heap, 7-program build-equivalence sample.
-> Gate green (58 suites, 188 tests + stdlib 8/8 + wordfreq).
-> See [Phase 6 report](docs/phases/phase-6-state-preserving-reload.md).
+> Phase 7 (production AOT + packages) complete — production
+> Cranelift AOT (LLVM NO-GO re-confirmed), package manager
+> with full transitive resolution, `toto.lock`, path/git/
+> local-publish sources, 5x-regression bench gate in CI.
+> Gate green (60 result lines, 219 tests, 0 failed).
+> See [Phase 7 report](docs/phases/phase-7-production-aot-packages.md).
 > Roadmap: [Implementation Roadmap v2.4](docs/) (D1–D8 + ratified decisions; title page verified at Phase 4 kickoff).
 
 ## Layout
