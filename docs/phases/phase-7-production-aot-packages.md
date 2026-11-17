@@ -3,8 +3,14 @@
 Branch `phase-7/production-aot-packages` off `main` (`94fcdbe`).
 Gate green throughout (`scripts/check.sh` exit 0).
 
-> **Stage 1 verdict: PENDING — evaluation in progress below. STOP
-> after Stage 1: no Stage 2 work until explicit user authorization.**
+> **Stage 1 verdict: NO-GO for LLVM — Cranelift AOT is sufficient;
+> LLVM stays cut (conditional on the §2.3 Stage 2 re-confirmation).**
+> Speed AOT ≈ Speed JIT (16 vs 15 ms on 1M iterations); both ≈120×
+> the interpreter. Full table and threshold in §Stage 1 below; the
+> evaluation text is preserved verbatim.
+>
+> **STOP: Stage 1 ends here. No Stage 2 work without explicit
+> user authorization.**
 
 Note on sources: no PDF was attached to the Phase 7 kickoff turn.
 The title page was verified against the local copy
