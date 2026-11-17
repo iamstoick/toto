@@ -729,7 +729,204 @@ Complete rule set, followed exactly:
 
 ### Implementation status
 
-Pending below (separate commits). Dev driver note (no code):
+Implemented as committed below (separate commits). Dev driver note (no code):
 `toto dev` stays single-file — a dependency import there
 fails through the existing loud single-file path; packaged
 programs are `build` / `run` / `test` scope.
+
+### Implementation evidence (all in-tree, committed with this section)
+
+New files: `crates/toto-cli/src/semver.rs` (166 lines: `^`/`~`/`=`
+parsing + matching, no pre-release/build-metadata, `0.x` not
+special-cased); `crates/toto-cli/src/packages.rs` (resolver with
+full transitive closure, `toto.lock` read/write, git fetch into
+the local cache, `.gzv-pkg` pack/unpack, `pkg_name_of`,
+`build_fingerprint`); `crates/toto-cli/src/pkg_cmd.rs`
+(`toto add` / `update` / `publish`); `crates/toto-cli/tests/packages.rs`
+(10 integration tests, all green — see below).
+Modified: `manifest.rs` (`[dependencies]` table), `project.rs`
+(`DepEntry` + Amendment 1 `E0601`), `build_cmd.rs` (fingerprint
++ `resolve_deps` on the build/run/test paths +
+`CARGO_TARGET_DIR` passthrough), `main.rs` (add/update/publish
+wiring), `lsp.rs` (dependency files resolve; dep import of an
+unknown file is still a diagnostic), `docs/spec.md` (§16
+amendment, `E0601`–`E0609`).
+
+The 10 integration tests pin every rule (each audited against
+the design before blessing — outputs asserted, never
+eyeballed):
+`amendment_1_ambiguity_is_a_loud_e0601`,
+`transitive_resolution_and_conflict` (highest-satisfying
+selection + conflict naming every requirement),
+`update_subtree_pins_satisfiable_pins` (pins outside the
+subtree hold; an unsatisfiable pin rejoins free selection
+with its bounds enforced),
+`missing_cached_git_rev_fails_loudly_naming_the_rev`
+(no network at build time),
+`path_dep_add_run_build_and_fresh_skip` (round trip +
+fingerprint fresh-skip message + untouched binary),
+`lockfile_disagreement_and_missing_lock` (error vs loud
+write-and-continue), `edited_source_fails_e0604_update_recovers`
+(stale-serve impossible: changed content at a locked version
+fails, `update` accepts the new hash),
+`git_dep_builds_from_cache_after_remote_vanishes`
+(add/update fetch; build never fetches),
+`publish_round_trip_pack_add_build` (pack → add → build),
+`unpinned_sourceless_and_conflict_add_time_errors`.
+
+## Stage 4 — gates (2026-11-17)
+
+### Conformance + differential
+
+Tier-1 + Tier-2 suites green on all three backends
+(interpreter, JIT, Cranelift AOT) via the existing gates —
+no backend code changed in this phase, so no new divergence
+is possible; `check.sh` re-confirms. Packaged programs are
+NOT in the file-based differential corpus (single-file only
+by construction) and are NOT in the Tier suites for the same
+reason; they are covered instead by the `packages.rs`
+round-trip tests, which assert `run` stdout on dependency
+code (`path_dep_add_run_build_and_fresh_skip`,
+`publish_round_trip_pack_add_build`). `toto run` and
+`toto test` resolve dependencies through the same
+`resolve_deps` path as `build` (`run_deps` /
+`test_all`), so there is no build-only resolution skew.
+`toto dev` cannot run packaged programs (single-file driver
+by design) — stated, not a gap in the gate.
+
+### Benchmark suite in CI
+
+`scripts/bench.sh` takes `--runs N` (default 5) and
+`--baseline <file>`; with a baseline it compares every
+median against the pinned value and FAILS (exit 1) on any
+ratio above 5x, printing `FLAG`. The 5x rule absorbs machine
+variance (the baseline mixes Stage 1 published medians with
+locally measured wordfreq-Off rows — sources recorded in
+`bench/baseline.txt` itself) while catching
+order-of-magnitude regressions: the Stage 1 wordfreq anomaly
+was ~500x its fixed time, two orders of magnitude above the
+flag line. Medians are order-statistic based and correct for
+any `--runs` value (the old `NR==3` line assumed 5 runs).
+CI runs the suite at `--runs 3` in a new `bench` job
+(`.github/workflows/ci.yml`); the full `--runs 5` suite
+remains the manual per-release gate (same honesty standard
+as `buildsample.sh` / `devloop_soak.sh`).
+
+Release benchmarks vs the Stage 1 baseline (`main` 94fcdbe,
+2026-11-17): the fixed code performs at the Stage 1 Off
+figures or better on every wordfreq row (Off AOT 12000-line
+515 ms vs 75 s anomalous; JIT/CR numbers unchanged — no
+backend code changed, only the task-mode FFI path). The
+per-release full-suite re-run is the publication record;
+this phase's numbers are the Stage 2 tables plus the
+cold/incremental timings below.
+
+### Cold + incremental build times (release, clean project target dir, warm cargo registry)
+
+Machine: Ryzen 5 5600G (12 threads), 27 GB RAM, Linux,
+rustc 1.100.0, `toto build --release`, `date +%s` wall time.
+Sizes: small = 13-line single-file arith project; medium =
+`apps/wordfreq` (52-line main + 58-line lib + stdlib
+imports); large = wordfreq + a `greetlib` path dependency
+(packaged: manifest + lockfile + cache resolution on every
+build). "Cold" = `rm -rf` the project's `target/` only
+(the cargo registry stays warm, as in Stage 1).
+
+| project | cold | no-change rebuild | content-change rebuild |
+|---|---|---|---|
+| small | 48 s | 0 s ("is fresh, skipping rebuild") | <1 s |
+| medium (wordfreq) | 52 s | 0 s | 2 s |
+| large (packaged wordfreq) | 50 s | 0 s (fingerprint over lockfile text too) | (not re-measured; same shape as medium) |
+
+Cold is size-independent: ~50 s is the cargo runtime link,
+not Toto code. Content-change rebuilds recompile only the
+shim against the warm project target dir (binary mtime
+verified newer than the edited source — no stale serve).
+
+### Clean-cache + reproducibility proof (packaged, ≥1 dep)
+
+Project: the large variant above (wordfreq + `greetlib`
+path dep), scratch-built under `target/scratch/sizes/big`
+(not committed — built from the committed `apps/wordfreq`
+plus a 5-line lib; the committed equivalent is the
+`publish_round_trip_pack_add_build` test).
+`TOTO_PKG_CACHE` emptied + `toto.lock` removed →
+`./target/debug/toto build --release` exit 0 (resolution
+re-created the lockfile loudly). `rm -rf target`, rebuild
+from the same lockfile → FULL sha256 of the named artifact
+`target/wordfreq`, twice:
+
+`6f44011f5fc4797175d78df42e3e436af0abb187ebab7a3afaa1748ee781928c`
+
+identical both times. The packaged binary prints the
+fixture-expected `[6,23,3,138,"toto",2]`.
+
+### Docs
+
+`docs/package-manager.md` (manifest, SemVer, lockfile,
+sources, imports incl. Amendment 1, add/update/publish,
+offline, failure modes); `docs/production-builds.md`
+extended with the warm-cache workflow (§1(d) close-out);
+spec §16 amendment (`E0601`–`E0609`); versioning doc
+unchanged (no package-manager impact on the stated policy).
+
+### Full gates + counts
+
+`scripts/check.sh` exit 0 (fresh run 2026-11-18: 60 result
+lines, 219 passed, 0 failed; per-binary composition in the
+commit message). CI green on both pre-existing jobs plus
+the new `bench` job. Exact reconciliation, every line
+counted once (spikes 39 + compiler/CLI 86 + runtime 26 +
+JIT 68 = 219): the Phase 6 table (58 / 188) stands as
+stated; Stage 2 at `0f24f81` added 3 tests + 1 line
+(`tests/cli.rs` 15 → 16 via `build_offline_needs_no_network`,
+toto-jit lib 28 → 29, new `zz_ffidiag` line — all
+verified untouched by Stage 3, `git diff 0f24f81` empty
+for those files); Stage 3 adds 28 tests + 1 line
+(packages integration 10, packages unit 8, semver unit 3,
+manifest unit +2, project integration +5). Corpus census
+unchanged (single-file corpus untouched; packaged coverage
+lives in `packages.rs`, 10 tests).
+
+Robustness fix found by this stage's own validation: the
+first `--runs 1 --baseline` rehearsal died at the startup
+section — `/tmp` quota (EDQUOT), not a benchmark failure.
+`bench.sh` kept all scratch under hardcoded `/tmp/` paths,
+so the fix moves every bench scratch file under `$SAMPLE`
+(`bench_medians.txt`, `bench_last_*.out`, wordfreq compare
+outputs, `bench_trivial.gzv`), which CI leaves at `/tmp`
+and low-space runs override via `TMPDIR`. The re-run with
+`TMPDIR` in the workspace completed: all rows ok, worst
+ratio start-aotrel 3.5x, "no regressions above 5x".
+
+### Acceptance checklist (brief §6, all ten)
+
+1. Starting state + Phase 6 flag close-outs: done (§Step 0,
+   committed `efd7e12`; verified HEAD `0f24f81` + CI
+   44087346205 before branching work).
+2. Benchmark evaluation: delivered Stage 1, STOP observed
+   (authorization `8a8c03e` Scope).
+3. LLVM verdict evidence-based: NO-GO re-confirmed at
+   production opt (§2.3; no ≥2x codegen-attributable gap).
+4. Production AOT = authorized Cranelift-only scope; no LLVM
+   exists anywhere in the tree.
+5. Reproducible builds proven (full sha256, named artifact,
+   §2.5 + packaged proof above); cross-compilation deferred
+   with rationale (§2.7).
+6. Design proposed, STOP observed, implementation matches
+   the approved design + both amendments exactly; no
+   module-model change (flat namespace, path imports,
+   `gzv.std/` prefix untouched); no public registry
+   (local-only `publish` packs a file; nothing uploaded).
+7. Clean-cache packaged install + reproducible build proven
+   (committed round-trip/cache tests + manual full-hash
+   proof above with exact commands).
+8. Fixed suite in CI with a stated 5x rule; release
+   benchmarks vs the Stage 1 baseline; cold + incremental
+   times recorded above.
+9. D8 frozen throughout (no ADR-008 change); 27 builtins
+   frozen (no new builtin); production builds carry no dev
+   machinery and do not hot-reload.
+10. This report covers all stages with benchmark tables,
+    the LLVM verdict, the design as approved, and every
+    deferral with rationale.

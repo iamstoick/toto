@@ -38,8 +38,9 @@ fn zz_ffidiag_threshold() {
         }
         std::fs::read_to_string(PathBuf::from(".").join(path)).ok()
     };
-    let (project, checked) = toto_compiler::project::load_and_check("main.gzv", &entry_src, &read)
-        .expect("wordfreq checks");
+    let (project, checked) =
+        toto_compiler::project::load_and_check("main.gzv", &entry_src, &read, &[])
+            .expect("wordfreq checks");
     for thresh in [u64::MAX, 1 << 20] {
         let mut jit = Jit::new_task().expect("jit");
         let prog = toto_compiler::mir::lower(&checked);

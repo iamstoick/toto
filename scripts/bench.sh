@@ -29,18 +29,34 @@
 # timing (constants for bench/*, cross-path identity for wordfreq).
 # A mismatch fails loudly — never timed blind.
 #
-# Usage: scripts/bench.sh [--runs N] [toto-binary]
+# Usage: scripts/bench.sh [--runs N] [--baseline FILE] [toto-binary]
 # Not part of scripts/check.sh: ~25 min wall time (4 cold debug + 5
 # cold release AOT links; needs ~4 GB free in $TMPDIR). Run manually
 # per release; the phase report records method + numbers. Statistics
 # are median + range over N runs (default 5); single runs are never
 # reported as conclusions.
+# With --baseline FILE (bench/baseline.txt committed), every timed
+# label is compared against the recorded median after the run: any
+# median above 5x its baseline prints FLAG and fails the suite
+# (exit 1). The 5x rule absorbs CI machine variance while catching
+# order-of-magnitude regressions (the wordfreq 75s anomaly was
+# ~500x). CI runs the full suite at --runs 3 with this flag; the
+# manual n=5 run stays the source of published numbers.
 set -eu
 RUNS=5
+BASELINE=""
 case "${1:-}" in
   --runs) RUNS="$2"; shift 2;;
   --runs=*) RUNS="${1#--runs=}"; shift;;
 esac
+case "${1:-}" in
+  --baseline) BASELINE="$2"; shift 2;;
+  --baseline=*) BASELINE="${1#--baseline=}"; shift;;
+esac
+if [ -n "$BASELINE" ] && [ ! -f "$BASELINE" ]; then
+  echo "FAIL: baseline file not found: $BASELINE"
+  exit 1
+fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TOTO="${1:-$ROOT/target/debug/toto}"
 PROBE="$ROOT/target/debug/jit_probe"
@@ -63,6 +79,9 @@ check_exact() { # $1=name $2=got $3=want
 }
 
 # median + range over "$RUNS" runs of "$@" (ms); prints "med [min-max]".
+# Every median is also appended to $MEDIANS for --baseline flagging.
+MEDIANS="$SAMPLE/bench_medians.txt"
+rm -f "$MEDIANS"
 timed() { # $1=label $2..=command
   label="$1"; shift
   times=""
@@ -72,13 +91,15 @@ timed() { # $1=label $2..=command
     out=$("$@" 2>/dev/null); code=$?
     end=$(date +%s%N)
     if [ "$code" != "0" ]; then echo "FAIL $label: exit $code"; exit 1; fi
-    echo "$out" > "/tmp/bench_last_$label.out"
+    echo "$out" > "$SAMPLE/bench_last_$label.out"
     times="$times $(( (end - start) / 1000000 ))"
     i=$((i + 1))
   done
   # shellcheck disable=SC2086
-  stats=$(echo $times | tr ' ' '\n' | sort -n | awk 'NR==1{m=$1} NR==3{med=$1} {x=$1} END{print med" ["m"-"x"]"}')
+  stats=$(echo $times | tr ' ' '\n' | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]" ["a[1]"-"a[NR]"]"}')
   echo "$label: ${stats} ms (n=$RUNS)"
+  med=${stats%% *}
+  echo "$label $med" >> "$MEDIANS"
 }
 
 echo "== correctness: bench programs =="
@@ -113,9 +134,9 @@ done
 out=$(cd "$SAMPLE/compute" && ./target/compute); check_exact compute-aot "$out" "$EXPECT_COMPUTE"
 out=$(cd "$SAMPLE/conc" && ./target/conc); check_exact conc-aot "$out" "$EXPECT_CONC"
 out=$(cd "$SAMPLE/stdlib" && ./target/stdlib); check_exact stdlib-aot "$out" "$EXPECT_STDLIB"
-(cd "$SAMPLE/wordfreq" && rm -f report.json && "$TOTO" run main.gzv > /tmp/bench_wf_interp.out 2>/dev/null && rm -f report.json)
-(cd "$SAMPLE/wordfreq" && rm -f report.json && ./target/wordfreq > /tmp/bench_wf_aot.out 2>/dev/null && rm -f report.json)
-if ! cmp -s /tmp/bench_wf_interp.out /tmp/bench_wf_aot.out; then echo "FAIL wordfreq: interp vs aot differ"; exit 1; fi
+(cd "$SAMPLE/wordfreq" && rm -f report.json && "$TOTO" run main.gzv > $SAMPLE/bench_wf_interp.out 2>/dev/null && rm -f report.json)
+(cd "$SAMPLE/wordfreq" && rm -f report.json && ./target/wordfreq > $SAMPLE/bench_wf_aot.out 2>/dev/null && rm -f report.json)
+if ! cmp -s $SAMPLE/bench_wf_interp.out $SAMPLE/bench_wf_aot.out; then echo "FAIL wordfreq: interp vs aot differ"; exit 1; fi
 echo "ok aot correctness (4/4; wordfreq interp==aot)"
 
 echo "== cpu: interpreter (conc + wordfreq via runtime executor) =="
@@ -139,7 +160,7 @@ timed aot-stdlib "$SAMPLE/stdlib/target/stdlib"
 # Debug sizes before the release rebuilds overwrite the binaries.
 for w in compute conc stdlib wordfreq; do
   echo "debug-size-$w: $(wc -c < "$SAMPLE/$w/target/$w")"
-done > /tmp/bench_sizes_debug.txt
+done > $SAMPLE/bench_sizes_debug.txt
 
 echo "== aot release builds (production opt: Speed + release link) =="
 for w in compute conc stdlib; do
@@ -151,8 +172,8 @@ echo "== correctness: aot release =="
 check_exact compute-aotrel "$("$SAMPLE/compute/target/compute")" "$EXPECT_COMPUTE"
 check_exact conc-aotrel "$("$SAMPLE/conc/target/conc")" "$EXPECT_CONC"
 check_exact stdlib-aotrel "$("$SAMPLE/stdlib/target/stdlib")" "$EXPECT_STDLIB"
-(cd "$SAMPLE/wordfreq" && rm -f report.json && ./target/wordfreq > /tmp/bench_wf_aotrel.out 2>/dev/null && rm -f report.json)
-if ! cmp -s /tmp/bench_wf_interp.out /tmp/bench_wf_aotrel.out; then echo "FAIL wordfreq: interp vs aot-release differ"; exit 1; fi
+(cd "$SAMPLE/wordfreq" && rm -f report.json && ./target/wordfreq > $SAMPLE/bench_wf_aotrel.out 2>/dev/null && rm -f report.json)
+if ! cmp -s $SAMPLE/bench_wf_interp.out $SAMPLE/bench_wf_aotrel.out; then echo "FAIL wordfreq: interp vs aot-release differ"; exit 1; fi
 echo "ok aot release correctness (4/4)"
 
 echo "== cpu: aot release (Speed, production opt) =="
@@ -168,11 +189,11 @@ echo "== wordfreq input-size series (FFI-path scaling; all 3 paths) =="
 for rep in 1 100 1000 2000; do
   lines=$((6 * rep))
   (cd "$SAMPLE/wordfreq" && rm -f report.json && for i in $(seq 1 $rep); do cat input.stock; done > input.txt)
-  (cd "$SAMPLE/wordfreq" && "$TOTO" run main.gzv > /tmp/bench_wf_series_interp.out 2>/dev/null; rm -f report.json)
-  (cd "$SAMPLE/wordfreq" && ./target/wordfreq > /tmp/bench_wf_series_aot.out 2>/dev/null; rm -f report.json)
-  (cd "$SAMPLE/wordfreq" && ./target/wordfreq-release > /tmp/bench_wf_series_aotrel.out 2>/dev/null; rm -f report.json)
-  if ! cmp -s /tmp/bench_wf_series_interp.out /tmp/bench_wf_series_aot.out; then echo "FAIL wordfreq series $lines: interp vs aot differ"; exit 1; fi
-  if ! cmp -s /tmp/bench_wf_series_interp.out /tmp/bench_wf_series_aotrel.out; then echo "FAIL wordfreq series $lines: interp vs aot-release differ"; exit 1; fi
+  (cd "$SAMPLE/wordfreq" && "$TOTO" run main.gzv > $SAMPLE/bench_wf_series_interp.out 2>/dev/null; rm -f report.json)
+  (cd "$SAMPLE/wordfreq" && ./target/wordfreq > $SAMPLE/bench_wf_series_aot.out 2>/dev/null; rm -f report.json)
+  (cd "$SAMPLE/wordfreq" && ./target/wordfreq-release > $SAMPLE/bench_wf_series_aotrel.out 2>/dev/null; rm -f report.json)
+  if ! cmp -s $SAMPLE/bench_wf_series_interp.out $SAMPLE/bench_wf_series_aot.out; then echo "FAIL wordfreq series $lines: interp vs aot differ"; exit 1; fi
+  if ! cmp -s $SAMPLE/bench_wf_series_interp.out $SAMPLE/bench_wf_series_aotrel.out; then echo "FAIL wordfreq series $lines: interp vs aot-release differ"; exit 1; fi
   (cd "$SAMPLE/wordfreq" && timed "interp-wf-$lines" "$TOTO" run main.gzv; rm -f report.json)
   (cd "$SAMPLE/wordfreq" && timed "aot-wf-$lines" ./target/wordfreq; rm -f report.json)
   (cd "$SAMPLE/wordfreq" && timed "aotrel-wf-$lines" ./target/wordfreq-release; rm -f report.json)
@@ -181,12 +202,12 @@ done
 echo "ok wordfreq series (4/4 sizes, interp==aot==aot-release)"
 
 echo "== startup (trivial program) =="
-printf 'fn main() -> int {\n    return 0;\n}\n' > /tmp/bench_trivial.gzv
-mkdir -p "$SAMPLE/trivial" && cp /tmp/bench_trivial.gzv "$SAMPLE/trivial/main.gzv"
+printf 'fn main() -> int {\n    return 0;\n}\n' > $SAMPLE/bench_trivial.gzv
+mkdir -p "$SAMPLE/trivial" && cp $SAMPLE/bench_trivial.gzv "$SAMPLE/trivial/main.gzv"
 printf '[project]\nname = "trivial"\nversion = "0.1.0"\nentry = "main.gzv"\n' > "$SAMPLE/trivial/toto.toml"
 (cd "$SAMPLE/trivial" && "$TOTO" build >/dev/null 2>&1)
-timed start-interp "$TOTO" run /tmp/bench_trivial.gzv
-timed start-jit "$PROBE" /tmp/bench_trivial.gzv
+timed start-interp "$TOTO" run $SAMPLE/bench_trivial.gzv
+timed start-jit "$PROBE" $SAMPLE/bench_trivial.gzv
 timed start-aot "$SAMPLE/trivial/target/trivial"
 (cd "$SAMPLE/trivial" && "$TOTO" build --release >/dev/null 2>&1)
 timed start-aotrel "$SAMPLE/trivial/target/trivial"
@@ -195,11 +216,28 @@ timed start-aotrel "$SAMPLE/trivial/target/trivial"
 (cd "$SAMPLE/wordfreq" && timed start-aotrel-wordfreq ./target/wordfreq-release && rm -f report.json)
 
 echo "== binary size (bytes) =="
-cat /tmp/bench_sizes_debug.txt
+cat $SAMPLE/bench_sizes_debug.txt
 for w in compute conc stdlib trivial; do
   echo "aotrel-$w: $(wc -c < "$SAMPLE/$w/target/$w")"
 done
 echo "aotrel-wordfreq: $(wc -c < "$SAMPLE/wordfreq/target/wordfreq-release")"
 rm -f "$SAMPLE/wordfreq/target/wordfreq-release"
+
+if [ -n "$BASELINE" ]; then
+  echo "== regression flagging vs $BASELINE (fail above 5x) =="
+  awk -v flag=5 '
+    NR==FNR { if ($1 !~ /^#/) base[$1]=$2; next }
+    { if ($1 in base) {
+        r = ($2 > 0 && base[$1] > 0) ? $2/base[$1] : 0;
+        printf "%-22s base=%-8s med=%-8s x%.1f %s\n", $1, base[$1], $2, r, (r > flag ? "FLAG" : "ok");
+        if (r > flag) bad = 1;
+      } else {
+        printf "%-22s med=%-8s (no baseline)\n", $1, $2;
+      }
+    }
+    END { exit bad }
+  ' "$BASELINE" "$MEDIANS" || { echo "FAIL: regression flagged above"; exit 1; }
+  echo "ok regressions: none above 5x"
+fi
 
 echo "bench done"
