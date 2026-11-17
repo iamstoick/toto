@@ -19,7 +19,8 @@ const HELP: &str = "toto — a new programming language (.gzv)\n\
                     \x20   toto dev [--workers N] [--drain-timeout SECS] [--opt-level LEVEL] <file.gzv>\n\
                     \x20                                      rebuild and restart on every save\n\
                     \x20   toto init <name>                   scaffold a runnable project\n\
-                    \x20   toto build [--release]             build the project executable\n\
+                    \x20   toto build [--release] [--offline]  build the project executable\n\
+                    \x20                                      (--offline: no network; fails loudly on a cold cargo cache)\n\
                     \x20   toto test                         run the project tests\n\
                     \x20   toto fmt [--check] <file.gzv>...   format files in place\n\
                     (--check: list files that would change, no writes)\n\
@@ -144,17 +145,18 @@ fn main() -> ExitCode {
         }
         Some("build") => {
             let release = args.iter().skip(2).any(|a| a == "--release");
+            let offline = args.iter().skip(2).any(|a| a == "--offline");
             let bad: Vec<&str> = args
                 .iter()
                 .skip(2)
                 .map(String::as_str)
-                .filter(|a| *a != "--release")
+                .filter(|a| *a != "--release" && *a != "--offline")
                 .collect();
             if !bad.is_empty() {
                 eprintln!("toto: unexpected `build` flags: {}", bad.join(" "));
                 return ExitCode::from(3);
             }
-            build_cmd::build(release)
+            build_cmd::build(release, offline)
         }
         Some("test") => {
             let rest: Vec<&str> = args.iter().skip(2).map(String::as_str).collect();

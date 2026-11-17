@@ -20,19 +20,21 @@
 # (the timings suite pins compile cost separately).
 # AOT = `toto build` output in an isolated project dir.
 # LIMIT (recorded): the probe is single-file only (clean E0401 on
-# imports), so JIT has no stdlib/wordfreq number. Filling that hole
-# needs an import-capable JIT runner — named as a Stage 2 scoping
-# input, not built here.
+# imports), so JIT has no stdlib number (Stage 2 decision:
+# record-the-limit; stdlib-JIT stays N/A). wordfreq JIT-task IS
+# measured outside this script by the zz_ffidiag diagnostic
+# (6000-line input, task mode), cited in the phase report.
 #
 # Correctness first: exact output asserted on every path before
 # timing (constants for bench/*, cross-path identity for wordfreq).
 # A mismatch fails loudly — never timed blind.
 #
 # Usage: scripts/bench.sh [--runs N] [toto-binary]
-# Not part of scripts/check.sh: ~10 min wall time (4 cold AOT
-# builds). Run manually per release; the phase report records method
-# + numbers. Statistics are median + range over N runs (default 5);
-# single runs are never reported as conclusions.
+# Not part of scripts/check.sh: ~25 min wall time (4 cold debug + 5
+# cold release AOT links; needs ~4 GB free in $TMPDIR). Run manually
+# per release; the phase report records method + numbers. Statistics
+# are median + range over N runs (default 5); single runs are never
+# reported as conclusions.
 set -eu
 RUNS=5
 case "${1:-}" in
@@ -100,7 +102,7 @@ mk compute "$ROOT/bench/compute.gzv"
 mk conc "$ROOT/bench/conc.gzv"
 mk stdlib "$ROOT/bench/stdlib.gzv"
 cp -r "$ROOT/apps/wordfreq" "$SAMPLE/wordfreq"
-(cd "$SAMPLE/wordfreq" && for i in $(seq 1 $SCALE); do cat input.txt; done > input.big && mv input.big input.txt && rm -f report.json)
+(cd "$SAMPLE/wordfreq" && cp input.txt input.stock && for i in $(seq 1 $SCALE); do cat input.stock; done > input.txt && rm -f report.json)
 echo "wordfreq scaled input: $(wc -l < "$SAMPLE/wordfreq/input.txt") lines"
 
 echo "== correctness: aot + cross-path identity =="
@@ -127,13 +129,56 @@ timed jit-compute "$PROBE" "$ROOT/bench/compute.gzv"
 timed jit-conc "$PROBE" --task "$ROOT/bench/conc.gzv"
 echo "SKIP jit-stdlib jit-wordfreq (probe is single-file only: E0401)"
 
-echo "== cpu: aot =="
+echo "== cpu: aot (debug/Off) =="
 timed aot-compute "$SAMPLE/compute/target/compute"
 timed aot-conc "$SAMPLE/conc/target/conc"
 timed aot-stdlib "$SAMPLE/stdlib/target/stdlib"
 # Wordfreq reads inputs relative to cwd and writes report.json
 # there: run inside its project dir (artifacts stay in /tmp).
 (cd "$SAMPLE/wordfreq" && timed aot-wordfreq ./target/wordfreq && rm -f report.json)
+# Debug sizes before the release rebuilds overwrite the binaries.
+for w in compute conc stdlib wordfreq; do
+  echo "debug-size-$w: $(wc -c < "$SAMPLE/$w/target/$w")"
+done > /tmp/bench_sizes_debug.txt
+
+echo "== aot release builds (production opt: Speed + release link) =="
+for w in compute conc stdlib; do
+  (cd "$SAMPLE/$w" && "$TOTO" build --release >/dev/null 2>&1)
+done
+(cd "$SAMPLE/wordfreq" && "$TOTO" build --release >/dev/null 2>&1)
+
+echo "== correctness: aot release =="
+check_exact compute-aotrel "$("$SAMPLE/compute/target/compute")" "$EXPECT_COMPUTE"
+check_exact conc-aotrel "$("$SAMPLE/conc/target/conc")" "$EXPECT_CONC"
+check_exact stdlib-aotrel "$("$SAMPLE/stdlib/target/stdlib")" "$EXPECT_STDLIB"
+(cd "$SAMPLE/wordfreq" && rm -f report.json && ./target/wordfreq > /tmp/bench_wf_aotrel.out 2>/dev/null && rm -f report.json)
+if ! cmp -s /tmp/bench_wf_interp.out /tmp/bench_wf_aotrel.out; then echo "FAIL wordfreq: interp vs aot-release differ"; exit 1; fi
+echo "ok aot release correctness (4/4)"
+
+echo "== cpu: aot release (Speed, production opt) =="
+timed aotrel-compute "$SAMPLE/compute/target/compute"
+timed aotrel-conc "$SAMPLE/conc/target/conc"
+timed aotrel-stdlib "$SAMPLE/stdlib/target/stdlib"
+(cd "$SAMPLE/wordfreq" && timed aotrel-wordfreq ./target/wordfreq && rm -f report.json)
+
+echo "== wordfreq input-size series (FFI-path scaling; all 3 paths) =="
+# Rebuild debug (the release step overwrote the binary); the series
+# then times interp + aot-debug + aot-release on the same inputs.
+(cd "$SAMPLE/wordfreq" && cp target/wordfreq target/wordfreq-release && "$TOTO" build >/dev/null 2>&1)
+for rep in 1 100 1000 2000; do
+  lines=$((6 * rep))
+  (cd "$SAMPLE/wordfreq" && rm -f report.json && for i in $(seq 1 $rep); do cat input.stock; done > input.txt)
+  (cd "$SAMPLE/wordfreq" && "$TOTO" run main.gzv > /tmp/bench_wf_series_interp.out 2>/dev/null; rm -f report.json)
+  (cd "$SAMPLE/wordfreq" && ./target/wordfreq > /tmp/bench_wf_series_aot.out 2>/dev/null; rm -f report.json)
+  (cd "$SAMPLE/wordfreq" && ./target/wordfreq-release > /tmp/bench_wf_series_aotrel.out 2>/dev/null; rm -f report.json)
+  if ! cmp -s /tmp/bench_wf_series_interp.out /tmp/bench_wf_series_aot.out; then echo "FAIL wordfreq series $lines: interp vs aot differ"; exit 1; fi
+  if ! cmp -s /tmp/bench_wf_series_interp.out /tmp/bench_wf_series_aotrel.out; then echo "FAIL wordfreq series $lines: interp vs aot-release differ"; exit 1; fi
+  (cd "$SAMPLE/wordfreq" && timed "interp-wf-$lines" "$TOTO" run main.gzv; rm -f report.json)
+  (cd "$SAMPLE/wordfreq" && timed "aot-wf-$lines" ./target/wordfreq; rm -f report.json)
+  (cd "$SAMPLE/wordfreq" && timed "aotrel-wf-$lines" ./target/wordfreq-release; rm -f report.json)
+done
+(cd "$SAMPLE/wordfreq" && cp input.stock input.txt && rm -f report.json)
+echo "ok wordfreq series (4/4 sizes, interp==aot==aot-release)"
 
 echo "== startup (trivial program) =="
 printf 'fn main() -> int {\n    return 0;\n}\n' > /tmp/bench_trivial.gzv
@@ -143,11 +188,18 @@ printf '[project]\nname = "trivial"\nversion = "0.1.0"\nentry = "main.gzv"\n' > 
 timed start-interp "$TOTO" run /tmp/bench_trivial.gzv
 timed start-jit "$PROBE" /tmp/bench_trivial.gzv
 timed start-aot "$SAMPLE/trivial/target/trivial"
+(cd "$SAMPLE/trivial" && "$TOTO" build --release >/dev/null 2>&1)
+timed start-aotrel "$SAMPLE/trivial/target/trivial"
+# Real-app startup: wordfreq release binary on the 6-line stock
+# input (input.txt restored by the series cleanup above).
+(cd "$SAMPLE/wordfreq" && timed start-aotrel-wordfreq ./target/wordfreq-release && rm -f report.json)
 
 echo "== binary size (bytes) =="
-for w in compute conc stdlib wordfreq trivial; do
-  bin="$SAMPLE/$w/target/$w"
-  echo "aot-$w: $(wc -c < "$bin")"
+cat /tmp/bench_sizes_debug.txt
+for w in compute conc stdlib trivial; do
+  echo "aotrel-$w: $(wc -c < "$SAMPLE/$w/target/$w")"
 done
+echo "aotrel-wordfreq: $(wc -c < "$SAMPLE/wordfreq/target/wordfreq-release")"
+rm -f "$SAMPLE/wordfreq/target/wordfreq-release"
 
 echo "bench done"

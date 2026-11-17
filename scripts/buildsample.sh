@@ -31,13 +31,22 @@ printf '[project]\nname = "stdlibproj"\nversion = "0.1.0"\nentry = "main.gzv"\n'
 pass=0; fail=0
 check() { # $1=name $2=golden-stdout $3=golden-status
   (cd "$SAMPLE/$1" && "$TOTO" build >/dev/null 2>&1) || { echo "FAIL $1: build"; fail=$((fail+1)); return; }
-  out=$(cd "$SAMPLE/$1" && ./target/$1 2>/tmp/err_$1.txt); code=$?
+  # The `|| code=$?` keeps `set -e` (top of file) from killing the
+  # script on nonzero exits — panic-path programs (divzero, exit 1)
+  # are expected results, compared below like any other golden.
+  code=0
+  out=$(cd "$SAMPLE/$1" && ./target/$1 2>/tmp/err_$1.txt) || code=$?
   want_out=$(cat "$2" 2>/dev/null); want_code=$(cat "$3")
   if [ "$out" = "$want_out" ] && [ "$code" = "$want_code" ]; then
     if [ "$code" != "0" ]; then
       # Panic path: compare code+message (locations move under AOT).
       got_head=$(head -1 /tmp/err_$1.txt | sed 's/.*\(panic\[E[0-9]*\]: .*\)/\1/')
-      want_head=$(head -1 "$SAMPLE/$1/main.stderr" 2>/dev/null || head -1 "$CORP/interp/$1.stderr" 2>/dev/null)
+      # Neither stderr golden exists for stdout-only programs (and
+      # `$1` is the sample name, not the corpus filename, so the
+      # second path misses too): `|| true` keeps `set -e` from
+      # killing the script. The head comparison is informational
+      # only — the verdict is exit code + stdout above.
+      want_head=$(head -1 "$SAMPLE/$1/main.stderr" 2>/dev/null || head -1 "$CORP/interp/$1.stderr" 2>/dev/null || true)
       echo "INFO $1 panic head: $got_head"
     fi
     echo "ok $1 (exit $code)"; pass=$((pass+1))

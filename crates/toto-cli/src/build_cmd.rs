@@ -100,7 +100,7 @@ fn workspace_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-pub fn build(release: bool) -> ExitCode {
+pub fn build(release: bool, offline: bool) -> ExitCode {
     let (root, manifest) = match project_root() {
         Ok(ok) => ok,
         Err(code) => return code,
@@ -155,11 +155,24 @@ pub fn build(release: bool) -> ExitCode {
         eprintln!("toto: couldn't write shim sources: {e}");
         return ExitCode::from(3);
     }
+    // Pin dependency resolution to the workspace lockfile so production
+    // builds link exactly the dependency versions the repo was tested
+    // with (two builds at different times otherwise resolve different
+    // registry versions). The shim is an isolated workspace, so cargo
+    // adapts the copied lock (adds the shim root) without refetching
+    // when the versions are satisfiable from the local cache.
+    let ws_lock = workspace_dir().join("Cargo.lock");
+    if let Ok(bytes) = std::fs::read(&ws_lock) {
+        let _ = std::fs::write(shim_dir.join("Cargo.lock"), bytes);
+    }
     let obj_abs = build_dir.join(format!("{}.o", manifest.name));
     let mut cmd = std::process::Command::new("cargo");
     cmd.arg("build").current_dir(&shim_dir);
     if release {
         cmd.arg("--release");
+    }
+    if offline {
+        cmd.arg("--offline");
     }
     // The object links in through a rustc link arg (absolute path):
     // the shim crate itself stays backend-agnostic. Any user RUSTFLAGS
