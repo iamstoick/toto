@@ -1,7 +1,7 @@
 # `gzv.std` — standard library (Phase 5, Stage 2)
 
-Eight modules of ordinary Toto on the frozen 27 builtins (plus the
-FFI module, which calls real C). Import by canonical path; the
+Nine modules of ordinary Toto on the frozen 27 builtins (plus the
+FFI modules, which call real C). Import by canonical path; the
 sources in `stdlib/*.gzv` are embedded in every `toto` binary (see
 [project.md](project.md)).
 
