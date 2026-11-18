@@ -402,3 +402,56 @@ fn opt_level_flag_rejects_bad_value() {
             .contains("needs off, speed, or speed_and_size")
     );
 }
+
+#[test]
+fn built_binary_ignores_later_source_edits() {
+    // Production builds carry no dev machinery: sources are baked
+    // into the binary at build time. Editing main.gzv after the
+    // build must NOT change what the already-built binary prints
+    // (no hot-reload, no live reload, no watch).
+    let dir = scratch_project("nostale");
+    let out = toto()
+        .arg("init")
+        .arg(dir.join("app"))
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let root = dir.join("app");
+    std::fs::write(
+        root.join("main.gzv"),
+        "fn main() -> int {\n    println(\"v1\");\n    return 0;\n}\n",
+    )
+    .expect("write main");
+    let out = toto()
+        .arg("build")
+        .current_dir(&root)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0), "build failed");
+    let bin = root.join("target").join("app");
+    let run = |b: &std::path::Path| {
+        String::from_utf8(
+            std::process::Command::new(b)
+                .output()
+                .expect("built binary runs")
+                .stdout,
+        )
+        .unwrap()
+    };
+    assert_eq!(run(&bin).trim(), "v1");
+    // Edit the source AFTER the build; the binary is immutable.
+    std::fs::write(
+        root.join("main.gzv"),
+        "fn main() -> int {\n    println(\"v2\");\n    return 0;\n}\n",
+    )
+    .expect("rewrite main");
+    assert_eq!(run(&bin).trim(), "v1", "binary reloaded edited sources");
+    // Sanity: the edit is real — the interpreter sees v2.
+    let out = toto()
+        .arg("run")
+        .arg(root.join("main.gzv"))
+        .output()
+        .expect("runs");
+    assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "v2");
+    let _ = std::fs::remove_dir_all(&dir);
+}

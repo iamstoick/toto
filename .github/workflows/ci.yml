@@ -30,3 +30,29 @@ jobs:
         run: cargo build -p toto-cli -p toto-jit
       - name: benchmark suite with regression flagging
         run: ./scripts/bench.sh --runs 3 --baseline bench/baseline.txt
+  # Enterprise Wave 0, Stage 1: Tier-1 feasibility probes. Scoped on
+  # purpose (build + Tier-1 conformance + corpus gate + one concurrent
+  # program) — promotion to the full check.sh per platform happens only
+  # on a SUPPORTED verdict with evidence (see the Wave 0 report).
+  tier1-probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build workspace
+        run: cargo build --workspace --exclude ffi-smoke-test
+      - name: Tier-1 conformance (frozen ADR-008, no codegen needed)
+        run: cargo test -p toto-compiler --test mir_conform
+      - name: corpus gate
+        run: cargo test -p toto-cli --test corpus
+      - name: one concurrent program end to end
+        run: |
+          out=$(cargo run -q -p toto-cli -- run tests/corpus/concurrent/conc01_pingpong.gzv)
+          [ "$out" = "42" ] || { echo "pingpong mismatch: [$out]"; exit 1; }

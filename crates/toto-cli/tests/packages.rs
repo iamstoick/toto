@@ -368,6 +368,16 @@ fn transitive_resolution_and_conflict() {
     assert_eq!(code, 3);
     assert!(err.contains("E0602"), "missing code: {err}");
     assert!(err.contains("mid2"), "must name the requirer: {err}");
+    // Full-requirement-list pin: EVERY conflicting requirement is
+    // named with its text and provenance, not just the newcomer.
+    assert!(
+        err.contains("^1.0.0") && err.contains("(required by mid 1.0.0)"),
+        "must name mid's requirement: {err}"
+    );
+    assert!(
+        err.contains("^2.0.0") && err.contains("(required by mid2 1.0.0)"),
+        "must name mid2's requirement: {err}"
+    );
     cleanup(&root);
 }
 
@@ -476,7 +486,9 @@ fn missing_cached_git_rev_fails_loudly_naming_the_rev() {
     let (code, _, err) = run_toto(&app, &cache, &["build"]);
     assert_eq!(code, 3);
     assert!(err.contains("E0604"), "missing code: {err}");
-    assert!(err.contains(&rev[..8]), "must name the missing rev: {err}");
+    // Full-rev pin: the error names the complete locked revision,
+    // not just a short prefix.
+    assert!(err.contains(&rev), "must name the full missing rev: {err}");
     cleanup(&root);
 }
 

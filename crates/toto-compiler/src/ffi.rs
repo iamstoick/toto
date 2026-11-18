@@ -22,7 +22,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_double, c_int, c_long, c_void};
+use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 
@@ -84,18 +84,21 @@ pub extern "C" fn toto_rt_read_i32(p: *const c_void) -> c_int {
 }
 
 /// Read 8 bytes as an `i64` bit pattern (pthread handles, data words).
+/// Fixed-width `i64`, not `c_long`: `long` is 32 bits on Windows
+/// (LLP64), which would silently truncate. LP64 platforms are
+/// unaffected (`c_long` == `i64` there).
 #[unsafe(no_mangle)]
-pub extern "C" fn toto_rt_read_i64(p: *const c_void) -> c_long {
+pub extern "C" fn toto_rt_read_i64(p: *const c_void) -> i64 {
     // SAFETY: same contract as `toto_rt_read_i32`, for 8-byte slots.
-    unsafe { (p as *const c_long).read_unaligned() }
+    unsafe { (p as *const i64).read_unaligned() }
 }
 
 /// Write an `i64` bit pattern (thread data buffers).
 #[unsafe(no_mangle)]
-pub extern "C" fn toto_rt_write_i64(p: *mut c_void, v: c_long) {
+pub extern "C" fn toto_rt_write_i64(p: *mut c_void, v: i64) {
     // SAFETY: the caller guarantees a live, writable 8-byte slot.
     unsafe {
-        (p as *mut c_long).write_unaligned(v);
+        (p as *mut i64).write_unaligned(v);
     }
 }
 
