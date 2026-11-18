@@ -8,6 +8,15 @@
 > See [Phase 7 report](docs/phases/phase-7-production-aot-packages.md).
 > Roadmap: [Implementation Roadmap v2.4](docs/) (D1–D8 + ratified decisions; title page verified at Phase 4 kickoff).
 
+## Policies (Enterprise Wave 0 — stability/deprecation/support proposed, security live on approval)
+
+- [Stability](docs/stability.md) — what is covered, what is not.
+- [Deprecation](docs/deprecation.md) — notice, migration path, period.
+- [Support window](docs/support.md) — N/N−1 minors, 12 months.
+- [Security](SECURITY.md) — private disclosure process.
+- [GC](docs/gc.md) — collector targets, knob, workloads.
+- [Releases](docs/release.md) — attestations, SBOM, reproducibility.
+
 ## Layout
 
 - `crates/toto-runtime/` — production runtime (GC heap, corosensei

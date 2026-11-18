@@ -1,0 +1,52 @@
+# Release pipeline (dry-run capable; no real release without a version tag)
+#
+# Real releases: push a `v*` tag. Dry runs: `gh workflow run release.yml
+# -f dry_run=true` — builds, SBOMs, and attests exactly like a release,
+# but skips the publish step (no tag needed, nothing uploaded).
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build + SBOM + attest without publishing"
+        required: false
+        default: "true"
+
+permissions:
+  contents: write # releases + artifacts (publish step only)
+  id-token: write # Sigstore OIDC for attestations
+  attestations: write
+
+jobs:
+  build-sign-sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build release binary
+        run: cargo build --locked --release -p toto-cli
+      - name: generate SPDX SBOM for the binary
+        uses: anchore/sbom-action@v0
+        with:
+          path: target/release/toto
+          format: spdx-json
+          output-file: toto.spdx.json
+      - name: attest build provenance (Sigstore, no keys to manage)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: target/release/toto
+      - name: record binary hash (dry-run reproducibility evidence)
+        run: sha256sum target/release/toto | tee toto.sha256
+      - name: publish to GitHub Release (real tags only)
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/toto
+            toto.spdx.json
+            toto.sha256
