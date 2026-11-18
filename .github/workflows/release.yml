@@ -31,7 +31,9 @@ jobs:
       - name: build release binary
         run: cargo build --locked --release -p toto-cli
       - name: stage exactly the shipped artifact (SBOM scans a dir)
-        run: mkdir -p dist && cp target/release/toto dist/toto
+        # Cargo.lock rides along so syft catalogs the full dependency
+        # closure, not just the binary itself.
+        run: mkdir -p dist && cp target/release/toto dist/toto && cp Cargo.lock dist/
       - name: generate SPDX SBOM for the binary
         uses: anchore/sbom-action@v0
         with:
