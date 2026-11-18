@@ -30,23 +30,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: build release binary
         run: cargo build --locked --release -p toto-cli
+      - name: stage exactly the shipped artifact (SBOM scans a dir)
+        run: mkdir -p dist && cp target/release/toto dist/toto
       - name: generate SPDX SBOM for the binary
         uses: anchore/sbom-action@v0
         with:
-          path: target/release/toto
+          path: dist/
           format: spdx-json
           output-file: toto.spdx.json
       - name: attest build provenance (Sigstore, no keys to manage)
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: target/release/toto
+          subject-path: dist/toto
       - name: record binary hash (dry-run reproducibility evidence)
-        run: sha256sum target/release/toto | tee toto.sha256
+        run: sha256sum dist/toto | tee toto.sha256
       - name: publish to GitHub Release (real tags only)
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/release/toto
+            dist/toto
             toto.spdx.json
             toto.sha256
