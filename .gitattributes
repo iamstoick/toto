@@ -1,0 +1,26 @@
+# Normalize line endings to LF on checkout on every platform.
+# The corpus gate compares diagnostic/source bytes exactly; a CRLF
+# checkout (Windows git defaults) breaks 167 golden comparisons
+# and shifts diagnostic carets. Toto itself reads CRLF sources
+# fine (lexer skips `\r`); this is checkout hygiene, not a
+# language rule.
+* text=auto eol=lf
+*.gzv text eol=lf
+*.stdout text eol=lf
+*.stderr text eol=lf
+*.status text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+*.sh text eol=lf
+*.rs text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+# Binary: never convert.
+*.gz -text
+*.png -text
+*.ico -text
+*.exe -text
+*.pkg -text
