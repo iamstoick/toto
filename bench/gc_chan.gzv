@@ -1,0 +1,145 @@
+// bench/gc_chan.gzv — channel-heavy stateful service shape.
+//
+// A long-lived registry task owns 64 counters (live state across
+// collections) while 3 client tasks exchange heap-allocated request
+// arrays and int replies over bounded channels. Addition commutes,
+// so the final state is identical under every interleaving; FIFO
+// request/reply pairing (each client has at most one outstanding
+// request) keeps every client sum deterministic. Executor-only,
+// like gc_alloc (tree-walker cannot run concurrent programs).
+fn main() -> int {
+    let req = chan<Array<int>>(8);
+    let rep = chan<int>(8);
+    let csum = chan<int>(3);
+    let done = chan<int>();
+    go {
+        let counts: Array<int> = [];
+        let mut c = 0;
+        while c < 64 {
+            push(counts, 0);
+            c = c + 1;
+        }
+        let mut served = 0;
+        while served < 1503 {
+            let m = <-req;
+            if m[0] == 0 {
+                let k = m[1] % 64;
+                counts[k] = counts[k] + m[2];
+                rep <- counts[k];
+            }
+            served = served + 1;
+        }
+        let mut total = 0;
+        let mut q = 0;
+        while q < 64 {
+            total = total + counts[q];
+            q = q + 1;
+        }
+        done <- total;
+    }
+    go {
+        let id = 0;
+        let mut i = 0;
+        let mut sum = 0;
+        while i < 500 {
+            let tmp: Array<int> = [];
+            let mut w = 0;
+            while w < 200 {
+                push(tmp, w * 3 - w / 2);
+                w = w + 1;
+            }
+            let mut t = 0;
+            let mut z = 0;
+            while z < len(tmp) {
+                t = t + tmp[z];
+                z = z + 1;
+            }
+            let m: Array<int> = [];
+            push(m, 0);
+            push(m, id * 64 + i);
+            push(m, i * 7 + id);
+            req <- m;
+            sum = sum + <-rep;
+            i = i + 1;
+        }
+        let fin: Array<int> = [];
+        push(fin, 1);
+        push(fin, 0);
+        push(fin, 0);
+        req <- fin;
+        csum <- sum;
+    }
+    go {
+        let id = 1;
+        let mut i = 0;
+        let mut sum = 0;
+        while i < 500 {
+            let tmp: Array<int> = [];
+            let mut w = 0;
+            while w < 200 {
+                push(tmp, w * 3 - w / 2);
+                w = w + 1;
+            }
+            let mut t = 0;
+            let mut z = 0;
+            while z < len(tmp) {
+                t = t + tmp[z];
+                z = z + 1;
+            }
+            let m: Array<int> = [];
+            push(m, 0);
+            push(m, id * 64 + i);
+            push(m, i * 7 + id);
+            req <- m;
+            sum = sum + <-rep;
+            i = i + 1;
+        }
+        let fin: Array<int> = [];
+        push(fin, 1);
+        push(fin, 0);
+        push(fin, 0);
+        req <- fin;
+        csum <- sum;
+    }
+    go {
+        let id = 2;
+        let mut i = 0;
+        let mut sum = 0;
+        while i < 500 {
+            let tmp: Array<int> = [];
+            let mut w = 0;
+            while w < 200 {
+                push(tmp, w * 3 - w / 2);
+                w = w + 1;
+            }
+            let mut t = 0;
+            let mut z = 0;
+            while z < len(tmp) {
+                t = t + tmp[z];
+                z = z + 1;
+            }
+            let m: Array<int> = [];
+            push(m, 0);
+            push(m, id * 64 + i);
+            push(m, i * 7 + id);
+            req <- m;
+            sum = sum + <-rep;
+            i = i + 1;
+        }
+        let fin: Array<int> = [];
+        push(fin, 1);
+        push(fin, 0);
+        push(fin, 0);
+        req <- fin;
+        csum <- sum;
+    }
+    let mut cs = 0;
+    let mut n = 0;
+    while n < 3 {
+        cs = cs + <-csum;
+        n = n + 1;
+    }
+    println(cs);
+    println(<-done);
+    return 0;
+}

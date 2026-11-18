@@ -32,7 +32,19 @@ fn run_thread() -> Result<int, string> {
 
 fn main() -> int {
     println(c_strlen("hello"));
-    println(c_strcmp("a", "b"));
+    // `strcmp` magnitudes are implementation-defined (glibc x86_64
+    // returns -1, glibc ARM64 returns -64); only the sign is
+    // contractual, so the proof pins the sign, not the value.
+    let cmp = c_strcmp("a", "b");
+    if cmp < 0 {
+        println(-1);
+    }
+    if cmp == 0 {
+        println(0);
+    }
+    if cmp > 0 {
+        println(1);
+    }
     println(c_pow(2.0, 10.0));
     println(c_strtod("2.5"));
     let a: *c_void = c_malloc(16);

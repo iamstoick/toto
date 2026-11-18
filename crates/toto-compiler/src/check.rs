@@ -2950,7 +2950,7 @@ impl Checker {
                 format!(
                     "foreign function `{}` is declared but not linked in this binary (linked: {})",
                     sig.name,
-                    crate::ffi::LINKED.join(", "),
+                    crate::ffi::linked_names().join(", "),
                 ),
                 span,
                 None,

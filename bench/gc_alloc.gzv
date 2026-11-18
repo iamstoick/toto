@@ -1,0 +1,59 @@
+// bench/gc_alloc.gzv — sustained allocation pressure across workers.
+//
+// Each of 4 workers builds and drops 300 short-lived int arrays
+// (200 elements each), keeping only a running checksum live. The
+// churn (~240k ints plus array shells and channel messages) forces
+// repeated stop-the-world collections at the default 1 MiB
+// threshold. Executor-only: the tree-walker cannot run concurrent
+// programs (the runtime executor is the reference here).
+// Deterministic: every worker does identical work, so the checksum
+// is the same on every run.
+fn fill(n: int) -> int {
+    let a: Array<int> = [];
+    let mut i = 0;
+    while i < n {
+        push(a, i * 3 - i / 2);
+        i = i + 1;
+    }
+    let mut s = 0;
+    let mut j = 0;
+    while j < len(a) {
+        s = s + a[j];
+        j = j + 1;
+    }
+    return s;
+}
+
+fn worker(iters: int, n: int) -> int {
+    let mut t = 0;
+    let mut k = 0;
+    while k < iters {
+        t = t + fill(n);
+        k = k + 1;
+    }
+    return t;
+}
+
+fn main() -> int {
+    let ch = chan<int>(4);
+    go {
+        ch <- worker(300, 200)
+    }
+    go {
+        ch <- worker(300, 200)
+    }
+    go {
+        ch <- worker(300, 200)
+    }
+    go {
+        ch <- worker(300, 200)
+    }
+    let mut total = 0;
+    let mut r = 0;
+    while r < 4 {
+        total = total + <-ch;
+        r = r + 1;
+    }
+    println(total);
+    return 0;
+}
