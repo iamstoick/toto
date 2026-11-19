@@ -453,13 +453,24 @@ fn socket_of(ty: c_int) -> Result<c_int, String> {
 /// Mark a socket nonblocking (executor path; the interpreter uses
 /// blocking sockets and never calls this).
 pub fn set_nonblocking(fd: c_int) -> Result<(), String> {
-    // F_GETFL=3, F_SETFL=4, O_NONBLOCK=0x800 (both Linux and macOS).
+    // F_GETFL=3, F_SETFL=4 on Linux and macOS. O_NONBLOCK differs:
+    // 0x800 (04000) on Linux, 0x10 on macOS (the old shared 0x800
+    // left macOS sockets blocking; loopback tests passed only
+    // because connects complete synchronously). The fallback is
+    // never exercised: non-unix net entry points refuse with E0301
+    // before any fd exists.
+    #[cfg(target_os = "linux")]
+    const O_NONBLOCK_FLAG: c_int = 0x800;
+    #[cfg(target_os = "macos")]
+    const O_NONBLOCK_FLAG: c_int = 0x10;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const O_NONBLOCK_FLAG: c_int = 0;
     let flags = unsafe { libc_fcntl(fd, 3, 0) };
     if flags < 0 {
         return Err(last_error());
     }
     // SAFETY: OR-ing O_NONBLOCK into the retrieved flags.
-    let r = unsafe { libc_fcntl(fd, 4, flags | 0x800) };
+    let r = unsafe { libc_fcntl(fd, 4, flags | O_NONBLOCK_FLAG) };
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
