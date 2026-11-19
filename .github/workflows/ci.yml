@@ -38,8 +38,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04-arm, macos-latest, windows-latest]
+        # Windows is DEFERRED WITH EVIDENCE (Wave 0 report: POSIX FFI
+        # surface), not Tier-1. Its probe keeps running as evidence but
+        # does not fail the run; flip experimental to false when the
+        # POSIX-compat decision lands and the corpus goes green there.
+        include:
+          - os: ubuntu-24.04-arm
+            experimental: false
+          - os: macos-latest
+            experimental: false
+          - os: windows-latest
+            experimental: true
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
     defaults:
       run:
         shell: bash

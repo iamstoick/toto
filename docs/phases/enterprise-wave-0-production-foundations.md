@@ -139,6 +139,15 @@ macos-latest, windows-latest — build (minus the C-toolchain
 corpus + pingpong end-to-end. Linux x86_64 stays the full
 `check.sh` baseline (unchanged, green throughout).
 
+Dated note 2026-11-18: the Windows matrix leg runs with
+`continue-on-error` (marked experimental in `ci.yml`) now
+that the verdict is recorded DEFERRED — the probe keeps
+running as evidence on every push, but the run-level gate
+reflects the Tier-1 (supported) set only. The Windows job
+itself still reports failure visibly; flip the flag back
+when the POSIX-compat decision lands and the corpus goes
+green there.
+
 ### Known risk areas per platform (as probed)
 
 Stack switching (corosensei: x86_64 + ARM64 unix verified by
