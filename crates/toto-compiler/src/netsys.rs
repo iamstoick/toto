@@ -757,8 +757,10 @@ pub fn resolve_blocking(host: &str) -> Result<Vec<String>, String> {
                 out.push(render_ipv6(&b[8..24]));
             }
         }
-        // SAFETY: ai_next at offset 32 on 64-bit Unix.
-        cur = unsafe { *(cur as *const *mut c_void).add(4) };
+        // SAFETY: ai_next at offset 40 on 64-bit Unix (flags,
+        // family, socktype, protocol, addrlen, addr *@24,
+        // canonname *@32, next *@40).
+        cur = unsafe { *(cur as *const *mut c_void).add(5) };
     }
     // SAFETY: frees the list from `getaddrinfo`.
     unsafe { libc_freeaddrinfo(res) };

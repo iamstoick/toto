@@ -103,12 +103,23 @@ fn corpus() {
             .parse()
             .unwrap_or(-999);
         let got_status = output.status.code().unwrap_or(-999);
+        // Name the killing signal when there is one (Unix): a silent
+        // `-999` hides whether the child segfaulted, aborted, or was
+        // OOM-killed, which decides the whole diagnosis.
+        #[cfg(unix)]
+        let got_signal = {
+            use std::os::unix::process::ExitStatusExt;
+            output.status.signal().map(|s| format!(" (signal {s})")).unwrap_or_default()
+        };
+        #[cfg(not(unix))]
+        let got_signal = String::new();
         if output.stdout != want_out || output.stderr != want_err || got_status != want_status {
             failures.push(format!(
-                "--- {}\n want exit={} got exit={}\n want stdout={:?}\n got  stdout={:?}\n want stderr={:?}\n got  stderr={:?}",
+                "--- {}\n want exit={} got exit={}{}\n want stdout={:?}\n got  stdout={:?}\n want stderr={:?}\n got  stderr={:?}",
                 case.display(),
                 want_status,
                 got_status,
+                got_signal,
                 String::from_utf8_lossy(&want_out),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&want_err),
