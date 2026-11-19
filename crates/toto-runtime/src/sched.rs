@@ -2022,8 +2022,10 @@ impl Scheduler {
                     }
                     PollerDone::Done(result) => {
                         {
-                            // TEMPORARY Wave 1 ARM diagnosis.
-                            eprintln!("T-ARM post task={}", reg.task.0);
+                            // Net debug trace (see op_net).
+                            if std::env::var_os("TOTO_NET_DEBUG").is_some() {
+                                eprintln!("T-NET post task={}", reg.task.0);
+                            }
                             let mut done = shared.done.lock().expect("done lock");
                             done.push_back(Completion {
                                 task: reg.task,
@@ -3171,16 +3173,20 @@ impl Scheduler {
     /// its registration submitted.
     #[cfg(unix)]
     fn op_net(&self, worker: usize, id: TaskId, op: NetOp, span: Span) {
-        // TEMPORARY Wave 1 ARM diagnosis (revert after root cause).
-        let opname: &'static str = match &op {
-            NetOp::Connect { .. } => "Connect",
-            NetOp::Accept { .. } => "Accept",
-            NetOp::Recv { .. } => "Recv",
-            NetOp::Send { .. } => "Send",
-            NetOp::UdpRecv { .. } => "UdpRecv",
-            NetOp::UdpSend { .. } => "UdpSend",
-        };
-        eprintln!("T-ARM task={} op={opname}", id.0);
+        // Net debug trace (Wave 1 diagnostic aid): enabled only with
+        // TOTO_NET_DEBUG set, so goldens stay clean. Names the task
+        // and op of every poller park.
+        if std::env::var_os("TOTO_NET_DEBUG").is_some() {
+            let opname: &'static str = match &op {
+                NetOp::Connect { .. } => "Connect",
+                NetOp::Accept { .. } => "Accept",
+                NetOp::Recv { .. } => "Recv",
+                NetOp::Send { .. } => "Send",
+                NetOp::UdpRecv { .. } => "UdpRecv",
+                NetOp::UdpSend { .. } => "UdpSend",
+            };
+            eprintln!("T-NET park task={} op={opname}", id.0);
+        }
         // No fail-fast check here: like `park`, the executor checks the
         // scope BEFORE yielding, so a task that reaches this request is
         // live. (A scope that fails while the wait is registered
