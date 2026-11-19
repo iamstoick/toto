@@ -1,0 +1,810 @@
+// gzv.std/toml — TOML parse + serialize, config-shaped subset
+// (Enterprise Wave 1).
+
+import "gzv.std/strings.gzv";
+//
+// Values are `TomlVal` structs, mirroring the `JsonVal` strata
+// design: nested tables store as their ORIGINAL SOURCE LINES
+// (multi-line fragments, re-parsed with an absolute-path prefix
+// on access — recursion is re-parse, never a recursive type,
+// which Toto v1 rejects). Scalars keep their ORIGINAL LITERAL,
+// so `toml_stringify` round-trips exactly (modulo whitespace and
+// comments, which are not preserved).
+//
+// Scope (stated subset): tables (incl. dotted `[a.b]` and dotted
+// keys), string/int/bool/float values, single-line arrays of
+// scalars, `#` comments. Integers allow `_` separators and signs;
+// floats are decimal with optional exponent. NOT covered (clear
+// errors, recorded follow-ups): inline tables, arrays of tables,
+// datetimes, multi-line strings, hex/octal/binary ints, `\u`
+// escapes (no codepoint builtin — same rule as `json`).
+
+pub struct TomlVal {
+    kind: string,
+    raw: string,
+    items: Array<string>,
+    keys: Array<string>,
+    vals: Array<string>,
+    prefix: string,
+}
+
+fn toml_make(kind: string, raw: string) -> TomlVal {
+    let a: Array<string> = [];
+    let b: Array<string> = [];
+    let c: Array<string> = [];
+    return TomlVal { kind: kind, raw: raw, items: a, keys: b, vals: c, prefix: "" };
+}
+
+pub fn toml_kind(v: TomlVal) -> string {
+    return v.kind;
+}
+
+// --- literal classification ---
+
+fn toml_is_digit(c: string) -> bool {
+    return c >= "0" && c <= "9";
+}
+
+fn toml_is_bare_char(c: string) -> bool {
+    if c >= "a" && c <= "z" {
+        return true;
+    }
+    if c >= "A" && c <= "Z" {
+        return true;
+    }
+    if toml_is_digit(c) {
+        return true;
+    }
+    if c == "_" || c == "-" {
+        return true;
+    }
+    return false;
+}
+
+fn toml_strip_underscores(s: string) -> string {
+    let chars: Array<string> = split(s, "");
+    let mut out: string = "";
+    for c in chars {
+        if c != "_" {
+            out = out + c;
+        } else {
+        }
+    }
+    return out;
+}
+
+fn toml_is_int_literal(s: string) -> bool {
+    let t = toml_strip_underscores(s);
+    let chars: Array<string> = split(t, "");
+    if len(chars) == 0 {
+        return false;
+    }
+    let mut i: int = 0;
+    if chars[0] == "+" || chars[0] == "-" {
+        i = 1;
+    }
+    if i >= len(chars) {
+        return false;
+    }
+    while i < len(chars) {
+        if !toml_is_digit(chars[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn toml_is_float_literal(s: string) -> bool {
+    let t = toml_strip_underscores(s);
+    let chars: Array<string> = split(t, "");
+    if len(chars) == 0 {
+        return false;
+    }
+    let mut i: int = 0;
+    if chars[0] == "+" || chars[0] == "-" {
+        i = 1;
+    }
+    let mut digits = false;
+    while i < len(chars) && toml_is_digit(chars[i]) {
+        digits = true;
+        i = i + 1;
+    }
+    if i < len(chars) && chars[i] == "." {
+        i = i + 1;
+        while i < len(chars) && toml_is_digit(chars[i]) {
+            digits = true;
+            i = i + 1;
+        }
+    }
+    if i < len(chars) && (chars[i] == "e" || chars[i] == "E") {
+        i = i + 1;
+        if i < len(chars) && (chars[i] == "+" || chars[i] == "-") {
+            i = i + 1;
+        }
+        let expstart = i;
+        while i < len(chars) && toml_is_digit(chars[i]) {
+            i = i + 1;
+        }
+        if i == expstart {
+            return false;
+        }
+        digits = true;
+    }
+    return digits && i == len(chars);
+}
+
+// Classify a scalar literal: kind + decoded content. Strings keep
+// their UNESCAPED content in `raw`.
+fn toml_classify(lit: string) -> Result<TomlVal, string> {
+    let chars: Array<string> = split(lit, "");
+    if len(chars) >= 2 && chars[0] == "\"" {
+        if chars[len(chars) - 1] != "\"" {
+            return Err("unterminated string: " + lit);
+        }
+        let mut out: string = "";
+        let mut i: int = 1;
+        while i < len(chars) - 1 {
+            if chars[i] == "\\" {
+                i = i + 1;
+                if i >= len(chars) - 1 {
+                    return Err("unterminated escape in: " + lit);
+                }
+                let e = chars[i];
+                if e == "n" {
+                    out = out + "\n";
+                } else {
+                    if e == "t" {
+                        out = out + "\t";
+                    } else {
+                        if e == "\"" || e == "\\" {
+                            out = out + e;
+                        } else {
+                            if e == "u" {
+                                return Err("unicode escapes (\\u) are not supported");
+                            } else {
+                                return Err("bad escape: \\" + e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                out = out + chars[i];
+            }
+            i = i + 1;
+        }
+        return Ok(toml_make("str", out));
+    }
+    if len(chars) >= 2 && chars[0] == "'" {
+        if chars[len(chars) - 1] != "'" {
+            return Err("unterminated literal string: " + lit);
+        }
+        let mut out: string = "";
+        for i in 1..(len(chars) - 1) {
+            out = out + chars[i];
+        }
+        return Ok(toml_make("str", out));
+    }
+    if lit == "true" || lit == "false" {
+        return Ok(toml_make("bool", lit));
+    }
+    if toml_is_int_literal(lit) {
+        return Ok(toml_make("int", toml_strip_underscores(lit)));
+    }
+    if toml_is_float_literal(lit) {
+        return Ok(toml_make("float", toml_strip_underscores(lit)));
+    }
+    return Err("bad value: " + lit);
+}
+
+// --- line parsing ---
+
+fn toml_trim(s: string) -> string {
+    let chars: Array<string> = split(s, "");
+    let mut a: int = 0;
+    while a < len(chars) && (chars[a] == " " || chars[a] == "\t") {
+        a = a + 1;
+    }
+    let mut b: int = len(chars);
+    while b > a && (chars[b - 1] == " " || chars[b - 1] == "\t") {
+        b = b - 1;
+    }
+    let mut out: string = "";
+    for i in a..b {
+        out = out + chars[i];
+    }
+    return out;
+}
+
+// Strip a `#` comment (outside quotes).
+fn toml_strip_comment(line: string) -> string {
+    let chars: Array<string> = split(line, "");
+    let mut quote: string = "";
+    let mut out: string = "";
+    for c in chars {
+        if quote != "" {
+            out = out + c;
+            if c == quote {
+                quote = "";
+            } else {
+            }
+        } else {
+            if c == "\"" || c == "'" {
+                quote = c;
+                out = out + c;
+            } else {
+                if c == "#" {
+                    break;
+                } else {
+                    out = out + c;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+fn toml_split_key(key: string) -> Result<Array<string>, string> {
+    let chars: Array<string> = split(key, "");
+    let mut parts: Array<string> = [];
+    let mut cur: string = "";
+    let mut quote: string = "";
+    for c in chars {
+        if quote != "" {
+            cur = cur + c;
+            if c == quote {
+                quote = "";
+            } else {
+            }
+        } else {
+            if c == "\"" || c == "'" {
+                quote = c;
+                cur = cur + c;
+            } else {
+                if c == "." {
+                    if toml_trim(cur) == "" {
+                        return Err("empty key segment in: " + key);
+                    }
+                    push(parts, toml_trim(cur));
+                    cur = "";
+                } else {
+                    cur = cur + c;
+                }
+            }
+        }
+    }
+    if quote != "" {
+        return Err("unterminated quoted key: " + key);
+    }
+    if toml_trim(cur) == "" {
+        return Err("empty key in: " + key);
+    }
+    push(parts, toml_trim(cur));
+    // Unquote quoted segments. Dots inside quoted segments are
+    // rejected: paths split on `.`, so a dotted quoted key cannot
+    // round-trip (documented limitation).
+    let mut clean: Array<string> = [];
+    for p in parts {
+        let pc: Array<string> = split(p, "");
+        if len(pc) >= 2 && ((pc[0] == "\"" && pc[len(pc) - 1] == "\"") || (pc[0] == "'" && pc[len(pc) - 1] == "'")) {
+            let mut inner: string = "";
+            for i in 1..(len(pc) - 1) {
+                inner = inner + pc[i];
+            }
+            let ic: Array<string> = split(inner, "");
+            for c in ic {
+                if c == "." {
+                    return Err("dotted quoted keys are not supported: " + key);
+                } else {
+                }
+            }
+            push(clean, inner);
+        } else {
+            push(clean, p);
+        }
+    }
+    return Ok(clean);
+}
+
+fn toml_join_path(prefix: string, segs: Array<string>) -> string {
+    let mut out: string = prefix;
+    for s in segs {
+        if out != "" {
+            out = out + ".";
+        }
+        out = out + s;
+    }
+    return out;
+}
+
+// --- document model: flat (dotted path, literal) entries ---
+
+struct TomlEntry {
+    path: string,
+    lit: string,
+    line: int,
+}
+
+struct TomlDoc {
+    entries: Array<TomlEntry>,
+}
+
+fn toml_parse_lines(lines: Array<string>) -> Result<TomlDoc, string> {
+    let mut entries: Array<TomlEntry> = [];
+    let mut section: string = "";
+    for ln in 0..len(lines) {
+        let raw = toml_strip_comment(lines[ln]);
+        let line = toml_trim(raw);
+        if line == "" {
+            continue;
+        }
+        let chars: Array<string> = split(line, "");
+        if chars[0] == "[" {
+            if chars[len(chars) - 1] != "]" {
+                return Err("bad section header at line " + to_string(ln + 1));
+            }
+            let mut inner: string = "";
+            for i in 1..(len(chars) - 1) {
+                inner = inner + chars[i];
+            }
+            let segs = toml_split_key(toml_trim(inner))?;
+            let mut p: string = "";
+            for s in segs {
+                if p != "" {
+                    p = p + ".";
+                }
+                p = p + s;
+            }
+            section = p;
+            continue;
+        }
+        // key = value: split on the first `=` outside quotes/brackets.
+        let mut eq = -1;
+        let mut quote: string = "";
+        let mut depth: int = 0;
+        for i in 0..len(chars) {
+            let c = chars[i];
+            if quote != "" {
+                if c == quote {
+                    quote = "";
+                } else {
+                }
+            } else {
+                if c == "\"" || c == "'" {
+                    quote = c;
+                } else {
+                    if c == "[" {
+                        depth = depth + 1;
+                    } else {
+                        if c == "]" {
+                            depth = depth - 1;
+                        } else {
+                            if c == "=" && depth == 0 {
+                                eq = i;
+                                break;
+                            } else {
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if eq < 0 {
+            return Err("expected `=` at line " + to_string(ln + 1));
+        }
+        let mut k: string = "";
+        for i in 0..eq {
+            k = k + chars[i];
+        }
+        let mut v: string = "";
+        for i in (eq + 1)..len(chars) {
+            v = v + chars[i];
+        }
+        let segs = toml_split_key(toml_trim(k))?;
+        let mut path: string = section;
+        for s in segs {
+            if path != "" {
+                path = path + ".";
+            }
+            path = path + s;
+        }
+        let lit = toml_trim(v);
+        if lit == "" {
+            return Err("missing value at line " + to_string(ln + 1));
+        }
+        push(entries, TomlEntry { path: path, lit: lit, line: ln + 1 });
+    }
+    return Ok(TomlDoc { entries: entries });
+}
+
+fn toml_has_newline(s: string) -> bool {
+    let chars: Array<string> = split(s, "");
+    for c in chars {
+        if c == "\n" {
+            return true;
+        } else {
+        }
+    }
+    return false;
+}
+
+// Build a table TomlVal for `prefix` from flat entries: immediate
+// children become scalar entries; deeper paths group into
+// multi-line source fragments (re-parsed with their absolute
+// prefix on access).
+fn toml_build(entries: Array<TomlEntry>, prefix: string) -> Result<TomlVal, string> {
+    let mut keys: Array<string> = [];
+    let mut vals: Array<string> = [];
+    let prelen = len(split(prefix, ""));
+    for e in entries {
+        // Segment-aware prefix match: `server` matches
+        // `server.host` but never `server2.x`.
+        let mut under = false;
+        let mut rest: string = "";
+        if prefix == "" {
+            under = true;
+            rest = e.path;
+        } else {
+            let ec: Array<string> = split(e.path, "");
+            let pc: Array<string> = split(prefix, "");
+            if len(ec) > len(pc) {
+                let mut same = true;
+                for i in 0..len(pc) {
+                    if ec[i] != pc[i] {
+                        same = false;
+                    } else {
+                    }
+                }
+                if same && ec[len(pc)] == "." {
+                    under = true;
+                    for i in (len(pc) + 1)..len(ec) {
+                        rest = rest + ec[i];
+                    }
+                } else {
+                }
+            } else {
+            }
+        }
+        if !under {
+            continue;
+        } else {
+        }
+        if rest == "" {
+            continue;
+        } else {
+        }
+        // First segment (up to the next dot).
+        let rc: Array<string> = split(rest, "");
+        let mut dot = -1;
+        for i in 0..len(rc) {
+            if rc[i] == "." {
+                dot = i;
+                break;
+            } else {
+            }
+        }
+        if dot < 0 {
+            // Immediate scalar child: duplicate keys are an error.
+            for k in 0..len(keys) {
+                if keys[k] == rest {
+                    return Err("duplicate key: " + e.path);
+                } else {
+                }
+            }
+            push(keys, rest);
+            push(vals, e.lit);
+        } else {
+            let mut name: string = "";
+            for i in 0..dot {
+                name = name + rc[i];
+            }
+            // Group under the subtable fragment: append the
+            // ORIGINAL line form so the fragment stays valid TOML.
+            let mut line: string = "";
+            if prefix != "" {
+                line = line + prefix + ".";
+            }
+            line = line + rest + " = " + e.lit;
+            let mut found = -1;
+            for k in 0..len(keys) {
+                if keys[k] == name {
+                    found = k;
+                } else {
+                }
+            }
+            // Fragments always end with a newline: that is exactly
+            // how table access tells a subtable fragment (multi-line
+            // by construction) from a scalar literal (never contains
+            // a newline — validated at parse).
+            if found < 0 {
+                push(keys, name);
+                push(vals, line + "\n");
+            } else {
+                vals[found] = vals[found] + line + "\n";
+            }
+        }
+    }
+    let none: Array<string> = [];
+    return Ok(TomlVal { kind: "table", raw: "", items: none, keys: keys, vals: vals, prefix: prefix });
+}
+
+pub fn toml_parse(text: string) -> Result<TomlVal, string> {
+    let lines: Array<string> = split(text, "\n");
+    let doc = toml_parse_lines(lines)?;
+    // Validate every scalar literal now (fail fast with line info).
+    for e in doc.entries {
+        if toml_has_newline(e.lit) {
+            return Err("multi-line values are not supported (line " + to_string(e.line) + ")");
+        }
+        let vc: Array<string> = split(toml_trim(e.lit), "");
+        if len(vc) > 0 && vc[0] == "[" {
+            // Array: validate brackets balance + each element.
+            if vc[len(vc) - 1] != "]" {
+                return Err("unterminated array (line " + to_string(e.line) + ")");
+            }
+            let inner = toml_array_inner(e.lit)?;
+            for el in inner {
+                toml_classify(el)?;
+            }
+        } else {
+            if vc[0] == "{" {
+                return Err("inline tables are not supported (line " + to_string(e.line) + ")");
+            }
+            toml_classify(e.lit)?;
+        }
+    }
+    // Duplicate full paths are an error (double definition).
+    for i in 0..len(doc.entries) {
+        for j in (i + 1)..len(doc.entries) {
+            if doc.entries[i].path == doc.entries[j].path {
+                return Err("duplicate key: " + doc.entries[i].path);
+            } else {
+            }
+        }
+    }
+    return toml_build(doc.entries, "");
+}
+
+// Array inner elements (top-level commas only; nested arrays and
+// tables are rejected — config-shaped scope).
+fn toml_array_inner(lit: string) -> Result<Array<string>, string> {
+    let chars: Array<string> = split(lit, "");
+    let mut inner: string = "";
+    for i in 1..(len(chars) - 1) {
+        inner = inner + chars[i];
+    }
+    let ic: Array<string> = split(inner, "");
+    let mut parts: Array<string> = [];
+    let mut cur: string = "";
+    let mut quote: string = "";
+    let mut depth: int = 0;
+    for c in ic {
+        if quote != "" {
+            cur = cur + c;
+            if c == quote {
+                quote = "";
+            } else {
+            }
+        } else {
+            if c == "\"" || c == "'" {
+                quote = c;
+                cur = cur + c;
+            } else {
+                if c == "[" || c == "{" {
+                    return Err("nested arrays/tables are not supported: " + lit);
+                } else {
+                    if c == "," && depth == 0 {
+                        push(parts, toml_trim(cur));
+                        cur = "";
+                    } else {
+                        cur = cur + c;
+                    }
+                }
+            }
+        }
+    }
+    if toml_trim(cur) != "" {
+        push(parts, toml_trim(cur));
+    }
+    return Ok(parts);
+}
+
+// --- accessors (mirror json) ---
+
+pub fn toml_table_get(v: TomlVal, key: string) -> Result<TomlVal, string> {
+    if v.kind != "table" {
+        return Err("expected table, got " + v.kind);
+    }
+    for i in 0..len(v.keys) {
+        if v.keys[i] == key {
+            let frag = v.vals[i];
+            if toml_has_newline(frag) {
+                // Subtable fragment (absolute paths): re-parse and
+                // rebuild under its absolute prefix.
+                let mut abs = key;
+                if v.prefix != "" {
+                    abs = v.prefix + "." + key;
+                }
+                let lines: Array<string> = split(frag, "\n");
+                let doc = toml_parse_lines(lines)?;
+                return toml_build(doc.entries, abs);
+            }
+            let c = toml_classify(frag)?;
+            if c.kind == "str" || c.kind == "int" || c.kind == "bool" || c.kind == "float" {
+                return Ok(c);
+            }
+            return Err("bad value for key: " + key);
+        } else {
+        }
+    }
+    return Err("missing key: " + key);
+}
+
+pub fn toml_array_len(v: TomlVal) -> Result<int, string> {
+    if v.kind != "arr" {
+        return Err("expected array, got " + v.kind);
+    }
+    return Ok(len(v.items));
+}
+
+pub fn toml_array_get(v: TomlVal, i: int) -> Result<TomlVal, string> {
+    if v.kind != "arr" {
+        return Err("expected array, got " + v.kind);
+    }
+    if i < 0 || i >= len(v.items) {
+        return Err("array index out of bounds: " + to_string(i));
+    }
+    return toml_classify(v.items[i]);
+}
+
+pub fn toml_as_bool(v: TomlVal) -> Result<bool, string> {
+    if v.kind != "bool" {
+        return Err("expected bool, got " + v.kind);
+    }
+    return Ok(v.raw == "true");
+}
+
+pub fn toml_as_int(v: TomlVal) -> Result<int, string> {
+    if v.kind != "int" {
+        return Err("expected int, got " + v.kind);
+    }
+    return Ok(parse_int(v.raw));
+}
+
+pub fn toml_as_float(v: TomlVal) -> Result<float, string> {
+    if v.kind != "float" {
+        return Err("expected float, got " + v.kind);
+    }
+    return toml_parse_float(v.raw);
+}
+
+pub fn toml_as_string(v: TomlVal) -> Result<string, string> {
+    if v.kind != "str" {
+        return Err("expected string, got " + v.kind);
+    }
+    return Ok(v.raw);
+}
+
+fn toml_parse_float(s: string) -> Result<float, string> {
+    let chars: Array<string> = split(s, "");
+    let mut i: int = 0;
+    let mut neg: bool = false;
+    if chars[i] == "-" || chars[i] == "+" {
+        neg = chars[i] == "-";
+        i = i + 1;
+    }
+    let mut value: float = 0.0;
+    while i < len(chars) && toml_is_digit(chars[i]) {
+        value = value * 10.0 + to_float(parse_int(chars[i]));
+        i = i + 1;
+    }
+    if i < len(chars) && chars[i] == "." {
+        i = i + 1;
+        let mut div: float = 1.0;
+        while i < len(chars) && toml_is_digit(chars[i]) {
+            div = div * 10.0;
+            value = value + to_float(parse_int(chars[i])) / div;
+            i = i + 1;
+        }
+    }
+    if i < len(chars) && (chars[i] == "e" || chars[i] == "E") {
+        i = i + 1;
+        let mut eneg: bool = false;
+        if i < len(chars) && (chars[i] == "-" || chars[i] == "+") {
+            eneg = chars[i] == "-";
+            i = i + 1;
+        }
+        let mut exp: int = 0;
+        while i < len(chars) && toml_is_digit(chars[i]) {
+            exp = exp * 10 + parse_int(chars[i]);
+            i = i + 1;
+        }
+        let mut j: int = 0;
+        while j < exp {
+            if eneg {
+                value = value / 10.0;
+            } else {
+                value = value * 10.0;
+            }
+            j = j + 1;
+        }
+    }
+    if neg {
+        value = 0.0 - value;
+    }
+    return Ok(value);
+}
+
+// Arrays surface through table access: a scalar entry whose
+// literal is `[...]` materializes as an `arr` TomlVal.
+pub fn toml_table_get_array(v: TomlVal, key: string) -> Result<TomlVal, string> {
+    if v.kind != "table" {
+        return Err("expected table, got " + v.kind);
+    }
+    for i in 0..len(v.keys) {
+        if v.keys[i] == key {
+            let lit = toml_trim(v.vals[i]);
+            let lc: Array<string> = split(lit, "");
+            if len(lc) < 2 || lc[0] != "[" {
+                return Err("expected array, got scalar for key: " + key);
+            }
+            let items = toml_array_inner(lit)?;
+            for el in items {
+                toml_classify(el)?;
+            }
+            let nokeys: Array<string> = [];
+            return Ok(TomlVal { kind: "arr", raw: "", items: items, keys: nokeys, vals: nokeys, prefix: v.prefix });
+        } else {
+        }
+    }
+    return Err("missing key: " + key);
+}
+
+fn toml_escape(s: string) -> string {
+    let chars: Array<string> = split(s, "");
+    let mut out: string = "";
+    for c in chars {
+        if c == "\"" {
+            out = out + "\\\"";
+        } else {
+            if c == "\\" {
+                out = out + "\\\\";
+            } else {
+                if c == "\n" {
+                    out = out + "\\n";
+                } else {
+                    if c == "\t" {
+                        out = out + "\\t";
+                    } else {
+                        out = out + c;
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+pub fn toml_stringify(v: TomlVal) -> string {
+    if v.kind == "str" {
+        return "\"" + toml_escape(v.raw) + "\"";
+    }
+    if v.kind == "int" || v.kind == "bool" || v.kind == "float" {
+        return v.raw;
+    }
+    if v.kind == "arr" {
+        return "[" + join(v.items, ", ") + "]";
+    }
+    // Table: scalar entries as `key = literal`, subtable fragments
+    // as their original section lines (absolute paths preserved).
+    let mut out: string = "";
+    for i in 0..len(v.keys) {
+        let frag = v.vals[i];
+        if toml_has_newline(frag) {
+            out = out + frag;
+        } else {
+            out = out + v.keys[i] + " = " + frag + "\n";
+        }
+    }
+    return out;
+}

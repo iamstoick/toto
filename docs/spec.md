@@ -1256,6 +1256,117 @@ eventually resumes under load. Workloads, seeds/workers,
 and run counts recorded in the Wave 1 report — the proof
 is evidence, not a timing assertion.
 
+## 18. Cryptography (Enterprise Wave 1; amendment record 2026-11-20)
+
+Primitives are BOUND, never implemented: every digest byte,
+tag, ciphertext, signature, random byte, and certificate
+verdict comes from the linked system libcrypto (OpenSSL 3 on
+Linux, LibreSSL on macOS — the same load-time link model as
+libc/libm; see `docs/ffi.md`). No new builtin type, no new
+builtin, no D5/type-system change. JIT/AOT refuse the surface
+(run with `toto run`/`toto test`); Windows gets check-time
+`E0301` like the net surface.
+
+### 18.1 Byte representation
+
+Same carve-out as §17.1: payloads are `Array<int>` with every
+element 0–255 (out-of-range is `E0308`). No handles are
+retained: every call is one-shot (no contexts, no key objects
+crossing the boundary — rooting covers the call).
+
+### 18.2 Functions (`gzv.std/crypto`)
+
+All return `Result<_, string>`; `Err` carries the library
+message (fixed strings where the library wording differs
+between OpenSSL and LibreSSL, so error goldens hold on every
+platform).
+
+- `crypto_sha256(data)` / `crypto_sha512(data)` → digests
+  (32/64 bytes).
+- `crypto_hmac_sha256(key, data)` /
+  `crypto_hmac_sha512(key, data)` → tags (32/64 bytes).
+- `crypto_aead_encrypt(key32, nonce12, pt, aad)` → `ciphertext
+  || tag(16)` (AES-256-GCM); `crypto_aead_decrypt` authenticates
+  or `Err`s.
+- `crypto_sign_keygen()` → `SignKeyPair { secret(32),
+  public(64) }` (`x || y`, no `0x04` prefix);
+  `crypto_sign_sign(secret32, msg)` → DER signature (ECDSA P-256
+  over SHA-256); `crypto_sign_verify(public64, msg, sig)` → 1
+  (valid), 0 (bad math), `Err` (malformed input).
+- `crypto_random(n)` → `n` bytes (`RAND_bytes`, 1–65536).
+- `crypto_x509_verify(leaf_pem, ca_pem)` → 1 iff the leaf chains
+  to the trust root (0 = bad chain; `Err` = unparseable PEM).
+- `crypto_openssl_version()` → the runtime library version
+  (infallible; never pinned in goldens).
+
+### 18.3 Conformance (what "done" means)
+
+Known-answer tests against published vectors for every
+primitive (NIST SHS digests, RFC 4231 HMAC, pinned AES-GCM and
+ECDSA vectors cross-checked with the OpenSSL CLI and Python
+`cryptography` before pinning, X.509 fixtures verified with
+`openssl verify` at generation), plus error-path negatives —
+green on every supported platform via the executor.
+
+## 19. Serialization beyond JSON (Enterprise Wave 1; amendment record 2026-11-20)
+
+Alongside the JSON already in `gzv.std`. Pure Toto code, except
+compression (runtime over the mature pure-Rust `flate2`
+crate — no C code, identical bytes everywhere). Each format
+states its scope; anything outside the scope is a clear error,
+never silent reinterpretation. New modules only
+(`gzv.std/toml`, `gzv.std/yaml`, `gzv.std/proto`,
+`gzv.std/compress`); no new builtin, no type-system change.
+Pure-Toto formats work in `toto build` outputs; compression
+refuses in JIT/AOT like the other byte-array surfaces.
+
+### 19.1 TOML (`gzv.std/toml`)
+
+Config-shaped subset: tables (incl. dotted `[a.b]` and dotted
+keys), string/int/bool/float values, single-line arrays of
+scalars, `#` comments. Values are `TomlVal` structs mirroring
+the `JsonVal` strata design (nested tables store as source-line
+fragments, re-parsed with an absolute-path prefix on access).
+NOT covered: inline tables, arrays of tables, datetimes,
+multi-line strings, hex/octal/binary ints, `\u` escapes (same
+rule as JSON). Empty tables report missing (documented
+limitation).
+
+### 19.2 YAML (`gzv.std/yaml`)
+
+Config-shaped subset: block mappings/sequences, nesting by
+spaces-only indentation, plain/single/double-quoted scalars,
+int/bool/null/float scalars, `#` comments, inline `- k: v`
+mappings. Same strata design (nested blocks store dedented,
+re-parsed on access); fragments are validated eagerly so
+malformed content fails at parse time. NOT covered: anchors,
+tags, flow styles, multi-document streams, tabs, `\u`
+escapes. Canonical 2-space-indent `yaml_stringify` output is
+verified re-parse-stable and cross-checked with PyYAML.
+
+### 19.3 Protobuf (`gzv.std/proto`)
+
+Wire subset: field numbers 1–2²⁹−1, wire types 0 (varint,
+non-negative only) and 2 (length-delimited bytes); no
+`.proto` compiler, no codegen — schema-driven encode/decode
+over explicit field descriptors (`PbField`/`PbSchema`).
+Unknown fields are SKIPPED per protobuf rules; unknown wire
+types, groups, fixed32/64, and negative ints are clear errors.
+Strings cross as bytes (the caller maps text). Conformance:
+hand-computed golden wire bytes for a stated contract
+(`Person{id=300, name="hi"}`), verified against the encoding
+rules independently of the implementation.
+
+### 19.4 Compression (`gzv.std/compress`)
+
+gzip (RFC 1952, default level) via `flate2`/`miniz_oxide`.
+Interop is proven against the system utilities, not our own
+bytes: the suite decompresses a `gzip -n` oracle vector and
+round-trips, and our encoder output is verified with the
+system gunzip; compressed bytes are never pinned (headers may
+vary). Failures are one fixed string (`decompress: invalid
+gzip data`), so error goldens hold everywhere.
+
 ## Appendix A. Spec decisions (choices beyond the PDF)
 
 Every **[Proposal]** above is a judgment call the PDF did not fix. For the

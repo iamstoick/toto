@@ -1,0 +1,188 @@
+import "gzv.std/crypto.gzv";
+import "gzv.std/strings.gzv";
+
+// Wave 1 crypto known-answer tests (NIST SHS / RFC 4231 / pinned
+// AES-GCM + ECDSA + X.509 fixtures). Every primitive has a passing
+// KAT: digests and HMAC against published vectors, AEAD/signatures
+// against vectors pinned with independent oracles (OpenSSL CLI +
+// Python `cryptography`, cross-checked before pinning), X.509 against
+// `fixtures/*.pem` (verified with `openssl verify` at generation).
+// Sections return `Result<string, string>`; `main` prints each so
+// the golden pins every vector outcome. Randomized outputs (keygen,
+// CSPRNG draws, fresh signatures) are never printed — only their
+// verified properties are.
+
+fn eq_bytes(a: Array<int>, b: Array<int>) -> bool {
+    if len(a) != len(b) {
+        return false;
+    }
+    for i in 0..len(a) {
+        if a[i] != b[i] {
+            return false;
+        } else {
+        }
+    }
+    return true;
+}
+
+fn tamper_at(a: Array<int>, idx: int) -> Array<int> {
+    let mut out: Array<int> = [];
+    for i in 0..len(a) {
+        if i == idx {
+            push(out, (a[i] + 1) % 256);
+        } else {
+            push(out, a[i]);
+        }
+    }
+    return out;
+}
+
+fn expect_arr_err(got: Result<Array<int>, string>, want_msg: string) -> Result<bool, string> {
+    let want: Result<Array<int>, string> = Err(want_msg);
+    if got != want {
+        return Err("wrong error, want `" + want_msg + "`");
+    }
+    return Ok(true);
+}
+
+fn expect_int_err(got: Result<int, string>, want_msg: string) -> Result<bool, string> {
+    let want: Result<int, string> = Err(want_msg);
+    if got != want {
+        return Err("wrong error, want `" + want_msg + "`");
+    }
+    return Ok(true);
+}
+
+fn t_digests() -> Result<string, string> {
+    let abc: Array<int> = [97, 98, 99];
+    let empty: Array<int> = [];
+    let sha_abc: Array<int> = [186, 120, 22, 191, 143, 1, 207, 234, 65, 65, 64, 222, 93, 174, 34, 35, 176, 3, 97, 163, 150, 23, 122, 156, 180, 16, 255, 97, 242, 0, 21, 173];
+    let sha_empty: Array<int> = [227, 176, 196, 66, 152, 252, 28, 20, 154, 251, 244, 200, 153, 111, 185, 36, 39, 174, 65, 228, 100, 155, 147, 76, 164, 149, 153, 27, 120, 82, 184, 85];
+    let sha512_abc: Array<int> = [221, 175, 53, 161, 147, 97, 122, 186, 204, 65, 115, 73, 174, 32, 65, 49, 18, 230, 250, 78, 137, 169, 126, 162, 10, 158, 238, 230, 75, 85, 211, 154, 33, 146, 153, 42, 39, 79, 193, 168, 54, 186, 60, 35, 163, 254, 235, 189, 69, 77, 68, 35, 100, 60, 232, 14, 42, 154, 201, 79, 165, 76, 164, 159];
+    if !eq_bytes(crypto_sha256(abc)?, sha_abc) {
+        return Err("sha256(abc) mismatch");
+    }
+    if !eq_bytes(crypto_sha256(empty)?, sha_empty) {
+        return Err("sha256() mismatch");
+    }
+    let d512 = crypto_sha512(abc)?;
+    if len(d512) != 64 || !eq_bytes(d512, sha512_abc) {
+        return Err("sha512(abc) mismatch");
+    }
+    return Ok("DIGEST-OK");
+}
+
+fn t_hmac() -> Result<string, string> {
+    let key20: Array<int> = [11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11];
+    let hithere: Array<int> = [72, 105, 32, 84, 104, 101, 114, 101];
+    let tc1: Array<int> = [176, 52, 76, 97, 216, 219, 56, 83, 92, 168, 175, 206, 175, 11, 241, 43, 136, 29, 194, 0, 201, 131, 61, 167, 38, 233, 55, 108, 46, 50, 207, 247];
+    let jefe_k: Array<int> = [74, 101, 102, 101];
+    let jefe_d: Array<int> = [119, 104, 97, 116, 32, 100, 111, 32, 121, 97, 32, 119, 97, 110, 116, 32, 102, 111, 114, 32, 110, 111, 116, 104, 105, 110, 103, 63];
+    let tc2: Array<int> = [91, 220, 193, 70, 191, 96, 117, 78, 106, 4, 36, 38, 8, 149, 117, 199, 90, 0, 63, 8, 157, 39, 57, 131, 157, 236, 88, 185, 100, 236, 56, 67];
+    let tc1_512: Array<int> = [135, 170, 124, 222, 165, 239, 97, 157, 79, 240, 180, 36, 26, 29, 108, 176, 35, 121, 244, 226, 206, 78, 194, 120, 122, 208, 179, 5, 69, 225, 124, 222, 218, 168, 51, 183, 214, 184, 167, 2, 3, 139, 39, 78, 174, 163, 244, 228, 190, 157, 145, 78, 235, 97, 241, 112, 46, 105, 108, 32, 58, 18, 104, 84];
+    if !eq_bytes(crypto_hmac_sha256(key20, hithere)?, tc1) {
+        return Err("hmac256 TC1 mismatch");
+    }
+    if !eq_bytes(crypto_hmac_sha256(jefe_k, jefe_d)?, tc2) {
+        return Err("hmac256 TC2 mismatch");
+    }
+    if !eq_bytes(crypto_hmac_sha512(key20, hithere)?, tc1_512) {
+        return Err("hmac512 TC1 mismatch");
+    }
+    return Ok("HMAC-OK");
+}
+
+fn t_aead() -> Result<string, string> {
+    let key: Array<int> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31];
+    let iv: Array<int> = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    let aad: Array<int> = [119, 97, 118, 101, 49, 45, 97, 97, 100];
+    let pt: Array<int> = [72, 101, 108, 108, 111, 44, 32, 65, 69, 65, 68, 32, 119, 111, 114, 108, 100, 33];
+    let ct: Array<int> = [15, 103, 186, 119, 170, 201, 226, 90, 200, 0, 211, 171, 198, 134, 10, 1, 231, 247, 52, 43, 249, 200, 20, 228, 98, 49, 241, 41, 235, 71, 245, 73, 105, 203];
+    if !eq_bytes(crypto_aead_encrypt(key, iv, pt, aad)?, ct) {
+        return Err("aead encrypt mismatch");
+    }
+    if !eq_bytes(crypto_aead_decrypt(key, iv, ct, aad)?, pt) {
+        return Err("aead decrypt mismatch");
+    }
+    expect_arr_err(crypto_aead_decrypt(key, iv, tamper_at(ct, 0), aad), "aead_decrypt: authentication failed")?;
+    let short_key: Array<int> = [0, 1, 2];
+    expect_arr_err(crypto_aead_encrypt(short_key, iv, pt, aad), "aead_encrypt key: need 32 bytes, got 3")?;
+    return Ok("AEAD-OK");
+}
+
+fn t_sign() -> Result<string, string> {
+    let priv: Array<int> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 255, 238, 18, 52];
+    let pubx: Array<int> = [128, 135, 77, 199, 82, 4, 153, 93, 102, 176, 205, 32, 212, 63, 159, 215, 165, 108, 235, 204, 229, 31, 6, 7, 72, 66, 68, 255, 208, 113, 23, 190];
+    let puby: Array<int> = [0, 96, 145, 14, 120, 136, 159, 95, 106, 73, 203, 130, 19, 59, 220, 117, 103, 48, 41, 9, 89, 243, 130, 123, 92, 7, 12, 11, 134, 234, 84, 137];
+    let mut public: Array<int> = [];
+    for i in 0..32 {
+        push(public, pubx[i]);
+    }
+    for i in 0..32 {
+        push(public, puby[i]);
+    }
+    let msg: Array<int> = [119, 97, 118, 101, 49, 45, 101, 99, 100, 115, 97, 45, 118, 101, 99, 116, 111, 114];
+    let sig: Array<int> = [48, 68, 2, 32, 22, 121, 28, 113, 240, 114, 117, 136, 248, 33, 40, 89, 212, 154, 69, 150, 113, 115, 33, 190, 255, 231, 192, 188, 29, 220, 142, 91, 49, 236, 30, 82, 2, 32, 4, 11, 102, 223, 60, 208, 63, 198, 192, 167, 27, 223, 132, 234, 216, 227, 95, 117, 169, 140, 133, 86, 44, 181, 217, 120, 57, 250, 69, 117, 222, 156];
+    if crypto_sign_verify(public, msg, sig)? != 1 {
+        return Err("fixed ECDSA vector rejected");
+    }
+    if crypto_sign_verify(public, msg, tamper_at(sig, 10))? != 0 {
+        return Err("tampered signature accepted");
+    }
+    let fresh = crypto_sign_sign(priv, msg)?;
+    if crypto_sign_verify(public, msg, fresh)? != 1 {
+        return Err("fresh signature rejected");
+    }
+    let short_pub: Array<int> = [1, 2, 3];
+    expect_int_err(crypto_sign_verify(short_pub, msg, sig), "verify public: need 64 bytes, got 3")?;
+    return Ok("SIGN-OK");
+}
+
+fn t_random() -> Result<string, string> {
+    let a = crypto_random(32)?;
+    let b = crypto_random(32)?;
+    if len(a) != 32 || len(b) != 32 {
+        return Err("bad random length");
+    }
+    if eq_bytes(a, b) {
+        return Err("two CSPRNG draws identical");
+    }
+    expect_arr_err(crypto_random(0), "random: need 1-65536 bytes, got 0")?;
+    return Ok("RANDOM-OK");
+}
+
+fn t_x509() -> Result<string, string> {
+    let leaf = read_file("fixtures/leaf.pem");
+    let ca = read_file("fixtures/ca.pem");
+    let expired = read_file("fixtures/expired.pem");
+    let other = read_file("fixtures/other-leaf.pem");
+    let other_ca = read_file("fixtures/other-ca.pem");
+    if crypto_x509_verify(leaf, ca)? != 1 {
+        return Err("valid chain rejected");
+    }
+    if crypto_x509_verify(expired, ca)? != 0 {
+        return Err("expired chain accepted");
+    }
+    if crypto_x509_verify(leaf, other_ca)? != 0 {
+        return Err("wrong-CA chain accepted");
+    }
+    if crypto_x509_verify(other, ca)? != 0 {
+        return Err("foreign leaf accepted");
+    }
+    expect_int_err(crypto_x509_verify("not a pem", ca), "x509 leaf: unparseable PEM")?;
+    let v = crypto_openssl_version();
+    if !starts_with(v, "OpenSSL ") && !starts_with(v, "LibreSSL ") {
+        return Err("unexpected library version: " + v);
+    }
+    return Ok("X509-OK");
+}
+
+fn main() -> int {
+    println(t_digests());
+    println(t_hmac());
+    println(t_aead());
+    println(t_sign());
+    println(t_random());
+    println(t_x509());
+    return 0;
+}

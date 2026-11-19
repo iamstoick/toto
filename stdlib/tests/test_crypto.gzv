@@ -1,0 +1,109 @@
+// stdlib crypto tests: run with `toto test` from stdlib/.
+//
+// Round-trips and properties (fixed vectors live in the proj13
+// corpus project; nothing random is printed here — only verified
+// properties). Sections return `Result<bool, string>`; `main`
+// compares against `Ok(true)` and exits nonzero on failure.
+
+import "gzv.std/crypto.gzv";
+
+fn eq_bytes(a: Array<int>, b: Array<int>) -> bool {
+    if len(a) != len(b) {
+        return false;
+    }
+    for i in 0..len(a) {
+        if a[i] != b[i] {
+            return false;
+        } else {
+        }
+    }
+    return true;
+}
+
+fn t_digests() -> Result<bool, string> {
+    if len(crypto_sha256([104, 105])?) != 32 {
+        return Err("sha256 length");
+    }
+    if len(crypto_sha512([104, 105])?) != 64 {
+        return Err("sha512 length");
+    }
+    if len(crypto_hmac_sha256([1, 2, 3], [4, 5])?) != 32 {
+        return Err("hmac256 length");
+    }
+    if len(crypto_hmac_sha512([1, 2, 3], [4, 5])?) != 64 {
+        return Err("hmac512 length");
+    }
+    return Ok(true);
+}
+
+fn t_aead_roundtrip() -> Result<bool, string> {
+    let key = crypto_random(32)?;
+    let iv = crypto_random(12)?;
+    let aad: Array<int> = [1, 2, 3];
+    let pt: Array<int> = [10, 20, 30, 40, 50];
+    let ct = crypto_aead_encrypt(key, iv, pt, aad)?;
+    if len(ct) != len(pt) + 16 {
+        return Err("aead length");
+    }
+    if !eq_bytes(crypto_aead_decrypt(key, iv, ct, aad)?, pt) {
+        return Err("aead roundtrip");
+    }
+    let empty: Array<int> = [];
+    if !eq_bytes(crypto_aead_decrypt(key, iv, crypto_aead_encrypt(key, iv, empty, empty)?, empty)?, empty) {
+        return Err("aead empty roundtrip");
+    }
+    return Ok(true);
+}
+
+fn t_sign_roundtrip() -> Result<bool, string> {
+    let kp = crypto_sign_keygen()?;
+    if len(kp.secret) != 32 || len(kp.public) != 64 {
+        return Err("keygen lengths");
+    }
+    let msg: Array<int> = [9, 9, 9];
+    let sig = crypto_sign_sign(kp.secret, msg)?;
+    if crypto_sign_verify(kp.public, msg, sig)? != 1 {
+        return Err("sign roundtrip");
+    }
+    let other: Array<int> = [8, 8, 8];
+    if crypto_sign_verify(kp.public, other, sig)? != 0 {
+        return Err("wrong message accepted");
+    }
+    return Ok(true);
+}
+
+fn t_random_version() -> Result<bool, string> {
+    if len(crypto_random(1)?) != 1 {
+        return Err("random(1) length");
+    }
+    if len(crypto_random(4096)?) != 4096 {
+        return Err("random(4096) length");
+    }
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_digests() != yes {
+        println("FAIL digests");
+        failures = failures + 1;
+    }
+    if t_aead_roundtrip() != yes {
+        println("FAIL aead");
+        failures = failures + 1;
+    }
+    if t_sign_roundtrip() != yes {
+        println("FAIL sign");
+        failures = failures + 1;
+    }
+    if t_random_version() != yes {
+        println("FAIL random");
+        failures = failures + 1;
+    }
+    if failures > 0 {
+        println(to_string(failures) + " crypto failures");
+        return 1;
+    }
+    return 0;
+}

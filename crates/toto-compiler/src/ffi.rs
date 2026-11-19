@@ -320,10 +320,30 @@ pub const LINKED: &[&str] = &[
     "toto_rt_net_udp_peer_host",
     "toto_rt_net_udp_peer_port",
     "toto_rt_net_last_error",
+    // Wave 1 crypto (unix-only — same gate as networking): one-shot
+    // OpenSSL/LibreSSL calls, no retained state, no poller.
+    "toto_rt_crypto_sha256",
+    "toto_rt_crypto_sha512",
+    "toto_rt_crypto_hmac256",
+    "toto_rt_crypto_hmac512",
+    "toto_rt_crypto_aead_encrypt",
+    "toto_rt_crypto_aead_decrypt",
+    "toto_rt_crypto_sign_keygen",
+    "toto_rt_crypto_sign_sign",
+    "toto_rt_crypto_sign_verify",
+    "toto_rt_crypto_random",
+    "toto_rt_crypto_x509_verify",
+    "toto_rt_crypto_last_error",
+    "toto_rt_crypto_version",
+    // Wave 1 compression (platform-independent pure-Rust gzip: no
+    // cfg gate, works on every platform including Windows).
+    "toto_rt_gzip_compress",
+    "toto_rt_gzip_decompress",
+    "toto_rt_gzip_last_error",
 ];
 
 /// POSIX-only FFI names: threads, file descriptors, `errno`, sleep,
-/// sockets. No MSVC equivalents; naming one on Windows is a clean
+/// sockets, crypto. No MSVC equivalents; naming one on Windows is a clean
 /// E0301 at check time (the dispatch arms are `cfg(unix)` to match,
 /// so the `unreachable!("linkage checked above")` tail stays sound).
 #[cfg(windows)]
@@ -349,6 +369,22 @@ const POSIX_ONLY: &[&str] = &[
     "toto_rt_net_udp_peer_host",
     "toto_rt_net_udp_peer_port",
     "toto_rt_net_last_error",
+    "toto_rt_crypto_sha256",
+    "toto_rt_crypto_sha512",
+    "toto_rt_crypto_hmac256",
+    "toto_rt_crypto_hmac512",
+    "toto_rt_crypto_aead_encrypt",
+    "toto_rt_crypto_aead_decrypt",
+    "toto_rt_crypto_sign_keygen",
+    "toto_rt_crypto_sign_sign",
+    "toto_rt_crypto_sign_verify",
+    "toto_rt_crypto_random",
+    "toto_rt_crypto_x509_verify",
+    "toto_rt_crypto_last_error",
+    "toto_rt_crypto_version",
+    "toto_rt_gzip_compress",
+    "toto_rt_gzip_decompress",
+    "toto_rt_gzip_last_error",
 ];
 
 pub fn is_linked(name: &str) -> bool {
@@ -721,7 +757,10 @@ fn call_inner(
                 other => {
                     return Err(fail(
                         "E0308",
-                        format!("cannot resolve {} (need a hostname string)", other.type_name()),
+                        format!(
+                            "cannot resolve {} (need a hostname string)",
+                            other.type_name()
+                        ),
                         span,
                     ));
                 }
@@ -746,7 +785,10 @@ fn call_inner(
                 other => {
                     return Err(fail(
                         "E0308",
-                        format!("cannot connect to {} (need an IP string)", other.type_name()),
+                        format!(
+                            "cannot connect to {} (need an IP string)",
+                            other.type_name()
+                        ),
                         span,
                     ));
                 }
@@ -910,6 +952,251 @@ fn call_inner(
         }
         #[cfg(unix)]
         "toto_rt_net_last_error" => Ok(Value::Str(std::rc::Rc::new(take_net_error()))),
+        // Wave 1 crypto (interpreter path: one-shot OpenSSL calls —
+        // no scheduler to integrate with, and none needed: nothing
+        // here parks. Bytes cross as `Array<int>` (elements 0–255,
+        // E0308 otherwise); scalar ops return the payload length or
+        // -1; array ops return the payload or an empty array. Either
+        // way the message lands in the call-duration error slot read
+        // by `toto_rt_crypto_last_error` ("" = clean). `verify`-style
+        // ops return 1/0 (valid/invalid, slot clean) or -1 + slot on
+        // malformed input. The `gzv.std/crypto` wrappers turn this
+        // into `Result<_, string>`.
+        #[cfg(unix)]
+        "toto_rt_crypto_sha256" => {
+            let buf = bytes_arg(&args[0], span)?;
+            match crate::cryptolib::sha256(&buf) {
+                Ok(out) => {
+                    set_crypto_error(None);
+                    Ok(bytes_value(out))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_crypto_sha512" => {
+            let buf = bytes_arg(&args[0], span)?;
+            match crate::cryptolib::sha512(&buf) {
+                Ok(out) => {
+                    set_crypto_error(None);
+                    Ok(bytes_value(out))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_crypto_hmac256" => {
+            let key = bytes_arg(&args[0], span)?;
+            let data = bytes_arg(&args[1], span)?;
+            match crate::cryptolib::hmac256(&key, &data) {
+                Ok(out) => {
+                    set_crypto_error(None);
+                    Ok(bytes_value(out))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_crypto_hmac512" => {
+            let key = bytes_arg(&args[0], span)?;
+            let data = bytes_arg(&args[1], span)?;
+            match crate::cryptolib::hmac512(&key, &data) {
+                Ok(out) => {
+                    set_crypto_error(None);
+                    Ok(bytes_value(out))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_crypto_aead_encrypt" => {
+            let key = bytes_arg(&args[0], span)?;
+            let nonce = bytes_arg(&args[1], span)?;
+            let pt = bytes_arg(&args[2], span)?;
+            let aad = bytes_arg(&args[3], span)?;
+            match crate::cryptolib::aead_encrypt(&key, &nonce, &pt, &aad) {
+                Ok(out) => {
+                    set_crypto_error(None);
+                    Ok(bytes_value(out))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_crypto_aead_decrypt" => {
+            let key = bytes_arg(&args[0], span)?;
+            let nonce = bytes_arg(&args[1], span)?;
+            let cttag = bytes_arg(&args[2], span)?;
+            let aad = bytes_arg(&args[3], span)?;
+            match crate::cryptolib::aead_decrypt(&key, &nonce, &cttag, &aad) {
+                Ok(out) => {
+                    set_crypto_error(None);
+                    Ok(bytes_value(out))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_crypto_sign_keygen" => match crate::cryptolib::sign_keygen() {
+            Ok(out) => {
+                set_crypto_error(None);
+                Ok(bytes_value(out))
+            }
+            Err(e) => {
+                set_crypto_error(Some(e));
+                Ok(bytes_value(Vec::new()))
+            }
+        },
+        #[cfg(unix)]
+        "toto_rt_crypto_sign_sign" => {
+            let secret = bytes_arg(&args[0], span)?;
+            let msg = bytes_arg(&args[1], span)?;
+            match crate::cryptolib::sign_sign(&secret, &msg) {
+                Ok(out) => {
+                    set_crypto_error(None);
+                    Ok(bytes_value(out))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_crypto_sign_verify" => {
+            let public = bytes_arg(&args[0], span)?;
+            let msg = bytes_arg(&args[1], span)?;
+            let sig = bytes_arg(&args[2], span)?;
+            match crate::cryptolib::sign_verify(&public, &msg, &sig) {
+                Ok(true) => {
+                    set_crypto_error(None);
+                    Ok(Value::Int(1))
+                }
+                Ok(false) => {
+                    set_crypto_error(None);
+                    Ok(Value::Int(0))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_crypto_random" => {
+            let n = int_arg(&args[0], &sig.params[0].1, span)?;
+            if !(1..=65536).contains(&n) {
+                set_crypto_error(Some(format!("random: need 1-65536 bytes, got {n}")));
+                return Ok(bytes_value(Vec::new()));
+            }
+            match crate::cryptolib::random_bytes(n as usize) {
+                Ok(out) => {
+                    set_crypto_error(None);
+                    Ok(bytes_value(out))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_crypto_x509_verify" => {
+            let leaf = match &args[0] {
+                Value::Str(s) => s.to_string(),
+                other => {
+                    return Err(fail(
+                        "E0308",
+                        format!("cannot verify {} (need a PEM string)", other.type_name()),
+                        span,
+                    ));
+                }
+            };
+            let ca = match &args[1] {
+                Value::Str(s) => s.to_string(),
+                other => {
+                    return Err(fail(
+                        "E0308",
+                        format!(
+                            "cannot verify against {} (need a PEM string)",
+                            other.type_name()
+                        ),
+                        span,
+                    ));
+                }
+            };
+            match crate::cryptolib::x509_verify(&leaf, &ca) {
+                Ok(true) => {
+                    set_crypto_error(None);
+                    Ok(Value::Int(1))
+                }
+                Ok(false) => {
+                    set_crypto_error(None);
+                    Ok(Value::Int(0))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_crypto_last_error" => Ok(Value::Str(std::rc::Rc::new(take_crypto_error()))),
+        #[cfg(unix)]
+        "toto_rt_crypto_version" => Ok(Value::Str(std::rc::Rc::new(
+            crate::cryptolib::openssl_version(),
+        ))),
+        // Wave 1 compression (interpreter path: one-shot gzip over
+        // the pure-Rust backend — same call-duration error-slot
+        // discipline as net/crypto; unix-gated like them).
+        #[cfg(unix)]
+        "toto_rt_gzip_compress" => {
+            let buf = bytes_arg_gzip(&args[0], span)?;
+            match crate::compress::gzip_compress(&buf) {
+                Ok(out) => {
+                    set_gzip_error(None);
+                    Ok(bytes_value_gzip(out))
+                }
+                Err(e) => {
+                    set_gzip_error(Some(e));
+                    Ok(bytes_value_gzip(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_gzip_decompress" => {
+            let buf = bytes_arg_gzip(&args[0], span)?;
+            match crate::compress::gzip_decompress(&buf) {
+                Ok(out) => {
+                    set_gzip_error(None);
+                    Ok(bytes_value_gzip(out))
+                }
+                Err(e) => {
+                    set_gzip_error(Some(e));
+                    Ok(bytes_value_gzip(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_gzip_last_error" => Ok(Value::Str(std::rc::Rc::new(take_gzip_error()))),
         "toto_rt_read_i32" => {
             let p = ptr_arg(&args[0], span)? as *const c_void;
             Ok(Value::Int(toto_rt_read_i32(p) as i64))
@@ -1056,10 +1343,96 @@ fn take_net_error() -> String {
     NET_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
 }
 
+// Interpreter-side crypto error slot (Wave 1): same discipline as
+// the net slot, kept separate so interleaved net/crypto calls in one
+// task never clobber each other's `last_error`.
+#[cfg(unix)]
+thread_local! {
+    static CRYPTO_LAST_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(unix)]
+fn set_crypto_error(msg: Option<String>) {
+    CRYPTO_LAST_ERROR.with(|s| *s.borrow_mut() = msg);
+}
+
+#[cfg(unix)]
+fn take_crypto_error() -> String {
+    CRYPTO_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
+// Interpreter-side gzip error slot (Wave 1): same discipline as
+// the net/crypto slots. (The backend is pure Rust and could run
+// anywhere; it rides the unix gate for uniformity with the other
+// Wave 1 surfaces — lifting it is cfg-only. Windows gets E0301.)
+#[cfg(unix)]
+thread_local! {
+    static GZIP_LAST_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(unix)]
+fn set_gzip_error(msg: Option<String>) {
+    GZIP_LAST_ERROR.with(|s| *s.borrow_mut() = msg);
+}
+
+#[cfg(unix)]
+fn take_gzip_error() -> String {
+    GZIP_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
+/// `Array<int>` to call-duration bytes for gzip (elements 0–255,
+/// E0308 otherwise — same rule as the socket carve-out).
+#[cfg(unix)]
+fn bytes_arg_gzip(
+    v: &Value,
+    span: Span,
+) -> Result<Vec<u8>, (Diag, Vec<crate::interp::TraceFrame>)> {
+    match v {
+        Value::Array(elems) => {
+            let mut out = Vec::with_capacity(elems.borrow().len());
+            for e in elems.borrow().iter() {
+                match e {
+                    Value::Int(n) if (0..=255).contains(n) => out.push(*n as u8),
+                    other => {
+                        return Err(fail(
+                            "E0308",
+                            format!(
+                                "cannot pass {} as gzip bytes (elements must be ints 0-255)",
+                                other.type_name()
+                            ),
+                            span,
+                        ));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        other => Err(fail(
+            "E0308",
+            format!(
+                "cannot pass {} as gzip bytes (need `Array<int>` of 0-255)",
+                other.type_name()
+            ),
+            span,
+        )),
+    }
+}
+
+/// Owned bytes back to a fresh Toto `Array<int>`.
+#[cfg(unix)]
+fn bytes_value_gzip(bytes: Vec<u8>) -> Value {
+    Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+        bytes.into_iter().map(|b| Value::Int(b as i64)).collect(),
+    )))
+}
+
 /// A Toto `Array<int>` to call-duration bytes (Wave 1 amendment
 /// 2026-11-19, user-approved): every element must be 0–255; anything
 /// else (non-int elements, out-of-range values) is a clean E0308.
 /// The copy lives only for the call — never retained past return.
+#[cfg(unix)]
 fn bytes_arg(v: &Value, span: Span) -> Result<Vec<u8>, (Diag, Vec<crate::interp::TraceFrame>)> {
     match v {
         Value::Array(elems) => {
@@ -1093,6 +1466,7 @@ fn bytes_arg(v: &Value, span: Span) -> Result<Vec<u8>, (Diag, Vec<crate::interp:
 }
 
 /// Owned bytes back to a fresh Toto `Array<int>`.
+#[cfg(unix)]
 fn bytes_value(bytes: Vec<u8>) -> Value {
     Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
         bytes.into_iter().map(|b| Value::Int(b as i64)).collect(),

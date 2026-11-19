@@ -179,6 +179,127 @@ contract (strings as NUL-copies, `open` failing as `-errno`,
 callbacks drained on the joining worker) is pinned by
 `test_ffi.gzv` and the `proj11_ffi` corpus project.
 
+## `net`
+
+Networking substrate (Enterprise Wave 1; unix-only — see
+[ffi.md](ffi.md) for the per-binding contract). Sockets are opaque
+`int` handles; bytes cross as `Array<int>` (elements must be
+0–255, `E0308` otherwise — the only foreign array shape in v1).
+Every function returns `Result<_, string>` with the OS message
+(`strerror` discipline); closing twice or using a closed socket
+is an `Err`, never a panic, never silent. `listen`/`bind` are
+loopback (`127.0.0.1`) only; there are no timeouts in v1.
+
+| Function | Behavior |
+|---|---|
+| `net_tcp_connect(host, port)` | Pool-DNS resolve, then poller-parked handshake; `Ok(fd)` |
+| `net_tcp_listen(port)` | Loopback bind + listen; `Ok(listener fd)` |
+| `net_accept(listener)` | Poller-parked accept; `Ok(conn fd)` |
+| `net_send(conn, data)` | One nonblocking syscall; may short-send (`Ok(n)`) |
+| `net_send_all(conn, data)` | Toto-level loop to full delivery; `Ok(len(data))` |
+| `net_recv(conn, max)` | Up to `max` bytes; empty array is orderly shutdown, not an error |
+| `net_close(sock)` | Close + unregister; `Ok(0)` |
+| `net_resolve(host)` | Blocking-pool DNS; `Ok(Array<string>)` (comma-joined inside) |
+| `net_udp_bind(port)` | Loopback datagram socket; `Ok(fd)` |
+| `net_udp_send_to(sock, data, host, port)` | Resolve + send; `Ok(n)` |
+| `net_udp_recv_from(sock, max)` | `Ok(UdpPacket)` (`{ data, host, port }` struct) |
+| `last_error()` | Read the per-task call-duration error slot; always read immediately |
+
+Network waits park the task on the M:N poller (a worker never
+blocks on a socket); DNS parks on the dedicated blocking pool.
+The JIT/AOT task runtime has no poller integration: net calls
+refuse at compile time (exit 3, "needs the M:N poller") — run
+net programs with `toto run`/`toto test`. Pinned by the
+`proj11_net_echo` corpus project (loopback TCP echo + UDP echo).
+
+## `crypto`
+
+Cryptographic bindings (Enterprise Wave 1; unix-only — see
+[ffi.md](ffi.md) for the per-binding contract and
+[spec §18](../spec.md) for the API record). Primitives are
+bound (system libcrypto), never implemented. Bytes cross as
+`Array<int>` (0–255, `E0308` otherwise). Every fallible
+function returns `Result<_, string>`; malformed inputs are
+runtime `Err` strings, never panics. Layouts: digests 32/64
+bytes; AES-256-GCM output is `ciphertext || tag(16)`;
+`SignKeyPair { secret(32), public(64, x||y) }`, DER signatures
+(ECDSA P-256 over SHA-256); `verify`/`x509_verify` return 1/0
+with a clean slot, -1 plus the slot on malformed input.
+
+| Function | Behavior |
+|---|---|
+| `crypto_sha256(data)` / `crypto_sha512(data)` | Digests; `Ok(bytes)` |
+| `crypto_hmac_sha256(key, data)` / `crypto_hmac_sha512(key, data)` | Tags; `Ok(bytes)` |
+| `crypto_aead_encrypt(key, nonce, pt, aad)` | AES-256-GCM; `Ok(ct \|\| tag)` |
+| `crypto_aead_decrypt(key, nonce, cttag, aad)` | Authenticates or `Err` |
+| `crypto_sign_keygen()` | Fresh P-256 keypair; `Ok(SignKeyPair)` |
+| `crypto_sign_sign(secret, msg)` | DER signature; `Ok(bytes)` |
+| `crypto_sign_verify(public, msg, sig)` | `Ok(1/0)`; `Err` on bad input |
+| `crypto_random(n)` | `RAND_bytes`, 1–65536; `Ok(bytes)` |
+| `crypto_x509_verify(leaf_pem, ca_pem)` | `Ok(1)` iff the chain verifies |
+| `crypto_openssl_version()` | Runtime library version (never pinned) |
+
+Calls run inline on the worker (one-shot OpenSSL calls — no
+parking, no pool). JIT/AOT refuse like the net surface (run
+with `toto run`/`toto test`). Pinned by `proj13_crypto_kat`
+(published/pinned vectors per primitive) and
+`proj14_crypto_errors` (every malformed input is `Err`).
+
+## `compress`
+
+gzip compression (Enterprise Wave 1; unix-gated like the other
+surfaces — the backend itself is portable pure Rust, so lifting
+is cfg-only). The codec is `flate2`/`miniz_oxide` (no C code).
+`gzip_compress(data)` returns the RFC 1952 stream (bytes never
+pinned — headers may vary); `gzip_decompress(data)` returns the
+payload or `Err("decompress: invalid gzip data")` (one fixed
+string, never library wording). Pinned by `test_compress.gzv`
+(round-trips plus a `gzip -n` oracle vector; the encoder is
+cross-checked against system gunzip — see the Wave 1 report).
+
+## `toml`
+
+TOML parse + serialize, config-shaped subset (Enterprise Wave
+1; pure Toto code — see [spec §19](../spec.md) for the scope
+record). Values are `TomlVal` structs mirroring the `JsonVal`
+strata design (nested tables store as source-line fragments,
+re-parsed on access). Tables, dotted tables/keys, strings,
+ints (with `_`/signs), bools, floats, single-line scalar
+arrays, `#` comments. NOT covered (clear errors): inline
+tables, arrays of tables, datetimes, multi-line strings,
+hex/octal/binary ints, `\u` escapes. `toml_parse` /
+`toml_stringify` round-trip (modulo whitespace/comments);
+`toml_table_get` / `toml_table_get_array` / `toml_array_get` /
+`toml_as_*` accessors mirror the json ones. Pinned by
+`test_toml.gzv` (shapes, reparse stability, error paths).
+
+## `yaml`
+
+YAML parse + serialize, config-shaped subset (Enterprise Wave
+1; pure Toto code). Values are `YamlVal` structs (same strata
+design; nested blocks store dedented, re-parsed — and
+validated — on access). Block mappings/sequences, nesting by
+spaces-only indentation, plain/single/double-quoted scalars,
+int/bool/null/float, `#` comments, inline `- k: v`. NOT
+covered (clear errors): anchors, tags, flow styles,
+multi-document streams, tabs, `\u` escapes. Canonical
+2-space-indent `yaml_stringify` (re-parse-stable;
+cross-checked with PyYAML). Pinned by `test_yaml.gzv`.
+
+## `proto`
+
+Protobuf wire codec, varint/length-delimited subset
+(Enterprise Wave 1; pure Toto code). No `.proto` compiler or
+codegen: schema-driven `pb_encode`/`pb_decode` over explicit
+`PbField`/`PbSchema` descriptors (field numbers 1–2²⁹−1;
+wire types 0 varint non-negative-only, 2 bytes). Unknown
+fields are skipped per protobuf rules; unknown wire types,
+groups, fixed32/64, and negative ints are clear errors.
+Strings cross as bytes (the caller maps text). Pinned by
+`test_proto.gzv` (hand-computed golden wire bytes for a
+stated `Person` contract, verified against the encoding rules
+independently of the implementation).
+
 ## Execution paths
 
 | Path | Status | Evidence |

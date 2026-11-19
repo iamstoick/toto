@@ -1,0 +1,210 @@
+// gzv.std/proto — protobuf wire codec, varint/length-delimited
+// subset (Enterprise Wave 1).
+//
+// Schema-driven encode/decode over explicit field descriptors —
+// no `.proto` compiler, no codegen (binding generation stays
+// deferred per the FFI rules). Wire scope (stated subset):
+// field numbers 1..2^29-1, wire types 0 (varint, non-negative
+// only) and 2 (length-delimited bytes). NOT covered (clear
+// errors): groups, fixed32/fixed64/sfixed/float/double, negative
+// ints (no 10-byte sign extension), unknown wire types.
+// Unknown FIELDS (known wire type, unlisted number) are SKIPPED
+// per protobuf rules. Strings cross as bytes — the caller maps
+// text (ASCII decimal literals in tests); there is no text
+// format in v1.
+
+pub struct PbField {
+    num: int,
+    kind: string,
+    ival: int,
+    bval: Array<int>,
+}
+
+pub struct PbSchema {
+    num: int,
+    kind: string,
+}
+
+fn pb_pow2(e: int) -> int {
+    let mut v: int = 1;
+    for i in 0..e {
+        v = v * 2;
+    }
+    return v;
+}
+
+fn pb_check_num(num: int) -> Result<int, string> {
+    if num < 1 || num > 536870911 {
+        return Err("bad field number: " + to_string(num));
+    }
+    return Ok(num);
+}
+
+// Unsigned varint encode (non-negative only).
+fn pb_encode_varint(v: int) -> Result<Array<int>, string> {
+    if v < 0 {
+        return Err("negative varints are not supported: " + to_string(v));
+    }
+    let mut out: Array<int> = [];
+    let mut x = v;
+    if x == 0 {
+        push(out, 0);
+        return Ok(out);
+    } else {
+    }
+    while x > 0 {
+        let mut b = x - (x / 128) * 128;
+        x = x / 128;
+        if x > 0 {
+            b = b + 128;
+        } else {
+        }
+        push(out, b);
+    }
+    return Ok(out);
+}
+
+// Unsigned varint decode: (value, next index).
+struct PbVarint {
+    value: int,
+    next: int,
+}
+
+fn pb_decode_varint(data: Array<int>, pos: int) -> Result<PbVarint, string> {
+    let mut v: int = 0;
+    let mut shift: int = 0;
+    let mut i = pos;
+    while true {
+        if i >= len(data) {
+            return Err("truncated varint");
+        }
+        let b = data[i];
+        if shift >= 64 {
+            return Err("varint overflow");
+        }
+        v = v + (b - (b / 128) * 128) * pb_pow2(shift);
+        i = i + 1;
+        if b < 128 {
+            return Ok(PbVarint { value: v, next: i });
+        }
+        shift = shift + 7;
+    }
+    return Err("unreachable");
+}
+
+fn pb_tag(num: int, wire: int) -> Result<Array<int>, string> {
+    pb_check_num(num)?;
+    return pb_encode_varint(num * 8 + wire);
+}
+
+pub fn pb_field_varint(num: int, v: int) -> Result<PbField, string> {
+    pb_check_num(num)?;
+    if v < 0 {
+        return Err("negative varints are not supported: " + to_string(v));
+    }
+    let none: Array<int> = [];
+    return Ok(PbField { num: num, kind: "varint", ival: v, bval: none });
+}
+
+pub fn pb_field_bytes(num: int, data: Array<int>) -> Result<PbField, string> {
+    pb_check_num(num)?;
+    return Ok(PbField { num: num, kind: "bytes", ival: 0, bval: data });
+}
+
+pub fn pb_encode(fields: Array<PbField>) -> Result<Array<int>, string> {
+    let mut out: Array<int> = [];
+    for f in 0..len(fields) {
+        let fld = fields[f];
+        if fld.kind == "varint" {
+            let tag = pb_tag(fld.num, 0)?;
+            for b in tag {
+                push(out, b);
+            }
+            let vv = pb_encode_varint(fld.ival)?;
+            for b in vv {
+                push(out, b);
+            }
+        } else {
+            if fld.kind == "bytes" {
+                let tag = pb_tag(fld.num, 2)?;
+                for b in tag {
+                    push(out, b);
+                }
+                let ll = pb_encode_varint(len(fld.bval))?;
+                for b in ll {
+                    push(out, b);
+                }
+                for b in fld.bval {
+                    push(out, b);
+                }
+            } else {
+                return Err("bad field kind: " + fld.kind);
+            }
+        }
+    }
+    return Ok(out);
+}
+
+pub fn pb_decode(data: Array<int>, schema: Array<PbSchema>) -> Result<Array<PbField>, string> {
+    let mut out: Array<PbField> = [];
+    let mut pos: int = 0;
+    while pos < len(data) {
+        let tag = pb_decode_varint(data, pos)?;
+        pos = tag.next;
+        let num = tag.value / 8;
+        let wire = tag.value - (tag.value / 8) * 8;
+        pb_check_num(num)?;
+        if wire == 0 {
+            let v = pb_decode_varint(data, pos)?;
+            pos = v.next;
+            // Schema check: known numbers must agree on kind.
+            for s in 0..len(schema) {
+                if schema[s].num == num && schema[s].kind != "varint" {
+                    return Err("wire kind mismatch for field " + to_string(num));
+                } else {
+                }
+            }
+            let none: Array<int> = [];
+            push(out, PbField { num: num, kind: "varint", ival: v.value, bval: none });
+        } else {
+            if wire == 2 {
+                let ln = pb_decode_varint(data, pos)?;
+                pos = ln.next;
+                if ln.value < 0 || pos + ln.value > len(data) {
+                    return Err("truncated length-delimited field");
+                }
+                let mut buf: Array<int> = [];
+                for i in pos..(pos + ln.value) {
+                    push(buf, data[i]);
+                }
+                pos = pos + ln.value;
+                for s in 0..len(schema) {
+                    if schema[s].num == num && schema[s].kind != "bytes" {
+                        return Err("wire kind mismatch for field " + to_string(num));
+                    } else {
+                    }
+                }
+                push(out, PbField { num: num, kind: "bytes", ival: 0, bval: buf });
+            } else {
+                return Err("unsupported wire type: " + to_string(wire));
+            }
+        }
+    }
+    return Ok(out);
+}
+
+// Decode and project onto the schema (unknown fields dropped —
+// callers that need them use `pb_decode` directly).
+pub fn pb_decode_known(data: Array<int>, schema: Array<PbSchema>) -> Result<Array<PbField>, string> {
+    let all = pb_decode(data, schema)?;
+    let mut out: Array<PbField> = [];
+    for f in 0..len(all) {
+        for s in 0..len(schema) {
+            if schema[s].num == all[f].num {
+                push(out, all[f]);
+            } else {
+            }
+        }
+    }
+    return Ok(out);
+}

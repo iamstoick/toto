@@ -1,0 +1,104 @@
+// stdlib compress tests: run with `toto test` from stdlib/.
+//
+// Round-trips (never pinned: encoder headers may vary) plus a
+// system-`gzip` oracle vector (deterministic `gzip -n` output for
+// `"0123456789ABCDEF" x 4`, pinned below — decompressing it must
+// yield the input exactly). Error paths pin the fixed message.
+
+import "gzv.std/compress.gzv";
+
+fn eq_bytes(a: Array<int>, b: Array<int>) -> bool {
+    if len(a) != len(b) {
+        return false;
+    }
+    for i in 0..len(a) {
+        if a[i] != b[i] {
+            return false;
+        } else {
+        }
+    }
+    return true;
+}
+
+fn expect_arr_err(got: Result<Array<int>, string>, want_msg: string) -> Result<bool, string> {
+    let want: Result<Array<int>, string> = Err(want_msg);
+    if got != want {
+        return Err("wrong error, want `" + want_msg + "`");
+    }
+    return Ok(true);
+}
+
+fn input64() -> Array<int> {
+    let digits: Array<int> = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 65, 66, 67, 68, 69, 70];
+    let mut out: Array<int> = [];
+    for r in 0..4 {
+        for i in 0..16 {
+            push(out, digits[i]);
+        }
+    }
+    return out;
+}
+
+fn t_oracle_vector() -> Result<bool, string> {
+    // `gzip -n` of input64() (39 bytes; magic 1f 8b, mtime 0).
+    let sys_gz: Array<int> = [31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 51, 48, 52, 50, 54, 49, 53, 51, 183, 176, 116, 116, 114, 118, 113, 117, 51, 32, 145, 15, 0, 178, 61, 190, 240, 64, 0, 0, 0];
+    if !eq_bytes(gzip_decompress(sys_gz)?, input64()) {
+        return Err("system gzip vector mismatch");
+    }
+    return Ok(true);
+}
+
+fn t_roundtrips() -> Result<bool, string> {
+    let hello: Array<int> = [104, 101, 108, 108, 111];
+    if !eq_bytes(gzip_decompress(gzip_compress(hello)?)?, hello) {
+        return Err("hello roundtrip");
+    }
+    let empty: Array<int> = [];
+    if !eq_bytes(gzip_decompress(gzip_compress(empty)?)?, empty) {
+        return Err("empty roundtrip");
+    }
+    // 4 KiB patterned input (compresses well; exercises streaming).
+    let mut big: Array<int> = [];
+    for r in 0..200 {
+        for i in 0..20 {
+            push(big, (r + i) % 256);
+        }
+    }
+    if len(gzip_compress(big)?) >= len(big) {
+        return Err("pattern did not compress");
+    }
+    if !eq_bytes(gzip_decompress(gzip_compress(big)?)?, big) {
+        return Err("big roundtrip");
+    }
+    return Ok(true);
+}
+
+fn t_errors() -> Result<bool, string> {
+    let garbage: Array<int> = [1, 2, 3];
+    expect_arr_err(gzip_decompress(garbage), "decompress: invalid gzip data")?;
+    let truncated: Array<int> = [31, 139, 8, 0, 0];
+    expect_arr_err(gzip_decompress(truncated), "decompress: invalid gzip data")?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_oracle_vector() != yes {
+        println("FAIL oracle");
+        failures = failures + 1;
+    }
+    if t_roundtrips() != yes {
+        println("FAIL roundtrips");
+        failures = failures + 1;
+    }
+    if t_errors() != yes {
+        println("FAIL errors");
+        failures = failures + 1;
+    }
+    if failures > 0 {
+        println(to_string(failures) + " compress failures");
+        return 1;
+    }
+    return 0;
+}

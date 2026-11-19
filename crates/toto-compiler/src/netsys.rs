@@ -81,13 +81,8 @@ unsafe extern "C" {
     #[link_name = "close"]
     fn libc_close(fd: c_int) -> c_int;
     #[link_name = "setsockopt"]
-    fn libc_setsockopt(
-        fd: c_int,
-        level: c_int,
-        name: c_int,
-        val: *const c_void,
-        len: u32,
-    ) -> c_int;
+    fn libc_setsockopt(fd: c_int, level: c_int, name: c_int, val: *const c_void, len: u32)
+    -> c_int;
     #[link_name = "fcntl"]
     fn libc_fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int;
     #[link_name = "getsockopt"]
@@ -122,7 +117,13 @@ pub fn parse_numeric_host(host: &str, port: u16) -> Result<(Vec<u8>, u32), Strin
         protocol: c_int,
         _rest: [u8; 32],
     }
-    let hints = Hints { flags: 0x4, family: 0, socktype: 1, protocol: 0, _rest: [0; 32] };
+    let hints = Hints {
+        flags: 0x4,
+        family: 0,
+        socktype: 1,
+        protocol: 0,
+        _rest: [0; 32],
+    };
     let mut res: *mut c_void = std::ptr::null_mut();
     // SAFETY: strings + hints outlive the call; result freed below.
     let r = unsafe {
@@ -208,7 +209,10 @@ pub fn sockaddr_to_host(addr: &[u8]) -> Option<(String, u16)> {
     let fam = u16::from_ne_bytes([addr[0], addr[1]]);
     let port = u16::from_be_bytes([addr[2], addr[3]]);
     if fam == 2 && addr.len() >= 8 {
-        return Some((format!("{}.{}.{}.{}", addr[4], addr[5], addr[6], addr[7]), port));
+        return Some((
+            format!("{}.{}.{}.{}", addr[4], addr[5], addr[6], addr[7]),
+            port,
+        ));
     }
     if (fam == 10 || fam == 30) && addr.len() >= 24 {
         return Some((render_ipv6(&addr[8..24]), port));
@@ -223,7 +227,11 @@ pub fn udp_send_to(fd: c_int, buf: &[u8], ip: &str, port: u16) -> Result<usize, 
     let r = unsafe {
         libc_sendto(
             fd,
-            if buf.is_empty() { std::ptr::null() } else { buf.as_ptr() } as *const c_void,
+            if buf.is_empty() {
+                std::ptr::null()
+            } else {
+                buf.as_ptr()
+            } as *const c_void,
             buf.len(),
             0,
             addr.as_ptr() as *const c_void,
@@ -261,6 +269,24 @@ unsafe extern "C" {
 /// Blocking UDP `recvfrom` (interpreter path): payload plus the
 /// numeric peer (host string, port).
 pub fn udp_recv_from(fd: c_int, max: usize) -> Result<(Vec<u8>, String, u16), String> {
+    match udp_recv_from_nb(fd, max) {
+        UdpRecvOutcome::Got(bytes, host, port) => Ok((bytes, host, port)),
+        UdpRecvOutcome::WouldBlock => Err("would block".to_string()),
+        UdpRecvOutcome::Failed(e) => Err(e),
+    }
+}
+
+/// One nonblocking `recvfrom`: payload + numeric peer, WouldBlock
+/// when no datagram waits, or a loud failure. Empty datagrams are
+/// real data (`Got` with an empty vec), never shutdown — UDP has
+/// no orderly-close signal.
+pub enum UdpRecvOutcome {
+    Got(Vec<u8>, String, u16),
+    WouldBlock,
+    Failed(String),
+}
+
+pub fn udp_recv_from_nb(fd: c_int, max: usize) -> UdpRecvOutcome {
     let mut buf = vec![0u8; max.max(1)];
     let mut addr = [0u8; 64];
     let mut addrlen: u32 = 64;
@@ -276,13 +302,49 @@ pub fn udp_recv_from(fd: c_int, max: usize) -> Result<(Vec<u8>, String, u16), St
         )
     };
     if r < 0 {
-        return Err(last_error());
+        return match errno_value() {
+            11 | 35 => UdpRecvOutcome::WouldBlock,
+            _ => UdpRecvOutcome::Failed(last_error()),
+        };
     }
     buf.truncate(r as usize);
     let addrlen = (addrlen as usize).min(64);
     match sockaddr_to_host(&addr[..addrlen]) {
-        Some((host, port)) => Ok((buf, host, port)),
-        None => Err("could not parse peer address".to_string()),
+        Some((host, port)) => UdpRecvOutcome::Got(buf, host, port),
+        None => UdpRecvOutcome::Failed("could not parse peer address".to_string()),
+    }
+}
+
+/// One nonblocking UDP `sendto` to a numeric IP (never blocks DNS:
+/// `AI_NUMERICHOST` parsing only — use `net_resolve` first for
+/// hostnames). Reuses the `SendOutcome` discipline.
+pub fn udp_send_to_nb(fd: c_int, buf: &[u8], ip: &str, port: u16) -> SendOutcome {
+    let (addr, len) = match parse_numeric_host(ip, port) {
+        Ok(a) => a,
+        Err(e) => return SendOutcome::Failed(e),
+    };
+    // SAFETY: `buf` and `addr` outlive the call.
+    let r = unsafe {
+        libc_sendto(
+            fd,
+            if buf.is_empty() {
+                std::ptr::null()
+            } else {
+                buf.as_ptr()
+            } as *const c_void,
+            buf.len(),
+            0,
+            addr.as_ptr() as *const c_void,
+            len,
+        )
+    };
+    if r < 0 {
+        match errno_value() {
+            11 | 35 => SendOutcome::WouldBlock,
+            _ => SendOutcome::Failed(last_error()),
+        }
+    } else {
+        SendOutcome::Wrote(r as usize)
     }
 }
 
@@ -309,6 +371,51 @@ pub fn lookup_peer(fd: c_int) -> Option<(String, u16)> {
 
 pub fn forget_peer(fd: c_int) {
     UDP_PEERS.lock().expect("peer table lock").remove(&fd);
+}
+
+/// A self-pipe for poller wakeups: writing one byte wakes a `poll`
+/// blocked on the read end. Both ends nonblocking (a full pipe must
+/// never stall the writer; the reader drains to `EAGAIN`). Used to
+/// deliver new registrations, `close` sweeps, and shutdown.
+pub fn self_pipe() -> (c_int, c_int) {
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: `fds` is a valid 2-int out-array.
+    let r = unsafe { libc_pipe(fds.as_mut_ptr()) };
+    if r < 0 {
+        panic!("net poller self-pipe failed: {}", last_error());
+    }
+    let _ = set_nonblocking(fds[0]);
+    let _ = set_nonblocking(fds[1]);
+    (fds[0], fds[1])
+}
+
+/// Drain a self-pipe read end (until `EAGAIN`).
+pub fn drain_pipe(fd: c_int) {
+    let mut buf = [0u8; 64];
+    loop {
+        // SAFETY: `buf` is owned and outlives the call.
+        let r = unsafe { libc_read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+        if r <= 0 {
+            return;
+        }
+    }
+}
+
+/// Write one wakeup byte; a full pipe is fine (level-triggered: the
+/// byte already pending is wakeup enough).
+pub fn poke_pipe(fd: c_int) {
+    let one = [1u8; 1];
+    // SAFETY: `one` outlives the call; O_NONBLOCK means this never stalls.
+    let _ = unsafe { libc_write(fd, one.as_ptr() as *const c_void, 1) };
+}
+
+unsafe extern "C" {
+    #[link_name = "pipe"]
+    fn libc_pipe(fds: *mut c_int) -> c_int;
+    #[link_name = "read"]
+    fn libc_read(fd: c_int, buf: *mut c_void, len: usize) -> isize;
+    #[link_name = "write"]
+    fn libc_write(fd: c_int, buf: *const c_void, len: usize) -> isize;
 }
 
 /// An IPv4 loopback socket address (`127.0.0.1:port`), wire layout.
@@ -339,11 +446,7 @@ pub fn socket_udp() -> Result<c_int, String> {
 fn socket_of(ty: c_int) -> Result<c_int, String> {
     // SAFETY: plain integers; returns a fresh fd or -1 with errno set.
     let fd = unsafe { libc_socket(2, ty, 0) };
-    if fd < 0 {
-        Err(last_error())
-    } else {
-        Ok(fd)
-    }
+    if fd < 0 { Err(last_error()) } else { Ok(fd) }
 }
 
 /// Mark a socket nonblocking (executor path; the interpreter uses
@@ -356,11 +459,7 @@ pub fn set_nonblocking(fd: c_int) -> Result<(), String> {
     }
     // SAFETY: OR-ing O_NONBLOCK into the retrieved flags.
     let r = unsafe { libc_fcntl(fd, 4, flags | 0x800) };
-    if r < 0 {
-        Err(last_error())
-    } else {
-        Ok(())
-    }
+    if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
 /// Bind to loopback with `SO_REUSEADDR` (tests re-bind the same
@@ -369,48 +468,28 @@ pub fn bind_loopback(fd: c_int, port: u16) -> Result<(), String> {
     let one: c_int = 1;
     // SOL_SOCKET=1, SO_REUSEADDR=2 on both Linux and macOS.
     // SAFETY: plain ints and a pointer to a stack int.
-    let r = unsafe {
-        libc_setsockopt(
-            fd,
-            1,
-            2,
-            &one as *const c_int as *const c_void,
-            4,
-        )
-    };
+    let r = unsafe { libc_setsockopt(fd, 1, 2, &one as *const c_int as *const c_void, 4) };
     if r < 0 {
         return Err(last_error());
     }
     let (addr, len) = sockaddr_loopback_v4(port);
     // SAFETY: `addr` outlives the call; the kernel copies it in.
     let r = unsafe { libc_bind(fd, addr.as_ptr() as *const c_void, len) };
-    if r < 0 {
-        Err(last_error())
-    } else {
-        Ok(())
-    }
+    if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
 /// `listen` with a modest backlog (test/small-service scale).
 pub fn listen(fd: c_int) -> Result<(), String> {
     // SAFETY: plain ints.
     let r = unsafe { libc_listen(fd, 16) };
-    if r < 0 {
-        Err(last_error())
-    } else {
-        Ok(())
-    }
+    if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
 /// Blocking `accept` (interpreter path).
 pub fn accept_blocking(listener: c_int) -> Result<c_int, String> {
     // SAFETY: NULL addr/len asks the kernel to skip the peer address.
     let fd = unsafe { libc_accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) };
-    if fd < 0 {
-        Err(last_error())
-    } else {
-        Ok(fd)
-    }
+    if fd < 0 { Err(last_error()) } else { Ok(fd) }
 }
 
 /// Nonblocking `accept`: `Ok(fd)`, or `Err(WouldBlock)` when no
@@ -627,11 +706,7 @@ pub fn connect_blocking(port: u16) -> Result<c_int, String> {
 pub fn close(fd: c_int) -> Result<(), String> {
     // SAFETY: plain int; EBADF and friends surface as strings.
     let r = unsafe { libc_close(fd) };
-    if r < 0 {
-        Err(last_error())
-    } else {
-        Ok(())
-    }
+    if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
 /// Resolve a hostname to IP strings via blocking `getaddrinfo`
@@ -642,7 +717,14 @@ pub fn resolve_blocking(host: &str) -> Result<Vec<String>, String> {
     // SAFETY: `h` outlives the call; NULL hints/service select
     // defaults; the result list is freed below before return.
     let mut res: *mut c_void = std::ptr::null_mut();
-    let r = unsafe { libc_getaddrinfo(h.as_ptr(), std::ptr::null(), std::ptr::null(), &mut res as *mut *mut c_void) };
+    let r = unsafe {
+        libc_getaddrinfo(
+            h.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            &mut res as *mut *mut c_void,
+        )
+    };
     if r != 0 {
         return Err(gai_error(r));
     }
@@ -690,8 +772,9 @@ pub fn resolve_blocking(host: &str) -> Result<Vec<String>, String> {
 /// pin `::1` for localhost via prefix matching, not this string).
 fn render_ipv6(b: &[u8]) -> String {
     let mut g = [0u16; 8];
-    for (i, chunk) in b.chunks_exact(2).enumerate() {
-        g[i] = u16::from_be_bytes([chunk[0], chunk[1]]);
+    let (chunks, _) = b.as_chunks::<2>();
+    for (i, chunk) in chunks.iter().enumerate() {
+        g[i] = u16::from_be_bytes(*chunk);
     }
     g.iter()
         .map(|x| format!("{x:x}"))
@@ -748,7 +831,7 @@ pub fn poll_wait(fds: &[(c_int, bool, bool)], timeout_ms: c_int) -> Result<Vec<u
         .iter()
         .map(|(fd, r, w)| PollFd {
             fd: *fd,
-            events: (*r as i16) * 0x1 | (*w as i16) * 0x4,
+            events: (*r as i16) | ((*w as i16) * 0x4),
             revents: 0,
         })
         .collect();

@@ -3,7 +3,13 @@ name = "toto-compiler"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+links = "crypto"
 
 [lib]
 name = "toto_compiler"
 path = "src/lib.rs"
+
+[dependencies]
+# Wave 1 compression backend: pure-Rust DEFLATE/gzip (no C code, no
+# system library — same static binary on every platform).
+flate2 = "1"

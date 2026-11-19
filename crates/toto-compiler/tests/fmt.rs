@@ -212,9 +212,9 @@ fn fmt_idempotent_and_semantics_preserving() {
     let mut expected: Vec<String> = EXPECTED_REFUSED.iter().map(|s| s.to_string()).collect();
     expected.sort();
     assert_eq!(refused_names, expected, "refused set changed");
-    assert_eq!(formatted, 140, "formatted count changed");
+    assert_eq!(formatted, 143, "formatted count changed");
     assert_eq!(refused, 17, "refused count changed");
-    assert_eq!(ran, 45, "executed count changed");
+    assert_eq!(ran, 46, "executed count changed");
     assert!(
         failures.iter().all(|f| f.starts_with("refused:")),
         "{} fmt failure(s):\n{}",

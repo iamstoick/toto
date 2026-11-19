@@ -1,0 +1,777 @@
+// gzv.std/yaml — YAML parse + serialize, config-shaped subset
+// (Enterprise Wave 1).
+//
+// Values are `YamlVal` structs, mirroring the `JsonVal` strata
+// design: nested mappings/sequences store as DEDENTED source
+// blocks (re-parsed with the same block parser on access —
+// recursion is re-parse, never a recursive type, which Toto v1
+// rejects). Scalars keep their literal; `yaml_stringify` emits
+// canonical 2-space-indent YAML.
+//
+// Scope (stated subset): block mappings and sequences, nesting
+// by spaces-only indentation, plain/single/double-quoted scalars,
+// int/bool/null/float scalars, `#` comments, inline `- k: v`
+// mappings. NOT covered (clear errors, recorded follow-ups):
+// anchors, tags, flow styles (`{}`, `[]`), multi-document streams,
+// tabs for indentation, `\u` escapes (no codepoint builtin — same
+// rule as `json`).
+
+import "gzv.std/strings.gzv";
+
+pub struct YamlVal {
+    kind: string,
+    raw: string,
+    items: Array<string>,
+    keys: Array<string>,
+    vals: Array<string>,
+}
+
+fn yaml_make(kind: string, raw: string) -> YamlVal {
+    let a: Array<string> = [];
+    let b: Array<string> = [];
+    let c: Array<string> = [];
+    return YamlVal { kind: kind, raw: raw, items: a, keys: b, vals: c };
+}
+
+pub fn yaml_kind(v: YamlVal) -> string {
+    return v.kind;
+}
+
+fn yaml_is_digit(c: string) -> bool {
+    return c >= "0" && c <= "9";
+}
+
+fn yaml_count_indent(line: string) -> Result<int, string> {
+    let chars: Array<string> = split(line, "");
+    let mut n: int = 0;
+    while n < len(chars) && chars[n] == " " {
+        n = n + 1;
+    }
+    if n < len(chars) && chars[n] == "\t" {
+        return Err("tabs are not valid YAML indentation");
+    }
+    return Ok(n);
+}
+
+// Strip a `#` comment (outside single/double quotes).
+fn yaml_strip_comment(line: string) -> string {
+    let chars: Array<string> = split(line, "");
+    let mut quote: string = "";
+    let mut out: string = "";
+    for c in chars {
+        if quote != "" {
+            out = out + c;
+            if c == quote {
+                quote = "";
+            } else {
+            }
+        } else {
+            if c == "\"" || c == "'" {
+                quote = c;
+                out = out + c;
+            } else {
+                if c == "#" {
+                    break;
+                } else {
+                    out = out + c;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+fn yaml_trim(s: string) -> string {
+    let chars: Array<string> = split(s, "");
+    let mut a: int = 0;
+    while a < len(chars) && (chars[a] == " " || chars[a] == "\t") {
+        a = a + 1;
+    }
+    let mut b: int = len(chars);
+    while b > a && (chars[b - 1] == " " || chars[b - 1] == "\t") {
+        b = b - 1;
+    }
+    let mut out: string = "";
+    for i in a..b {
+        out = out + chars[i];
+    }
+    return out;
+}
+
+fn yaml_unquote(s: string) -> Result<string, string> {
+    let chars: Array<string> = split(s, "");
+    if len(chars) >= 2 && chars[0] == "\"" {
+        if chars[len(chars) - 1] != "\"" {
+            return Err("unterminated string: " + s);
+        }
+        let mut out: string = "";
+        let mut i: int = 1;
+        while i < len(chars) - 1 {
+            if chars[i] == "\\" {
+                i = i + 1;
+                if i >= len(chars) - 1 {
+                    return Err("unterminated escape in: " + s);
+                }
+                let e = chars[i];
+                if e == "n" {
+                    out = out + "\n";
+                } else {
+                    if e == "t" {
+                        out = out + "\t";
+                    } else {
+                        if e == "\"" || e == "\\" {
+                            out = out + e;
+                        } else {
+                            if e == "u" {
+                                return Err("unicode escapes (\\u) are not supported");
+                            } else {
+                                return Err("bad escape: \\" + e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                out = out + chars[i];
+            }
+            i = i + 1;
+        }
+        return Ok(out);
+    }
+    if len(chars) >= 2 && chars[0] == "'" {
+        if chars[len(chars) - 1] != "'" {
+            return Err("unterminated literal string: " + s);
+        }
+        let mut out: string = "";
+        let mut i: int = 1;
+        while i < len(chars) - 1 {
+            if chars[i] == "'" && i + 1 < len(chars) - 1 && chars[i + 1] == "'" {
+                out = out + "'";
+                i = i + 2;
+            } else {
+                out = out + chars[i];
+                i = i + 1;
+            }
+        }
+        return Ok(out);
+    }
+    return Ok(s);
+}
+
+// Classify a scalar: kind + decoded content in `raw`.
+fn yaml_classify(lit: string) -> Result<YamlVal, string> {
+    let t = yaml_trim(lit);
+    if t == "" || t == "~" || t == "null" || t == "Null" || t == "NULL" {
+        return Ok(yaml_make("null", ""));
+    }
+    if t == "true" || t == "True" || t == "TRUE" {
+        return Ok(yaml_make("bool", "true"));
+    }
+    if t == "false" || t == "False" || t == "FALSE" {
+        return Ok(yaml_make("bool", "false"));
+    }
+    let chars: Array<string> = split(t, "");
+    if len(chars) >= 2 && (chars[0] == "\"" || chars[0] == "'") {
+        return Ok(yaml_make("str", yaml_unquote(t)?));
+    }
+    // Reject flow/anchor/tag markers up front (clear scope errors).
+    for c in chars {
+        if c == "[" || c == "]" || c == "{" || c == "}" || c == "*" || c == "&" || c == "!" || c == "|" || c == ">" {
+            return Err("flow styles, anchors, tags, and block scalars are not supported: " + t);
+        } else {
+        }
+    }
+    if yaml_is_int(t) {
+        return Ok(yaml_make("int", t));
+    }
+    if yaml_is_float(t) {
+        return Ok(yaml_make("float", t));
+    }
+    return Ok(yaml_make("str", t));
+}
+
+fn yaml_is_int(s: string) -> bool {
+    let chars: Array<string> = split(s, "");
+    if len(chars) == 0 {
+        return false;
+    }
+    let mut i: int = 0;
+    if chars[0] == "+" || chars[0] == "-" {
+        i = 1;
+    }
+    if i >= len(chars) {
+        return false;
+    }
+    while i < len(chars) {
+        if !yaml_is_digit(chars[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn yaml_is_float(s: string) -> bool {
+    let chars: Array<string> = split(s, "");
+    let mut i: int = 0;
+    if len(chars) > 0 && (chars[0] == "+" || chars[0] == "-") {
+        i = 1;
+    }
+    let mut digits = false;
+    while i < len(chars) && yaml_is_digit(chars[i]) {
+        digits = true;
+        i = i + 1;
+    }
+    if i < len(chars) && chars[i] == "." {
+        i = i + 1;
+        while i < len(chars) && yaml_is_digit(chars[i]) {
+            digits = true;
+            i = i + 1;
+        }
+    }
+    if i < len(chars) && (chars[i] == "e" || chars[i] == "E") {
+        i = i + 1;
+        if i < len(chars) && (chars[i] == "+" || chars[i] == "-") {
+            i = i + 1;
+        }
+        let expstart = i;
+        while i < len(chars) && yaml_is_digit(chars[i]) {
+            i = i + 1;
+        }
+        if i == expstart {
+            return false;
+        }
+        digits = true;
+    }
+    return digits && i == len(chars) && (yaml_has_dot(s) || yaml_has_exp(s));
+}
+
+fn yaml_has_dot(s: string) -> bool {
+    let chars: Array<string> = split(s, "");
+    for c in chars {
+        if c == "." {
+            return true;
+        } else {
+        }
+    }
+    return false;
+}
+
+fn yaml_has_exp(s: string) -> bool {
+    let chars: Array<string> = split(s, "");
+    for c in chars {
+        if c == "e" || c == "E" {
+            return true;
+        } else {
+        }
+    }
+    return false;
+}
+
+// Prepared lines: (indent, content) with blanks/comments dropped,
+// plus the original line number for errors.
+struct YamlLine {
+    indent: int,
+    text: string,
+    no: int,
+}
+
+fn yaml_prepare(text: string) -> Result<Array<YamlLine>, string> {
+    let raw: Array<string> = split(text, "\n");
+    let mut out: Array<YamlLine> = [];
+    for n in 0..len(raw) {
+        let line = yaml_strip_comment(raw[n]);
+        if yaml_trim(line) == "" {
+            continue;
+        } else {
+        }
+        let ind = yaml_count_indent(line)?;
+        let chars: Array<string> = split(line, "");
+        let mut content: string = "";
+        for i in ind..len(chars) {
+            content = content + chars[i];
+        }
+        if content == "---" || content == "..." {
+            return Err("multi-document streams are not supported");
+        }
+        push(out, YamlLine { indent: ind, text: content, no: n + 1 });
+    }
+    return Ok(out);
+}
+
+struct YamlParseOut {
+    value: YamlVal,
+    next: int,
+}
+
+// Original line text (indentation intact) for fragments: the
+// parsed `.text` drops leading spaces, but nested blocks need
+// their relative indentation until dedented.
+fn yaml_pad(n: int) -> string {
+    let mut out: string = "";
+    for i in 0..n {
+        out = out + " ";
+    }
+    return out;
+}
+
+fn yaml_raw_line(l: YamlLine) -> string {
+    return yaml_pad(l.indent) + l.text;
+}
+
+// Parse one block (mapping, sequence, or scalar) at lines[i:].
+fn yaml_parse_block(lines: Array<YamlLine>, i: int) -> Result<YamlParseOut, string> {
+    if i >= len(lines) {
+        return Err("unexpected end of input");
+    }
+    let base = lines[i].indent;
+    let first = lines[i].text;
+    let fc: Array<string> = split(first, "");
+    // Sequence block: every line at `base` starts with `- ` or is `-`.
+    if len(fc) >= 1 && fc[0] == "-" && (len(fc) == 1 || fc[1] == " ") {
+        let mut items: Array<string> = [];
+        let mut j = i;
+        while j < len(lines) {
+            if lines[j].indent != base {
+                break;
+            } else {
+            }
+            let t = lines[j].text;
+            let tc: Array<string> = split(t, "");
+            if len(tc) == 0 || tc[0] != "-" || (len(tc) > 1 && tc[1] != " ") {
+                break;
+            } else {
+            }
+            // Item head after `-`.
+            let mut head: string = "";
+            for k in 2..len(tc) {
+                head = head + tc[k];
+            }
+            head = yaml_trim(head);
+            // Nested lines (greater indent) belong to this item,
+            // with indentation intact until dedented.
+            let mut frag: Array<string> = [];
+            if head != "" {
+                push(frag, head);
+            } else {
+            }
+            let mut inner = 0;
+            let mut k = j + 1;
+            if k < len(lines) && lines[k].indent > base {
+                inner = lines[k].indent;
+            } else {
+            }
+            while k < len(lines) && lines[k].indent > base {
+                push(frag, yaml_raw_line(lines[k]));
+                k = k + 1;
+            }
+            if len(frag) == 0 {
+                return Err("empty sequence item at line " + to_string(lines[j].no));
+            }
+            push(items, yaml_dedent_frag(frag, inner, head != "")?);
+            // Fail fast: validate the fragment now (re-parse and
+            // discard) so malformed content errors at parse time,
+            // not only when accessed.
+            yaml_reparse(items[len(items) - 1])?;
+            j = k;
+        }
+        let none: Array<string> = [];
+        return Ok(YamlParseOut { value: YamlVal { kind: "arr", raw: "", items: items, keys: none, vals: none }, next: j });
+    }
+    // Mapping block.
+    if yaml_find_mapping_colon(first) < 0 {
+        // Lone scalar block (fragments re-parse here too).
+        return Ok(YamlParseOut { value: yaml_classify(first)?, next: i + 1 });
+    }
+    let mut keys: Array<string> = [];
+    let mut vals: Array<string> = [];
+    let mut j = i;
+    while j < len(lines) {
+        if lines[j].indent != base {
+            break;
+        } else {
+        }
+        let t = lines[j].text;
+        let col = yaml_find_mapping_colon(t);
+        if col < 0 {
+            break;
+        } else {
+        }
+        let tc: Array<string> = split(t, "");
+        let mut key: string = "";
+        for k in 0..col {
+            key = key + tc[k];
+        }
+        let mut rest: string = "";
+        for k in (col + 1)..len(tc) {
+            rest = rest + tc[k];
+        }
+        key = yaml_trim(key);
+        rest = yaml_trim(rest);
+        if key == "" {
+            return Err("empty key at line " + to_string(lines[j].no));
+        }
+        let keyval = yaml_unquote(key)?;
+        // Duplicate keys are an error.
+        for q in 0..len(keys) {
+            if keys[q] == keyval {
+                return Err("duplicate key: " + keyval);
+            } else {
+            }
+        }
+        push(keys, keyval);
+        if rest != "" {
+            // Fail fast on scalar literals (flow styles etc.).
+            yaml_classify(rest)?;
+            push(vals, rest);
+        } else {
+            // Nested block: following lines with greater indent
+            // (indentation intact until dedented).
+            if j + 1 >= len(lines) || lines[j + 1].indent <= base {
+                return Err("expected nested block at line " + to_string(lines[j].no));
+            }
+            let inner = lines[j + 1].indent;
+            let mut frag: Array<string> = [];
+            let mut k = j + 1;
+            while k < len(lines) && lines[k].indent > base {
+                push(frag, yaml_raw_line(lines[k]));
+                k = k + 1;
+            }
+            push(vals, yaml_dedent_frag(frag, inner, false)?);
+            // Fail fast (see the sequence branch).
+            yaml_reparse(vals[len(vals) - 1])?;
+            j = k - 1;
+        }
+        j = j + 1;
+    }
+    let none2: Array<string> = [];
+    return Ok(YamlParseOut { value: YamlVal { kind: "obj", raw: "", items: none2, keys: keys, vals: vals }, next: j });
+}
+
+// Column of the `:` ending a mapping key (outside quotes; must be
+// followed by space/end) or -1.
+fn yaml_find_mapping_colon(t: string) -> int {
+    let tc: Array<string> = split(t, "");
+    let mut quote: string = "";
+    for i in 0..len(tc) {
+        let c = tc[i];
+        if quote != "" {
+            if c == quote {
+                quote = "";
+            } else {
+            }
+        } else {
+            if c == "\"" || c == "'" {
+                quote = c;
+            } else {
+                if c == ":" && (i + 1 >= len(tc) || tc[i + 1] == " " || tc[i + 1] == "\t") {
+                    return i;
+                } else {
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+// Dedent a fragment to base 0: `inner` is the indentation of
+// its nested lines (0 when there are none); an inline head
+// (`has_head`) is already at base 0 and passes through.
+fn yaml_dedent_frag(frag: Array<string>, inner: int, has_head: bool) -> Result<string, string> {
+    if len(frag) == 0 {
+        return Err("empty block");
+    }
+    let mut out: string = "";
+    for f in 0..len(frag) {
+        let line = frag[f];
+        if has_head && f == 0 {
+            out = out + line + "\n";
+            continue;
+        } else {
+        }
+        let lc: Array<string> = split(line, "");
+        if len(lc) < inner {
+            return Err("bad indentation in nested block");
+        }
+        // The stripped prefix must be all spaces (fragments are
+        // built from measured indents, so anything else is a bug).
+        for k in 0..inner {
+            if lc[k] != " " {
+                return Err("bad indentation in nested block");
+            } else {
+            }
+        }
+        let mut rest: string = "";
+        for k in inner..len(lc) {
+            rest = rest + lc[k];
+        }
+        out = out + rest + "\n";
+    }
+    return Ok(out);
+}
+
+pub fn yaml_parse(text: string) -> Result<YamlVal, string> {
+    let lines = yaml_prepare(text)?;
+    if len(lines) == 0 {
+        return Err("empty document");
+    }
+    let out = yaml_parse_block(lines, 0)?;
+    if out.next != len(lines) {
+        return Err("trailing content at line " + to_string(lines[out.next].no));
+    }
+    return Ok(out.value);
+}
+
+fn yaml_reparse(frag: string) -> Result<YamlVal, string> {
+    let lines = yaml_prepare(frag)?;
+    if len(lines) == 0 {
+        return Err("empty block");
+    }
+    let out = yaml_parse_block(lines, 0)?;
+    return Ok(out.value);
+}
+
+pub fn yaml_object_get(v: YamlVal, key: string) -> Result<YamlVal, string> {
+    if v.kind != "obj" {
+        return Err("expected mapping, got " + v.kind);
+    }
+    for i in 0..len(v.keys) {
+        if v.keys[i] == key {
+            return yaml_reparse(v.vals[i]);
+        } else {
+        }
+    }
+    return Err("missing key: " + key);
+}
+
+pub fn yaml_array_len(v: YamlVal) -> Result<int, string> {
+    if v.kind != "arr" {
+        return Err("expected sequence, got " + v.kind);
+    }
+    return Ok(len(v.items));
+}
+
+pub fn yaml_array_get(v: YamlVal, i: int) -> Result<YamlVal, string> {
+    if v.kind != "arr" {
+        return Err("expected sequence, got " + v.kind);
+    }
+    if i < 0 || i >= len(v.items) {
+        return Err("sequence index out of bounds: " + to_string(i));
+    }
+    return yaml_reparse(v.items[i]);
+}
+
+pub fn yaml_as_bool(v: YamlVal) -> Result<bool, string> {
+    if v.kind != "bool" {
+        return Err("expected bool, got " + v.kind);
+    }
+    return Ok(v.raw == "true");
+}
+
+pub fn yaml_as_int(v: YamlVal) -> Result<int, string> {
+    if v.kind != "int" {
+        return Err("expected int, got " + v.kind);
+    }
+    return Ok(parse_int(v.raw));
+}
+
+pub fn yaml_as_float(v: YamlVal) -> Result<float, string> {
+    if v.kind != "float" {
+        return Err("expected float, got " + v.kind);
+    }
+    return yaml_parse_float(v.raw);
+}
+
+pub fn yaml_as_string(v: YamlVal) -> Result<string, string> {
+    if v.kind != "str" {
+        return Err("expected string, got " + v.kind);
+    }
+    return Ok(v.raw);
+}
+
+pub fn yaml_is_null(v: YamlVal) -> bool {
+    return v.kind == "null";
+}
+
+fn yaml_parse_float(s: string) -> Result<float, string> {
+    let chars: Array<string> = split(s, "");
+    let mut i: int = 0;
+    let mut neg: bool = false;
+    if len(chars) > 0 && (chars[0] == "-" || chars[0] == "+") {
+        neg = chars[0] == "-";
+        i = i + 1;
+    }
+    let mut value: float = 0.0;
+    while i < len(chars) && yaml_is_digit(chars[i]) {
+        value = value * 10.0 + to_float(parse_int(chars[i]));
+        i = i + 1;
+    }
+    if i < len(chars) && chars[i] == "." {
+        i = i + 1;
+        let mut div: float = 1.0;
+        while i < len(chars) && yaml_is_digit(chars[i]) {
+            div = div * 10.0;
+            value = value + to_float(parse_int(chars[i])) / div;
+            i = i + 1;
+        }
+    }
+    if i < len(chars) && (chars[i] == "e" || chars[i] == "E") {
+        i = i + 1;
+        let mut eneg: bool = false;
+        if i < len(chars) && (chars[i] == "-" || chars[i] == "+") {
+            eneg = chars[i] == "-";
+            i = i + 1;
+        }
+        let mut exp: int = 0;
+        while i < len(chars) && yaml_is_digit(chars[i]) {
+            exp = exp * 10 + parse_int(chars[i]);
+            i = i + 1;
+        }
+        let mut j: int = 0;
+        while j < exp {
+            if eneg {
+                value = value / 10.0;
+            } else {
+                value = value * 10.0;
+            }
+            j = j + 1;
+        }
+    }
+    if neg {
+        value = 0.0 - value;
+    }
+    return Ok(value);
+}
+
+fn yaml_escape(s: string) -> string {
+    let chars: Array<string> = split(s, "");
+    let mut out: string = "";
+    for c in chars {
+        if c == "\"" {
+            out = out + "\\\"";
+        } else {
+            if c == "\\" {
+                out = out + "\\\\";
+            } else {
+                if c == "\n" {
+                    out = out + "\\n";
+                } else {
+                    if c == "\t" {
+                        out = out + "\\t";
+                    } else {
+                        out = out + c;
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+fn yaml_needs_quotes(s: string) -> bool {
+    if s == "" {
+        return true;
+    }
+    let chars: Array<string> = split(s, "");
+    if chars[0] == " " || chars[len(chars) - 1] == " " {
+        return true;
+    }
+    for c in chars {
+        if c == ":" || c == "#" || c == "\"" || c == "'" || c == "\n" {
+            return true;
+        } else {
+        }
+    }
+    // Quote anything that would re-parse as a non-string: int,
+    // float, bool, and null literals (same shapes the classifier
+    // accepts, checked without failing).
+    if s == "~" || s == "null" || s == "Null" || s == "NULL" {
+        return true;
+    }
+    if s == "true" || s == "True" || s == "TRUE" || s == "false" || s == "False" || s == "FALSE" {
+        return true;
+    }
+    if yaml_is_int(s) || yaml_is_float(s) {
+        return true;
+    }
+    return false;
+}
+
+fn yaml_render_scalar(v: YamlVal) -> string {
+    if v.kind == "str" && !yaml_needs_quotes(v.raw) {
+        return v.raw;
+    }
+    if v.kind == "str" {
+        return "\"" + yaml_escape(v.raw) + "\"";
+    }
+    if v.kind == "null" {
+        return "null";
+    }
+    return v.raw;
+}
+
+fn yaml_indent_block(block: string, n: int) -> string {
+    let pad: string = "";
+    let mut p: string = pad;
+    for i in 0..n {
+        p = p + "  ";
+    }
+    let lines: Array<string> = split(block, "\n");
+    let mut out: string = "";
+    for l in lines {
+        if l != "" {
+            out = out + p + l + "\n";
+        } else {
+        }
+    }
+    return out;
+}
+
+pub fn yaml_stringify(v: YamlVal) -> Result<string, string> {
+    if v.kind == "obj" {
+        let mut out: string = "";
+        for i in 0..len(v.keys) {
+            let sub = yaml_reparse(v.vals[i])?;
+            if sub.kind == "obj" || sub.kind == "arr" {
+                out = out + v.keys[i] + ":\n" + yaml_indent_block(yaml_stringify(sub)?, 1);
+            } else {
+                out = out + v.keys[i] + ": " + yaml_render_scalar(sub) + "\n";
+            }
+        }
+        return Ok(out);
+    }
+    if v.kind == "arr" {
+        let mut out: string = "";
+        for i in 0..len(v.items) {
+            let sub = yaml_reparse(v.items[i])?;
+            if sub.kind == "obj" || sub.kind == "arr" {
+                let inner = yaml_stringify(sub)?;
+                let first_nl = yaml_first_line(inner);
+                out = out + "- " + first_nl + yaml_indent_block(yaml_rest_lines(inner), 1);
+            } else {
+                out = out + "- " + yaml_render_scalar(sub) + "\n";
+            }
+        }
+        return Ok(out);
+    }
+    return Ok(yaml_render_scalar(v) + "\n");
+}
+
+fn yaml_first_line(block: string) -> string {
+    let lines: Array<string> = split(block, "\n");
+    if len(lines) == 0 {
+        return "";
+    }
+    return lines[0];
+}
+
+fn yaml_rest_lines(block: string) -> string {
+    let lines: Array<string> = split(block, "\n");
+    let mut out: string = "";
+    for i in 1..len(lines) {
+        if lines[i] != "" {
+            out = out + lines[i] + "\n";
+        } else {
+        }
+    }
+    return out;
+}

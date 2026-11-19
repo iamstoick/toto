@@ -6,6 +6,9 @@
 pub mod ast;
 pub mod builtins;
 pub mod check;
+pub mod compress;
+#[cfg(unix)]
+pub mod cryptolib;
 pub mod diag;
 pub mod ffi;
 pub mod fmt;
@@ -14,6 +17,7 @@ pub mod interp;
 pub mod lexer;
 pub mod mir;
 pub mod mir_interp;
+#[cfg(unix)]
 pub mod netsys;
 pub mod ops;
 pub mod parser;
