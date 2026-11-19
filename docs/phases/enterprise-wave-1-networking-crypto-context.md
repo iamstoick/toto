@@ -332,17 +332,20 @@ not a silent drop). Corpus + conformance + differential hold
 to the v1 standard (same harnesses, same exactness).
 
 macOS tier1-probe verdict: PENDING — the run-44606812115
-macOS job is queued behind a GitHub-hosted macOS runner
-backlog (8h+ at time of writing; three wedged pre-fix runs
+macOS job is queued behind the documented GitHub-hosted
+macOS ARM64 capacity constraint of November 2026 ("jobs
+targeting macOS arm64 runners may experience longer queue
+times"; 10h+ at time of writing; three wedged pre-fix runs
 were cancelled to free runners). Pre-fix evidence stands:
 macOS build + Tier-1 mir_conform green on run 44587228308;
 the delta since is the stack-frame refactor (strictly less
 stack on every platform) and the O_NONBLOCK correction
 (macOS behavior now matches the green Linux path), with the
 macOS-only cfg branch compile-verified via
-`cargo check --target aarch64-apple-darwin`. This line is
-updated to green/red the moment the verdict lands; no other
-gate depends on it.
+`cargo check --target aarch64-apple-darwin` (and the
+Windows fallback via `--target x86_64-pc-windows-msvc`).
+This line is updated to green/red the moment the verdict
+lands; no other gate depends on it.
 
 ## Acceptance checklist (§7)
 
