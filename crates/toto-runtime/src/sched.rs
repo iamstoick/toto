@@ -1608,8 +1608,13 @@ impl Scheduler {
     /// so no collection can run concurrently; the response lands in the
     /// slot before release and is published by the next rendezvous.
     fn drain_completions_locked(&self, worker: usize, sched: &mut SchedState) -> bool {
+        // Net debug trace (see op_net).
+        let env_on = std::env::var_os("TOTO_NET_DEBUG").is_some();
         let completions: Vec<Completion> = {
             let mut done = self.shared.done.lock().expect("done lock");
+            if env_on && !done.is_empty() {
+                eprintln!("T-NET drain w={worker} len={}", done.len());
+            }
             done.drain(..).collect()
         };
         let mut enqueued = false;
