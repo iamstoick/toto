@@ -63,6 +63,17 @@ jobs:
         run: cargo test -p toto-compiler --test mir_conform
       - name: corpus gate
         run: cargo test -p toto-cli --test corpus
+      # TEMPORARY Wave 1 ARM diagnosis: runs only when the corpus
+      # gate fails on the ARM probe, to capture the native crash
+      # context that the harness cannot see (signal-only failure).
+      # Reverted once the ARM segfault is root-caused.
+      - name: diagnose ARM net crash (temporary)
+        if: failure() && matrix.os == 'ubuntu-24.04-arm'
+        run: |
+          getent hosts localhost || true
+          getent ahosts localhost || true
+          ldd target/debug/toto | grep -i crypto || true
+          ./target/debug/toto run tests/corpus/project/proj11_net_echo/main.gzv; echo "raw-exit=$?"
       - name: one concurrent program end to end
         run: |
           out=$(cargo run -q -p toto-cli -- run tests/corpus/concurrent/conc01_pingpong.gzv)
