@@ -54,11 +54,20 @@ pub fn net_tcp_connect(host: string, port: int) -> Result<int, string> {
         return Err("invalid port (want 1-65535)");
     }
     let addrs = net_resolve(host)?;
-    let fd = toto_rt_net_connect_ip(addrs[0], port);
-    if fd < 0 {
-        return Err(last_error());
+    // Try each resolved address in order (getaddrinfo order follows
+    // system policy — IPv6 may come first where only IPv4 sockets
+    // exist yet). First success wins; if all fail, report the last
+    // error rather than the first guess.
+    let mut err: string = "could not connect to " + host;
+    for i in 0..len(addrs) {
+        let fd = toto_rt_net_connect_ip(addrs[i], port);
+        if fd < 0 {
+            err = last_error();
+        } else {
+            return Ok(fd);
+        }
     }
-    return Ok(fd);
+    return Err(err);
 }
 
 // Bind loopback (`127.0.0.1`) + listen. No all-interfaces bind in
