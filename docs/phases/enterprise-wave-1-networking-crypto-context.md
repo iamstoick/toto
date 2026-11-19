@@ -306,27 +306,43 @@ and rationale recorded here and in spec §19.
 ## Stage 5 — gates and report (this section)
 
 Full gate on the branch: `check.sh` exit 0 — 61 result lines,
-224 passed, 0 failed (re-derived from fresh runs; per-crate
-account from `cargo test --workspace`: spikes 55
-(ffi-smoke-test 8 + gc-scheduler 7 + stack-switching 6 +
-hot-reload 10 + cranelift 24), toto-cli 32, toto-compiler 69,
-toto-jit 39, toto-runtime 29 — sums to 224 exactly), plus the
-stdlib suite 13/13 and wordfreq build-identity. Corpus census: 42 status-0 + 4 status-1
+224 passed, 0 failed (re-derived from fresh runs, verified
+both workspace-wide and per-package with `cargo test -p`;
+per-crate account: spikes 39 (ffi-smoke-test 7 +
+gc-scheduler 8 + stack-switching 6 + hot-reload 10 +
+cranelift 8), toto-cli 47, toto-compiler 41, toto-jit 68,
+toto-runtime 29 — sums to 224 exactly; an earlier draft of
+this report had the same total with a misattributed split,
+corrected here), plus the stdlib suite 13/13 and wordfreq
+build-identity. Corpus census: 42 status-0 + 4 status-1
 runnable single-file programs (diag16 joined in Wave 1);
 22 concurrent (conc20 joined in Wave 1); 91 static negatives
 (diag17 joined in Wave 1); diag10 excluded; 4 project
 corpora (proj11/12 net, proj13/14 crypto).
 
-CI: run <PENDING — filled after push> (check + release-gates
-+ bench + macOS/Linux ARM64 tier1-probes green; Windows
-probe informational under continue-on-error — Wave 0
-disposition, unchanged). Bench suite: no new rows (decision:
-crypto one-shots are microsecond-scale and do not fit the
-calibrated-workload methodology; the suite stays at the v1
-set with the 5x flagging rule; crypto/serialization bench
-rows are a recorded follow-up, not a silent drop). Corpus +
-conformance + differential hold to the v1 standard (same
-harnesses, same exactness).
+CI: run 44606812115 (check + release-gates + bench +
+Linux ARM64 tier1-probe green; Windows probe informational
+under continue-on-error — Wave 0 disposition, unchanged;
+macOS tier1-probe verdict below). Bench suite: no new rows
+(decision: crypto one-shots are microsecond-scale and do
+not fit the calibrated-workload methodology; the suite
+stays at the v1 set with the 5x flagging rule;
+crypto/serialization bench rows are a recorded follow-up,
+not a silent drop). Corpus + conformance + differential hold
+to the v1 standard (same harnesses, same exactness).
+
+macOS tier1-probe verdict: PENDING — the run-44606812115
+macOS job is queued behind a GitHub-hosted macOS runner
+backlog (8h+ at time of writing; three wedged pre-fix runs
+were cancelled to free runners). Pre-fix evidence stands:
+macOS build + Tier-1 mir_conform green on run 44587228308;
+the delta since is the stack-frame refactor (strictly less
+stack on every platform) and the O_NONBLOCK correction
+(macOS behavior now matches the green Linux path), with the
+macOS-only cfg branch compile-verified via
+`cargo check --target aarch64-apple-darwin`. This line is
+updated to green/red the moment the verdict lands; no other
+gate depends on it.
 
 ## Acceptance checklist (§7)
 
@@ -352,9 +368,12 @@ harnesses, same exactness).
    implementation in this wave.
 5. Serialization shipped: YAML, TOML, protobuf, compression,
    each with stated scope and conformance tests.
-6. Full gates green (check.sh exit 0; CI run id to be filled
-   on push); corpus, conformance, differential to the v1
-   standard; totals re-derived (61/224/0).
+6. Full gates green (check.sh exit 0; CI run 44606812115
+   green on check, release-gates, bench, Linux ARM64;
+   macOS verdict pending per the note above); corpus,
+   conformance, differential to the v1 standard; totals
+   re-derived (61 result lines / 224 passed / 0 failed,
+   per-crate account corrected above).
 7. Report complete with checklist, API design (§17, flagged),
    library choice + vector sets, ADR (appendix below),
    and every deferral with rationale (multi-worker stall,
@@ -379,6 +398,17 @@ harnesses, same exactness).
   surfaces, TOML empty-table reporting → follow-ups noted
   above; Windows stays deferred per the POSIX-compat
   decision.
+- Intermittent CI stall (runs 44583177946/44585320505 check
+  jobs wedged 3h+ with no log output — one in fmt/clippy/
+  test phase, one after typing `type_state_self_ref`; a
+  macOS corpus gate also stalled): pre-existing (both runs
+  predate the stack fix), sequential harness (no
+  parallelism to race), unreproducible locally (the suspect
+  case exits 2 three-for-three), and absent from the final
+  tree (four consecutive runs green on every completed gate
+  — check, ARM, bench, release-gates — plus local green).
+  Recorded as a CI-stall follow-up; checker and harness are
+  frozen territory, so no Wave 1 change.
 - No real release, tag, or artifact publication (forbidden).
 
 ## Appendix — context ADR
