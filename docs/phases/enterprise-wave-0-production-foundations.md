@@ -1,5 +1,7 @@
 # Enterprise Wave 0 — Production Foundations (GATED)
 
+> **Wave 0 verdict: CONDITIONAL — merged to main as 4e99096. Linux x86_64 + macOS ARM64 + Linux ARM64 SUPPORTED; Windows DEFERRED WITH EVIDENCE (POSIX FFI surface). Verdict and policy numbers approved by the user 2026-11-19. Gate green (61 result lines, 224 tests, 0 failed); CI green on run 44446354225 (check + release-gates + bench + macOS/Linux ARM64 probes; Windows probe informational under continue-on-error). Details in the sections below; earlier section text is preserved verbatim.**
+
 > **Wave 0 verdict: CONDITIONAL — Linux x86_64 + macOS ARM64 + Linux
 > ARM64 SUPPORTED; Windows DEFERRED WITH EVIDENCE (POSIX FFI
 > surface); GC targets published and measured; policies proposed
@@ -330,3 +332,50 @@ are executor-only additions, checksummed in bench.sh).
 - Release pipeline on the default branch (dispatch
   currently 404s for branch-only workflow files — see
   Stage 4 notes); second-run reproducibility compare.
+
+## Merge-hygiene dated notes (2026-11-19, on `main`; append-only — existing section text above is preserved verbatim)
+
+- (a) Windows evidence overstatement: the Stage 1 sentence
+  "The `toto` binary, scheduler, GC, and concurrent execution
+  are proven on Windows" overstates the probe evidence.
+  Correct record: build and Tier-1 `mir_conform` pass on
+  Windows; concurrent execution (coroutine switching, JIT
+  execution, the pingpong program) is UNPROVEN on Windows —
+  the pingpong step never ran there (skipped after the corpus
+  gate failed). The deferral evidence itself (24 corpus
+  cases, all POSIX FFI, clean E0301s) stands.
+- (b) Wordfreq startup figure: the Stage 0(e) "total run
+  9 ms" is a separate fourth invocation (full wall time to
+  completion, stdout discarded — `./target/wordfreq
+  >/dev/null`), NOT any of the three first-byte runs
+  (16 / 10 / 9 ms; it cannot be the 16 ms run). It is
+  numerically equal to run 3's 9 ms because the 6-line
+  program prints almost immediately — startup dominates
+  total. The "8 ms" figure is the Phase 7 wordfreq
+  time-to-first-output number (total 9 ms minus 1.2 ms
+  teardown — itself derived, and recorded alongside the
+  trivial-program figures, not replacing them); Wave 0's
+  "trivial figure it replaces" misstates both the program
+  and the relation. Wave 0 directly timed 9–16 ms,
+  consistent with the derived 8 ms.
+- (c) Scratch repo not deleted: the Stage 4 claim that the
+  scratch repo was "deleted after" is wrong.
+  `iamstoick/toto-release-dryrun` still exists (re-privatized,
+  tags/releases inside, invisible). Deletion is a USER
+  action (`gh repo delete iamstoick/toto-release-dryrun
+  --yes` after `gh auth refresh -s delete_repo`, or from the
+  web UI) — not attempted; the agent lacks `delete_repo`
+  scope. Nothing ever touched the real repo: no tags, no
+  releases, no artifacts there (verified: local dry-run
+  tags deleted, `git tag` clean).
+- (d) CI run + lines bridge: Stage 5 cites no CI run id —
+  record run `44446354225` (Status Success; check,
+  release-gates, bench, macOS + Linux ARM64 probes green;
+  Windows probe job fails visibly under continue-on-error
+  while the run stays green). Result-lines bridge 60 → 61
+  verified against the branch gate log (`check_wave0.log`,
+  61 lines / 224 passed / 0 failed): the one new line is
+  `tests/gc_perf.rs` (3 tests); the diag-renderer test rides
+  the existing toto-compiler lib line (0 → 1) and the
+  no-stale test rides the existing `cli.rs` line (16 → 17):
+  219 + 3 + 1 + 1 = 224.

@@ -1,4 +1,4 @@
-# Stability policy (Enterprise Wave 0 — PROPOSED, awaiting user approval)
+# Stability policy (Enterprise Wave 0 — APPROVED 2026-11-19: user approval of the verdict and policy numbers as written)
 
 What the project promises not to break, and what it explicitly
 reserves the right to change. Takes effect from the first

@@ -1,14 +1,15 @@
 # Toto (.gzv) — language implementation in Rust
 
-> Phase 7 (production AOT + packages) complete — production
-> Cranelift AOT (LLVM NO-GO re-confirmed), package manager
-> with full transitive resolution, `toto.lock`, path/git/
-> local-publish sources, 5x-regression bench gate in CI.
-> Gate green (60 result lines, 219 tests, 0 failed).
-> See [Phase 7 report](docs/phases/phase-7-production-aot-packages.md).
-> Roadmap: [Implementation Roadmap v2.4](docs/) (D1–D8 + ratified decisions; title page verified at Phase 4 kickoff).
+> Enterprise Wave 0 (production foundations) complete —
+> CONDITIONAL: Linux x86_64 + macOS ARM64 + Linux ARM64
+> supported, Windows deferred with evidence (POSIX FFI
+> surface). GC targets published and measured; policies,
+> signing/SBOM pipeline in place.
+> Gate green (61 result lines, 224 tests, 0 failed).
+> See [Wave 0 report](docs/phases/enterprise-wave-0-production-foundations.md).
+> Roadmap: [Implementation Roadmap v2.5](docs/) (D1–D8 + ratified decisions; Enterprise Track gated waves).
 
-## Policies (Enterprise Wave 0 — stability/deprecation/support proposed, security live on approval)
+## Policies (Enterprise Wave 0 — approved 2026-11-19)
 
 - [Stability](docs/stability.md) — what is covered, what is not.
 - [Deprecation](docs/deprecation.md) — notice, migration path, period.

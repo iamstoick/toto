@@ -1,4 +1,4 @@
-# Support window (Enterprise Wave 0 — PROPOSED, awaiting user approval)
+# Support window (Enterprise Wave 0 — APPROVED 2026-11-19: user approval of the verdict and policy numbers as written)
 
 ## The promise (PROPOSED — user approval required)
 
