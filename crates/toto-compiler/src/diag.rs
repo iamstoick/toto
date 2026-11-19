@@ -40,11 +40,17 @@ impl Diag {
         out.push_str(&format!("{:width$} |\n", "", width = width));
         out.push_str(&format!("{line} | {line_text}\n"));
         // Caret span: clamp to the line, count in characters.
-        let line_start = src
-            .lines()
-            .take(line.saturating_sub(1))
-            .map(|l| l.len() + 1)
-            .sum::<usize>();
+        // Byte offset of the line start, not `lines()` lengths:
+        // `lines()` strips a `\r\n` terminator's `\r`, which put
+        // every caret one column right on CRLF sources.
+        let line_start = if line <= 1 {
+            0
+        } else {
+            src.match_indices('\n')
+                .nth(line - 2)
+                .map(|(i, _)| i + 1)
+                .unwrap_or(src.len())
+        };
         let start_in_line = (self.span.start as usize).saturating_sub(line_start);
         let char_col = line_text
             .char_indices()
@@ -87,4 +93,38 @@ pub fn render_all(diags: &[Diag], src: &str, filename: &str, is_panic: bool) -> 
         .map(|d| d.render(src, filename, is_panic))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diag_at(start: u32, end: u32) -> Diag {
+        Diag::new(
+            "E0001",
+            "unexpected character `'`".to_string(),
+            Span { start, end },
+            None,
+        )
+    }
+
+    #[test]
+    fn caret_aligns_identically_on_lf_and_crlf() {
+        // `'` at line 2, column 13 in both variants.
+        let lf = "fn main() -> int {\n    println('hi');\n    return 0;\n}\n";
+        let crlf = "fn main() -> int {\r\n    println('hi');\r\n    return 0;\r\n}\r\n";
+        let lf_start = lf.find('\'').expect("quote") as u32;
+        let crlf_start = crlf.find('\'').expect("quote") as u32;
+        let lf_out = diag_at(lf_start, lf_start + 1).render(lf, "f.gzv", false);
+        let crlf_out = diag_at(crlf_start, crlf_start + 1).render(crlf, "f.gzv", false);
+        // Same caret line, and no carriage return leaks into output.
+        let caret = |out: &str| {
+            out.lines()
+                .find(|l| l.split('|').nth(1).is_some_and(|r| r.contains('^')))
+                .expect("caret line")
+                .to_string()
+        };
+        assert_eq!(caret(&lf_out), caret(&crlf_out));
+        assert!(!crlf_out.contains('\r'), "CR leaked: {crlf_out:?}");
+    }
 }

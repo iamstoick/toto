@@ -22,7 +22,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_double, c_int, c_long, c_void};
+use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 
@@ -43,13 +43,23 @@ unsafe extern "C" {
     fn strlen(s: *const c_char) -> usize;
     fn strcmp(s1: *const c_char, s2: *const c_char) -> c_int;
     fn strtod(s: *const c_char, endptr: *mut *mut c_char) -> c_double;
+    fn strerror(errnum: c_int) -> *mut c_char;
+}
+
+// POSIX-only surface (file descriptors, `errno`, threads, sleep):
+// present in libc on Linux/macOS, absent from MSVC. Unix-only by
+// construction — naming one on Windows is a clean E0301 at check
+// time via `is_linked` (never a link failure, never a panic). The
+// Windows-compat decision (Win32/pthread layer + UCRT fd/errno
+// semantics) is recorded as deferred Wave 0 work, not designed here.
+#[cfg(unix)]
+unsafe extern "C" {
     // `open` is variadic in libc (`open(path, flags, ...)`); the
     // two-argument form is valid without `O_CREAT`, and Rust admits
     // the variadic declaration directly.
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn close(fd: c_int) -> c_int;
-    fn strerror(errnum: c_int) -> *mut c_char;
-    fn __errno_location() -> *mut c_int;
+    fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn pthread_create(
         thread: *mut c_void,
         attr: *const c_void,
@@ -58,10 +68,40 @@ unsafe extern "C" {
     ) -> c_int;
     fn pthread_join(thread: u64, retval: *mut *mut c_void) -> c_int;
     fn sleep(seconds: c_int) -> c_int;
-    fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
 }
 
+// `errno` accessor: `__errno_location` on glibc (Linux), `__error`
+// on macOS. Both return the calling thread's slot.
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn __errno_location() -> *mut c_int;
+}
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn __error() -> *mut c_int;
+}
+#[cfg(unix)]
+fn errno_slot() -> *mut c_int {
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            __errno_location()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            __error()
+        }
+    }
+}
+
+#[cfg(unix)]
 #[link(name = "m")]
+unsafe extern "C" {
+    fn pow(x: c_double, y: c_double) -> c_double;
+}
+// No `m` on Windows: `pow` lives in the UCRT/MSVCRT default libs,
+// so no link attribute is needed (or valid) there.
+#[cfg(windows)]
 unsafe extern "C" {
     fn pow(x: c_double, y: c_double) -> c_double;
 }
@@ -84,25 +124,29 @@ pub extern "C" fn toto_rt_read_i32(p: *const c_void) -> c_int {
 }
 
 /// Read 8 bytes as an `i64` bit pattern (pthread handles, data words).
+/// Fixed-width `i64`, not `c_long`: `long` is 32 bits on Windows
+/// (LLP64), which would silently truncate. LP64 platforms are
+/// unaffected (`c_long` == `i64` there).
 #[unsafe(no_mangle)]
-pub extern "C" fn toto_rt_read_i64(p: *const c_void) -> c_long {
+pub extern "C" fn toto_rt_read_i64(p: *const c_void) -> i64 {
     // SAFETY: same contract as `toto_rt_read_i32`, for 8-byte slots.
-    unsafe { (p as *const c_long).read_unaligned() }
+    unsafe { (p as *const i64).read_unaligned() }
 }
 
 /// Write an `i64` bit pattern (thread data buffers).
 #[unsafe(no_mangle)]
-pub extern "C" fn toto_rt_write_i64(p: *mut c_void, v: c_long) {
+pub extern "C" fn toto_rt_write_i64(p: *mut c_void, v: i64) {
     // SAFETY: the caller guarantees a live, writable 8-byte slot.
     unsafe {
-        (p as *mut c_long).write_unaligned(v);
+        (p as *mut i64).write_unaligned(v);
     }
 }
 
 /// Close a file descriptor. `close(2)` cannot be named in a Toto
 /// `unsafe extern` block (`close` is the reserved channel builtin),
 /// so this alias is the sanctioned spelling; `stdlib/ffi.gzv` wraps
-/// it as `c_close`.
+/// it as `c_close`. POSIX-only with the rest of the fd surface.
+#[cfg(unix)]
 #[unsafe(no_mangle)]
 pub extern "C" fn toto_rt_close(fd: c_int) -> c_int {
     // SAFETY: `fd` is just a number to the kernel; a bogus fd fails
@@ -262,8 +306,44 @@ pub const LINKED: &[&str] = &[
     "read",
 ];
 
+/// POSIX-only FFI names: threads, file descriptors, `errno`, sleep.
+/// No MSVC equivalents; naming one on Windows is a clean E0301 at
+/// check time (the dispatch arms are `cfg(unix)` to match, so the
+/// `unreachable!("linkage checked above")` tail stays sound).
+#[cfg(windows)]
+const POSIX_ONLY: &[&str] = &[
+    "open",
+    "close",
+    "read",
+    "__errno_location",
+    "pthread_create",
+    "pthread_join",
+    "sleep",
+    "toto_rt_close",
+];
+
 pub fn is_linked(name: &str) -> bool {
+    #[cfg(windows)]
+    if POSIX_ONLY.contains(&name) {
+        return false;
+    }
     LINKED.contains(&name)
+}
+
+/// Names actually linked in this binary (drives the E0301 message so
+/// it never lists names the platform cannot provide).
+pub fn linked_names() -> Vec<&'static str> {
+    LINKED
+        .iter()
+        .copied()
+        .filter(|_n| {
+            #[cfg(windows)]
+            if POSIX_ONLY.contains(_n) {
+                return false;
+            }
+            true
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +452,10 @@ pub fn call(
     result.map(|v| (v, claimed))
 }
 
+// `claimed`/`preclaimed` currently serve only the `pthread_create`
+// arm (unix-only): on Windows no arm consumes them. `allow` is scoped
+// to Windows so a genuinely dead parameter on unix still warns.
+#[cfg_attr(windows, allow(unused_variables))]
 fn call_inner(
     name: &str,
     sig: &HExternFn,
@@ -434,6 +518,7 @@ fn call_inner(
             };
             Ok(Value::Float(unsafe { strtod(s, end) }))
         }
+        #[cfg(unix)]
         "open" => {
             let p = str_arg(&args[0], owned, span)? as *const c_char;
             let flags = int_arg(&args[1], &sig.params[1].1, span)? as c_int;
@@ -447,16 +532,18 @@ fn call_inner(
             // the number to `strerror`, which needs no `errno` state.
             let fd = unsafe { open(p, flags) };
             if fd < 0 {
-                let e = unsafe { *__errno_location() };
+                let e = unsafe { *errno_slot() };
                 Ok(Value::Int(-(e as i64)))
             } else {
                 Ok(Value::Int(fd as i64))
             }
         }
+        #[cfg(unix)]
         "close" => {
             let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
             Ok(Value::Int(unsafe { close(fd) } as i64))
         }
+        #[cfg(unix)]
         "read" => {
             let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
             let buf = ptr_arg(&args[1], span)? as *mut c_void;
@@ -466,17 +553,18 @@ fn call_inner(
             // Success is the byte count (0 is EOF), never negative.
             let r = unsafe { read(fd, buf, n) };
             if r < 0 {
-                let e = unsafe { *__errno_location() };
+                let e = unsafe { *errno_slot() };
                 Ok(Value::Int(-(e as i64)))
             } else {
                 Ok(Value::Int(r as i64))
             }
         }
+        #[cfg(unix)]
         "toto_rt_close" => {
             let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
             let rc = toto_rt_close(fd);
             if rc < 0 {
-                let e = unsafe { *__errno_location() };
+                let e = unsafe { *errno_slot() };
                 Ok(Value::Int(-(e as i64)))
             } else {
                 Ok(Value::Int(0))
@@ -510,10 +598,13 @@ fn call_inner(
             let p = unsafe { strerror(e) };
             Ok(c_string_to_value(p, span)?)
         }
+        #[cfg(unix)]
         "__errno_location" => {
-            let p = unsafe { __errno_location() };
+            // Historical name; on macOS this is the `__error` slot.
+            let p = errno_slot();
             Ok(Value::Ptr(p as u64))
         }
+        #[cfg(unix)]
         "pthread_create" => {
             let thread = ptr_arg(&args[0], span)? as *mut c_void;
             let attr = match &args[1] {
@@ -547,6 +638,7 @@ fn call_inner(
                 unsafe { pthread_create(thread, attr, f, arg) } as i64
             ))
         }
+        #[cfg(unix)]
         "pthread_join" => {
             let thread = int_arg(&args[0], &sig.params[0].1, span)? as u64;
             let retval = match &args[1] {
@@ -565,6 +657,7 @@ fn call_inner(
             };
             Ok(Value::Int(unsafe { pthread_join(thread, retval) } as i64))
         }
+        #[cfg(unix)]
         "sleep" => {
             let s = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
             Ok(Value::Int(unsafe { sleep(s) } as i64))
@@ -701,7 +794,9 @@ fn str_arg(
 /// A Toto function value to a C function pointer: claim a trampoline
 /// slot and hand out its address. Slots stay live for the evaluator's
 /// drain (which maps them to callables and releases them); on call
-/// failure `call` releases everything it claimed.
+/// failure `call` releases everything it claimed. Unix-only caller
+/// (`pthread_create` arm); no Windows caller yet.
+#[cfg_attr(windows, allow(dead_code))]
 fn fn_arg(
     v: &Value,
     arg_idx: usize,

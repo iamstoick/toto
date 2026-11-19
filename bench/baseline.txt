@@ -1,13 +1,16 @@
-# bench/baseline.txt — release-benchmark medians (ms) for regression
-# flagging (`scripts/bench.sh --baseline`). Sources: benchmark rows are
-# the Stage 1 published medians (n=5, methodology in the Phase 7 report
+# bench/baseline.txt — benchmark medians (ms) for regression flagging
+# (`scripts/bench.sh --baseline`). Sources: benchmark rows are the
+# Stage 1 published medians (n=5, methodology in the Phase 7 report
 # §Stage 1); `aot*-wf-*` and `start-*` rows were measured locally on
 # 2026-11-17 (Ryzen 5 5600G, 27 GB RAM, Linux, rustc 1.100.0, n=5 for
-# wordfreq Off, n=3 for the rest). CI compares `--runs 3` medians
-# against these; any median above 5x its baseline prints FLAG and fails
-# the suite (exit 1). The 5x rule absorbs machine variance (CI runners
-# differ from the recording machines) while catching order-of-magnitude
-# regressions (the wordfreq 75s anomaly was ~500x its fixed time).
+# wordfreq Off, n=3 for the rest); `exec-gc-*` rows are debug-executor
+# medians measured locally on 2026-11-18 (same machine, n=3) — the GC
+# workloads run on the runtime executor (debug `toto`), not AOT.
+# CI compares `--runs 3` medians against these; any median above 5x
+# its baseline prints FLAG and fails the suite (exit 1). The 5x rule
+# absorbs machine variance (CI runners differ from the recording
+# machines) while catching order-of-magnitude regressions (the
+# wordfreq 75s anomaly was ~500x its fixed time).
 interp-compute 1874
 jit-compute 16
 aot-compute 96
@@ -20,6 +23,8 @@ interp-stdlib 1761
 aot-stdlib 201
 aotrel-stdlib 48
 interp-wordfreq 1189
+exec-gc-alloc 2682
+exec-gc-chan 3553
 aot-wordfreq 515
 aotrel-wordfreq 145
 interp-wf-6 16

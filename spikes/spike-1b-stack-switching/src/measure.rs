@@ -11,8 +11,26 @@
 
 const PATTERN: u64 = 0xAA_AA_AA_AA_AA_AA_AA_AA;
 
+#[cfg(unix)]
 pub fn page_size() -> usize {
     let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    assert!(ps.is_power_of_two(), "page size must be a power of two");
+    ps
+}
+
+/// Windows fallback: `GetSystemInfo` from kernel32 (always linked;
+/// no new dependency). `SYSTEM_INFO` is 48 bytes on 64-bit Windows
+/// with `dwPageSize` as the second DWORD (offset 4) — stable ABI,
+/// documented on MSDN. Only the page-size field is read.
+#[cfg(windows)]
+pub fn page_size() -> usize {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemInfo(info: *mut [u8; 48]);
+    }
+    let mut buf = [0u8; 48];
+    unsafe { GetSystemInfo(&mut buf) };
+    let ps = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
     assert!(ps.is_power_of_two(), "page size must be a power of two");
     ps
 }

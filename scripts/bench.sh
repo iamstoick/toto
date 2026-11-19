@@ -67,6 +67,8 @@ SCALE=2000
 EXPECT_COMPUTE="1249999000000"
 EXPECT_CONC="499999500000"
 EXPECT_STDLIB="166666668"
+EXPECT_GC_ALLOC="59760000"
+EXPECT_GC_CHAN="$(printf '21943430\n2621250')"
 
 cargo build -q -p toto-cli -p toto-jit --bin jit_probe
 TOTO="$ROOT/target/debug/toto"
@@ -108,6 +110,10 @@ out=$("$PROBE" "$ROOT/bench/compute.gzv"); check_exact compute-jit "$out" "$EXPE
 out=$("$TOTO" run "$ROOT/bench/conc.gzv"); check_exact conc "$out" "$EXPECT_CONC"
 out=$("$PROBE" --task "$ROOT/bench/conc.gzv"); check_exact conc-jit "$out" "$EXPECT_CONC"
 out=$("$TOTO" run "$ROOT/bench/stdlib.gzv"); check_exact stdlib "$out" "$EXPECT_STDLIB"
+# GC workloads run on the runtime executor only (the tree-walker
+# cannot run concurrent programs; the JIT probe is single-file).
+out=$("$TOTO" run "$ROOT/bench/gc_alloc.gzv"); check_exact gc-alloc "$out" "$EXPECT_GC_ALLOC"
+out=$("$TOTO" run "$ROOT/bench/gc_chan.gzv"); check_exact gc-chan "$out" "$EXPECT_GC_CHAN"
 echo "probe import limit (recorded, not a failure):"
 "$PROBE" "$ROOT/bench/stdlib.gzv" 2>&1 | head -n 1 || true
 echo "ok correctness (interp + jit where runnable)"
@@ -144,6 +150,10 @@ timed interp-compute "$TOTO" run "$ROOT/bench/compute.gzv"
 timed interp-conc "$TOTO" run "$ROOT/bench/conc.gzv"
 timed interp-stdlib "$TOTO" run "$ROOT/bench/stdlib.gzv"
 (cd "$SAMPLE/wordfreq" && timed interp-wordfreq "$TOTO" run main.gzv)
+
+echo "== cpu: gc workloads (runtime executor; STW collector under test) =="
+timed exec-gc-alloc "$TOTO" run "$ROOT/bench/gc_alloc.gzv"
+timed exec-gc-chan "$TOTO" run "$ROOT/bench/gc_chan.gzv"
 
 echo "== cpu: jit (compile+run) =="
 timed jit-compute "$PROBE" "$ROOT/bench/compute.gzv"
