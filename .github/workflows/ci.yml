@@ -74,6 +74,7 @@ jobs:
           getent ahosts localhost || true
           ldd target/debug/toto | grep -i crypto || true
           cd tests/corpus/project/proj11_net_echo && TOTO_NET_DEBUG=1 ../../../../target/debug/toto run main.gzv || echo "raw-exit=$?"
+          (command -v gdb >/dev/null || sudo apt-get install -y -q gdb) || echo "gdb-install-failed=$?"
           TOTO_NET_DEBUG=1 gdb -batch -ex run -ex bt --args ../../../../target/debug/toto run main.gzv 2>&1 | tail -40 || echo "gdb-exit=$?"
       - name: one concurrent program end to end
         run: |
