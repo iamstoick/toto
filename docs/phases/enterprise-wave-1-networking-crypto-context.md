@@ -380,8 +380,9 @@ lands; no other gate depends on it.
 7. Report complete with checklist, API design (§17, flagged),
    library choice + vector sets, ADR (appendix below),
    and every deferral with rationale (multi-worker stall,
-   no new bench rows, empty TOML tables, Windows, AOT-native
-   net/crypto/gzip, all-interfaces bind, Group C items).
+   intermittent CI stall, no new bench rows, empty TOML
+   tables, Windows, AOT-native net/crypto/gzip,
+   all-interfaces bind, Group C items).
    No Waves 2–5 work (no TLS/HTTP/logging/metrics/DB/auth/
    tracing/profiling/debugger/embedding/cloud/plugin ABI);
    no frozen-decision change.
