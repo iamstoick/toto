@@ -109,7 +109,11 @@ fn corpus() {
         #[cfg(unix)]
         let got_signal = {
             use std::os::unix::process::ExitStatusExt;
-            output.status.signal().map(|s| format!(" (signal {s})")).unwrap_or_default()
+            output
+                .status
+                .signal()
+                .map(|s| format!(" (signal {s})"))
+                .unwrap_or_default()
         };
         #[cfg(not(unix))]
         let got_signal = String::new();
