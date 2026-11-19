@@ -206,6 +206,13 @@ pub fn sockaddr_to_host(addr: &[u8]) -> Option<(String, u16)> {
     if addr.len() < 8 {
         return None;
     }
+    // Family position is platform-dependent: BSD sockets (macOS)
+    // carry a `sin_len` byte first, so family lives at [1];
+    // Linux packs the u16 family at [0..2]. Port (big-endian)
+    // and address offsets coincide on both.
+    #[cfg(target_vendor = "apple")]
+    let fam = addr[1] as u16;
+    #[cfg(not(target_vendor = "apple"))]
     let fam = u16::from_ne_bytes([addr[0], addr[1]]);
     let port = u16::from_be_bytes([addr[2], addr[3]]);
     if fam == 2 && addr.len() >= 8 {
@@ -418,19 +425,13 @@ unsafe extern "C" {
     fn libc_write(fd: c_int, buf: *const c_void, len: usize) -> isize;
 }
 
-/// An IPv4 loopback socket address (`127.0.0.1:port`), wire layout.
-pub fn sockaddr_loopback_v4(port: u16) -> ([u8; 16], u32) {
-    let mut addr = [0u8; 16];
-    // sa_family (AF_INET=2) + port (big-endian) + 127.0.0.1.
-    addr[0] = 2;
-    addr[1] = 0;
-    addr[2] = (port >> 8) as u8;
-    addr[3] = (port & 0xff) as u8;
-    addr[4] = 127;
-    addr[5] = 0;
-    addr[6] = 0;
-    addr[7] = 1;
-    (addr, 16)
+/// An IPv4 loopback socket address (`127.0.0.1:port`) in the
+/// kernel's own layout, via `getaddrinfo` (Wave 1 macOS fix: a
+/// hand-rolled Linux `sockaddr_in` lacks the BSD `sin_len` byte,
+/// so `bind`/`connect` failed on macOS. Asking libc removes the
+/// per-platform layout from our code entirely).
+pub fn sockaddr_loopback_v4(port: u16) -> Result<(Vec<u8>, u32), String> {
+    parse_numeric_host("127.0.0.1", port)
 }
 
 /// Create a TCP (`SOCK_STREAM`) or UDP (`SOCK_DGRAM`) socket.
@@ -472,7 +473,7 @@ pub fn bind_loopback(fd: c_int, port: u16) -> Result<(), String> {
     if r < 0 {
         return Err(last_error());
     }
-    let (addr, len) = sockaddr_loopback_v4(port);
+    let (addr, len) = sockaddr_loopback_v4(port)?;
     // SAFETY: `addr` outlives the call; the kernel copies it in.
     let r = unsafe { libc_bind(fd, addr.as_ptr() as *const c_void, len) };
     if r < 0 { Err(last_error()) } else { Ok(()) }
@@ -689,7 +690,7 @@ pub fn recv_blocking(fd: c_int, max: usize) -> Result<Vec<u8>, String> {
 /// Blocking `connect` to loopback (interpreter path).
 pub fn connect_blocking(port: u16) -> Result<c_int, String> {
     let fd = socket_tcp()?;
-    let (addr, len) = sockaddr_loopback_v4(port);
+    let (addr, len) = sockaddr_loopback_v4(port)?;
     // SAFETY: `addr` outlives the call; the kernel copies it in.
     let r = unsafe { libc_connect(fd, addr.as_ptr() as *const c_void, len) };
     if r == 0 {

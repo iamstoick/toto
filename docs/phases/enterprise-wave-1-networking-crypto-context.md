@@ -116,24 +116,35 @@ needs no order (post + `in_flight` decrement hold both
 locks). Post-fix: 5 consecutive pressure runs green, plus
 3× full `fmt_equiv` + `concurrent` suites green.
 
+Portability fix in this stage (broken-session code): the
+hand-rolled `sockaddr_in` lacked the BSD `sin_len` byte, so
+`bind`/`connect` failed on macOS, and the recvfrom peer
+parser read the family from the wrong offset. Fixed by
+building loopback sockaddrs via `getaddrinfo` (the kernel's
+own layout on every platform) and parsing peers with an
+Apple-aware family offset. `parse_numeric_host` (also
+`getaddrinfo`-based) and `resolve_blocking` were already
+portable and are unchanged.
+
 GATING DEFECT (reported, not promised around): with 8
-workers the 4-client hammer (and smaller 2×2 variants)
-stalls intermittently — posted completions sit undrained
+workers the 4-client hammer stalls intermittently (smaller
+2-client shapes stall too) — posted completions sit undrained
 while workers stop deciding; the 1-worker deterministic
-harness is unaffected and consistently green. Evidence:
-`target/tmp-tmpdir/trace*.log` park/post/drain correlations
-(unposted parks + posted-undrained completions, then
-silence), `/proc` switch counts frozen, futex/condvar
-waits with no GC rendezvous involved, `sched` observed held
-at watchdog time. Repro: `toto run --workers 8` on
-`conc20_net_hammer` (or the `m2x2` shape). TRACED TO the
-broken-session scheduler/poller path (single-file net
-programs, which the JIT differential skips, are unaffected;
-the defect needs ≥2 concurrent connections + workers).
-Single-worker M:N proof stands (exit criterion as worded —
-deterministic harness, seeded, exact goldens); parallel
-starvation coverage is the recorded follow-up (multi-worker
-scheduler audit with the `m2x2` repro). No Waves 2–5 work was
+harness is unaffected and consistently green. Evidence
+(temporary scheduler tracing, since reverted): park/post/
+drain correlation (unposted parks + posted-undrained
+completions, then silence), `/proc` switch counts frozen
+across all threads, futex waits with no GC rendezvous
+involved, `sched` observed held at watchdog time. Repro:
+`toto run --workers 8` on `conc20_net_hammer` (2-client ×
+few-round variants stall as well; needs ≥2 concurrent
+connections + multiple workers). TRACED TO the broken-session
+scheduler/poller path (single-file net programs, which the
+JIT differential skips, are unaffected). Single-worker M:N
+proof stands (exit criterion as worded — deterministic
+harness, seeded, exact goldens); parallel starvation coverage
+is the recorded follow-up (multi-worker scheduler audit
+with the `conc20` repro). No Waves 2–5 work was
 done for this; no timeout parameters were added to net calls
 (§17.4/§17.5 stand).
 
@@ -259,15 +270,12 @@ and rationale recorded here and in spec §19.
 ## Stage 5 — gates and report (this section)
 
 Full gate on the branch: `check.sh` exit 0 — 61 result lines,
-224 passed, 0 failed (re-derived from a fresh run; per-binary
-account: 53 test binaries across spikes, toto-cli (cli,
-corpus, lsp, packages), toto-compiler (lib + 8 suites),
-toto-jit (lib, probes + 10 suites incl. differential,
-differential_concurrent, differential_task, timings, opt,
-mn_jit, gate, panics, race, dev), toto-runtime (lib +
-sequential, concurrent, fmt_equiv, mn, gc, gc_perf, blocking,
-stack), plus the stdlib suite 13/13 and wordfreq
-build-identity. Corpus census: 42 status-0 + 4 status-1
+224 passed, 0 failed (re-derived from fresh runs; per-crate
+account from `cargo test --workspace`: spikes 55
+(ffi-smoke-test 8 + gc-scheduler 7 + stack-switching 6 +
+hot-reload 10 + cranelift 24), toto-cli 32, toto-compiler 69,
+toto-jit 39, toto-runtime 29 — sums to 224 exactly), plus the
+stdlib suite 13/13 and wordfreq build-identity. Corpus census: 42 status-0 + 4 status-1
 runnable single-file programs (diag16 joined in Wave 1);
 22 concurrent (conc20 joined in Wave 1); 91 static negatives
 (diag17 joined in Wave 1); diag10 excluded; 4 project
@@ -323,7 +331,8 @@ harnesses, same exactness).
 ## Deferrals carried with rationale (summary)
 
 - Multi-worker scheduler stall (gating defect, evidence +
-  repro in Stage 1) → follow-up: parallel-scheduler audit.
+  repro in Stage 1) → follow-up: parallel-scheduler audit
+  with the `conc20` repro.
 - Native AOT net/crypto/gzip (JIT/AOT refuse by design) →
   follow-up; executor is the reference.
 - All-interfaces bind, Group C items (raw sockets, packet

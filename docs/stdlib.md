@@ -216,7 +216,7 @@ net programs with `toto run`/`toto test`. Pinned by the
 
 Cryptographic bindings (Enterprise Wave 1; unix-only — see
 [ffi.md](ffi.md) for the per-binding contract and
-[spec §18](../spec.md) for the API record). Primitives are
+[spec §18](spec.md) for the API record). Primitives are
 bound (system libcrypto), never implemented. Bytes cross as
 `Array<int>` (0–255, `E0308` otherwise). Every fallible
 function returns `Result<_, string>`; malformed inputs are
@@ -260,7 +260,7 @@ cross-checked against system gunzip — see the Wave 1 report).
 ## `toml`
 
 TOML parse + serialize, config-shaped subset (Enterprise Wave
-1; pure Toto code — see [spec §19](../spec.md) for the scope
+1; pure Toto code — see [spec §19](spec.md) for the scope
 record). Values are `TomlVal` structs mirroring the `JsonVal`
 strata design (nested tables store as source-line fragments,
 re-parsed on access). Tables, dotted tables/keys, strings,

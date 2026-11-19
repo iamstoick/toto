@@ -24,13 +24,23 @@ fn main() {
         || target.contains("apple-macos")
         || target.contains("darwin")
     {
+        // System LibreSSL first (present on every macOS with CLT);
+        // Homebrew OpenSSL as fallback (same C ABI surface used).
         dirs.push("/usr/lib".to_string());
+        dirs.push("/opt/homebrew/opt/openssl@3/lib".to_string());
+        dirs.push("/usr/local/opt/openssl@3/lib".to_string());
     } else if target.contains("aarch64") {
         dirs.push("/usr/lib/aarch64-linux-gnu".to_string());
+        dirs.push("/lib/aarch64-linux-gnu".to_string());
         dirs.push("/usr/lib64".to_string());
+        dirs.push("/lib64".to_string());
+        dirs.push("/usr/lib".to_string());
     } else {
         dirs.push("/usr/lib/x86_64-linux-gnu".to_string());
+        dirs.push("/lib/x86_64-linux-gnu".to_string());
         dirs.push("/usr/lib64".to_string());
+        dirs.push("/lib64".to_string());
+        dirs.push("/usr/lib".to_string());
     }
     let names: &[&str] = if target.contains("apple") || target.contains("darwin") {
         &["libcrypto.dylib"]
