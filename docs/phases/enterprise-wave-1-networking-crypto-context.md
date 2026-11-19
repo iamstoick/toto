@@ -151,6 +151,17 @@ diagnostics from the hunt (T-NET tracing, gdb CI step,
 corpus per-case lines) are reverted in the cleanup commit;
 only the refactor ships.
 
+Portability fix from the same audit (2026-11-19):
+`set_nonblocking` OR-ed a shared `O_NONBLOCK=0x800`, which
+is Linux-only — macOS needs `0x10`, so macOS sockets stayed
+blocking and the loopback tests passed only because
+loopback connects complete synchronously. Now a
+per-platform constant (`0x800` Linux, `0x10` macOS,
+never-exercised fallback elsewhere — non-unix net entry
+points refuse with `E0301` before any fd exists). Validated
+by the macOS Tier-1 probe; Linux behavior is unchanged
+(cfg-gated).
+
 GATING DEFECT (reported, not promised around): with 8
 workers the 4-client hammer stalls intermittently (smaller
 2-client shapes stall too) — posted completions sit undrained
