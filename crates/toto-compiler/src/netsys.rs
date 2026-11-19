@@ -714,6 +714,8 @@ pub fn close(fd: c_int) -> Result<(), String> {
 /// (pool thread or interpreter — never a worker).
 pub fn resolve_blocking(host: &str) -> Result<Vec<String>, String> {
     use std::ffi::CString;
+    // TEMPORARY Wave 1 ARM diagnosis (revert after root cause).
+    eprintln!("T-ARM resolve start {host:?}");
     let h = CString::new(host).map_err(|_| format!("invalid hostname {host:?}"))?;
     // SAFETY: `h` outlives the call; NULL hints/service select
     // defaults; the result list is freed below before return.
@@ -764,6 +766,8 @@ pub fn resolve_blocking(host: &str) -> Result<Vec<String>, String> {
     }
     // SAFETY: frees the list from `getaddrinfo`.
     unsafe { libc_freeaddrinfo(res) };
+    // TEMPORARY Wave 1 ARM diagnosis (revert after root cause).
+    eprintln!("T-ARM resolve done count={}", out.len());
     if out.is_empty() {
         Err(format!("could not resolve {host:?}"))
     } else {
