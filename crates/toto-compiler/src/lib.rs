@@ -14,6 +14,7 @@ pub mod interp;
 pub mod lexer;
 pub mod mir;
 pub mod mir_interp;
+pub mod netsys;
 pub mod ops;
 pub mod parser;
 pub mod project;

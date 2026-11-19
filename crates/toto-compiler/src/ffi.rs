@@ -304,12 +304,28 @@ pub const LINKED: &[&str] = &[
     "toto_rt_close",
     "toto_rt_read_str",
     "read",
+    // Wave 1 networking (unix-only — see POSIX_ONLY below): socket
+    // setup/teardown plus readiness-gated I/O. DNS resolves on the
+    // blocking pool; everything else parks on the M:N poller.
+    "toto_rt_net_resolve",
+    "toto_rt_net_connect_ip",
+    "toto_rt_net_listen",
+    "toto_rt_net_accept",
+    "toto_rt_net_send",
+    "toto_rt_net_recv",
+    "toto_rt_net_close",
+    "toto_rt_net_udp_bind",
+    "toto_rt_net_udp_send_to",
+    "toto_rt_net_udp_recv_from",
+    "toto_rt_net_udp_peer_host",
+    "toto_rt_net_udp_peer_port",
+    "toto_rt_net_last_error",
 ];
 
-/// POSIX-only FFI names: threads, file descriptors, `errno`, sleep.
-/// No MSVC equivalents; naming one on Windows is a clean E0301 at
-/// check time (the dispatch arms are `cfg(unix)` to match, so the
-/// `unreachable!("linkage checked above")` tail stays sound).
+/// POSIX-only FFI names: threads, file descriptors, `errno`, sleep,
+/// sockets. No MSVC equivalents; naming one on Windows is a clean
+/// E0301 at check time (the dispatch arms are `cfg(unix)` to match,
+/// so the `unreachable!("linkage checked above")` tail stays sound).
 #[cfg(windows)]
 const POSIX_ONLY: &[&str] = &[
     "open",
@@ -320,6 +336,19 @@ const POSIX_ONLY: &[&str] = &[
     "pthread_join",
     "sleep",
     "toto_rt_close",
+    "toto_rt_net_resolve",
+    "toto_rt_net_connect_ip",
+    "toto_rt_net_listen",
+    "toto_rt_net_accept",
+    "toto_rt_net_send",
+    "toto_rt_net_recv",
+    "toto_rt_net_close",
+    "toto_rt_net_udp_bind",
+    "toto_rt_net_udp_send_to",
+    "toto_rt_net_udp_recv_from",
+    "toto_rt_net_udp_peer_host",
+    "toto_rt_net_udp_peer_port",
+    "toto_rt_net_last_error",
 ];
 
 pub fn is_linked(name: &str) -> bool {
@@ -675,6 +704,212 @@ fn call_inner(
             };
             Ok(Value::Float(unsafe { pow(x, y) }))
         }
+        // Wave 1 networking (interpreter path: blocking syscalls — the
+        // tree-walker has no scheduler to integrate with, so it is the
+        // reference semantics; the runtime executor parks instead).
+        // All arms are unix-only (see POSIX_ONLY).
+        //
+        // Error discipline (uniform): scalar ops return the fd/count or
+        // -1; array ops return the payload or an empty array. Either
+        // way the message lands in the call-duration error slot read
+        // by `toto_rt_net_last_error` ("" = clean). The `gzv.std/net`
+        // wrappers turn this into `Result<_, string>`.
+        #[cfg(unix)]
+        "toto_rt_net_resolve" => {
+            let host = match &args[0] {
+                Value::Str(s) => s.to_string(),
+                other => {
+                    return Err(fail(
+                        "E0308",
+                        format!("cannot resolve {} (need a hostname string)", other.type_name()),
+                        span,
+                    ));
+                }
+            };
+            // Comma-joined (see the `net.gzv` decl): IPv6 uses colons,
+            // never commas, so `split(joined, ",")` recovers the list.
+            match crate::netsys::resolve_blocking(&host) {
+                Ok(addrs) => {
+                    set_net_error(None);
+                    Ok(Value::Str(std::rc::Rc::new(addrs.join(","))))
+                }
+                Err(e) => {
+                    set_net_error(Some(e));
+                    Ok(Value::Str(std::rc::Rc::new(String::new())))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_net_connect_ip" => {
+            let ip = match &args[0] {
+                Value::Str(s) => s.to_string(),
+                other => {
+                    return Err(fail(
+                        "E0308",
+                        format!("cannot connect to {} (need an IP string)", other.type_name()),
+                        span,
+                    ));
+                }
+            };
+            let port = int_arg(&args[1], &sig.params[1].1, span)? as u16;
+            match crate::netsys::connect_ip_blocking(&ip, port) {
+                Ok(fd) => {
+                    set_net_error(None);
+                    Ok(Value::Int(fd as i64))
+                }
+                Err(e) => {
+                    set_net_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_net_listen" => {
+            let port = int_arg(&args[0], &sig.params[0].1, span)? as u16;
+            match crate::netsys::listen_loopback(port) {
+                Ok(fd) => {
+                    set_net_error(None);
+                    Ok(Value::Int(fd as i64))
+                }
+                Err(e) => {
+                    set_net_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_net_accept" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            match crate::netsys::accept_blocking(fd) {
+                Ok(c) => {
+                    set_net_error(None);
+                    Ok(Value::Int(c as i64))
+                }
+                Err(e) => {
+                    set_net_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_net_send" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let buf = bytes_arg(&args[1], span)?;
+            match crate::netsys::send_all_blocking(fd, &buf) {
+                Ok(n) => {
+                    set_net_error(None);
+                    Ok(Value::Int(n as i64))
+                }
+                Err(e) => {
+                    set_net_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_net_recv" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let max = size_arg(&args[1], span)?;
+            match crate::netsys::recv_blocking(fd, max) {
+                Ok(bytes) => {
+                    set_net_error(None);
+                    Ok(bytes_value(bytes))
+                }
+                Err(e) => {
+                    set_net_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_net_close" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            crate::netsys::forget_peer(fd);
+            match crate::netsys::close(fd) {
+                Ok(()) => {
+                    set_net_error(None);
+                    Ok(Value::Int(0))
+                }
+                Err(e) => {
+                    set_net_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_net_udp_bind" => {
+            let port = int_arg(&args[0], &sig.params[0].1, span)? as u16;
+            match crate::netsys::bind_udp_loopback(port) {
+                Ok(fd) => {
+                    set_net_error(None);
+                    Ok(Value::Int(fd as i64))
+                }
+                Err(e) => {
+                    set_net_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_net_udp_send_to" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let buf = bytes_arg(&args[1], span)?;
+            let ip = match &args[2] {
+                Value::Str(s) => s.to_string(),
+                other => {
+                    return Err(fail(
+                        "E0308",
+                        format!("cannot send to {} (need an IP string)", other.type_name()),
+                        span,
+                    ));
+                }
+            };
+            let port = int_arg(&args[3], &sig.params[3].1, span)? as u16;
+            match crate::netsys::udp_send_to(fd, &buf, &ip, port) {
+                Ok(n) => {
+                    set_net_error(None);
+                    Ok(Value::Int(n as i64))
+                }
+                Err(e) => {
+                    set_net_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_net_udp_recv_from" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let max = size_arg(&args[1], span)?;
+            match crate::netsys::udp_recv_from(fd, max) {
+                Ok((bytes, host, port)) => {
+                    crate::netsys::record_peer(fd, host, port);
+                    set_net_error(None);
+                    Ok(bytes_value(bytes))
+                }
+                Err(e) => {
+                    set_net_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_net_udp_peer_host" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            match crate::netsys::lookup_peer(fd) {
+                Some((host, _)) => Ok(Value::Str(std::rc::Rc::new(host))),
+                None => Ok(Value::Str(std::rc::Rc::new(String::new()))),
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_net_udp_peer_port" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            match crate::netsys::lookup_peer(fd) {
+                Some((_, port)) => Ok(Value::Int(port as i64)),
+                None => Ok(Value::Int(0)),
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_net_last_error" => Ok(Value::Str(std::rc::Rc::new(take_net_error()))),
         "toto_rt_read_i32" => {
             let p = ptr_arg(&args[0], span)? as *const c_void;
             Ok(Value::Int(toto_rt_read_i32(p) as i64))
@@ -701,6 +936,15 @@ fn call_inner(
             "E0308",
             format!(
                 "foreign function `{name}` is declared `-> string` but did not return a string"
+            ),
+            span,
+        ));
+    }
+    if matches!(sig.ret, Ty::Array(_)) && !matches!(v, Value::Array(_)) {
+        return Err(fail(
+            "E0308",
+            format!(
+                "foreign function `{name}` is declared `-> Array<int>` but did not return an array"
             ),
             span,
         ));
@@ -789,6 +1033,70 @@ fn str_arg(
             span,
         )),
     }
+}
+
+// Interpreter-side network error slot (Wave 1): the runtime
+// executor keeps this per task (see `Slot.net_error`); the
+// single-threaded tree-walker keeps it in a thread-local.
+// Every net arm sets it (`None` = clean); `toto_rt_net_last_error`
+// reads it. Never retains heap references — plain strings only.
+#[cfg(unix)]
+thread_local! {
+    static NET_LAST_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(unix)]
+fn set_net_error(msg: Option<String>) {
+    NET_LAST_ERROR.with(|s| *s.borrow_mut() = msg);
+}
+
+#[cfg(unix)]
+fn take_net_error() -> String {
+    NET_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
+/// A Toto `Array<int>` to call-duration bytes (Wave 1 amendment
+/// 2026-11-19, user-approved): every element must be 0–255; anything
+/// else (non-int elements, out-of-range values) is a clean E0308.
+/// The copy lives only for the call — never retained past return.
+fn bytes_arg(v: &Value, span: Span) -> Result<Vec<u8>, (Diag, Vec<crate::interp::TraceFrame>)> {
+    match v {
+        Value::Array(elems) => {
+            let mut out = Vec::with_capacity(elems.borrow().len());
+            for e in elems.borrow().iter() {
+                match e {
+                    Value::Int(n) if (0..=255).contains(n) => out.push(*n as u8),
+                    other => {
+                        return Err(fail(
+                            "E0308",
+                            format!(
+                                "cannot pass {} as socket bytes (elements must be ints 0-255)",
+                                other.type_name()
+                            ),
+                            span,
+                        ));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        other => Err(fail(
+            "E0308",
+            format!(
+                "cannot pass {} as socket bytes (need `Array<int>` of 0-255)",
+                other.type_name()
+            ),
+            span,
+        )),
+    }
+}
+
+/// Owned bytes back to a fresh Toto `Array<int>`.
+fn bytes_value(bytes: Vec<u8>) -> Value {
+    Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+        bytes.into_iter().map(|b| Value::Int(b as i64)).collect(),
+    )))
 }
 
 /// A Toto function value to a C function pointer: claim a trampoline

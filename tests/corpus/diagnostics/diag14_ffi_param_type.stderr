@@ -1,5 +1,5 @@
-error[E0302]: foreign parameter `n` must be a C type, found int
+error[E0302]: foreign parameter `n` must be a C type or `Array<int>`, found int
  --> diag14_ffi_param_type.gzv:2:15
   |
 2 |     fn strlen(n: int) -> c_long;
-  |               ^ help: use `c_char`, `c_int`, `c_long`, `c_double`, `*T`, or a `fn` callback type
+  |               ^ help: use `c_char`, `c_int`, `c_long`, `c_double`, `*T`, `Array<int>`, or a `fn` callback type

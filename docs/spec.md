@@ -1140,6 +1140,122 @@ are CLI errors (exit 3) carrying the code. `E0401`
 (unresolvable) and `E0311` (cross-package duplicates) reused
 unchanged.
 
+## 17. Networking substrate (Enterprise Wave 1; amendment record 2026-11-19 — DESIGN FOR USER REVIEW)
+
+**[Proposal — the whole section]** No socket API existed (v2.5 open
+question). This section designs the smallest API that covers TCP/UDP
+sockets + DNS on all supported platforms, with a platform-neutral
+shape so deferred Windows can join later without an API redesign.
+The user reviews this design at acceptance review; it is flagged
+here and in the Wave 1 report, not approved by inattention.
+
+No new builtin type, no new builtin, no D5/type-system change —
+everything below is existing types (`int`, `string`,
+`Array<int>`, `Result<T, string>`, user structs) plus new
+`gzv.std/net` wrappers over new runtime helpers
+(`toto_rt_net_*`, recorded in `docs/ffi.md`). If the API as
+built needs more than this section, that is a STOP-and-ask,
+not a silent extension — and the full bytes / binary-data
+story (v2.5 Group C, item 23) stays a separate gated proposal.
+
+### 17.1 Byte representation (the Wave 1 carve-out only)
+
+Socket payloads are `Array<int>` with every element 0–255.
+An out-of-range element is a loud `E0308` at send time (the
+existing FFI-coercion error — no new code). Received bytes
+arrive as `Array<int>`. Rationale: strings cannot hold
+arbitrary bytes (UTF-8 invariant), and a real bytestring
+type belongs to the Group C bytes story, which this wave
+explicitly does not design. The carve-out is exactly: byte
+arrays for send/receive, nothing else.
+
+### 17.2 Handles are ints
+
+Sockets are `int` handles (OS fds underneath), opaque like
+pointers: never print them in goldens (fd numbers are
+process-unstable). Closing twice, or operating on a closed
+socket, is a runtime `Err` naming the failure — never a
+panic, never silent.
+
+### 17.3 Functions (`gzv.std/net`)
+
+All return `Result<_, string>`; `Err` carries the OS message
+(`strerror` discipline — no errno ints cross the boundary).
+`Ok` values: fds/counts are `int`; payloads are
+`Array<int>`; addresses are `string`s.
+
+- `net_tcp_connect(host: string, port: int) -> Result<int, string>`
+- `net_tcp_listen(port: int) -> Result<int, string>` —
+  loopback (`127.0.0.1`) only, by decision (§17.4).
+- `net_accept(listener: int) -> Result<int, string>`
+- `net_send(conn: int, data: Array<int>) -> Result<int, string>` —
+  bytes written in this one syscall; may short-send.
+- `net_send_all(conn: int, data: Array<int>) -> Result<int, string>` —
+  Toto-level loop to full delivery; returns `len(data)`.
+- `net_recv(conn: int, max: int) -> Result<Array<int>, string>` —
+  up to `max` bytes; an empty array is orderly shutdown,
+  NOT an error.
+- `net_close(sock: int) -> Result<int, string>` — `Ok(0)`.
+- `net_resolve(host: string) -> Result<Array<string>, string>` —
+  blocking-pool DNS (genuinely blocking; see §17.5).
+- `net_udp_bind(port: int) -> Result<int, string>` — loopback only.
+- `net_udp_send_to(sock: int, data: Array<int>, host: string, port: int) -> Result<int, string>`
+- `net_udp_recv_from(sock: int, max: int) -> Result<UdpPacket, string>`
+  with `pub struct UdpPacket { data: Array<int>, host: string, port: int }`
+  declared in `gzv.std/net` (a user-level struct — no type-system change).
+
+Invalid ports (outside 1–65535) and negative `max` are runtime
+`Err` strings, not diagnostics (values, not programs, are wrong).
+
+### 17.4 Loopback-only listen/bind (scoped decision)
+
+`net_tcp_listen` and `net_udp_bind` bind `127.0.0.1` only —
+no address parameter, no all-interfaces bind. Rationale: the
+Wave 1 substrate serves loopback tests and the poller proof;
+a public bind address is API surface with security posture
+that belongs with the service waves, not the substrate. An
+all-interfaces bind is a recorded follow-up, explicitly NOT
+raw sockets (Group C stays gated).
+
+### 17.5 Blocking semantics (poller vs pool)
+
+Connect/accept/send/receive waits park the green thread on
+the runtime-integrated poller: the fd goes nonblocking, the
+task suspends, the worker is free, readiness wakes exactly
+that task. Network waits never occupy workers AND never
+occupy pool threads (that is what makes it a poller, not a
+second pool). DNS resolution parks on the dedicated blocking
+pool instead — `getaddrinfo` cannot be made nonblocking, so
+it is genuinely blocking per the Phase 3 policy. Boundary
+stated as a rule: a wait is poller-eligible iff its fd can
+be nonblocking and its readiness is `poll()`able; everything
+else (DNS, files) goes to the pool. No timeout parameters
+in v1 (timeouts interact with the context-propagation ADR —
+designed, not implemented, in this wave); cancellation is
+scope cancellation at suspension boundaries only (existing
+rule; a parked net wait is a suspension point).
+
+### 17.6 Conformance (what "done" means)
+
+Loopback TCP echo (client + server + concurrent clients),
+UDP echo with address round-trip, DNS for `localhost`, every
+error path (refused/unresolvable/closed/double-close/short
+send), close semantics — green on every supported platform
+via the executor (concurrent by nature; AOT execution where
+the harness supports it). The poller proof is separate and
+stronger (§17.7, wave exit criterion).
+
+### 17.7 Poller correctness proof (wave exit criterion)
+
+No lost wakeups, no worker starvation, demonstrated in the
+deterministic concurrency harness (seeded, exact goldens
+where deterministic; count-based assertions where the OS
+schedules): many clients × many messages, every byte
+accounted; a starvation probe showing every parked task
+eventually resumes under load. Workloads, seeds/workers,
+and run counts recorded in the Wave 1 report — the proof
+is evidence, not a timing assertion.
+
 ## Appendix A. Spec decisions (choices beyond the PDF)
 
 Every **[Proposal]** above is a judgment call the PDF did not fix. For the
@@ -1175,6 +1291,11 @@ reviewer, the load-bearing ones:
     top-level namespace, `pub` accepted with no effect, `mod`/`use` not in
     v1; duplicates across files are `E0311`, circular imports `E0402`,
     unresolved single-file imports `E0401` (§3.1, §3.3, §9.1).
+18. Networking substrate (Wave 1): `gzv.std/net` socket API —
+    bytes as `Array<int>` 0–255 (the Wave 1 carve-out only; full
+    bytes story stays Group C), sockets as opaque `int` handles,
+    loopback-only listen/bind, `Result<_, string>` errors, no
+    timeouts in v1, poller-vs-pool rule as stated (§17).
 
 Review record (2026-11-14): all items APPROVED — item 1 amended (unit type
 added), item 2 amended (else-required rule), items 15–16 added by the
