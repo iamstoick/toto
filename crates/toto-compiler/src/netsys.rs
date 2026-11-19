@@ -105,10 +105,6 @@ unsafe extern "C" {
 /// never DNS, never blocking. Returns the raw sockaddr bytes + len.
 pub fn parse_numeric_host(host: &str, port: u16) -> Result<(Vec<u8>, u32), String> {
     use std::ffi::CString;
-    // Net debug trace (see sched op_net).
-    if std::env::var_os("TOTO_NET_DEBUG").is_some() {
-        eprintln!("T-NET parse {host:?}");
-    }
     let h = CString::new(host).map_err(|_| format!("invalid IP literal {host:?}"))?;
     let svc = port.to_string();
     let s = CString::new(svc).unwrap();
@@ -532,10 +528,6 @@ pub enum ConnectOutcome {
 }
 
 pub fn connect_start(fd: c_int, ip: &str, port: u16) -> ConnectOutcome {
-    // Net debug trace (see sched op_net).
-    if std::env::var_os("TOTO_NET_DEBUG").is_some() {
-        eprintln!("T-NET connect_start {ip:?}");
-    }
     let (addr, len) = match parse_numeric_host(ip, port) {
         Ok(a) => a,
         Err(e) => return ConnectOutcome::Failed(e),
@@ -722,11 +714,6 @@ pub fn close(fd: c_int) -> Result<(), String> {
 /// (pool thread or interpreter — never a worker).
 pub fn resolve_blocking(host: &str) -> Result<Vec<String>, String> {
     use std::ffi::CString;
-    // Net debug trace (see sched op_net): enabled only with
-    // TOTO_NET_DEBUG set.
-    if std::env::var_os("TOTO_NET_DEBUG").is_some() {
-        eprintln!("T-NET resolve start {host:?}");
-    }
     let h = CString::new(host).map_err(|_| format!("invalid hostname {host:?}"))?;
     // SAFETY: `h` outlives the call; NULL hints/service select
     // defaults; the result list is freed below before return.
@@ -777,9 +764,6 @@ pub fn resolve_blocking(host: &str) -> Result<Vec<String>, String> {
     }
     // SAFETY: frees the list from `getaddrinfo`.
     unsafe { libc_freeaddrinfo(res) };
-    if std::env::var_os("TOTO_NET_DEBUG").is_some() {
-        eprintln!("T-NET resolve done count={}", out.len());
-    }
     if out.is_empty() {
         Err(format!("could not resolve {host:?}"))
     } else {

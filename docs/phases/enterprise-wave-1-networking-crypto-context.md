@@ -126,6 +126,31 @@ Apple-aware family offset. `parse_numeric_host` (also
 `getaddrinfo`-based) and `resolve_blocking` were already
 portable and are unchanged.
 
+ARM64 stack-overflow root cause and fix (2026-11-19): the
+ARM Tier-1 probe crashed with SIGSEGV in `proj11` after DNS
+resolve completed (6 addrs) and the pool completion drained
+— always between drain and the first connect, with variable
+delay. `gdb` on the runner caught it inside `str::split`'s
+iterator nest under `call_builtin`, and the runtime stack
+high-water probe read 64,512 / 65,536 bytes on x86_64 —
+~1 KiB of margin: coroutine stacks are spec-fixed 64 KiB
+(spec §1, ADR-002/ADR-008), and the interpreter chain
+(`run_task` → `loop_frames` → `exec_instr` → `exec_builtin`
+→ `call_builtin`'s merged ~24 KiB debug match frame → the
+`split` adapter nest) barely fits on x86_64 but overflows
+the guard page under ARM64's larger frames. Reproduced
+locally by halving the stack default (same SIGSEGV in the
+interpreter chain). Fix (spec-compliant — the 64 KiB budget
+is unchanged): `call_builtin` is now a thin dispatch over
+four `#[inline(never)]` group helpers (`str`/`num`/`arr`/`fs`
+builtins), so only one group's temporaries are live at a
+time; post-fix high-water is 60,584 bytes on x86_64 and the
+ARM probe is green. No builtin behavior changed (same
+messages/codes/spans; full suites green). All temporary
+diagnostics from the hunt (T-NET tracing, gdb CI step,
+corpus per-case lines) are reverted in the cleanup commit;
+only the refactor ships.
+
 GATING DEFECT (reported, not promised around): with 8
 workers the 4-client hammer stalls intermittently (smaller
 2-client shapes stall too) — posted completions sit undrained
