@@ -117,7 +117,7 @@ jobs:
               return 0;
           }
           EOF
-          for t in op_listen op_refused op_echo; do
+          for t in op_listen op_refused; do
             echo "=== $t ===";
             ./target/debug/toto run /tmp/$t.gzv > /tmp/$t.out 2>&1 &
             PID=$!;
@@ -127,6 +127,18 @@ jobs:
               kill -9 $PID || true;
             else
               echo "DONE $t:"; cat /tmp/$t.out || true;
+            fi;
+          done
+          for v in 0x0 0x4 0x10 0x40 0x80 0x400 0x800 0x4000; do
+            echo "=== op_echo with TOTO_O_NONBLOCK=$v ===";
+            TOTO_O_NONBLOCK=$v ./target/debug/toto run /tmp/op_echo.gzv > /tmp/echo_$v.out 2>&1 &
+            PID=$!;
+            sleep 20;
+            if kill -0 $PID 2>/dev/null; then
+              echo "TIMEOUT op_echo@$v (alive after 20s); killing";
+              kill -9 $PID || true;
+            else
+              echo "DONE op_echo@$v:"; cat /tmp/echo_$v.out || true;
             fi;
           done
       - name: Tier-1 conformance (frozen ADR-008, no codegen needed)

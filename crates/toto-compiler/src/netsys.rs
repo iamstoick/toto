@@ -492,12 +492,26 @@ pub fn set_nonblocking(fd: c_int) -> Result<(), String> {
     const O_NONBLOCK_FLAG: c_int = 0x4;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     const O_NONBLOCK_FLAG: c_int = 0;
+    // TEMPORARY empirical sweep aid (revert after root cause):
+    // TOTO_O_NONBLOCK=0xNN overrides the compiled-in flag so CI
+    // can bisect the true macOS bit without header trust.
+    #[cfg(unix)]
+    fn flag_override() -> Option<c_int> {
+        std::env::var("TOTO_O_NONBLOCK").ok().and_then(|s| {
+            let s = s.strip_prefix("0x").unwrap_or(&s);
+            i32::from_str_radix(s, 16).ok()
+        })
+    }
+    #[cfg(unix)]
+    let flag = flag_override().unwrap_or(O_NONBLOCK_FLAG);
+    #[cfg(not(unix))]
+    let flag = O_NONBLOCK_FLAG;
     let flags = unsafe { libc_fcntl(fd, 3, 0) };
     if flags < 0 {
         return Err(last_error());
     }
-    // SAFETY: OR-ing O_NONBLOCK into the retrieved flags.
-    let r = unsafe { libc_fcntl(fd, 4, flags | O_NONBLOCK_FLAG) };
+    // SAFETY: OR-ing the nonblocking flag into the retrieved flags.
+    let r = unsafe { libc_fcntl(fd, 4, flags | flag) };
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
