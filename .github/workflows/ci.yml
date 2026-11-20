@@ -119,7 +119,15 @@ jobs:
           EOF
           for t in op_listen op_refused op_echo; do
             echo "=== $t ===";
-            timeout 25 ./target/debug/toto run /tmp/$t.gzv; echo "$t-exit=$?";
+            ./target/debug/toto run /tmp/$t.gzv > /tmp/$t.out 2>&1 &
+            PID=$!;
+            sleep 20;
+            if kill -0 $PID 2>/dev/null; then
+              echo "TIMEOUT $t (alive after 20s); killing";
+              kill -9 $PID || true;
+            else
+              echo "DONE $t:"; cat /tmp/$t.out || true;
+            fi;
           done
       - name: Tier-1 conformance (frozen ADR-008, no codegen needed)
         run: cargo test -p toto-compiler --test mir_conform
