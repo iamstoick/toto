@@ -101,6 +101,20 @@ unsafe extern "C" {
 // and to keep every foreign symbol in this file visibly namespaced.
 
 /// Parse a numeric IP literal (v4 dotted-quad or v6) to a wire
+/// Word offset of `ai_addr` in `struct addrinfo` (64-bit Unix):
+/// Linux lays out addrlen, addr, canonname, next (addr at word 3
+/// = byte 24); macOS (BSD) lays out addrlen, canonname, addr,
+/// next (addr at word 4 = byte 32). Verified against the libc
+/// crate's platform headers — the old shared @24 read
+/// `ai_canonname` (NULL for numeric hosts) on macOS, so every
+/// parse failed. `ai_addrlen` (@16) and `ai_next` (@40) coincide.
+#[cfg(target_os = "linux")]
+const AI_ADDR_WORD: usize = 3;
+#[cfg(target_os = "macos")]
+const AI_ADDR_WORD: usize = 4;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const AI_ADDR_WORD: usize = 3;
+
 /// sockaddr via `getaddrinfo` with `AI_NUMERICHOST` — parsing only,
 /// never DNS, never blocking. Returns the raw sockaddr bytes + len.
 pub fn parse_numeric_host(host: &str, port: u16) -> Result<(Vec<u8>, u32), String> {
@@ -138,7 +152,8 @@ pub fn parse_numeric_host(host: &str, port: u16) -> Result<(Vec<u8>, u32), Strin
         return Err(format!("not a numeric IP address: {host:?}"));
     }
     // First result only (loopback tests use one address).
-    // Layout: ai_addrlen u32@16, ai_addr *@24 (64-bit Unix).
+    // ai_addrlen u32@16 on both; ai_addr at AI_ADDR_WORD
+    // (platform-dependent, see above).
     // SAFETY: `res` points at a live result list; freed below.
     let (bytes, len) = unsafe {
         if res.is_null() {
@@ -146,7 +161,7 @@ pub fn parse_numeric_host(host: &str, port: u16) -> Result<(Vec<u8>, u32), Strin
             return Err(format!("could not parse IP address {host:?}"));
         }
         let len = *(res as *const u32).add(4) as u32;
-        let addr = *(res as *const *const c_void).add(3);
+        let addr = *(res as *const *const c_void).add(AI_ADDR_WORD);
         if addr.is_null() || len == 0 || len > 64 {
             libc_freeaddrinfo(res);
             return Err(format!("could not parse IP address {host:?}"));
@@ -781,17 +796,13 @@ pub fn resolve_blocking(host: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut cur = res;
     while !cur.is_null() {
-        // ai_family at offset 0 (int), ai_addr/ai_addrlen follow the
-        // libc layout; read the address bytes directly instead of
-        // trusting struct offsets beyond family + pointer.
-        //
-        // Layout (both Linux and macOS, 64-bit): ai_flags int@0,
-        // ai_family int@4, ai_socktype int@8, ai_protocol int@12,
-        // ai_addrlen u32/socklen_t@16, ai_addr *@24, ai_next *@32.
+        // ai_family at offset 4 (int); ai_addrlen u32@16 and
+        // ai_next @40 coincide, but ai_addr sits at AI_ADDR_WORD
+        // (24 Linux, 32 macOS — see above).
         // SAFETY: `cur` points to a live addrinfo node owned by the
         // result list until `freeaddrinfo` below.
         let fam = unsafe { *(cur as *const c_int).add(1) };
-        let addr_ptr = unsafe { *(cur as *const *const c_void).add(3) };
+        let addr_ptr = unsafe { *(cur as *const *const c_void).add(AI_ADDR_WORD) };
         if !addr_ptr.is_null() {
             if fam == 2 {
                 // AF_INET: sin_port[2..4], sin_addr[4..8].
@@ -806,9 +817,9 @@ pub fn resolve_blocking(host: &str) -> Result<Vec<String>, String> {
                 out.push(render_ipv6(&b[8..24]));
             }
         }
-        // SAFETY: ai_next at offset 40 on 64-bit Unix (flags,
-        // family, socktype, protocol, addrlen, addr *@24,
-        // canonname *@32, next *@40).
+        // SAFETY: ai_next at offset 40 on 64-bit Unix on both
+        // platforms (only ai_addr moves: word 3 Linux, word 4
+        // macOS — see AI_ADDR_WORD).
         cur = unsafe { *(cur as *const *mut c_void).add(5) };
     }
     // SAFETY: frees the list from `getaddrinfo`.
