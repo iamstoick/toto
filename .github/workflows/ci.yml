@@ -59,6 +59,68 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: build workspace
         run: cargo build --workspace --exclude ffi-smoke-test
+      # TEMPORARY macOS net-op isolation (revert after root cause):
+      # runs each TCP op separately with timeouts so a hang names
+      # the failing op instead of wedging the corpus gate.
+      - name: isolate macOS net op (temporary)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cat > /tmp/op_listen.gzv <<'EOF'
+          import "gzv.std/net.gzv";
+          fn run() -> Result<string, string> {
+              let l = net_tcp_listen(48221)?;
+              net_close(l)?;
+              return Ok("LISTEN-OK");
+          }
+          fn main() -> int {
+              println(run());
+              return 0;
+          }
+          EOF
+          cat > /tmp/op_refused.gzv <<'EOF'
+          import "gzv.std/net.gzv";
+          fn main() -> int {
+              let r = net_tcp_connect("127.0.0.1", 48222);
+              println(r);
+              return 0;
+          }
+          EOF
+          cat > /tmp/op_echo.gzv <<'EOF'
+          import "gzv.std/net.gzv";
+          fn tcp_serve_inner(listener: int) -> Result<int, string> {
+              let conn = net_accept(listener)?;
+              let data = net_recv(conn, 2)?;
+              let n = net_send_all(conn, data)?;
+              net_close(conn)?;
+              net_close(listener)?;
+              return Ok(n);
+          }
+          fn tcp_serve(listener: int, out: chan<Result<int, string>>) -> int {
+              out <- tcp_serve_inner(listener);
+              return 0;
+          }
+          fn run() -> Result<string, string> {
+              let done = chan<Result<int, string>>(1);
+              let listener = net_tcp_listen(48223)?;
+              go {
+                  tcp_serve(listener, done);
+              }
+              let conn = net_tcp_connect("127.0.0.1", 48223)?;
+              let sent = net_send_all(conn, [72, 105])?;
+              let resp = net_recv(conn, 2)?;
+              net_close(conn)?;
+              let n = <-done;
+              return Ok("done");
+          }
+          fn main() -> int {
+              println(run());
+              return 0;
+          }
+          EOF
+          for t in op_listen op_refused op_echo; do
+            echo "=== $t ===";
+            timeout 25 ./target/debug/toto run /tmp/$t.gzv; echo "$t-exit=$?";
+          done
       - name: Tier-1 conformance (frozen ADR-008, no codegen needed)
         run: cargo test -p toto-compiler --test mir_conform
       - name: corpus gate
