@@ -66,7 +66,7 @@ jobs:
       - name: sample conc01 on macOS (temporary)
         if: matrix.os == 'macos-latest'
         run: |
-          ./target/debug/toto run tests/corpus/concurrent/conc01_pingpong.gzv > /tmp/conc01.out 2>&1 &
+          TOTO_PIPE_DEBUG=1 ./target/debug/toto run tests/corpus/concurrent/conc01_pingpong.gzv > /tmp/conc01.out 2>&1 &
           PID=$!
           sleep 20
           if kill -0 $PID 2>/dev/null; then
@@ -74,6 +74,7 @@ jobs:
             ps -M -o pid,tt,state,wchan,command -p $PID || true
             sample $PID 5 -file /tmp/conc01.sample >/dev/null 2>&1 || true
             grep -a -A 200 "Call graph" /tmp/conc01.sample | head -400 || true
+            echo "--- conc01.out:"; cat /tmp/conc01.out || true
             kill -9 $PID || true
           else
             echo "conc01 finished: [$(cat /tmp/conc01.out)]"

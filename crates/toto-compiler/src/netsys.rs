@@ -393,6 +393,16 @@ pub fn self_pipe() -> (c_int, c_int) {
     }
     let _ = set_nonblocking(fds[0]);
     let _ = set_nonblocking(fds[1]);
+    // TEMPORARY macOS fcntl diagnosis (revert after root cause):
+    // read back the flags so the log shows whether O_NONBLOCK
+    // actually landed (env-gated; CI sample step sets it).
+    #[cfg(unix)]
+    if std::env::var_os("TOTO_PIPE_DEBUG").is_some() {
+        for (tag, fd) in [("rd", fds[0]), ("wr", fds[1])] {
+            let flags = unsafe { libc_fcntl(fd, 3, 0) };
+            eprintln!("PIPE-DBG {tag} fd={fd} fcntl-flags={flags:#x}");
+        }
+    }
     (fds[0], fds[1])
 }
 
