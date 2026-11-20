@@ -454,15 +454,17 @@ fn socket_of(ty: c_int) -> Result<c_int, String> {
 /// blocking sockets and never calls this).
 pub fn set_nonblocking(fd: c_int) -> Result<(), String> {
     // F_GETFL=3, F_SETFL=4 on Linux and macOS. O_NONBLOCK differs:
-    // 0x800 (04000) on Linux, 0x10 on macOS (the old shared 0x800
-    // left macOS sockets blocking; loopback tests passed only
-    // because connects complete synchronously). The fallback is
+    // 0x800 (04000) on Linux, 0x4 on macOS (BSD value, which Apple
+    // inherits with no override — verified against the libc crate's
+    // Apple headers; a 0x10 guess was empirically proven wrong: the
+    // self-pipe stayed blocking and `drain_pipe` hung the poller,
+    // wedging every macOS concurrent program). The fallback is
     // never exercised: non-unix net entry points refuse with E0301
     // before any fd exists.
     #[cfg(target_os = "linux")]
     const O_NONBLOCK_FLAG: c_int = 0x800;
     #[cfg(target_os = "macos")]
-    const O_NONBLOCK_FLAG: c_int = 0x10;
+    const O_NONBLOCK_FLAG: c_int = 0x4;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     const O_NONBLOCK_FLAG: c_int = 0;
     let flags = unsafe { libc_fcntl(fd, 3, 0) };
@@ -478,9 +480,26 @@ pub fn set_nonblocking(fd: c_int) -> Result<(), String> {
 /// port across runs and suites).
 pub fn bind_loopback(fd: c_int, port: u16) -> Result<(), String> {
     let one: c_int = 1;
-    // SOL_SOCKET=1, SO_REUSEADDR=2 on both Linux and macOS.
+    // Socket-option levels differ: SOL_SOCKET=1, SO_REUSEADDR=2 on
+    // Linux; SOL_SOCKET=0xffff, SO_REUSEADDR=0x4 on macOS (verified
+    // against the libc crate's Apple headers — the old shared
+    // Linux values made every macOS bind fail).
+    #[cfg(target_os = "linux")]
+    const SOL_SOCKET_REUSE: (c_int, c_int) = (1, 2);
+    #[cfg(target_os = "macos")]
+    const SOL_SOCKET_REUSE: (c_int, c_int) = (0xffff, 0x4);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const SOL_SOCKET_REUSE: (c_int, c_int) = (1, 2);
     // SAFETY: plain ints and a pointer to a stack int.
-    let r = unsafe { libc_setsockopt(fd, 1, 2, &one as *const c_int as *const c_void, 4) };
+    let r = unsafe {
+        libc_setsockopt(
+            fd,
+            SOL_SOCKET_REUSE.0,
+            SOL_SOCKET_REUSE.1,
+            &one as *const c_int as *const c_void,
+            4,
+        )
+    };
     if r < 0 {
         return Err(last_error());
     }
@@ -560,13 +579,22 @@ pub fn connect_start(fd: c_int, ip: &str, port: u16) -> ConnectOutcome {
 pub fn so_error(fd: c_int) -> Result<(), String> {
     let mut err: c_int = 0;
     let mut len: u32 = 4;
-    // SOL_SOCKET=1, SO_ERROR=4 on both Linux and macOS.
+    // SOL_SOCKET=1, SO_ERROR=4 on Linux; SOL_SOCKET=0xffff,
+    // SO_ERROR=0x1007 on macOS (verified against the libc
+    // crate's Apple headers — the old shared Linux values made
+    // every macOS EINPROGRESS connect report failure).
+    #[cfg(target_os = "linux")]
+    const SOL_SOCKET_ERROR: (c_int, c_int) = (1, 4);
+    #[cfg(target_os = "macos")]
+    const SOL_SOCKET_ERROR: (c_int, c_int) = (0xffff, 0x1007);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const SOL_SOCKET_ERROR: (c_int, c_int) = (1, 4);
     // SAFETY: stack ints outlive the call.
     let r = unsafe {
         libc_getsockopt(
             fd,
-            1,
-            4,
+            SOL_SOCKET_ERROR.0,
+            SOL_SOCKET_ERROR.1,
             &mut err as *mut c_int as *mut c_void,
             &mut len as *mut u32,
         )
