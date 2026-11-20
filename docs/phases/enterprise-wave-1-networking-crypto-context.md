@@ -393,8 +393,10 @@ lands; no other gate depends on it.
 5. Serialization shipped: YAML, TOML, protobuf, compression,
    each with stated scope and conformance tests.
 6. Full gates green (check.sh exit 0 locally; CI run
-   44659508115 on the fix tip — check, ARM, release-gates
-   green, bench running, macOS queued per the note above);
+   44715292740 on the tip with all macOS fixes — x86_64
+   check, ARM, release-gates green, bench and macOS verdict
+   pending per the fix-forward note above; the earlier run
+   44659508115 went green on the same non-macOS gates);
    corpus, conformance,
    differential to the v1 standard; totals re-derived (62
    result lines / 225 passed / 0 failed — 224 + the
@@ -524,4 +526,39 @@ by design with attribution).
 Test totals re-derived at the fix tip: 62 result lines /
 225 passed / 0 failed — the Stage 5 per-crate account plus
 the new `net_hammer_mw` binary (toto-runtime 29 → 30).
+
+Fix 3 continued — macOS root causes (criterion 6). The first
+macOS verdict (run 44712863860) unblocked the gate: corpus
+runs to completion in ~2 minutes, no hangs. What it found
+instead were three hard-coded Linux layouts in `netsys.rs`,
+each fixed and verified against the libc crate's Apple
+headers plus macOS-target cross-compilation:
+(1) `drain_pipe` could block forever on a blocking pipe, and
+the old shared `O_NONBLOCK=0x800` was a no-op on macOS, so
+the poller wedged on its first drain — every concurrent
+program hung deterministically (proven by macOS thread
+stacks showing the poller stuck in `read`, and reproduced
+locally with a forced-blocking pipe). Fix: the drain now
+probes readability with a zero-timeout `poll` before each
+read, so it can never block regardless of fcntl state.
+(2) The `O_NONBLOCK` flag itself is 0x4 on macOS (BSD
+value, inherited — a 0x10 guess was tried and empirically
+refuted by a readback diagnostic showing the bit never
+stuck; Linux stays 0x800, cfg-gated).
+(3) `SOL_SOCKET`/`SO_REUSEADDR`/`SO_ERROR` are
+0xffff/0x4/0x1007 on macOS vs 1/2/4 on Linux — the old
+shared values made every macOS bind fail and every
+EINPROGRESS connect report failure.
+(4) `struct addrinfo` lays out addrlen, canonname, addr,
+next on macOS (addr at word 4 = byte 32) vs addrlen, addr,
+canonname, next on Linux (word 3 = byte 24) — the old
+shared @24 read `ai_canonname` (NULL for numeric hosts), so
+`parse_numeric_host("127.0.0.1")` failed on macOS; both
+walks now use a cfg-gated `AI_ADDR_WORD`. The pre-fix
+macOS corpus stalls (runs that sat 3–5h in the corpus gate:
+44589198454, 44590757745, 44590439566, 44589683496,
+44587228308, all cancelled to free runners) are explained
+by (1): any concurrent program wedged the poller on its
+first drain. Post-fix macOS verdict: run <PENDING — filled
+when the verdict run lands>.
 
