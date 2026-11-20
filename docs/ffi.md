@@ -118,6 +118,17 @@ still the SONAME (`libcrypto.so.3`). `TOTO_CRYPTO_LIB_DIR`
 overrides the search path. The pure-Rust backends (gzip via
 `flate2`) need no native library at all.
 
+Crypto library identity (Wave 1): the system libcrypto —
+OpenSSL 3 on Linux (`libcrypto.so.3`), LibreSSL on macOS.
+The version is runtime-detected, never pinned: call
+`crypto_openssl_version()` (Toto) / `toto_rt_crypto_version`
+(FFI) for the loaded library's own string, and no golden
+pins a version — pinning would bake one runner's distro
+libcrypto into the suite while macOS ships a different
+library family entirely. Licenses: Apache License 2.0 for
+OpenSSL 3.x; LibreSSL retains the original OpenSSL/SSLeay
+dual-license terms (plus ISC for newer parts).
+
 ## End-to-end proof dispositions (smoke-test unproven list)
 
 1. **Real library — proven.** libc (`strlen`, `strcmp`, `strtod`,

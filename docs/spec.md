@@ -671,7 +671,7 @@ reach it: `==`/`!=` with mismatched static types is `E0303`.
   type; `return` must match the declared return type; `for` iterates
   `Range`/`Array` only. Arithmetic, ordering, and equality follow the
   §5.2/§5.4 matrices exactly; cross-type `==` is rejected statically.
-- Calls check arity and argument types. The frozen 25 builtins (§7) check
+- Calls check arity and argument types. The frozen 27 builtins (§7) check
   by fixed signatures; the catalog does not grow. Builtins are callable by
   name only — a bare builtin in value position is `E0305`, as is calling a
   non-function value.

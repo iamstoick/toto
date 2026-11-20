@@ -1,5 +1,9 @@
 # Enterprise Wave 1 report — networking substrate, crypto, context
 
+Status: CONDITIONAL — NOT YET ACCEPTABLE (reviewed 2026-11-20;
+criterion 4 awaits user approval regardless; see the dated
+fix-forward section at the end for the red-gate closures).
+
 Branch: `enterprise/wave-1-networking-crypto-context`, from `main`
 at `4f88bf3`. This report is appended stage by stage (§6); the
 acceptance checklist (§7 of the brief) is answered at the end.
@@ -148,8 +152,15 @@ time; post-fix high-water is 60,584 bytes on x86_64 and the
 ARM probe is green. No builtin behavior changed (same
 messages/codes/spans; full suites green). All temporary
 diagnostics from the hunt (T-NET tracing, gdb CI step,
-corpus per-case lines) are reverted in the cleanup commit;
-only the refactor ships.
+corpus per-case lines) are reverted from the tree in the
+cleanup commit — verified zero markers survive; the hunt
+commits themselves remain in history (never rewritten, per
+policy). Two related diffs ship BY DESIGN, not as leftovers:
+57cf017's try-each-address connect loop (stdlib feature,
+only its CI diagnostic path was reverted) and the
+diag13/14/15 stderr goldens (expanded linked-symbol list +
+`Array<int>` E0302 text from the Stage 1+2 feature commits,
+not from any hunt commit).
 
 Portability fix from the same audit (2026-11-19):
 `set_nonblocking` OR-ed a shared `O_NONBLOCK=0x800`, which
@@ -187,9 +198,14 @@ done for this; no timeout parameters were added to net calls
 ## Stage 2 — crypto via FFI (bind, do not implement)
 
 Library: the system libcrypto — OpenSSL 3 on Linux
-(`libcrypto.so.3`; this machine: OpenSSL 3.5.5), LibreSSL on
-macOS — Apache-2.0 (OpenSSL) / ISC-and-friends (LibreSSL),
-both mature and audited. Rationale: the only C library that
+(`libcrypto.so.3`; observed OpenSSL 3.5.5 on this machine,
+runtime-detected via `crypto_openssl_version()`, never
+pinned in goldens — pinning would bake one runner's distro
+lib into the suite while macOS ships LibreSSL), LibreSSL on
+macOS — Apache License 2.0 (OpenSSL 3.x) / original
+OpenSSL+SSLeay terms plus ISC parts (LibreSSL), recorded in
+`docs/ffi.md` — both mature and audited. Rationale: the
+only C library that
 covers all six required primitives (hashing, HMAC, AEAD,
 signatures, CSPRNG, X.509 verification) with an opaque-pointer
 API — no caller-allocated structs, so the no-structs-by-value
@@ -360,8 +376,13 @@ lands; no other gate depends on it.
    deterministic concurrency harness (no lost wakeups on the
    1-worker seeded pressure config; one real lost-wakeup
    race found and fixed, evidence above); conformance green
-   on supported platforms. KNOWN GAP (reported, gating):
-   intermittent multi-worker stall (repro + evidence above).
+   on supported platforms. FIX-FORWARD 2026-11-20: the
+   multi-worker stall is root-caused (State->SchedState ABBA
+   in `net_last_error` vs the drain) and fixed (commit
+   `ac6933c`), re-proven by the 18-cell
+   `net_hammer_mw` regression test at workers 2/3/4 —
+   evidence in the fix-forward section; the KNOWN GAP is
+   closed.
 3. Crypto bindings shipped via FFI to documented system
    libcrypto (name/version/license + D6-fit rationale above
    and in ffi.md); known-answer tests passing per primitive;
@@ -371,12 +392,14 @@ lands; no other gate depends on it.
    implementation in this wave.
 5. Serialization shipped: YAML, TOML, protobuf, compression,
    each with stated scope and conformance tests.
-6. Full gates green (check.sh exit 0; CI run 44606812115
-   green on check, release-gates, bench, Linux ARM64;
-   macOS verdict pending per the note above); corpus,
-   conformance, differential to the v1 standard; totals
-   re-derived (61 result lines / 224 passed / 0 failed,
-   per-crate account corrected above).
+6. Full gates green (check.sh exit 0 locally; CI run
+   44659508115 on the fix tip — check, ARM, release-gates
+   green, bench running, macOS queued per the note above);
+   corpus, conformance,
+   differential to the v1 standard; totals re-derived (62
+   result lines / 225 passed / 0 failed — 224 + the
+   `net_hammer_mw` regression test, per-crate account
+   corrected above).
 7. Report complete with checklist, API design (§17, flagged),
    library choice + vector sets, ADR (appendix below),
    and every deferral with rationale (multi-worker stall,
@@ -422,4 +445,83 @@ See `docs/decisions/adr-009-context-propagation.md`
 all three): (1) spawn-inheritance as the default; (2)
 absolute-monotonic-ms deadlines; (3) Wave 2 owning the
 clock, the slot field, and the cancel hook.
+
+## Fix-forward (2026-11-20) — red-gate closures
+
+Review verdict was CONDITIONAL — NOT YET ACCEPTABLE
+(criteria 2 and 6 FAIL, 4 PARTIAL). This section records the
+fixes; the sections above stand un-rewritten.
+
+Fix 1 — multi-worker stall root cause + fix (criterion 2).
+The "lost wakeup in poll_wait" presents as every worker
+parked with no wakeup, but the mechanism is a lock-order
+inversion (ABBA), proven by gdb stacks of a hung run: one
+worker held the heap-state lock inside `alloc_with` and
+blocked acquiring the sched lock in `net_take_error`
+(`exec.rs`, `toto_rt_net_last_error` arm), while another
+held the sched lock in `drain_completions_locked` and
+blocked acquiring the heap-state lock for a completion
+payload. Single-worker cannot deadlock (no second thread);
+two workers race rarely, four usually — the exact observed
+shape. Fix (commit `ac6933c`): hoist the error-slot take
+above the allocation (two sequential critical sections, no
+nesting), mirroring the crypto/gzip last-error arms which
+were already correct; full audit of every `alloc_with` call
+site and every direct heap-state region found no other
+sched-nesting (all sequential or pure reads). `alloc_with`
+now documents the lock-order contract. No D1–D8, ABI,
+socket-API, or ADR change; 64 KiB budget untouched.
+Re-proof: new regression test
+`crates/toto-runtime/tests/net_hammer_mw.rs` (18 cells:
+workers 2/3/4 × seeds 42–47, exact one-line golden, 15 s
+watchdog per cell, stack high-water asserted under 64 KiB
+on every cell) — pre-fix it stalled (e.g. workers=4
+seed=47, workers=3 seed=44); post-fix 10/10 sweeps green
+(180 cell-runs) plus 10/10 CLI `toto run --workers 4`
+hammer runs exit 0. Proof workloads/seeds/counts are these;
+CI re-verifies on every run.
+
+Fix 2 — tip check failure (criterion 6). Run 44641742691
+(tip `aeb34ba`): `rebuild_cancels_parked_generation`
+(`toto-jit/tests/dev.rs:481`) got E0216 (deadlock) where
+E0214 (scope cancel) was expected — a timing-sensitive
+cancel-vs-deadlock race in JIT dev-mode settle (Phase 4
+code; neither the test nor its implementation was touched
+by Wave 1, and the tip delta is 3 lines of report prose, so
+the tip commit cannot have caused it). Reproduction: 34/34
+local passes (20× single, 10× full binary serial, 4× full
+binary parallel) — does not reproduce. Literal `gh run
+rerun --failed` was refused (the run is still open: its
+macOS job is queued); identical-code check was green on run
+44635755882 and four other consecutive runs. Stated plainly:
+not reproduced, not waved away — and the fix tip's check is
+green on run 44659508115 with no recurrence, which closes
+this item empirically.
+
+Fix 3 — macOS Tier-1 verdict (criterion 6). Still queued at
+time of writing (runs 44606812115, 44635755882, 44641742691,
+44631337623; the review's 44603510550/44602323178 return
+404 — phantom ids, not real runs). Queue ages corrected:
+they are per-run (≈4.5h max observed on 44606812115 at
+check time; the tip run ≈1h), not the cumulative "10h+"
+the earlier note implied — the backlog itself is the
+documented November macOS-ARM64 capacity constraint. The
+verdict line in Stage 5 is updated the moment a result
+lands; if no verdict proves obtainable, macOS deferral goes
+back to the user for an explicit evidence-based decision
+(per this section's rule, never silent).
+
+Minor fixes (same turn): crypto version/license recorded in
+`docs/ffi.md` + Stage 2 (runtime-detected via
+`crypto_openssl_version()`, never pinned, rationale stated;
+Apache-2.0 / OpenSSL+SSLeay+ISC lines); spec §12.1 "frozen
+25" → "frozen 27" (one line; the Phase-2 report's "25" is
+historical and stands); hunt-history wording sharpened
+(tree verified zero markers, history never rewritten,
+57cf017's try-each-address and the diag13/14/15 goldens ship
+by design with attribution).
+
+Test totals re-derived at the fix tip: 62 result lines /
+225 passed / 0 failed — the Stage 5 per-crate account plus
+the new `net_hammer_mw` binary (toto-runtime 29 → 30).
 
