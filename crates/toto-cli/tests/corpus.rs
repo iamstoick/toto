@@ -78,55 +78,13 @@ fn corpus() {
             .expect("file name")
             .to_string_lossy()
             .into_owned();
-        // TEMPORARY macOS-stall diagnosis (revert after root
-        // cause): name each case as it starts so a hung run shows
-        // its stuck point in the log (needs --nocapture in CI).
-        eprintln!("T-CASE {}", case.display());
         let dir = case.parent().expect("parent dir").to_path_buf();
-        // TEMPORARY macOS-stall diagnosis (revert after root cause):
-        // per-case timeout converts a hung subprocess into a named
-        // failure and lets the run continue past it, revealing every
-        // stuck case instead of wedging on the first.
-        let output = {
-            use std::process::Stdio;
-            use std::time::{Duration, Instant};
-            let mut child = Command::new(toto)
-                .arg("run")
-                .arg(&name)
-                .current_dir(&dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("toto spawns");
-            let deadline = Instant::now() + Duration::from_secs(60);
-            let status = loop {
-                match child.try_wait().expect("try_wait") {
-                    Some(status) => break status,
-                    None if Instant::now() >= deadline => {
-                        eprintln!("T-TIMEOUT {} (killed after 60s)", case.display());
-                        let _ = child.kill();
-                        // The reaped status carries SIGKILL, so the
-                        // signal line below names timeouts distinctly.
-                        break child.wait().expect("reap after kill");
-                    }
-                    None => std::thread::sleep(Duration::from_millis(50)),
-                }
-            };
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            use std::io::Read;
-            if let Some(mut o) = child.stdout.take() {
-                let _ = o.read_to_end(&mut stdout);
-            }
-            if let Some(mut e) = child.stderr.take() {
-                let _ = e.read_to_end(&mut stderr);
-            }
-            std::process::Output {
-                status,
-                stdout,
-                stderr,
-            }
-        };
+        let output = Command::new(toto)
+            .arg("run")
+            .arg(&name)
+            .current_dir(&dir)
+            .output()
+            .expect("toto runs");
         // Clean up program-created scratch files before comparing.
         for entry in std::fs::read_dir(&dir).expect("read case dir") {
             let path = entry.expect("entry").path();

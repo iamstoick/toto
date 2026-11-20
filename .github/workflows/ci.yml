@@ -59,34 +59,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: build workspace
         run: cargo build --workspace --exclude ffi-smoke-test
-      # TEMPORARY macOS-stall diagnosis (revert after root cause):
-      # sample a directly-run conc01 so a hang yields userspace
-      # stacks instead of silence. Runs before the corpus gate so
-      # it executes even if the gate wedges.
-      - name: sample conc01 on macOS (temporary)
-        if: matrix.os == 'macos-latest'
-        run: |
-          TOTO_PIPE_DEBUG=1 ./target/debug/toto run tests/corpus/concurrent/conc01_pingpong.gzv > /tmp/conc01.out 2>&1 &
-          PID=$!
-          sleep 20
-          if kill -0 $PID 2>/dev/null; then
-            echo "STUCK: conc01 alive after 20s; sampling threads"
-            ps -M -o pid,tt,state,wchan,command -p $PID || true
-            sample $PID 5 -file /tmp/conc01.sample >/dev/null 2>&1 || true
-            grep -a -A 200 "Call graph" /tmp/conc01.sample | head -400 || true
-            echo "--- conc01.out:"; cat /tmp/conc01.out || true
-            kill -9 $PID || true
-          else
-            echo "conc01 finished: [$(cat /tmp/conc01.out)]"
-          fi
       - name: Tier-1 conformance (frozen ADR-008, no codegen needed)
         run: cargo test -p toto-compiler --test mir_conform
       - name: corpus gate
-        # TEMPORARY macOS-stall diagnosis (revert after root
-        # cause): --nocapture streams per-case progress so a
-        # hung run shows its stuck point (check.sh does this
-        # permanently for the same reason).
-        run: cargo test -p toto-cli --test corpus -- --nocapture
+        run: cargo test -p toto-cli --test corpus
       - name: one concurrent program end to end
         run: |
           out=$(cargo run -q -p toto-cli -- run tests/corpus/concurrent/conc01_pingpong.gzv)
