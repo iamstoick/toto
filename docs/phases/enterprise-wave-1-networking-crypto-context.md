@@ -1,6 +1,6 @@
 # Enterprise Wave 1 report — networking substrate, crypto, context
 
-Wave 1 verdict: ACCEPTED-WITH-FLAGS — merged to main as cdfaad56631d6d2559a9c1a8e108eb75dd63d6c3. Networking substrate + crypto + context ADR shipped; poller proven under M:N at workers 2/3/4; macOS Tier-1 green. Verdict, ADR-009, and spec §17 approved by the user 2026-11-21. Gate green (62 result lines, 225 tests, 0 failed); CI green on run PENDING-STEP-3 (check + release-gates + bench + macOS/Linux ARM64 probes; Windows probe informational under continue-on-error). Details in the sections below; earlier section text is preserved verbatim.
+Wave 1 verdict: ACCEPTED-WITH-FLAGS — merged to main as cdfaad56631d6d2559a9c1a8e108eb75dd63d6c3. Networking substrate + crypto + context ADR shipped; poller proven under M:N at workers 2/3/4; macOS Tier-1 green. Verdict, ADR-009, and spec §17 approved by the user 2026-11-21. Gate green (62 result lines, 225 tests, 0 failed); CI green on run 44831744461 (check + release-gates + bench + macOS/Linux ARM64 probes; Windows probe informational under continue-on-error). Details in the sections below; earlier section text is preserved verbatim.
 
 Status: ACCEPTED-WITH-FLAGS (fix-forward 2026-11-20 closed
 both red gates; remaining flags: criterion 4 needs user
