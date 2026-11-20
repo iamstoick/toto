@@ -73,7 +73,7 @@ jobs:
             echo "STUCK: conc01 alive after 20s; sampling threads"
             ps -M -o pid,tt,state,wchan,command -p $PID || true
             sample $PID 5 -file /tmp/conc01.sample >/dev/null 2>&1 || true
-            grep -a -A 12 "Call graph\|Thread_" /tmp/conc01.sample | head -80 || true
+            grep -a -A 200 "Call graph" /tmp/conc01.sample | head -400 || true
             kill -9 $PID || true
           else
             echo "conc01 finished: [$(cat /tmp/conc01.out)]"
