@@ -13,6 +13,8 @@
 //! Toto values cross this boundary (callers marshal); no heap
 //! access, so poller and pool threads may call freely.
 
+#[cfg(target_os = "macos")]
+use std::os::raw::c_ulong;
 use std::os::raw::{c_char, c_int, c_void};
 
 /// Last OS error as a Rust string (`strerror(errno)`).
@@ -93,6 +95,9 @@ unsafe extern "C" {
         val: *mut c_void,
         len: *mut u32,
     ) -> c_int;
+    #[cfg(target_os = "macos")]
+    #[link_name = "ioctl"]
+    fn libc_ioctl(fd: c_int, req: c_ulong, arg: *mut c_int) -> c_int;
 }
 
 // Symbol shim: the real symbols are `socket`, `bind`, … — declared
@@ -478,40 +483,41 @@ fn socket_of(ty: c_int) -> Result<c_int, String> {
 /// Mark a socket nonblocking (executor path; the interpreter uses
 /// blocking sockets and never calls this).
 pub fn set_nonblocking(fd: c_int) -> Result<(), String> {
-    // F_GETFL=3, F_SETFL=4 on Linux and macOS. O_NONBLOCK differs:
-    // 0x800 (04000) on Linux, 0x4 on macOS (BSD value, which Apple
-    // inherits with no override — verified against the libc crate's
-    // Apple headers; a 0x10 guess was empirically proven wrong: the
-    // self-pipe stayed blocking and `drain_pipe` hung the poller,
-    // wedging every macOS concurrent program). The fallback is
-    // never exercised: non-unix net entry points refuse with E0301
-    // before any fd exists.
+    // Linux: fcntl F_SETFL with O_NONBLOCK=0x800 (04000).
+    // macOS: ioctl FIONBIO, the canonical BSD way — macOS fcntl
+    // flag semantics proved unreliable in practice (no O_NONBLOCK
+    // candidate stuck: neither the shared 0x800 nor 0x4/0x10, and
+    // an 8-value sweep all left sockets blocking, hanging every
+    // concurrent program), so macOS bypasses fcntl entirely here.
+    // The fallback (non-Linux/macOS unix) is never exercised:
+    // non-unix net entry points refuse with E0301 before any fd
+    // exists.
     #[cfg(target_os = "linux")]
     const O_NONBLOCK_FLAG: c_int = 0x800;
     #[cfg(target_os = "macos")]
     const O_NONBLOCK_FLAG: c_int = 0x4;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     const O_NONBLOCK_FLAG: c_int = 0;
-    // TEMPORARY empirical sweep aid (revert after root cause):
-    // TOTO_O_NONBLOCK=0xNN overrides the compiled-in flag so CI
-    // can bisect the true macOS bit without header trust.
-    #[cfg(unix)]
-    fn flag_override() -> Option<c_int> {
-        std::env::var("TOTO_O_NONBLOCK").ok().and_then(|s| {
-            let s = s.strip_prefix("0x").unwrap_or(&s);
-            i32::from_str_radix(s, 16).ok()
-        })
+    // macOS takes the ioctl path: FIONBIO is the canonical BSD way
+    // to flip a socket nonblocking without depending on fcntl flag
+    // values (FIONBIO=0x8004667e from _IOW('f',126,int), matches
+    // the libc crate). Linux keeps fcntl (proven there).
+    #[cfg(target_os = "macos")]
+    {
+        let mut one: c_int = 1;
+        // SAFETY: FIONBIO takes a pointer to int; `one` outlives it.
+        let r = unsafe { libc_ioctl(fd, 0x8004667e, &mut one as *mut c_int) };
+        if r < 0 {
+            return Err(last_error());
+        }
+        return Ok(());
     }
-    #[cfg(unix)]
-    let flag = flag_override().unwrap_or(O_NONBLOCK_FLAG);
-    #[cfg(not(unix))]
-    let flag = O_NONBLOCK_FLAG;
     let flags = unsafe { libc_fcntl(fd, 3, 0) };
     if flags < 0 {
         return Err(last_error());
     }
     // SAFETY: OR-ing the nonblocking flag into the retrieved flags.
-    let r = unsafe { libc_fcntl(fd, 4, flags | flag) };
+    let r = unsafe { libc_fcntl(fd, 4, flags | O_NONBLOCK_FLAG) };
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
