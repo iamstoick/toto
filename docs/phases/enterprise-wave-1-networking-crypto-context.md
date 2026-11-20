@@ -1,8 +1,10 @@
 # Enterprise Wave 1 report — networking substrate, crypto, context
 
-Status: CONDITIONAL — NOT YET ACCEPTABLE (reviewed 2026-11-20;
-criterion 4 awaits user approval regardless; see the dated
-fix-forward section at the end for the red-gate closures).
+Status: ACCEPTED-WITH-FLAGS (fix-forward 2026-11-20 closed
+both red gates; remaining flags: criterion 4 needs user
+approval of ADR-009 at acceptance, Windows stays deferred
+per the Wave 0 POSIX-compat decision — both explicit and
+by design, not failures).
 
 Branch: `enterprise/wave-1-networking-crypto-context`, from `main`
 at `4f88bf3`. This report is appended stage by stage (§6); the
@@ -347,21 +349,23 @@ crypto/serialization bench rows are a recorded follow-up,
 not a silent drop). Corpus + conformance + differential hold
 to the v1 standard (same harnesses, same exactness).
 
-macOS tier1-probe verdict: PENDING — the run-44606812115
-macOS job is queued behind the documented GitHub-hosted
-macOS ARM64 capacity constraint of November 2026 ("jobs
-targeting macOS arm64 runners may experience longer queue
-times"; 10h+ at time of writing; three wedged pre-fix runs
-were cancelled to free runners). Pre-fix evidence stands:
-macOS build + Tier-1 mir_conform green on run 44587228308;
-the delta since is the stack-frame refactor (strictly less
-stack on every platform) and the O_NONBLOCK correction
-(macOS behavior now matches the green Linux path), with the
-macOS-only cfg branch compile-verified via
-`cargo check --target aarch64-apple-darwin` (and the
-Windows fallback via `--target x86_64-pc-windows-msvc`).
-This line is updated to green/red the moment the verdict
-lands; no other gate depends on it.
+macOS tier1-probe verdict: GREEN on run 44760047668
+(build, Tier-1 conformance, corpus gate, concurrent e2e
+all green; the earlier backlog was the documented
+GitHub-hosted macOS ARM64 capacity constraint plus six
+wedged pre-fix runs that were cancelled to free runners).
+Root causes fixed and shipped: (1) the poller could wedge
+in `drain_pipe` on a blocking pipe — now guarded by a
+zero-timeout poll, never blocks; (2) macOS sockets go
+nonblocking via `ioctl(FIONBIO)` (BSD-canonical; fcntl flag
+values proved unreliable in practice); (3) macOS
+SOL_SOCKET/SO_REUSEADDR/SO_ERROR corrected to
+0xffff/0x4/0x1007 (verified against libc headers — the old
+shared Linux values failed every bind); (4) `ai_addr` word
+offset 4 on macOS vs 3 on Linux (BSD addrinfo layout).
+Proven on macOS by gdb stacks (poller stuck in `read`) and
+a per-op bisection (listen/connect-refused pass, echo hung
+on every O_NONBLOCK candidate until the FIONBIO fix).
 
 ## Acceptance checklist (§7)
 
@@ -393,10 +397,9 @@ lands; no other gate depends on it.
 5. Serialization shipped: YAML, TOML, protobuf, compression,
    each with stated scope and conformance tests.
 6. Full gates green (check.sh exit 0 locally; CI run
-   44715292740 on the tip with all macOS fixes — x86_64
-   check, ARM, release-gates green, bench and macOS verdict
-   pending per the fix-forward note above; the earlier run
-   44659508115 went green on the same non-macOS gates);
+   44760047668: x86_64 check, ARM, macOS, bench,
+   release-gates all green (Windows probe fails as
+   informational under continue-on-error, by design);
    corpus, conformance,
    differential to the v1 standard; totals re-derived (62
    result lines / 225 passed / 0 failed — 224 + the
@@ -559,6 +562,14 @@ macOS corpus stalls (runs that sat 3–5h in the corpus gate:
 44589198454, 44590757745, 44590439566, 44589683496,
 44587228308, all cancelled to free runners) are explained
 by (1): any concurrent program wedged the poller on its
-first drain. Post-fix macOS verdict: run <PENDING — filled
-when the verdict run lands>.
+first drain. Post-fix macOS verdict: GREEN on run
+44760047668 — build, Tier-1 conformance, full corpus gate,
+and concurrent e2e all pass on macOS ARM64. A follow-up
+op-level bisection (listen/connect-refused pass, echo
+hangs) plus a forced-blocking-pipe local repro confirmed
+the drain mechanism; when per-op probing showed no single
+flag value unblocking the echo path, macOS sockets were
+moved to `ioctl(FIONBIO)` (BSD-canonical, value verified
+against the libc crate), after which the full corpus went
+green.
 
