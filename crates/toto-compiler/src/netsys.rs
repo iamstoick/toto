@@ -399,8 +399,13 @@ pub fn self_pipe() -> (c_int, c_int) {
     #[cfg(unix)]
     if std::env::var_os("TOTO_PIPE_DEBUG").is_some() {
         for (tag, fd) in [("rd", fds[0]), ("wr", fds[1])] {
-            let flags = unsafe { libc_fcntl(fd, 3, 0) };
-            eprintln!("PIPE-DBG {tag} fd={fd} fcntl-flags={flags:#x}");
+            let before = unsafe { libc_fcntl(fd, 3, 0) };
+            let r = unsafe { libc_fcntl(fd, 4, before | 0x4) };
+            let e = errno_value();
+            let after = unsafe { libc_fcntl(fd, 3, 0) };
+            eprintln!(
+                "PIPE-DBG {tag} fd={fd} before={before:#x} set_r={r} errno={e} after={after:#x}"
+            );
         }
     }
     (fds[0], fds[1])
