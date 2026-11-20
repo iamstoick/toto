@@ -1,0 +1,139 @@
+// stdlib proto tests: run with `toto test` from stdlib/.
+//
+// Contract under test: message Person { int64 id = 1; bytes name
+// = 2 } with id 300 and name "hi" — the golden wire bytes are
+// hand-computed from the protobuf encoding rules (tag 0x08 +
+// varint 300 = AC 02; tag 0x12 + len 2 + "hi") and confirmed
+// against the spec, not against our own encoder.
+
+import "gzv.std/proto.gzv";
+
+fn eq_bytes(a: Array<int>, b: Array<int>) -> bool {
+    if len(a) != len(b) {
+        return false;
+    }
+    for i in 0..len(a) {
+        if a[i] != b[i] {
+            return false;
+        } else {
+        }
+    }
+    return true;
+}
+
+fn schema() -> Array<PbSchema> {
+    let mut s: Array<PbSchema> = [];
+    push(s, PbSchema { num: 1, kind: "varint" });
+    push(s, PbSchema { num: 2, kind: "bytes" });
+    return s;
+}
+
+fn person_fields() -> Result<Array<PbField>, string> {
+    let mut f: Array<PbField> = [];
+    push(f, pb_field_varint(1, 300)?);
+    push(f, pb_field_bytes(2, [104, 105])?);
+    return Ok(f);
+}
+
+fn t_golden() -> Result<bool, string> {
+    // 0x08 AC 02 | 0x12 0x02 68 69.
+    let want: Array<int> = [8, 172, 2, 18, 2, 104, 105];
+    if !eq_bytes(pb_encode(person_fields()?)?, want) {
+        return Err("golden encode mismatch");
+    }
+    let got = pb_decode_known(want, schema())?;
+    if len(got) != 2 {
+        return Err("golden decode count");
+    }
+    if got[0].num != 1 || got[0].ival != 300 {
+        return Err("golden decode id");
+    }
+    if got[1].num != 2 || !eq_bytes(got[1].bval, [104, 105]) {
+        return Err("golden decode name");
+    }
+    return Ok(true);
+}
+
+fn t_roundtrip() -> Result<bool, string> {
+    let mut f: Array<PbField> = [];
+    push(f, pb_field_varint(7, 0)?);
+    push(f, pb_field_bytes(9, [])?);
+    push(f, pb_field_varint(3, 1000000)?);
+    let enc = pb_encode(f)?;
+    let got = pb_decode_known(enc, schema())?;
+    // Unknown numbers (7, 9) are dropped by decode_known; the
+    // known field 3 is not in the schema either — empty result.
+    if len(got) != 0 {
+        return Err("unknown fields not dropped");
+    }
+    let all = pb_decode(enc, schema())?;
+    if len(all) != 3 || all[0].ival != 0 || all[2].ival != 1000000 {
+        return Err("full decode mismatch");
+    }
+    return Ok(true);
+}
+
+fn expect_enc(got: Result<Array<int>, string>, want_msg: string) -> Result<bool, string> {
+    let want: Result<Array<int>, string> = Err(want_msg);
+    if got != want {
+        return Err("wrong error, want `" + want_msg + "`");
+    }
+    return Ok(true);
+}
+
+fn expect_dec(got: Result<Array<PbField>, string>, want_msg: string) -> Result<bool, string> {
+    let want: Result<Array<PbField>, string> = Err(want_msg);
+    if got != want {
+        return Err("wrong error, want `" + want_msg + "`");
+    }
+    return Ok(true);
+}
+
+fn expect_field(got: Result<PbField, string>, want_msg: string) -> Result<bool, string> {
+    let none: Array<int> = [];
+    let want: Result<PbField, string> = Err(want_msg);
+    if got != want {
+        return Err("wrong error, want `" + want_msg + "`");
+    }
+    return Ok(true);
+}
+
+fn t_errors() -> Result<bool, string> {
+    let none: Array<int> = [];
+    expect_field(pb_field_varint(1, -1), "negative varints are not supported: -1")?;
+    let mut bad: Array<PbField> = [];
+    push(bad, PbField { num: 1, kind: "varint", ival: -1, bval: none });
+    expect_enc(pb_encode(bad), "negative varints are not supported: -1")?;
+    let mut badnum: Array<PbField> = [];
+    push(badnum, PbField { num: 0, kind: "varint", ival: 1, bval: [] });
+    expect_enc(pb_encode(badnum), "bad field number: 0")?;
+    expect_dec(pb_decode([8], schema()), "truncated varint")?;
+    expect_dec(pb_decode([18, 5, 1], schema()), "truncated length-delimited field")?;
+    // Wire type 5 (fixed32) is out of scope.
+    expect_dec(pb_decode([45, 1, 2, 3, 4], schema()), "unsupported wire type: 5")?;
+    // Schema kind disagreement with the wire.
+    expect_dec(pb_decode([8, 1], [PbSchema { num: 1, kind: "bytes" }]), "wire kind mismatch for field 1")?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_golden() != yes {
+        println("FAIL golden");
+        failures = failures + 1;
+    }
+    if t_roundtrip() != yes {
+        println("FAIL roundtrip");
+        failures = failures + 1;
+    }
+    if t_errors() != yes {
+        println("FAIL errors");
+        failures = failures + 1;
+    }
+    if failures > 0 {
+        println(to_string(failures) + " proto failures");
+        return 1;
+    }
+    return 0;
+}

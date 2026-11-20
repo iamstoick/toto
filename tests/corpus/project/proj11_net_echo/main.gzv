@@ -1,0 +1,78 @@
+import "gzv.std/net.gzv";
+
+fn tcp_serve_inner(listener: int) -> Result<string, string> {
+    let conn = net_accept(listener)?;
+    let data = net_recv(conn, 16)?;
+    let n = net_send_all(conn, data)?;
+    net_close(conn)?;
+    net_close(listener)?;
+    if n == 2 {
+        return Ok("SERVE-OK");
+    }
+    return Err("short echo");
+}
+
+fn tcp_serve(listener: int, out: chan<Result<string, string>>) -> int {
+    out <- tcp_serve_inner(listener);
+    return 0;
+}
+
+fn tcp_client(port: int) -> Result<string, string> {
+    let conn = net_tcp_connect("localhost", port)?;
+    let sent = net_send_all(conn, [72, 105])?;
+    let resp = net_recv(conn, 16)?;
+    net_close(conn)?;
+    if sent == 2 && len(resp) == 2 && resp[0] == 72 && resp[1] == 105 {
+        return Ok("CLIENT-OK");
+    }
+    return Err("bad echo");
+}
+
+fn run_tcp() -> Result<string, string> {
+    let done = chan<Result<string, string>>(1);
+    let listener = net_tcp_listen(48127)?;
+    go {
+        tcp_serve(listener, done);
+    }
+    let cr = tcp_client(48127)?;
+    println(<-done);
+    return Ok(cr);
+}
+
+fn udp_serve_inner(sock: int) -> Result<string, string> {
+    let pkt = net_udp_recv_from(sock, 16)?;
+    let n = net_udp_send_to(sock, pkt.data, pkt.host, pkt.port)?;
+    net_close(sock)?;
+    if n == 2 {
+        return Ok("UDP-SERVE-OK");
+    }
+    return Err("short udp echo");
+}
+
+fn udp_serve(sock: int, out: chan<Result<string, string>>) -> int {
+    out <- udp_serve_inner(sock);
+    return 0;
+}
+
+fn run_udp() -> Result<string, string> {
+    let done = chan<Result<string, string>>(1);
+    let sock = net_udp_bind(48203)?;
+    go {
+        udp_serve(sock, done);
+    }
+    let cli = net_udp_bind(48204)?;
+    let n = net_udp_send_to(cli, [72, 105], "127.0.0.1", 48203)?;
+    let pkt = net_udp_recv_from(cli, 16)?;
+    net_close(cli)?;
+    println(<-done);
+    if n == 2 && len(pkt.data) == 2 && pkt.data[0] == 72 && pkt.data[1] == 105 {
+        return Ok("UDP-CLIENT-OK");
+    }
+    return Err("bad udp echo");
+}
+
+fn main() -> int {
+    println(run_tcp());
+    println(run_udp());
+    return 0;
+}

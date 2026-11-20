@@ -1,0 +1,140 @@
+// `gzv.std/crypto` — cryptographic bindings (Enterprise Wave 1).
+//
+// Toto wrappers over the runtime `toto_rt_crypto_*` foreign
+// functions (unix-only; see `docs/ffi.md` for the per-binding
+// contract). The primitives themselves live in the linked system
+// libcrypto (OpenSSL/LibreSSL) — this module binds, never
+// implements. Bytes cross as `Array<int>` (0–255; out-of-range is
+// E0308 at the boundary). Every fallible function returns
+// `Result<_, string>` with the library message (`strerror`
+// discipline via the call-duration error slot); malformed inputs
+// (wrong key/nonce lengths, unparseable PEM/DER) are runtime `Err`
+// strings, never panics, never silent.
+//
+// Layouts (fixed, documented here and in spec §18):
+// - digests: SHA-256 (32 bytes), SHA-512 (64 bytes).
+// - HMAC: HMAC-SHA-256/512 (key any length, output 32/64 bytes).
+// - AEAD: AES-256-GCM; key 32 bytes, nonce 12 bytes, encrypt output
+//   is `ciphertext || tag(16)`; decrypt authenticates or `Err`s.
+// - Signatures: ECDSA P-256 over SHA-256; secret 32 bytes, public
+//   64 bytes (`x || y`, no `0x04` prefix), signatures DER.
+// - CSPRNG: `RAND_bytes`, 1–65536 bytes per call.
+// - X.509: `verify(leaf_pem, ca_pem)` is 1 iff the leaf chains to
+//   the trust root (0 = bad chain; `Err` = unparseable PEM).
+
+pub struct SignKeyPair {
+    secret: Array<int>,
+    public: Array<int>,
+}
+
+unsafe extern "C" {
+    fn toto_rt_crypto_sha256(data: Array<int>) -> Array<int>;
+    fn toto_rt_crypto_sha512(data: Array<int>) -> Array<int>;
+    fn toto_rt_crypto_hmac256(key: Array<int>, data: Array<int>) -> Array<int>;
+    fn toto_rt_crypto_hmac512(key: Array<int>, data: Array<int>) -> Array<int>;
+    fn toto_rt_crypto_aead_encrypt(key: Array<int>, nonce: Array<int>, pt: Array<int>, aad: Array<int>) -> Array<int>;
+    fn toto_rt_crypto_aead_decrypt(key: Array<int>, nonce: Array<int>, cttag: Array<int>, aad: Array<int>) -> Array<int>;
+    fn toto_rt_crypto_sign_keygen() -> Array<int>;
+    fn toto_rt_crypto_sign_sign(secret: Array<int>, msg: Array<int>) -> Array<int>;
+    fn toto_rt_crypto_sign_verify(public: Array<int>, msg: Array<int>, sig: Array<int>) -> c_int;
+    fn toto_rt_crypto_random(n: c_int) -> Array<int>;
+    fn toto_rt_crypto_x509_verify(leaf: *c_char, ca: *c_char) -> c_int;
+    fn toto_rt_crypto_last_error() -> string;
+    fn toto_rt_crypto_version() -> string;
+}
+
+fn crypto_last_error() -> string {
+    return toto_rt_crypto_last_error();
+}
+
+fn ok_or_empty(out: Array<int>) -> Result<Array<int>, string> {
+    let e = crypto_last_error();
+    if len(out) == 0 && e != "" {
+        return Err(e);
+    }
+    return Ok(out);
+}
+
+fn check_len(what: string, v: Array<int>, want: int) -> Result<Array<int>, string> {
+    if len(v) != want {
+        return Err(what + ": need " + to_string(want) + " bytes, got " + to_string(len(v)));
+    }
+    return Ok(v);
+}
+
+pub fn crypto_sha256(data: Array<int>) -> Result<Array<int>, string> {
+    return ok_or_empty(toto_rt_crypto_sha256(data));
+}
+
+pub fn crypto_sha512(data: Array<int>) -> Result<Array<int>, string> {
+    return ok_or_empty(toto_rt_crypto_sha512(data));
+}
+
+pub fn crypto_hmac_sha256(key: Array<int>, data: Array<int>) -> Result<Array<int>, string> {
+    return ok_or_empty(toto_rt_crypto_hmac256(key, data));
+}
+
+pub fn crypto_hmac_sha512(key: Array<int>, data: Array<int>) -> Result<Array<int>, string> {
+    return ok_or_empty(toto_rt_crypto_hmac512(key, data));
+}
+
+pub fn crypto_aead_encrypt(key: Array<int>, nonce: Array<int>, pt: Array<int>, aad: Array<int>) -> Result<Array<int>, string> {
+    check_len("aead_encrypt key", key, 32)?;
+    check_len("aead_encrypt nonce", nonce, 12)?;
+    return ok_or_empty(toto_rt_crypto_aead_encrypt(key, nonce, pt, aad));
+}
+
+pub fn crypto_aead_decrypt(key: Array<int>, nonce: Array<int>, cttag: Array<int>, aad: Array<int>) -> Result<Array<int>, string> {
+    check_len("aead_decrypt key", key, 32)?;
+    check_len("aead_decrypt nonce", nonce, 12)?;
+    return ok_or_empty(toto_rt_crypto_aead_decrypt(key, nonce, cttag, aad));
+}
+
+pub fn crypto_sign_keygen() -> Result<SignKeyPair, string> {
+    let raw = ok_or_empty(toto_rt_crypto_sign_keygen())?;
+    if len(raw) != 96 {
+        return Err("sign_keygen: bad keypair length");
+    }
+    let mut secret: Array<int> = [];
+    let mut public: Array<int> = [];
+    for i in 0..32 {
+        push(secret, raw[i]);
+    }
+    for i in 32..96 {
+        push(public, raw[i]);
+    }
+    return Ok(SignKeyPair { secret: secret, public: public });
+}
+
+pub fn crypto_sign_sign(secret: Array<int>, msg: Array<int>) -> Result<Array<int>, string> {
+    check_len("sign secret", secret, 32)?;
+    return ok_or_empty(toto_rt_crypto_sign_sign(secret, msg));
+}
+
+pub fn crypto_sign_verify(public: Array<int>, msg: Array<int>, sig: Array<int>) -> Result<int, string> {
+    check_len("verify public", public, 64)?;
+    let v = toto_rt_crypto_sign_verify(public, msg, sig);
+    if v < 0 {
+        return Err(crypto_last_error());
+    }
+    return Ok(v);
+}
+
+pub fn crypto_random(n: int) -> Result<Array<int>, string> {
+    if n < 1 || n > 65536 {
+        return Err("random: need 1-65536 bytes, got " + to_string(n));
+    }
+    return ok_or_empty(toto_rt_crypto_random(n));
+}
+
+pub fn crypto_x509_verify(leaf_pem: string, ca_pem: string) -> Result<int, string> {
+    let v = toto_rt_crypto_x509_verify(leaf_pem, ca_pem);
+    if v < 0 {
+        return Err(crypto_last_error());
+    }
+    return Ok(v);
+}
+
+pub fn crypto_openssl_version() -> string {
+    return toto_rt_crypto_version();
+}

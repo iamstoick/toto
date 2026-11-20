@@ -1,0 +1,5 @@
+error[E0302]: foreign parameter `s` must be a C type or `Array<int>`, found Array<string>
+ --> diag17_ffi_nonbyte_array.gzv:2:15
+  |
+2 |     fn strlen(s: Array<string>) -> c_long;
+  |               ^ help: use `c_char`, `c_int`, `c_long`, `c_double`, `*T`, `Array<int>`, or a `fn` callback type

@@ -1,0 +1,103 @@
+// stdlib yaml tests: run with `toto test` from stdlib/.
+//
+// Sections return `Result<bool, string>`; `main` compares against
+// `Ok(true)` and exits nonzero on failure.
+
+import "gzv.std/yaml.gzv";
+
+fn doc() -> string {
+    return "title: hello\ncount: 42\nratio: 1.5\non: true\nnothing: ~\nnames:\n  - a\n  - b\nserver:\n  host: leaf.local\n  port: 8080\n  tls:\n    enabled: true\n";
+}
+
+fn t_shapes() -> Result<bool, string> {
+    let root = yaml_parse(doc())?;
+    if yaml_as_string(yaml_object_get(root, "title")?)? != "hello" {
+        return Err("title");
+    }
+    if yaml_as_int(yaml_object_get(root, "count")?)? != 42 {
+        return Err("count");
+    }
+    if yaml_as_float(yaml_object_get(root, "ratio")?)? != 1.5 {
+        return Err("ratio");
+    }
+    if yaml_as_bool(yaml_object_get(root, "on")?)? != true {
+        return Err("on");
+    }
+    if yaml_is_null(yaml_object_get(root, "nothing")?) != true {
+        return Err("null");
+    }
+    let names = yaml_object_get(root, "names")?;
+    if yaml_array_len(names)? != 2 {
+        return Err("names len");
+    }
+    if yaml_as_string(yaml_array_get(names, 1)?)? != "b" {
+        return Err("names[1]");
+    }
+    let server = yaml_object_get(root, "server")?;
+    if yaml_as_string(yaml_object_get(server, "host")?)? != "leaf.local" {
+        return Err("server.host");
+    }
+    if yaml_as_int(yaml_object_get(server, "port")?)? != 8080 {
+        return Err("server.port");
+    }
+    let tls = yaml_object_get(server, "tls")?;
+    if yaml_as_bool(yaml_object_get(tls, "enabled")?)? != true {
+        return Err("tls.enabled");
+    }
+    return Ok(true);
+}
+
+fn t_roundtrip() -> Result<bool, string> {
+    let root = yaml_parse(doc())?;
+    let once = yaml_stringify(root)?;
+    let root2 = yaml_parse(once)?;
+    if yaml_stringify(root2)? != once {
+        return Err("stringify not stable");
+    }
+    if yaml_as_int(yaml_object_get(yaml_object_get(root2, "server")?, "port")?)? != 8080 {
+        return Err("reparse server.port");
+    }
+    return Ok(true);
+}
+
+fn expect_val(got: Result<YamlVal, string>, want_msg: string) -> Result<bool, string> {
+    let want: Result<YamlVal, string> = Err(want_msg);
+    if got != want {
+        return Err("wrong error, want `" + want_msg + "`");
+    }
+    return Ok(true);
+}
+
+fn t_errors() -> Result<bool, string> {
+    expect_val(yaml_parse("a: 1\na: 2"), "duplicate key: a")?;
+    expect_val(yaml_parse("a: [1]"), "flow styles, anchors, tags, and block scalars are not supported: [1]")?;
+    expect_val(yaml_parse("---\na: 1"), "multi-document streams are not supported")?;
+    expect_val(yaml_parse("a:\n"), "expected nested block at line 1")?;
+    expect_val(yaml_parse(""), "empty document")?;
+    let root = yaml_parse(doc())?;
+    expect_val(yaml_object_get(root, "nope"), "missing key: nope")?;
+    expect_val(yaml_object_get(yaml_object_get(root, "title")?, "x"), "expected mapping, got str")?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_shapes() != yes {
+        println("FAIL shapes");
+        failures = failures + 1;
+    }
+    if t_roundtrip() != yes {
+        println("FAIL roundtrip");
+        failures = failures + 1;
+    }
+    if t_errors() != yes {
+        println("FAIL errors");
+        failures = failures + 1;
+    }
+    if failures > 0 {
+        println(to_string(failures) + " yaml failures");
+        return 1;
+    }
+    return 0;
+}

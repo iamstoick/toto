@@ -39,6 +39,7 @@ fn differential_task_concurrent() {
         .collect();
     files.sort();
     let mut ran = 0u32;
+    let mut skipped_net = 0u32;
     let mut failures = Vec::new();
     for case in files {
         let name = case
@@ -80,6 +81,15 @@ fn differential_task_concurrent() {
         let session = match jit.compile_task(&prog) {
             Ok(s) => s,
             Err(e) => {
+                // Network waits need the executor poller (spec
+                // §17.5): the task JIT refuses them by design, the
+                // same reason the gate differential skips concurrent
+                // programs. Count the skip deliberately; any other
+                // refusal is still a failure.
+                if format!("{e}").contains("needs the M:N poller") {
+                    skipped_net += 1;
+                    continue;
+                }
                 failures.push(format!("{name}: task JIT refused: {e}"));
                 continue;
             }
@@ -135,8 +145,11 @@ fn differential_task_concurrent() {
         }
         ran += 1;
     }
-    // 21 concurrent cases (state06-07 joined in Phase 6).
+    // 22 concurrent cases (state06-07 joined in Phase 6;
+    // conc20_net_hammer joined in Wave 1 but refused by the task
+    // JIT — needs the M:N poller — counted in `skipped_net`).
     assert_eq!(ran, 21, "concurrent differential count changed");
+    assert_eq!(skipped_net, 1, "concurrent net-refusal count changed");
     assert!(
         failures.is_empty(),
         "{} concurrent divergence(s):\n{}",

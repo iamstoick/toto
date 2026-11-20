@@ -84,6 +84,9 @@ runtime helpers. Ownership, encoding, and thread-safety per binding:
 | `read` | `c_read` | byte count (0 is EOF) or `-errno` in-band, like `open`; the buffer must hold `n` bytes |
 | `toto_rt_close` | `c_close` | `close(2)` alias (`close` itself is unnameable — reserved channel token); `Ok(0)` or `Err` with the `errno` text |
 | `toto_rt_read_str` | `c_read_str` | counted bytes to a Toto string, UTF-8 validated (`E0210` on bad bytes, `E0308` on NULL); backs `c_read_file` chunk decoding |
+| `toto_rt_net_*` (13 names) | `gzv.std/net` wrappers | Wave 1 sockets (unix-only): fds are opaque `int` handles; bytes cross as `Array<int>` (0–255, `E0308` otherwise); every failure is a `Result` `Err` with the `strerror` text via the per-task call-duration slot; park on the M:N poller (DNS on the blocking pool), never on a worker |
+| `toto_rt_crypto_*` (13 names) | `gzv.std/crypto` wrappers | Wave 1 crypto (unix-only): one-shot OpenSSL/LibreSSL calls through `cryptolib` — no retained contexts or key handles (rooting covers the call); bytes cross as `Array<int>`; `verify`-style ops return 1/0 with a clean slot or -1 plus the slot on malformed input; fixed strings (never library queue wording) wherever goldens pin messages, so error text holds on OpenSSL and LibreSSL alike |
+| `toto_rt_gzip_*` (3 names) | `gzv.std/compress` wrappers | Wave 1 compression (unix-only gate; backend is portable pure Rust): one-shot gzip over `flate2`/`miniz_oxide`; same byte/error-slot discipline; failures are one fixed string |
 
 Two linked names have no wrapper: `close` cannot be named in an
 `unsafe extern` block (`close` is the channel builtin — reserved
@@ -91,6 +94,40 @@ token), so file-descriptor lifecycle ends at process exit in
 examples until the naming restriction is lifted; `free`'s slot and
 `toto_rt_*` helpers are covered above. (`memset` with nonzero fill
 and `memcmp` over overlapping regions follow C semantics.)
+
+## Wave 1 allowlist extension (rationale)
+
+The 18-name Phase 5 allowlist grows by 29 names within this
+wave's FFI rules (13 net + 13 crypto + 3 gzip), each recorded
+above with its per-binding contract. No deferred-FFI work is
+smuggled in: no structs-by-value cross (opaque OpenSSL pointers
+never leave Rust — Toto sees `int` handles and `Array<int>`
+bytes; the `Array<int>` extern shape was authorized 2026-11-19),
+no `dlopen` (every symbol is linked at binary build time), no
+binding generation (all `unsafe extern` blocks are hand-written).
+
+Link model (unchanged from Phase 5): "static linking" means
+statically-declared linkage — every foreign symbol known at
+build time, no runtime loading. The system libraries
+(libc/libm/libpthread, plus libcrypto here) link the same way:
+load-time `DT_NEEDED` entries, never `dlopen`. The
+`toto-compiler` build script symlinks the versioned system
+libcrypto it finds (`OUT_DIR/libcrypto.so`) so `-lcrypto`
+resolves without a dev symlink; the recorded `DT_NEEDED` is
+still the SONAME (`libcrypto.so.3`). `TOTO_CRYPTO_LIB_DIR`
+overrides the search path. The pure-Rust backends (gzip via
+`flate2`) need no native library at all.
+
+Crypto library identity (Wave 1): the system libcrypto —
+OpenSSL 3 on Linux (`libcrypto.so.3`), LibreSSL on macOS.
+The version is runtime-detected, never pinned: call
+`crypto_openssl_version()` (Toto) / `toto_rt_crypto_version`
+(FFI) for the loaded library's own string, and no golden
+pins a version — pinning would bake one runner's distro
+libcrypto into the suite while macOS ships a different
+library family entirely. Licenses: Apache License 2.0 for
+OpenSSL 3.x; LibreSSL retains the original OpenSSL/SSLeay
+dual-license terms (plus ISC for newer parts).
 
 ## End-to-end proof dispositions (smoke-test unproven list)
 

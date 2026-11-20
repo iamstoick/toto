@@ -2412,6 +2412,47 @@ impl<'a> FnCx<'a> {
                         ),
                     });
                 }
+                // Network calls need the M:N poller (a worker or pool
+                // thread must never block on a network wait), and the
+                // JIT task runtime has no poller integration: refuse
+                // with the workaround, never miscompile or stall in
+                // generated code. AOT shares this lowering, so the
+                // same refusal covers `toto build` (native net I/O is
+                // a recorded follow-up; the executor is the reference).
+                if name.starts_with("toto_rt_net_") {
+                    return Err(SubsetError {
+                        func: self.func.clone(),
+                        message: format!(
+                            "foreign function `{name}` is a network wait, which needs the M:N poller (run with `toto run`/`toto test`)"
+                        ),
+                    });
+                }
+                // Crypto calls lower through the executor (the runtime
+                // task executor runs them inline); the JIT task runtime
+                // has no byte-array foreign ABI wired, so refuse with
+                // the workaround like the net surface, never
+                // miscompile. AOT shares this lowering, so the same
+                // refusal covers `toto build` (native crypto in AOT is
+                // a recorded follow-up; the executor is the reference).
+                if name.starts_with("toto_rt_crypto_") {
+                    return Err(SubsetError {
+                        func: self.func.clone(),
+                        message: format!(
+                            "foreign function `{name}` needs the executor crypto runtime (run with `toto run`/`toto test`)"
+                        ),
+                    });
+                }
+                // Compression lowers through the executor like the
+                // other byte-array surfaces (run with `toto run`/`toto
+                // test`); AOT-native gzip is a recorded follow-up.
+                if name.starts_with("toto_rt_gzip_") {
+                    return Err(SubsetError {
+                        func: self.func.clone(),
+                        message: format!(
+                            "foreign function `{name}` needs the executor gzip runtime (run with `toto run`/`toto test`)"
+                        ),
+                    });
+                }
                 let idx = Self::extern_index(prog, name).ok_or_else(|| SubsetError {
                     func: self.func.clone(),
                     message: format!(

@@ -1,0 +1,44 @@
+// `gzv.std/compress` — gzip compression (Enterprise Wave 1).
+//
+// Toto wrappers over the runtime `toto_rt_gzip_*` foreign
+// functions (unix-only, like the other Wave 1 surfaces; the
+// backend itself is portable pure Rust — lifting the gate is
+// cfg-only). The codec is the mature `flate2` crate (DEFLATE via
+// `miniz_oxide`, no C code, identical bytes on every platform);
+// this module binds it, never reimplements it. Bytes cross as
+// `Array<int>` (0–255; out-of-range is E0308 at the boundary).
+// Failures are `Result` `Err` strings with a fixed message
+// (`decompress: invalid gzip data` — never library wording, so
+// error goldens hold on every platform).
+
+unsafe extern "C" {
+    fn toto_rt_gzip_compress(data: Array<int>) -> Array<int>;
+    fn toto_rt_gzip_decompress(data: Array<int>) -> Array<int>;
+    fn toto_rt_gzip_last_error() -> string;
+}
+
+fn gzip_last_error() -> string {
+    return toto_rt_gzip_last_error();
+}
+
+fn gzip_ok(out: Array<int>) -> Result<Array<int>, string> {
+    let e = gzip_last_error();
+    if len(out) == 0 && e != "" {
+        return Err(e);
+    }
+    return Ok(out);
+}
+
+// Compress to a gzip stream (RFC 1952, default level). The output
+// is deterministic for a given backend version but is NOT pinned
+// in goldens (headers may vary) — tests round-trip and cross-check
+// against the system `gzip` utility instead.
+pub fn gzip_compress(data: Array<int>) -> Result<Array<int>, string> {
+    return gzip_ok(toto_rt_gzip_compress(data));
+}
+
+// Decompress a gzip stream. Truncated, corrupt, or non-gzip input
+// is `Err("decompress: invalid gzip data")`.
+pub fn gzip_decompress(data: Array<int>) -> Result<Array<int>, string> {
+    return gzip_ok(toto_rt_gzip_decompress(data));
+}

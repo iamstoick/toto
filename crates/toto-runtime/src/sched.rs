@@ -99,6 +99,19 @@ pub enum ToSched {
         op: BlockingOp,
         span: Span,
     },
+    /// Network wait (Wave 1, unix-only): the task parks until the
+    /// poller thread observes readiness on its fd and completes the
+    /// nonblocking syscall. Unlike `Blocking`, the waiter never
+    /// occupies a pool thread — that is what makes this a poller.
+    /// The full op crosses here (owned plain data only); the poller
+    /// executes it under the net lock, so value conversion stays on
+    /// the worker at park (marshal) and drain (convert) time, where
+    /// the heap is available.
+    #[cfg(unix)]
+    Net {
+        op: NetOp,
+        span: Span,
+    },
 }
 
 /// A file-system call for the dedicated blocking pool. Owned plain
@@ -127,6 +140,14 @@ pub enum BlockingOp {
         sig: toto_compiler::hir::HExternFn,
         args: Vec<ForeignArg>,
         slots: Vec<(usize, u64)>,
+    },
+    /// Blocking DNS resolution (Wave 1): `getaddrinfo` cannot be made
+    /// nonblocking, so names resolve on the dedicated pool — never on
+    /// a worker, never on the poller (which must never block). Unix
+    /// only (same gate as the socket surface).
+    #[cfg(unix)]
+    DnsResolve {
+        host: String,
     },
 }
 
@@ -176,6 +197,34 @@ pub enum BlockingResult {
         code: &'static str,
         message: String,
     },
+    /// Network results (Wave 1, unix-only): plain data the worker
+    /// converts to runtime values (heap-allocating there, where the
+    /// heap is available — the poller thread never touches the heap).
+    /// Every variant either carries the payload or names the failure;
+    /// the drain sets the task's `net_error` slot from it (see
+    /// `drain_completions_locked`).
+    #[cfg(unix)]
+    NetInt(i64),
+    /// Received bytes (empty = orderly shutdown when the error slot
+    /// stays clean; empty + error = failure — see the slot rule).
+    #[cfg(unix)]
+    NetBytes(Vec<u8>),
+    /// Loud failure: the drain sets `net_error` and resumes with
+    /// `Unit`; the executor's `net_last_error` reads the slot.
+    #[cfg(unix)]
+    NetFail(String),
+    /// DNS results (Wave 1, unix-only): same conversion discipline
+    /// as the poller variants, but posted by the blocking POOL (see
+    /// `BlockingOp::DnsResolve`) and accepted only by tasks parked
+    /// on `"blocking"` with a matching `blocking_seq`. Separate
+    /// variants so a stale pool completion can never satisfy a
+    /// poller wait or vice versa (the two seq counters are
+    /// independent).
+    #[cfg(unix)]
+    DnsAddrs(Vec<String>),
+    /// DNS failure: like `NetFail` but for the blocking path.
+    #[cfg(unix)]
+    DnsFail(String),
 }
 
 /// A finished pool job awaiting pickup. The scheduler turns it into
@@ -440,6 +489,16 @@ pub struct Shared {
     pub pool: Mutex<PoolState>,
     pub pool_cv: Condvar,
     pub done: Mutex<VecDeque<Completion>>,
+    /// M:N network poller (Wave 1, unix-only): registrations in,
+    /// readiness completions out. The poller thread touches neither
+    /// the heap nor scheduler state directly (same discipline as the
+    /// pool). It blocks in `poll()`, woken via `net_wake`.
+    #[cfg(unix)]
+    pub net: Mutex<NetState>,
+    /// Self-pipe wakeup ends: `net_wake[0]` read by the poller,
+    /// `net_wake[1]` written by parker/closer/shutdown.
+    #[cfg(unix)]
+    pub net_wake: [std::os::fd::RawFd; 2],
     /// Fixed worker count for the run (1 = deterministic Stage 1 mode).
     pub workers: usize,
     /// Fixed blocking-pool thread count for the run.
@@ -586,7 +645,18 @@ impl Shared {
             let generation = g.generation;
             g.arrived += 1;
             if g.arrived == g.workers {
-                // Last arrival: collect. Snapshot resume-response
+                // Last arrival: collect WITHOUT holding the gc lock.
+                // Lock order is sched -> gc on the decide path, so
+                // nesting gc -> sched here would cycle under M:N
+                // (worker in decide holds sched and wants gc while a
+                // rendezvousing worker holds gc and wants sched).
+                // Dropping `g` first keeps every section below
+                // single-lock; re-acquiring afterwards is safe because
+                // only the last arrival collects (arrivals beyond
+                // `workers` cannot match `== workers`), and waiters
+                // key off `generation`, never the counter.
+                drop(g);
+                // Snapshot resume-response
                 // pendings under `sched` first — a response sitting in
                 // a slot can be the only reference to its value.
                 // Every other worker is parked holding no locks and no
@@ -616,9 +686,12 @@ impl Shared {
                     let mut st = self.state.lock().expect("shared state lock");
                     st.heap.collect(&roots);
                 }
-                g.arrived = 0;
-                g.requested = false;
-                g.generation += 1;
+                {
+                    let mut g = self.gc.lock().expect("gc lock");
+                    g.arrived = 0;
+                    g.requested = false;
+                    g.generation += 1;
+                }
                 self.gc_cv.notify_all();
                 return;
             }
@@ -672,6 +745,187 @@ pub struct Slot {
     /// A stale completion (task released and re-parked meanwhile) can
     /// never wake the wrong wait.
     blocking_seq: u64,
+    /// Generation counter for poller round trips: same discipline as
+    /// `blocking_seq`, for `Blocked { op: "net" }` parks.
+    #[cfg(unix)]
+    net_seq: u64,
+    /// Last network error for this task (`None` = clean). Set on every
+    /// net completion (or inline net failure); read (and cleared) by
+    /// `toto_rt_net_last_error`. Plain data, never a heap ref.
+    #[cfg(unix)]
+    pub(crate) net_error: Option<String>,
+    /// Last crypto error for this task (`None` = clean). Separate
+    /// from `net_error` so interleaved net/crypto calls in one task
+    /// never clobber each other's `last_error`; read (and cleared)
+    /// by `toto_rt_crypto_last_error`. Set on every crypto call.
+    #[cfg(unix)]
+    pub(crate) crypto_error: Option<String>,
+    /// Last gzip error for this task (`None` = clean). Same
+    /// separate-slot discipline as crypto; read (and cleared) by
+    /// `toto_rt_gzip_last_error`.
+    #[cfg(unix)]
+    pub(crate) gzip_error: Option<String>,
+}
+
+/// One parked network wait, as the poller sees it. Owned plain data
+/// only: the poller thread never touches the GC heap, channel
+/// tables, or scheduler state beyond the net table + completions.
+///
+/// Lifetime rule (no generations needed): a registration exists from
+/// park until exactly one of (a) readiness completion, (b) `close`
+/// unregister + `NetFail`, (c) fail_scope sweep + `Cancelled`. The
+/// poller executes its nonblocking syscall with the net lock HELD
+/// (microsecond-scale, never blocks), so a close+reuse cannot slip
+/// between verification and syscall — `close` waits for the same
+/// lock. Level-triggered `poll` + self-pipe wakeups mean no wakeup
+/// is ever lost.
+/// One parked network operation: everything the poller needs to
+/// wait for readiness AND complete the nonblocking syscall, owned
+/// plain data only (no heap refs). Unix-only: socket fds and
+/// readiness kinds with no Windows equivalent yet (POSIX-compat
+/// decision, Wave 0 deferral).
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub enum NetOp {
+    /// `connect()` finished: wait for writability, then `SO_ERROR`.
+    Connect { fd: std::os::fd::RawFd },
+    /// `accept()` a listener: wait for readability.
+    Accept { fd: std::os::fd::RawFd },
+    /// `recv()` up to `max` bytes: wait for readability. Empty
+    /// bytes on completion is orderly shutdown (not an error).
+    Recv { fd: std::os::fd::RawFd, max: usize },
+    /// `send()` bytes: wait for writability. Short writes return
+    /// short (the Toto `net_send_all` wrapper loops).
+    Send {
+        fd: std::os::fd::RawFd,
+        bytes: Vec<u8>,
+    },
+    /// `recvfrom()` up to `max` bytes: wait for readability. The
+    /// peer is recorded for `net_udp_peer_*`.
+    UdpRecv { fd: std::os::fd::RawFd, max: usize },
+    /// `sendto()` bytes to a numeric IP: wait for writability.
+    UdpSend {
+        fd: std::os::fd::RawFd,
+        bytes: Vec<u8>,
+        ip: String,
+        port: u16,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct NetReg {
+    fd: std::os::fd::RawFd,
+    task: TaskId,
+    seq: u64,
+    op: NetOp,
+    span: Span,
+}
+
+#[cfg(unix)]
+impl NetReg {
+    fn wants_read(&self) -> bool {
+        matches!(
+            self.op,
+            NetOp::Accept { .. } | NetOp::Recv { .. } | NetOp::UdpRecv { .. }
+        )
+    }
+    fn wants_write(&self) -> bool {
+        matches!(
+            self.op,
+            NetOp::Connect { .. } | NetOp::Send { .. } | NetOp::UdpSend { .. }
+        )
+    }
+}
+
+/// One poller wakeup outcome: either re-arm the wait (spurious
+/// readiness) or a finished result to post as the completion.
+#[cfg(unix)]
+enum PollerDone {
+    Rearm,
+    Done(BlockingResult),
+}
+
+/// Execute one parked net op after readiness fired. The caller
+/// holds the net lock across this call (see the lifetime rule on
+/// `NetReg`); everything here is a nonblocking syscall plus plain
+/// data handling — no heap, no scheduler state, no blocking.
+/// Returns `Rearm` on spurious readiness (EAGAIN after a race:
+/// level-triggered `poll` fired, but another consumer — only
+/// possible via a close+reopen that the wakeup path already
+/// handled — got there first; the caller re-registers).
+#[cfg(unix)]
+fn poller_do(reg: &NetReg) -> PollerDone {
+    use toto_compiler::netsys as nn;
+    match &reg.op {
+        NetOp::Connect { fd } => match nn::so_error(*fd) {
+            Ok(()) => PollerDone::Done(BlockingResult::NetInt(*fd as i64)),
+            Err(e) => PollerDone::Done(BlockingResult::NetFail(e)),
+        },
+        NetOp::Accept { fd } => match nn::accept_nonblocking(*fd) {
+            nn::AcceptOutcome::Accepted(c) => {
+                nn::set_nonblocking(c).ok();
+                PollerDone::Done(BlockingResult::NetInt(c as i64))
+            }
+            nn::AcceptOutcome::WouldBlock => PollerDone::Rearm,
+            nn::AcceptOutcome::Failed(e) => PollerDone::Done(BlockingResult::NetFail(e)),
+        },
+        NetOp::Recv { fd, max } => match nn::recv_nonblocking(*fd, *max) {
+            nn::RecvOutcome::Got(bytes) => PollerDone::Done(BlockingResult::NetBytes(bytes)),
+            // Orderly shutdown reads as an empty payload; the
+            // error slot stays clean (see the drain conversion).
+            nn::RecvOutcome::Closed => PollerDone::Done(BlockingResult::NetBytes(Vec::new())),
+            nn::RecvOutcome::WouldBlock => PollerDone::Rearm,
+            nn::RecvOutcome::Failed(e) => PollerDone::Done(BlockingResult::NetFail(e)),
+        },
+        NetOp::Send { fd, bytes } => match nn::send_nonblocking(*fd, bytes) {
+            nn::SendOutcome::Wrote(n) => PollerDone::Done(BlockingResult::NetInt(n as i64)),
+            nn::SendOutcome::WouldBlock => PollerDone::Rearm,
+            // A closed peer on send is an error, not a count.
+            nn::SendOutcome::Closed => PollerDone::Done(BlockingResult::NetFail(
+                "connection closed by peer".to_string(),
+            )),
+            nn::SendOutcome::Failed(e) => PollerDone::Done(BlockingResult::NetFail(e)),
+        },
+        NetOp::UdpRecv { fd, max } => match nn::udp_recv_from_nb(*fd, *max) {
+            nn::UdpRecvOutcome::Got(bytes, host, port) => {
+                // Peer recorded here (static map, no heap) so
+                // `net_udp_peer_*` works without another syscall. The
+                // completion carries only the bytes; the Toto wrapper
+                // assembles the `UdpPacket` struct itself.
+                nn::record_peer(*fd, host, port);
+                PollerDone::Done(BlockingResult::NetBytes(bytes))
+            }
+            nn::UdpRecvOutcome::WouldBlock => PollerDone::Rearm,
+            nn::UdpRecvOutcome::Failed(e) => PollerDone::Done(BlockingResult::NetFail(e)),
+        },
+        NetOp::UdpSend {
+            fd,
+            bytes,
+            ip,
+            port,
+        } => {
+            match nn::udp_send_to_nb(*fd, bytes, ip, *port) {
+                nn::SendOutcome::Wrote(n) => PollerDone::Done(BlockingResult::NetInt(n as i64)),
+                nn::SendOutcome::WouldBlock => PollerDone::Rearm,
+                nn::SendOutcome::Closed | nn::SendOutcome::Failed(_) => {
+                    // UDP has no peer-closed state; treat any
+                    // failure uniformly as the OS message.
+                    PollerDone::Done(BlockingResult::NetFail(nn::last_error()))
+                }
+            }
+        }
+    }
+}
+
+/// Poller-table state. Registrations are one-shot: a readiness
+/// completion, a `close`, or a fail_scope sweep unregisters them —
+/// exactly once, so every park ends in exactly one wakeup.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub struct NetState {
+    regs: Vec<NetReg>,
+    shutdown: bool,
 }
 
 pub struct Scheduler {
@@ -767,6 +1021,13 @@ impl Scheduler {
             }),
             pool_cv: Condvar::new(),
             done: Mutex::new(VecDeque::new()),
+            #[cfg(unix)]
+            net: Mutex::new(NetState::default()),
+            #[cfg(unix)]
+            net_wake: {
+                let (r, w) = toto_compiler::netsys::self_pipe();
+                [r, w]
+            },
             workers,
             pool_threads,
         });
@@ -861,6 +1122,14 @@ impl Scheduler {
             writable_start,
             high_water: None,
             blocking_seq: 0,
+            #[cfg(unix)]
+            net_seq: 0,
+            #[cfg(unix)]
+            net_error: None,
+            #[cfg(unix)]
+            crypto_error: None,
+            #[cfg(unix)]
+            gzip_error: None,
         });
         sched.tasks_spawned += 1;
         sched.live += 1;
@@ -999,10 +1268,17 @@ impl Scheduler {
             for _ in 0..self.shared.pool_threads {
                 scope.spawn(|| Self::pool_loop(&self.shared));
             }
+            #[cfg(unix)]
+            scope.spawn(|| Self::poller_loop(&self.shared));
             for worker in 0..self.shared.workers {
                 scope.spawn(move || self.worker_loop(worker));
             }
         });
+        // The poller closed the read end on shutdown; close the write
+        // end here so one run never leaks an fd into the next (the
+        // corpus runs 100+ programs in one test process).
+        #[cfg(unix)]
+        toto_compiler::netsys::close(self.shared.net_wake[1]).ok();
         // All workers exited and the last one shut the pool down, so
         // every thread joined. Compose the outcome.
         let (collections, allocated, reclaimed) = {
@@ -1130,10 +1406,53 @@ impl Scheduler {
                                         .any(|s| matches!(s.state, TaskState::Running { .. }));
                                     // Pool work outstanding (a job a pool
                                     // thread will complete, or an undrained
-                                    // completion) is future work.
+                                    // completion) is future work. So is a
+                                    // live poller registration: readiness
+                                    // (or a peer error) is an external
+                                    // wakeup the worker cannot see yet —
+                                    // the poller will post it. Lock order
+                                    // is sched -> net (op_net's order).
+                                    //
+                                    // CHECK ORDER is soundness-critical:
+                                    // pool, then net registrations, then
+                                    // the completion queue LAST. The
+                                    // poller posts a completion BEFORE
+                                    // removing its registration (two
+                                    // separate lock sections), so a
+                                    // worker that checked `done` before
+                                    // `regs` could observe a
+                                    // posted-but-not-yet-drained
+                                    // completion as absent and claim a
+                                    // false deadlock (Wave 1 race fix:
+                                    // lost-wakeup false positive under
+                                    // GC-pressure timing). Checking
+                                    // registrations first closes the
+                                    // hole: any completion whose
+                                    // registration is already gone was
+                                    // posted before the regs check, so
+                                    // the later `done` check sees it.
+                                    // The pool needs no order (its post
+                                    // + `in_flight` decrement hold both
+                                    // locks), and `settling` rides the
+                                    // `sched` lock already held here.
                                     let pool_active = {
                                         let pool = self.shared.pool.lock().expect("pool lock");
                                         !pool.jobs.is_empty() || pool.in_flight > 0
+                                    } || {
+                                        #[cfg(unix)]
+                                        {
+                                            !self
+                                                .shared
+                                                .net
+                                                .lock()
+                                                .expect("net lock")
+                                                .regs
+                                                .is_empty()
+                                        }
+                                        #[cfg(not(unix))]
+                                        {
+                                            false
+                                        }
                                     } || !self
                                         .shared
                                         .done
@@ -1237,6 +1556,14 @@ impl Scheduler {
                         pool.shutdown = true;
                         drop(pool);
                         self.shared.pool_cv.notify_all();
+                        // Same for the poller (unix-only): set the
+                        // flag and poke the pipe so its `poll`
+                        // wakes, sees shutdown, and returns.
+                        #[cfg(unix)]
+                        {
+                            self.shared.net.lock().expect("net lock").shutdown = true;
+                            toto_compiler::netsys::poke_pipe(self.shared.net_wake[1]);
+                        }
                     }
                     return;
                 }
@@ -1245,7 +1572,8 @@ impl Scheduler {
                 }
                 Step::Run(id, co, input) => {
                     let mut co = co.0;
-                    match co.resume(input) {
+                    let outcome = co.resume(input);
+                    match outcome {
                         CoroutineResult::Yield(req) => {
                             {
                                 let mut sched = self.shared.sched.lock().expect("sched lock");
@@ -1286,6 +1614,85 @@ impl Scheduler {
         };
         let mut enqueued = false;
         for c in completions {
+            // Network completions (unix-only) take a separate path
+            // with their own stale guard (`"net"` + `net_seq`, or
+            // `"blocking"` + `blocking_seq` for pool-posted DNS) and
+            // set the task's `net_error` slot. The split keeps the
+            // two seq counters from ever cross-accepting.
+            #[cfg(unix)]
+            {
+                use BlockingResult as B;
+                let net_kind: Option<bool> = match &c.result {
+                    B::NetInt(_)
+                    | B::NetBytes(_)
+                    | B::NetFail(_)
+                    | B::DnsAddrs(_)
+                    | B::DnsFail(_) => Some(matches!(
+                        c.result,
+                        B::NetInt(_) | B::NetBytes(_) | B::NetFail(_)
+                    )),
+                    _ => None,
+                };
+                if let Some(is_poller) = net_kind {
+                    let Completion {
+                        task,
+                        result,
+                        span: _,
+                        seq,
+                    } = c;
+                    let (resp, err): (ToTask, Option<String>) = match result {
+                        B::NetInt(n) => (ToTask::Value(RtVal::Int(n)), None),
+                        B::NetBytes(bytes) => {
+                            let r = {
+                                let mut st = self.shared.state.lock().expect("shared state lock");
+                                let elems: Vec<RtVal> =
+                                    bytes.into_iter().map(|b| RtVal::Int(b as i64)).collect();
+                                st.heap.alloc_array(elems)
+                            };
+                            (ToTask::Value(RtVal::Heap(r)), None)
+                        }
+                        B::NetFail(m) => (ToTask::Value(RtVal::Unit), Some(m)),
+                        B::DnsAddrs(addrs) => {
+                            // Comma-joined contract (see `gzv.std/net`):
+                            // IPv6 has colons, never commas, so the
+                            // wrapper splits losslessly; the foreign
+                            // signature promises `string`, never an
+                            // array (the Array<int> carve-out is the
+                            // only foreign array shape).
+                            let joined = addrs.join(",");
+                            let r = {
+                                let mut st = self.shared.state.lock().expect("shared state lock");
+                                st.heap.alloc_str(&joined)
+                            };
+                            (ToTask::Value(RtVal::Heap(r)), None)
+                        }
+                        B::DnsFail(m) => {
+                            let r = {
+                                let mut st = self.shared.state.lock().expect("shared state lock");
+                                st.heap.alloc_str("")
+                            };
+                            (ToTask::Value(RtVal::Heap(r)), Some(m))
+                        }
+                        _ => unreachable!("net-kind match is exhaustive"),
+                    };
+                    let slot = &mut sched.slots[task.0];
+                    let live = if is_poller {
+                        matches!(slot.state, TaskState::Blocked { op: "net", .. })
+                            && slot.net_seq == seq
+                    } else {
+                        matches!(slot.state, TaskState::Blocked { op: "blocking", .. })
+                            && slot.blocking_seq == seq
+                    };
+                    if live {
+                        slot.net_error = err;
+                        Self::enqueue_locked(sched, worker, task, resp);
+                        enqueued = true;
+                    } else {
+                        // Stale completion for a task that moved on; drop it.
+                    }
+                    continue;
+                }
+            }
             let resp = match c.result {
                 BlockingResult::File(bytes) => {
                     let r = {
@@ -1319,11 +1726,18 @@ impl Scheduler {
                 BlockingResult::ForeignErr { code, message } => ToTask::OpPanic {
                     diag: Diag::new(code, message, c.span, None),
                 },
+                // Network results drain in the pre-pass above; reaching
+                // here would mean a stale classification — impossible
+                // (the pre-pass matches the same set), so fail loud.
+                #[cfg(unix)]
+                _ => unreachable!("net completion escaped the net drain path"),
             };
             // Stale-completion guard: only a task still parked on
             // `blocking` with the matching seq takes the response.
             // Anything else (released, re-parked, done) drops it.
-            let slot = &sched.slots[c.task.0];
+            // (Net completions never reach here; the pre-pass above
+            // takes them with their own `"net"` guard.)
+            let slot = &mut sched.slots[c.task.0];
             let live = matches!(slot.state, TaskState::Blocked { op: "blocking", .. })
                 && slot.blocking_seq == c.seq;
             if live {
@@ -1438,6 +1852,13 @@ impl Scheduler {
                     args,
                     slots,
                 } => Self::run_foreign(&name, &sig, &args, &slots),
+                #[cfg(unix)]
+                BlockingOp::DnsResolve { host } => {
+                    match toto_compiler::netsys::resolve_blocking(&host) {
+                        Ok(addrs) => BlockingResult::DnsAddrs(addrs),
+                        Err(e) => BlockingResult::DnsFail(e),
+                    }
+                }
             };
             {
                 let mut pool = shared.pool.lock().expect("pool lock");
@@ -1451,6 +1872,184 @@ impl Scheduler {
                 pool.in_flight -= 1;
             }
             shared.sched_cv.notify_all();
+        }
+    }
+
+    /// Unregister every wait on one fd and wake each waiter with
+    /// `NetFail("socket closed")`. Called by `close` (inline, on the
+    /// worker) and by the fail_scope sweep path. Draining drops the
+    /// completions of tasks that already moved on (seq guard), so
+    /// over-waking is impossible — every removed registration ends
+    /// in exactly one wakeup.
+    #[cfg(unix)]
+    pub(crate) fn net_unregister_fd(shared: &Shared, fd: std::os::fd::RawFd, why: &str) {
+        let mut net = shared.net.lock().expect("net lock");
+        let mut i = 0;
+        let mut done = shared.done.lock().expect("done lock");
+        while i < net.regs.len() {
+            if net.regs[i].fd == fd {
+                let reg = net.regs.remove(i);
+                done.push_back(Completion {
+                    task: reg.task,
+                    result: BlockingResult::NetFail(why.to_string()),
+                    span: Span::new(0, 0),
+                    seq: reg.seq,
+                });
+            } else {
+                i += 1;
+            }
+        }
+        drop(net);
+        drop(done);
+        shared.sched_cv.notify_all();
+    }
+
+    /// The M:N network poller (Wave 1, unix-only): one thread, no heap,
+    /// no scheduler state beyond the net table + completions. It
+    /// blocks in `poll()` on registered fds plus the self-pipe;
+    /// readiness runs the nonblocking syscall INLINE with the net lock
+    /// held (microsecond-scale, never blocks — so close+reuse cannot
+    /// slip between verification and syscall), then the registration
+    /// is removed and exactly one completion is posted. EAGAIN after
+    /// readiness (consumed-by-race, vanishingly rare single-threaded)
+    /// re-arms silently; anything else completes the wait.
+    ///
+    /// GC coordination: the poller never joins the STW rendezvous
+    /// (only workers count) and never touches the heap — a stop
+    /// happening mid-`poll` is invisible to it, and parked tasks'
+    /// roots stay published through their slots.
+    #[cfg(unix)]
+    fn poller_loop(shared: &Arc<Shared>) {
+        use toto_compiler::netsys as nn;
+        let pipe_rd = shared.net_wake[0];
+        loop {
+            // Snapshot the poll set under one lock section. `ids`
+            // carries the registration identity per pollfd so a
+            // ready fd resolves to exactly its own wait — never a
+            // different wait on a reused fd number (close+reuse
+            // hands the number to a new socket while an old
+            // completion is still in flight).
+            let (fds, ids, shutdown) = {
+                let net = shared.net.lock().expect("net lock");
+                let mut fds: Vec<(std::os::fd::RawFd, bool, bool)> = net
+                    .regs
+                    .iter()
+                    .map(|r| (r.fd, r.wants_read(), r.wants_write()))
+                    .collect();
+                let mut ids: Vec<Option<(TaskId, u64)>> =
+                    net.regs.iter().map(|r| Some((r.task, r.seq))).collect();
+                fds.push((pipe_rd, true, false));
+                ids.push(None);
+                (fds, ids, net.shutdown)
+            };
+            if shutdown {
+                nn::close(pipe_rd).ok();
+                return;
+            }
+            // Indefinite wait: every table change pokes the pipe, so
+            // wakeups cannot be missed; the 60 s timeout only bounds
+            // a hypothetical missed wakeup (fail-safe, not a timer).
+            let ready = match nn::poll_wait(&fds, -1) {
+                Ok(r) => r,
+                Err(_) => {
+                    // `poll` itself failed (fd table torn down under
+                    // us is impossible — close paths hold this lock;
+                    // an `EINTR`-class blip just retries).
+                    continue;
+                }
+            };
+            // Drain the pipe first: every table change (register,
+            // unregister, shutdown) pokes it, so by the time we look
+            // at the table no wakeup is missed. `poll` uses an
+            // indefinite wait — the pipe IS the wakeup path.
+            nn::drain_pipe(pipe_rd);
+            {
+                let net = shared.net.lock().expect("net lock");
+                if net.shutdown {
+                    drop(net);
+                    // The write end is closed by the run owner after
+                    // join; close our read end here. Any registered
+                    // fds belong to dead runs — unreachable: shutdown
+                    // happens after all tasks are done.
+                    nn::close(pipe_rd).ok();
+                    return;
+                }
+            }
+            let mut woke = false;
+            for &i in &ready {
+                if fds[i].0 == pipe_rd {
+                    continue;
+                }
+                // Peek, execute, then post-before-remove: close paths
+                // wait for the net lock, so no close and reuse can slip
+                // between verification and the nonblocking syscall.
+                // The registration is removed only after its completion
+                // is posted, so the deadlock check never observes a
+                // parked wait with neither a registration nor its
+                // completion (Wave 1 race fix). Each lock stands alone
+                // (never nested): net for peek/execute, done for post,
+                // net again for exact remove — so the poller can never
+                // ABBA against the net -> done order of close/sweep.
+                let (reg, result) = {
+                    let net = shared.net.lock().expect("net lock");
+                    let want = match ids[i] {
+                        Some(w) => w,
+                        // Pipe entry (already skipped above) or a
+                        // snapshot inconsistency: safe drop.
+                        None => continue,
+                    };
+                    let reg = match net
+                        .regs
+                        .iter()
+                        .find(|r| r.task == want.0 && r.seq == want.1)
+                        .cloned()
+                    {
+                        Some(reg) => reg,
+                        // Close/sweep raced us: those paths post their
+                        // own wakeups, so a miss here is a safe drop.
+                        None => continue,
+                    };
+                    let result = poller_do(&reg);
+                    (reg, result)
+                };
+                match result {
+                    PollerDone::Rearm => {
+                        // Spurious readiness (EAGAIN after a race): the
+                        // registration was never removed (peek, never
+                        // take), so there is nothing to restore.
+                        // Close/sweep paths unregister + post on their
+                        // own; the seq guard drops anything stray.
+                    }
+                    PollerDone::Done(result) => {
+                        {
+                            let mut done = shared.done.lock().expect("done lock");
+                            done.push_back(Completion {
+                                task: reg.task,
+                                result,
+                                span: reg.span,
+                                seq: reg.seq,
+                            });
+                        }
+                        woke = true;
+                        // Remove exactly this wait *after* posting: the fd
+                        // number may already be reused by a newer wait, so
+                        // identity (task + seq) is the only safe key.
+                        {
+                            let mut net = shared.net.lock().expect("net lock");
+                            if let Some(pos) = net
+                                .regs
+                                .iter()
+                                .position(|r| r.task == reg.task && r.seq == reg.seq)
+                            {
+                                net.regs.remove(pos);
+                            }
+                        }
+                    }
+                }
+            }
+            if woke {
+                shared.sched_cv.notify_all();
+            }
         }
     }
 
@@ -1562,6 +2161,10 @@ impl Scheduler {
             }
             ToSched::Blocking { op, span } => {
                 self.op_blocking(worker, id, op, span);
+            }
+            #[cfg(unix)]
+            ToSched::Net { op, span } => {
+                self.op_net(worker, id, op, span);
             }
         }
     }
@@ -2508,6 +3111,46 @@ impl Scheduler {
             st.select_waiters.retain(|w| !released.contains(&w.task.0));
             st.channels.sweep_released(&released);
         }
+        // Unix: unregister any parked net waits in the failed subtree.
+        // Two phases, never nested (net→done matches the pool order;
+        // sched is taken alone in between): snapshot candidates, check
+        // scopes without holding net, then remove + post. Each
+        // unregistered wait gets a `NetFail` completion — the sweep
+        // never drops a wakeup.
+        #[cfg(unix)]
+        {
+            let snap: Vec<(TaskId, u64)> = {
+                let net = self.shared.net.lock().expect("net lock");
+                net.regs.iter().map(|r| (r.task, r.seq)).collect()
+            };
+            let mut dead = Vec::new();
+            {
+                let t = self.shared.scopes.lock().expect("scopes lock");
+                let sched = self.shared.sched.lock().expect("sched lock");
+                for (task, seq) in &snap {
+                    if t.in_subtree(sched.slots[task.0].scope, scope) {
+                        dead.push((*task, *seq));
+                    }
+                }
+            }
+            if !dead.is_empty() {
+                let mut net = self.shared.net.lock().expect("net lock");
+                let mut done = self.shared.done.lock().expect("done lock");
+                net.regs.retain(|r| {
+                    if dead.contains(&(r.task, r.seq)) {
+                        done.push_back(Completion {
+                            task: r.task,
+                            result: BlockingResult::NetFail("scope cancelled".to_string()),
+                            span: Span::new(0, 0),
+                            seq: r.seq,
+                        });
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
         for (tid, op) in in_sub {
             // Conditional: a pairing that already woke the task (its
             // `Value` stands) is not overwritten. Either way the task
@@ -2517,10 +3160,48 @@ impl Scheduler {
         }
     }
 
-    /// Blocking file-system call (Stage 2 policy: dedicated pool, so no
-    /// worker ever stalls on IO). The executor converted arguments to
-    /// owned plain data; the job runs on a pool thread and the task
-    /// parks on `blocking` until the completion arrives.
+    /// Park a task on a network wait (Wave 1, unix-only): mark
+    /// `Blocked` on `"net"` with a fresh `net_seq`, register the fd
+    /// with the poller (assigning its close+reuse generation), and
+    /// wake the poller via the self-pipe. Same atomicity discipline
+    /// as `op_blocking` (one `sched` section, net table nested
+    /// inside): a task observed as `Blocked` on `"net"` always has
+    /// its registration submitted.
+    #[cfg(unix)]
+    fn op_net(&self, worker: usize, id: TaskId, op: NetOp, span: Span) {
+        // No fail-fast check here: like `park`, the executor checks the
+        // scope BEFORE yielding, so a task that reaches this request is
+        // live. (A scope that fails while the wait is registered
+        // releases the task with `Cancelled`; the sweep in
+        // `fail_scope` unregisters it and the stale completion is
+        // dropped by its `seq` — see `drain_completions_locked`.)
+        let _ = worker;
+        let fd = match op {
+            NetOp::Connect { fd }
+            | NetOp::Accept { fd }
+            | NetOp::Recv { fd, .. }
+            | NetOp::Send { fd, .. }
+            | NetOp::UdpRecv { fd, .. }
+            | NetOp::UdpSend { fd, .. } => fd,
+        };
+        {
+            let mut sched = self.shared.sched.lock().expect("sched lock");
+            let slot = &mut sched.slots[id.0];
+            slot.net_seq += 1;
+            let seq = slot.net_seq;
+            slot.state = TaskState::Blocked { span, op: "net" };
+            let mut net = self.shared.net.lock().expect("net lock");
+            net.regs.push(NetReg {
+                fd,
+                task: id,
+                seq,
+                op,
+                span,
+            });
+        }
+        toto_compiler::netsys::poke_pipe(self.shared.net_wake[1]);
+    }
+
     fn op_blocking(&self, worker: usize, id: TaskId, op: BlockingOp, span: Span) {
         // No fail-fast check here: like `park`, the executor checks the
         // scope BEFORE yielding, so a task that reaches this request is

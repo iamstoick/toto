@@ -113,7 +113,8 @@ fn check_formatted(
         Err((diag, trace)) => {
             if want_status != "1" {
                 failures.push(format!(
-                    "{name}: formatted panics, want status {want_status}"
+                    "{name}: formatted panics, want status {want_status}: got {} {}",
+                    diag.code, diag.message
                 ));
                 return;
             }
@@ -149,6 +150,7 @@ const POSITIVES: &[&str] = &[
     "conc10_select_send",
     "conc11_chan_of_chan",
     "conc19_chan_eq",
+    "conc20_net_hammer",
 ];
 
 const NEGATIVES: &[&str] = &[

@@ -590,6 +590,12 @@ impl<'a> Executor<'a> {
 
     /// Allocate on the GC heap behind a safepoint (uniform: every
     /// executor allocation publishes first, then collects on threshold).
+    ///
+    /// Lock-order contract: `f` runs with the heap-state lock held,
+    /// so it must NEVER take the sched lock (nor any lock above
+    /// state) — the drain nests sched -> state, and the reverse
+    /// deadlocks M:N. Take error slots and other sched-owned values
+    /// before calling (see the `*_last_error` arms).
     fn alloc_with<R>(&self, f: impl FnOnce(&mut Heap) -> R) -> R {
         self.maybe_collect();
         f(&mut self.shared.state.lock().expect("shared state lock").heap)
@@ -1503,6 +1509,33 @@ impl<'a> Executor<'a> {
         args: &[usize],
         span: Span,
     ) -> Result<(), ExecErr> {
+        // Network foreign calls bypass the generic pool path: they
+        // need the M:N poller (never the pool, never inline blocking).
+        // Unix-only surface; checked code on other platforms cannot
+        // name these (E0301), so the cfg'd-out fallthrough below is
+        // unreachable there.
+        #[cfg(unix)]
+        if Self::NET_FNS.contains(&name) {
+            return self.exec_net(dst, name, args, span);
+        }
+        // Crypto foreign calls run inline on the worker: they are
+        // one-shot OpenSSL calls (microseconds, never blocking, never
+        // parking) — the poller and the pool are both uninvolved.
+        // Unix-only surface; checked code on other platforms cannot
+        // name these (E0301), so the cfg'd-out fallthrough below is
+        // unreachable there.
+        #[cfg(unix)]
+        if Self::CRYPTO_FNS.contains(&name) {
+            return self.exec_crypto(dst, name, args, span);
+        }
+        // Gzip foreign calls run inline on the worker: one-shot
+        // pure-Rust compression, never blocking, never parking.
+        // Unix-gated like the other Wave 1 surfaces (uniformity;
+        // the backend itself is portable, so lifting is cfg-only).
+        #[cfg(unix)]
+        if Self::GZIP_FNS.contains(&name) {
+            return self.exec_gzip(dst, name, args, span);
+        }
         use crate::sched::{BlockingOp, ForeignArg};
         use toto_compiler::ffi;
         let Some(sig) = self.code.externs.get(name).cloned() else {
@@ -1603,6 +1636,842 @@ impl<'a> Executor<'a> {
                 let _ = other;
                 Err(self.internal("blocking response", span))
             }
+        }
+    }
+
+    /// Network foreign calls (Wave 1, unix-only): native executor
+    /// handling with M:N poller integration. Routed here — never
+    /// through the generic pool `Foreign` path (a pool thread must
+    /// never block on a network wait) — by name from `exec_foreign`.
+    ///
+    /// Shape per call: fast nonblocking syscall inline on the worker;
+    /// `WouldBlock` parks on the poller (`ToSched::Net`) exactly once
+    /// and the resume value is the finished result (the poller ran the
+    /// syscall). DNS is the exception: it rides
+    /// the blocking pool (`BlockingOp::DnsResolve`), the only
+    /// genuinely blocking network call. The per-task `net_error`
+    /// slot carries failures (set on every completion, read and
+    /// cleared by `toto_rt_net_last_error`).
+    #[cfg(unix)]
+    const NET_FNS: &[&str] = &[
+        "toto_rt_net_resolve",
+        "toto_rt_net_connect_ip",
+        "toto_rt_net_listen",
+        "toto_rt_net_accept",
+        "toto_rt_net_send",
+        "toto_rt_net_recv",
+        "toto_rt_net_close",
+        "toto_rt_net_udp_bind",
+        "toto_rt_net_udp_send_to",
+        "toto_rt_net_udp_recv_from",
+        "toto_rt_net_udp_peer_host",
+        "toto_rt_net_udp_peer_port",
+        "toto_rt_net_last_error",
+    ];
+
+    /// Park the current task on a readiness wait. The resume value
+    /// IS the finished result: the poller executed the nonblocking
+    /// syscall and the drain converted it (setting the error slot).
+    /// Map it with `net_scalar_resume` / `net_array_resume`.
+    /// Cancellations and unexpected responses propagate as errors.
+    #[cfg(unix)]
+    fn net_wait(&mut self, op: crate::sched::NetOp, span: Span) -> Result<RtVal, ExecErr> {
+        if self.scope_failed() {
+            return Err(self.cancelled("net", span));
+        }
+        self.maybe_collect();
+        self.trace.push(TraceFrame {
+            name: "net wait".to_string(),
+            span,
+        });
+        let out = match self.y.suspend(crate::sched::ToSched::Net { op, span }) {
+            ToTask::Value(v) => Ok(v),
+            ToTask::Cancelled { op } => Err(self.cancelled(op, span)),
+            other => {
+                let _ = other;
+                Err(self.internal("net response", span))
+            }
+        };
+        self.trace.pop();
+        out
+    }
+
+    /// Assign `dst` (if any). No trace handling: callers manage their
+    /// own frames around parks (see `net_wait`).
+    #[cfg(unix)]
+    fn net_assign(&mut self, dst: Option<usize>, v: RtVal) {
+        if let Some(d) = dst {
+            let top = self.frames.len() - 1;
+            self.frames[top].locals[d] = v;
+        }
+    }
+
+    /// Read an int arg (checked code guarantees the static type; a
+    /// mismatch is a bug, not a user error).
+    #[cfg(unix)]
+    fn net_int(&self, args: &[usize], i: usize, name: &str, span: Span) -> Result<i64, ExecErr> {
+        let top = self.frames.len() - 1;
+        match self.frames[top].locals[args[i]] {
+            RtVal::Int(n) => Ok(n),
+            _ => Err(self.internal(&format!("`{name}` argument must be an int"), span)),
+        }
+    }
+
+    /// Read a validated port (1-65535; the Toto wrapper pre-checks,
+    /// this is the backstop for hand-built MIR).
+    #[cfg(unix)]
+    fn net_port(&self, args: &[usize], i: usize, name: &str, span: Span) -> Result<u16, ExecErr> {
+        let n = self.net_int(args, i, name, span)?;
+        if !(1..=65535).contains(&n) {
+            return Err(self.err("E0308", format!("invalid port {n} (want 1-65535)"), span));
+        }
+        Ok(n as u16)
+    }
+
+    /// Read an fd arg (checked code guarantees `int`; negative fds
+    /// fail loudly in the syscall, never silently).
+    #[cfg(unix)]
+    fn net_fd(&self, args: &[usize], i: usize, name: &str, span: Span) -> Result<i32, ExecErr> {
+        Ok(self.net_int(args, i, name, span)? as i32)
+    }
+
+    /// Read a byte count (must be >= 1; the wrapper pre-checks, this
+    /// is the backstop for hand-built MIR).
+    #[cfg(unix)]
+    fn net_count(
+        &self,
+        args: &[usize],
+        i: usize,
+        name: &str,
+        span: Span,
+    ) -> Result<usize, ExecErr> {
+        let n = self.net_int(args, i, name, span)?;
+        if n < 1 {
+            return Err(self.err("E0308", format!("invalid max {n} (want >= 1)"), span));
+        }
+        Ok(n as usize)
+    }
+
+    /// Read a string arg (checked code guarantees the static type).
+    #[cfg(unix)]
+    fn net_str(&self, args: &[usize], i: usize, name: &str, span: Span) -> Result<String, ExecErr> {
+        let top = self.frames.len() - 1;
+        match &self.frames[top].locals[args[i]] {
+            RtVal::Heap(r) => {
+                let st = self.shared.state.lock().expect("shared state lock");
+                match st.heap.get(*r) {
+                    Some(crate::heap::Payload::Str(s)) => Ok(s.clone()),
+                    _ => Err(self.internal(&format!("`{name}` argument must be a string"), span)),
+                }
+            }
+            _ => Err(self.internal(&format!("`{name}` argument must be a string"), span)),
+        }
+    }
+
+    /// Read a byte-array arg, validating 0-255 per element (E0308 —
+    /// a value error the checker cannot see statically).
+    #[cfg(unix)]
+    fn net_bytes(&self, args: &[usize], i: usize, span: Span) -> Result<Vec<u8>, ExecErr> {
+        use crate::heap::Payload;
+        let top = self.frames.len() - 1;
+        match &self.frames[top].locals[args[i]] {
+            RtVal::Heap(r) => {
+                let st = self.shared.state.lock().expect("shared state lock");
+                match st.heap.get(*r) {
+                    Some(Payload::Array(elems)) => {
+                        let mut out = Vec::with_capacity(elems.len());
+                        for e in elems {
+                            match e {
+                                RtVal::Int(n) if (0..=255).contains(n) => out.push(*n as u8),
+                                other => {
+                                    let tn = other.type_name(&st.heap);
+                                    drop(st);
+                                    return Err(self.err(
+                                        "E0308",
+                                        format!(
+                                            "cannot pass {tn} as socket bytes (elements must be ints 0-255)"
+                                        ),
+                                        span,
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(out)
+                    }
+                    _ => Err(self.internal("socket data argument must be an array", span)),
+                }
+            }
+            _ => Err(self.internal("socket data argument must be an array", span)),
+        }
+    }
+
+    /// Set (or clear) this task's network error slot.
+    #[cfg(unix)]
+    fn net_set_error(&self, msg: Option<String>) {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        sched.slots[self.task.0].net_error = msg;
+    }
+
+    /// Take (read + clear) this task's network error slot.
+    #[cfg(unix)]
+    fn net_take_error(&self) -> String {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        sched.slots[self.task.0]
+            .net_error
+            .take()
+            .unwrap_or_default()
+    }
+
+    /// Allocate a byte array on the GC heap (worker side, where the
+    /// heap is available; never on the poller thread).
+    #[cfg(unix)]
+    fn net_alloc_bytes(&self, bytes: Vec<u8>) -> RtVal {
+        RtVal::Heap(self.alloc_with(|h| {
+            h.alloc_array(bytes.into_iter().map(|b| RtVal::Int(b as i64)).collect())
+        }))
+    }
+
+    /// Resume mapping for scalar (int-returning) net ops: an Int
+    /// resume is the result; a Unit resume means the drain set
+    /// `net_error` (the Toto wrapper reads it via `net_last_error`).
+    #[cfg(unix)]
+    fn net_scalar_resume(&mut self, dst: Option<usize>, v: RtVal) {
+        match v {
+            RtVal::Int(n) => self.net_assign(dst, RtVal::Int(n)),
+            _ => self.net_assign(dst, RtVal::Int(-1)),
+        }
+    }
+
+    /// Resume mapping for array-returning net ops: an array resume is
+    /// the payload (possibly empty); a Unit resume means the drain
+    /// set `net_error`. Empty + clean slot is orderly EOF.
+    #[cfg(unix)]
+    fn net_array_resume(&mut self, dst: Option<usize>, v: RtVal) {
+        match v {
+            RtVal::Heap(_) => self.net_assign(dst, v),
+            _ => self.net_assign(dst, self.net_alloc_bytes(Vec::new())),
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    fn exec_net(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
+        use crate::sched::NetOp;
+        use toto_compiler::netsys as nn;
+        // Every arm assigns `dst` and returns Ok, or returns an
+        // executor error (E0308 on bad values, Cancelled on scope
+        // failure, internal on impossible states). The error slot is
+        // set on every path that produces a value.
+        match name {
+            "toto_rt_net_resolve" => {
+                self.arity(name, args.len(), 1, span)?;
+                let host = self.net_str(args, 0, name, span)?;
+                // DNS cannot be nonblocking: park on the pool.
+                if self.scope_failed() {
+                    return Err(self.cancelled("net", span));
+                }
+                self.maybe_collect();
+                self.trace.push(TraceFrame {
+                    name: "net resolve (pool)".to_string(),
+                    span,
+                });
+                let v = match self.y.suspend(crate::sched::ToSched::Blocking {
+                    op: crate::sched::BlockingOp::DnsResolve { host },
+                    span,
+                }) {
+                    // Drain converted + set the slot; the array (empty
+                    // on failure) is the whole result.
+                    ToTask::Value(v) => v,
+                    ToTask::Cancelled { op } => {
+                        self.trace.pop();
+                        return Err(self.cancelled(op, span));
+                    }
+                    other => {
+                        let _ = other;
+                        self.trace.pop();
+                        return Err(self.internal("dns response", span));
+                    }
+                };
+                self.trace.pop();
+                self.net_array_resume(dst, v);
+                Ok(())
+            }
+            "toto_rt_net_connect_ip" => {
+                self.arity(name, args.len(), 2, span)?;
+                let ip = self.net_str(args, 0, name, span)?;
+                let port = self.net_port(args, 1, name, span)?;
+                let fd = match nn::socket_tcp() {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        self.net_set_error(Some(e));
+                        self.net_assign(dst, RtVal::Int(-1));
+                        return Ok(());
+                    }
+                };
+                if let Err(e) = nn::set_nonblocking(fd) {
+                    nn::close(fd).ok();
+                    self.net_set_error(Some(e));
+                    self.net_assign(dst, RtVal::Int(-1));
+                    return Ok(());
+                }
+                match nn::connect_start(fd, &ip, port) {
+                    nn::ConnectOutcome::Connected(fd) => {
+                        self.net_set_error(None);
+                        self.net_assign(dst, RtVal::Int(fd as i64));
+                        Ok(())
+                    }
+                    nn::ConnectOutcome::Failed(e) => {
+                        nn::close(fd).ok();
+                        self.net_set_error(Some(e));
+                        self.net_assign(dst, RtVal::Int(-1));
+                        Ok(())
+                    }
+                    nn::ConnectOutcome::InProgress(fd) => {
+                        // The poller waits for writability and runs
+                        // SO_ERROR itself; the resume carries the
+                        // verdict (NetInt on success, Unit+slot on
+                        // failure).
+                        let v = self.net_wait(NetOp::Connect { fd }, span)?;
+                        self.net_scalar_resume(dst, v);
+                        Ok(())
+                    }
+                }
+            }
+            "toto_rt_net_listen" => {
+                self.arity(name, args.len(), 1, span)?;
+                let port = self.net_port(args, 0, name, span)?;
+                match nn::listen_loopback(port) {
+                    Ok(fd) => {
+                        if let Err(e) = nn::set_nonblocking(fd) {
+                            nn::close(fd).ok();
+                            self.net_set_error(Some(e));
+                            self.net_assign(dst, RtVal::Int(-1));
+                            return Ok(());
+                        }
+                        self.net_set_error(None);
+                        self.net_assign(dst, RtVal::Int(fd as i64));
+                        Ok(())
+                    }
+                    Err(e) => {
+                        self.net_set_error(Some(e));
+                        self.net_assign(dst, RtVal::Int(-1));
+                        Ok(())
+                    }
+                }
+            }
+            "toto_rt_net_accept" => {
+                self.arity(name, args.len(), 1, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                match nn::accept_nonblocking(fd) {
+                    nn::AcceptOutcome::Accepted(c) => {
+                        // Accepted fds must be nonblocking before any
+                        // park can wait on them; a failure here is a
+                        // loud error, never a blocking socket.
+                        if let Err(e) = nn::set_nonblocking(c) {
+                            nn::close(c).ok();
+                            self.net_set_error(Some(e));
+                            self.net_assign(dst, RtVal::Int(-1));
+                            return Ok(());
+                        }
+                        self.net_set_error(None);
+                        self.net_assign(dst, RtVal::Int(c as i64));
+                        Ok(())
+                    }
+                    nn::AcceptOutcome::WouldBlock => {
+                        let v = self.net_wait(NetOp::Accept { fd }, span)?;
+                        self.net_scalar_resume(dst, v);
+                        Ok(())
+                    }
+                    nn::AcceptOutcome::Failed(e) => {
+                        self.net_set_error(Some(e));
+                        self.net_assign(dst, RtVal::Int(-1));
+                        Ok(())
+                    }
+                }
+            }
+            "toto_rt_net_send" => {
+                self.arity(name, args.len(), 2, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                let buf = self.net_bytes(args, 1, span)?;
+                // Fast path first (usually succeeds on loopback); one
+                // park if the buffer is full (the poller completes the
+                // send — no exec-side retry needed).
+                match nn::send_nonblocking(fd, &buf) {
+                    nn::SendOutcome::Wrote(n) => {
+                        self.net_set_error(None);
+                        self.net_assign(dst, RtVal::Int(n as i64));
+                        Ok(())
+                    }
+                    nn::SendOutcome::WouldBlock => {
+                        let op = NetOp::Send { fd, bytes: buf };
+                        let v = self.net_wait(op, span)?;
+                        self.net_scalar_resume(dst, v);
+                        Ok(())
+                    }
+                    nn::SendOutcome::Closed => {
+                        self.net_set_error(Some("connection closed by peer".to_string()));
+                        self.net_assign(dst, RtVal::Int(-1));
+                        Ok(())
+                    }
+                    nn::SendOutcome::Failed(e) => {
+                        self.net_set_error(Some(e));
+                        self.net_assign(dst, RtVal::Int(-1));
+                        Ok(())
+                    }
+                }
+            }
+            "toto_rt_net_recv" => {
+                self.arity(name, args.len(), 2, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                let max = self.net_count(args, 1, name, span)?;
+                // Fast path first; one park on WouldBlock.
+                match nn::recv_nonblocking(fd, max) {
+                    nn::RecvOutcome::Got(bytes) => {
+                        self.net_set_error(None);
+                        let v = self.net_alloc_bytes(bytes);
+                        self.net_assign(dst, v);
+                        Ok(())
+                    }
+                    // Orderly shutdown reads as an empty array with a
+                    // clean slot — NOT an error (spec §17.1).
+                    nn::RecvOutcome::Closed => {
+                        self.net_set_error(None);
+                        let v = self.net_alloc_bytes(Vec::new());
+                        self.net_assign(dst, v);
+                        Ok(())
+                    }
+                    nn::RecvOutcome::WouldBlock => {
+                        let v = self.net_wait(NetOp::Recv { fd, max }, span)?;
+                        self.net_array_resume(dst, v);
+                        Ok(())
+                    }
+                    nn::RecvOutcome::Failed(e) => {
+                        self.net_set_error(Some(e));
+                        let v = self.net_alloc_bytes(Vec::new());
+                        self.net_assign(dst, v);
+                        Ok(())
+                    }
+                }
+            }
+            "toto_rt_net_close" => {
+                self.arity(name, args.len(), 1, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                // Unregister first so parked waiters fail loudly
+                // instead of operating on a recycled fd number.
+                crate::sched::Scheduler::net_unregister_fd(self.shared, fd, "socket closed");
+                nn::forget_peer(fd);
+                match nn::close(fd) {
+                    Ok(()) => {
+                        self.net_set_error(None);
+                        self.net_assign(dst, RtVal::Int(0));
+                        Ok(())
+                    }
+                    Err(e) => {
+                        self.net_set_error(Some(e));
+                        self.net_assign(dst, RtVal::Int(-1));
+                        Ok(())
+                    }
+                }
+            }
+            "toto_rt_net_udp_bind" => {
+                self.arity(name, args.len(), 1, span)?;
+                let port = self.net_port(args, 0, name, span)?;
+                match nn::bind_udp_loopback(port) {
+                    Ok(fd) => {
+                        if let Err(e) = nn::set_nonblocking(fd) {
+                            nn::close(fd).ok();
+                            self.net_set_error(Some(e));
+                            self.net_assign(dst, RtVal::Int(-1));
+                            return Ok(());
+                        }
+                        self.net_set_error(None);
+                        self.net_assign(dst, RtVal::Int(fd as i64));
+                        Ok(())
+                    }
+                    Err(e) => {
+                        self.net_set_error(Some(e));
+                        self.net_assign(dst, RtVal::Int(-1));
+                        Ok(())
+                    }
+                }
+            }
+            "toto_rt_net_udp_send_to" => {
+                self.arity(name, args.len(), 4, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                let buf = self.net_bytes(args, 1, span)?;
+                let ip = self.net_str(args, 2, name, span)?;
+                let port = self.net_port(args, 3, name, span)?;
+                match nn::udp_send_to_nb(fd, &buf, &ip, port) {
+                    nn::SendOutcome::Wrote(n) => {
+                        self.net_set_error(None);
+                        self.net_assign(dst, RtVal::Int(n as i64));
+                        Ok(())
+                    }
+                    nn::SendOutcome::WouldBlock => {
+                        let op = NetOp::UdpSend {
+                            fd,
+                            bytes: buf,
+                            ip,
+                            port,
+                        };
+                        let v = self.net_wait(op, span)?;
+                        self.net_scalar_resume(dst, v);
+                        Ok(())
+                    }
+                    nn::SendOutcome::Closed | nn::SendOutcome::Failed(_) => {
+                        self.net_set_error(Some(nn::last_error()));
+                        self.net_assign(dst, RtVal::Int(-1));
+                        Ok(())
+                    }
+                }
+            }
+            "toto_rt_net_udp_recv_from" => {
+                self.arity(name, args.len(), 2, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                let max = self.net_count(args, 1, name, span)?;
+                match nn::udp_recv_from_nb(fd, max) {
+                    nn::UdpRecvOutcome::Got(bytes, host, port) => {
+                        // Fast path mirrors the poller: record the peer
+                        // for `net_udp_peer_*` and return the bytes. The
+                        // Toto wrapper assembles the `UdpPacket` struct
+                        // itself (foreign signature returns `Array<int>`).
+                        nn::record_peer(fd, host, port);
+                        self.net_set_error(None);
+                        let v = self.net_alloc_bytes(bytes);
+                        self.net_assign(dst, v);
+                        Ok(())
+                    }
+                    // Empty datagrams are real data (UDP has no EOF).
+                    nn::UdpRecvOutcome::WouldBlock => {
+                        let v = self.net_wait(NetOp::UdpRecv { fd, max }, span)?;
+                        self.net_array_resume(dst, v);
+                        Ok(())
+                    }
+                    nn::UdpRecvOutcome::Failed(e) => {
+                        self.net_set_error(Some(e));
+                        let v = self.net_alloc_bytes(Vec::new());
+                        self.net_assign(dst, v);
+                        Ok(())
+                    }
+                }
+            }
+            "toto_rt_net_udp_peer_host" => {
+                self.arity(name, args.len(), 1, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                let v = match nn::lookup_peer(fd) {
+                    Some((host, _)) => self.alloc_with(|h| h.alloc_str(&host)),
+                    None => self.alloc_with(|h| h.alloc_str("")),
+                };
+                self.net_assign(dst, RtVal::Heap(v));
+                Ok(())
+            }
+            "toto_rt_net_udp_peer_port" => {
+                self.arity(name, args.len(), 1, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                let v = match nn::lookup_peer(fd) {
+                    Some((_, port)) => RtVal::Int(port as i64),
+                    None => RtVal::Int(0),
+                };
+                self.net_assign(dst, v);
+                Ok(())
+            }
+            "toto_rt_net_last_error" => {
+                self.arity(name, args.len(), 0, span)?;
+                // Take the error BEFORE allocating: `alloc_with`
+                // holds the heap-state lock, and the drain nests
+                // sched -> state, so taking the sched lock inside the
+                // closure inverts the order and deadlocks M:N (Wave 1
+                // fix-forward: ABBA between this arm and
+                // `drain_completions_locked`). Same shape as the
+                // crypto/gzip last-error arms.
+                let e = self.net_take_error();
+                let v = self.alloc_with(|h| h.alloc_str(&e));
+                self.net_assign(dst, RtVal::Heap(v));
+                Ok(())
+            }
+            _ => Err(self.internal("unknown net function", span)),
+        }
+    }
+
+    /// Crypto foreign functions (Wave 1, unix-only): one-shot
+    /// OpenSSL calls dispatched by name from `exec_foreign`.
+    ///
+    /// Shape: parse args with the shared `net_*` readers (byte
+    /// arrays validated 0–255, `E0308` on bad values), call the
+    /// `toto_compiler::cryptolib` bridge inline on the worker, assign
+    /// `dst`, and set the per-task `crypto_error` slot on every path
+    /// that produces a value (read and cleared by
+    /// `toto_rt_crypto_last_error`). Array results carry the payload
+    /// (empty on failure); `verify`-style results are 1/0 (slot clean)
+    /// or -1 + slot on malformed input. Never parks, never blocks.
+    #[cfg(unix)]
+    const CRYPTO_FNS: &[&str] = &[
+        "toto_rt_crypto_sha256",
+        "toto_rt_crypto_sha512",
+        "toto_rt_crypto_hmac256",
+        "toto_rt_crypto_hmac512",
+        "toto_rt_crypto_aead_encrypt",
+        "toto_rt_crypto_aead_decrypt",
+        "toto_rt_crypto_sign_keygen",
+        "toto_rt_crypto_sign_sign",
+        "toto_rt_crypto_sign_verify",
+        "toto_rt_crypto_random",
+        "toto_rt_crypto_x509_verify",
+        "toto_rt_crypto_last_error",
+        "toto_rt_crypto_version",
+    ];
+
+    /// Set (or clear) this task's crypto error slot.
+    #[cfg(unix)]
+    fn crypto_set_error(&mut self, msg: Option<String>) {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        sched.slots[self.task.0].crypto_error = msg;
+    }
+
+    /// Take (read + clear) this task's crypto error slot.
+    #[cfg(unix)]
+    fn crypto_take_error(&mut self) -> String {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        sched.slots[self.task.0]
+            .crypto_error
+            .take()
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    fn exec_crypto(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
+        use toto_compiler::cryptolib as cc;
+        // Map a bridge `Result<Vec<u8>, String>` to an array assign +
+        // slot update (empty array + slot on failure).
+        macro_rules! array_call {
+            ($call:expr) => {{
+                match $call {
+                    Ok(bytes) => {
+                        self.crypto_set_error(None);
+                        let v = self.net_alloc_bytes(bytes);
+                        self.net_assign(dst, v);
+                    }
+                    Err(e) => {
+                        self.crypto_set_error(Some(e));
+                        let v = self.net_alloc_bytes(Vec::new());
+                        self.net_assign(dst, v);
+                    }
+                }
+            }};
+        }
+        // Map a bridge `Result<bool, String>` to a 1/0/-1 assign.
+        macro_rules! verify_call {
+            ($call:expr) => {{
+                match $call {
+                    Ok(true) => {
+                        self.crypto_set_error(None);
+                        self.net_assign(dst, RtVal::Int(1));
+                    }
+                    Ok(false) => {
+                        self.crypto_set_error(None);
+                        self.net_assign(dst, RtVal::Int(0));
+                    }
+                    Err(e) => {
+                        self.crypto_set_error(Some(e));
+                        self.net_assign(dst, RtVal::Int(-1));
+                    }
+                }
+            }};
+        }
+        match name {
+            "toto_rt_crypto_sha256" => {
+                self.arity(name, args.len(), 1, span)?;
+                let buf = self.net_bytes(args, 0, span)?;
+                array_call!(cc::sha256(&buf));
+                Ok(())
+            }
+            "toto_rt_crypto_sha512" => {
+                self.arity(name, args.len(), 1, span)?;
+                let buf = self.net_bytes(args, 0, span)?;
+                array_call!(cc::sha512(&buf));
+                Ok(())
+            }
+            "toto_rt_crypto_hmac256" => {
+                self.arity(name, args.len(), 2, span)?;
+                let key = self.net_bytes(args, 0, span)?;
+                let data = self.net_bytes(args, 1, span)?;
+                array_call!(cc::hmac256(&key, &data));
+                Ok(())
+            }
+            "toto_rt_crypto_hmac512" => {
+                self.arity(name, args.len(), 2, span)?;
+                let key = self.net_bytes(args, 0, span)?;
+                let data = self.net_bytes(args, 1, span)?;
+                array_call!(cc::hmac512(&key, &data));
+                Ok(())
+            }
+            "toto_rt_crypto_aead_encrypt" => {
+                self.arity(name, args.len(), 4, span)?;
+                let key = self.net_bytes(args, 0, span)?;
+                let nonce = self.net_bytes(args, 1, span)?;
+                let pt = self.net_bytes(args, 2, span)?;
+                let aad = self.net_bytes(args, 3, span)?;
+                array_call!(cc::aead_encrypt(&key, &nonce, &pt, &aad));
+                Ok(())
+            }
+            "toto_rt_crypto_aead_decrypt" => {
+                self.arity(name, args.len(), 4, span)?;
+                let key = self.net_bytes(args, 0, span)?;
+                let nonce = self.net_bytes(args, 1, span)?;
+                let cttag = self.net_bytes(args, 2, span)?;
+                let aad = self.net_bytes(args, 3, span)?;
+                array_call!(cc::aead_decrypt(&key, &nonce, &cttag, &aad));
+                Ok(())
+            }
+            "toto_rt_crypto_sign_keygen" => {
+                self.arity(name, args.len(), 0, span)?;
+                array_call!(cc::sign_keygen());
+                Ok(())
+            }
+            "toto_rt_crypto_sign_sign" => {
+                self.arity(name, args.len(), 2, span)?;
+                let secret = self.net_bytes(args, 0, span)?;
+                let msg = self.net_bytes(args, 1, span)?;
+                array_call!(cc::sign_sign(&secret, &msg));
+                Ok(())
+            }
+            "toto_rt_crypto_sign_verify" => {
+                self.arity(name, args.len(), 3, span)?;
+                let public = self.net_bytes(args, 0, span)?;
+                let msg = self.net_bytes(args, 1, span)?;
+                let sig = self.net_bytes(args, 2, span)?;
+                verify_call!(cc::sign_verify(&public, &msg, &sig));
+                Ok(())
+            }
+            "toto_rt_crypto_random" => {
+                self.arity(name, args.len(), 1, span)?;
+                let n = self.net_int(args, 0, name, span)?;
+                if !(1..=65536).contains(&n) {
+                    self.crypto_set_error(Some(format!("random: need 1-65536 bytes, got {n}")));
+                    let v = self.net_alloc_bytes(Vec::new());
+                    self.net_assign(dst, v);
+                    return Ok(());
+                }
+                array_call!(cc::random_bytes(n as usize));
+                Ok(())
+            }
+            "toto_rt_crypto_x509_verify" => {
+                self.arity(name, args.len(), 2, span)?;
+                let leaf = self.net_str(args, 0, name, span)?;
+                let ca = self.net_str(args, 1, name, span)?;
+                verify_call!(cc::x509_verify(&leaf, &ca));
+                Ok(())
+            }
+            "toto_rt_crypto_last_error" => {
+                self.arity(name, args.len(), 0, span)?;
+                let e = self.crypto_take_error();
+                let v = self.alloc_with(|h| h.alloc_str(&e));
+                self.net_assign(dst, RtVal::Heap(v));
+                Ok(())
+            }
+            "toto_rt_crypto_version" => {
+                self.arity(name, args.len(), 0, span)?;
+                let v = self.alloc_with(|h| h.alloc_str(&cc::openssl_version()));
+                self.net_assign(dst, RtVal::Heap(v));
+                Ok(())
+            }
+            _ => Err(self.internal("unknown crypto function", span)),
+        }
+    }
+
+    /// Gzip foreign functions (Wave 1, unix-only): one-shot
+    /// pure-Rust compression dispatched by name from `exec_foreign`.
+    /// Same shape as crypto (inline on the worker, per-task
+    /// `gzip_error` slot, array results); never parks, never blocks.
+    #[cfg(unix)]
+    const GZIP_FNS: &[&str] = &[
+        "toto_rt_gzip_compress",
+        "toto_rt_gzip_decompress",
+        "toto_rt_gzip_last_error",
+    ];
+
+    /// Set (or clear) this task's gzip error slot.
+    #[cfg(unix)]
+    fn gzip_set_error(&mut self, msg: Option<String>) {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        sched.slots[self.task.0].gzip_error = msg;
+    }
+
+    /// Take (read + clear) this task's gzip error slot.
+    #[cfg(unix)]
+    fn gzip_take_error(&mut self) -> String {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        sched.slots[self.task.0]
+            .gzip_error
+            .take()
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    fn exec_gzip(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
+        use toto_compiler::compress as gz;
+        match name {
+            "toto_rt_gzip_compress" => {
+                self.arity(name, args.len(), 1, span)?;
+                let buf = self.net_bytes(args, 0, span)?;
+                match gz::gzip_compress(&buf) {
+                    Ok(bytes) => {
+                        self.gzip_set_error(None);
+                        let v = self.net_alloc_bytes(bytes);
+                        self.net_assign(dst, v);
+                    }
+                    Err(e) => {
+                        self.gzip_set_error(Some(e));
+                        let v = self.net_alloc_bytes(Vec::new());
+                        self.net_assign(dst, v);
+                    }
+                }
+                Ok(())
+            }
+            "toto_rt_gzip_decompress" => {
+                self.arity(name, args.len(), 1, span)?;
+                let buf = self.net_bytes(args, 0, span)?;
+                match gz::gzip_decompress(&buf) {
+                    Ok(bytes) => {
+                        self.gzip_set_error(None);
+                        let v = self.net_alloc_bytes(bytes);
+                        self.net_assign(dst, v);
+                    }
+                    Err(e) => {
+                        self.gzip_set_error(Some(e));
+                        let v = self.net_alloc_bytes(Vec::new());
+                        self.net_assign(dst, v);
+                    }
+                }
+                Ok(())
+            }
+            "toto_rt_gzip_last_error" => {
+                self.arity(name, args.len(), 0, span)?;
+                let e = self.gzip_take_error();
+                let v = self.alloc_with(|h| h.alloc_str(&e));
+                self.net_assign(dst, RtVal::Heap(v));
+                Ok(())
+            }
+            _ => Err(self.internal("unknown gzip function", span)),
         }
     }
 

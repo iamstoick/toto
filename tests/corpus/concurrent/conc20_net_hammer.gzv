@@ -1,0 +1,226 @@
+// Wave 1 poller proof (M:N deterministic concurrency harness):
+// 4 concurrent TCP clients x 25 x 16-byte messages through one
+// echo server, every byte accounted on both sides. The server
+// accepts 4 connections and serves each in its own task while the
+// clients run concurrently; with 1 worker every one of the 9 tasks
+// parks and resumes many times, so completion itself is the
+// no-lost-wakeup / no-starvation evidence (a lost wakeup hangs and
+// fails loudly instead of printing). Output is pure arithmetic
+// (byte totals, client count) — no ports, fds, or timing — so the
+// golden is exact under the fixed seed + GC-pressure config.
+//
+// Single-file note: the `concurrent.rs` harness checks programs in
+// single-file mode (no imports), so the TCP wrappers used here are
+// inlined instead of importing `gzv.std/net` (the module itself is
+// proven by the proj11 project, which runs the same runtime arms
+// through the real wrappers). DNS is skipped on purpose (numeric
+// `127.0.0.1`; resolution is proven in proj11).
+
+unsafe extern "C" {
+    fn toto_rt_net_connect_ip(ip: *c_char, port: c_int) -> c_int;
+    fn toto_rt_net_listen(port: c_int) -> c_int;
+    fn toto_rt_net_accept(listener: c_int) -> c_int;
+    fn toto_rt_net_send(conn: c_int, data: Array<int>) -> c_int;
+    fn toto_rt_net_recv(conn: c_int, max: c_int) -> Array<int>;
+    fn toto_rt_net_close(sock: c_int) -> c_int;
+    fn toto_rt_net_last_error() -> string;
+}
+
+fn n_last_error() -> string {
+    return toto_rt_net_last_error();
+}
+
+fn n_connect(port: int) -> Result<int, string> {
+    if port < 1 || port > 65535 {
+        return Err("invalid port (want 1-65535)");
+    }
+    let fd = toto_rt_net_connect_ip("127.0.0.1", port);
+    if fd < 0 {
+        return Err(n_last_error());
+    }
+    return Ok(fd);
+}
+
+fn n_listen(port: int) -> Result<int, string> {
+    if port < 1 || port > 65535 {
+        return Err("invalid port (want 1-65535)");
+    }
+    let fd = toto_rt_net_listen(port);
+    if fd < 0 {
+        return Err(n_last_error());
+    }
+    return Ok(fd);
+}
+
+fn n_accept(listener: int) -> Result<int, string> {
+    let fd = toto_rt_net_accept(listener);
+    if fd < 0 {
+        return Err(n_last_error());
+    }
+    return Ok(fd);
+}
+
+fn n_send(conn: int, data: Array<int>) -> Result<int, string> {
+    let n = toto_rt_net_send(conn, data);
+    if n < 0 {
+        return Err(n_last_error());
+    }
+    return Ok(n);
+}
+
+fn n_send_all(conn: int, data: Array<int>) -> Result<int, string> {
+    let mut off = 0;
+    while off < len(data) {
+        let rest: Array<int> = [];
+        let mut i = off;
+        while i < len(data) {
+            push(rest, data[i]);
+            i = i + 1;
+        }
+        let n = toto_rt_net_send(conn, rest);
+        if n < 0 {
+            return Err(n_last_error());
+        }
+        off = off + n;
+    }
+    return Ok(len(data));
+}
+
+fn n_recv(conn: int, max: int) -> Result<Array<int>, string> {
+    if max < 1 {
+        return Err("invalid max (want >= 1)");
+    }
+    let data = toto_rt_net_recv(conn, max);
+    let e = n_last_error();
+    if len(data) == 0 && e != "" {
+        return Err(e);
+    }
+    return Ok(data);
+}
+
+fn n_close(sock: int) -> Result<int, string> {
+    let rc = toto_rt_net_close(sock);
+    if rc < 0 {
+        return Err(n_last_error());
+    }
+    return Ok(0);
+}
+
+fn msg_byte(client: int, round: int, k: int) -> int {
+    return (client * 25 + round + k) % 256;
+}
+
+fn make_msg(client: int, round: int) -> Array<int> {
+    let mut m: Array<int> = [];
+    for k in 0..16 {
+        push(m, msg_byte(client, round, k));
+    }
+    return m;
+}
+
+fn eq_bytes(a: Array<int>, b: Array<int>) -> bool {
+    if len(a) != len(b) {
+        return false;
+    }
+    for i in 0..len(a) {
+        if a[i] != b[i] {
+            return false;
+        } else {
+        }
+    }
+    return true;
+}
+
+// Read exactly `n` bytes (TCP segments: one `recv` may return
+// short). Empty-before-full is a loud short read, never silent.
+fn recv_all(conn: int, n: int) -> Result<Array<int>, string> {
+    let mut out: Array<int> = [];
+    while len(out) < n {
+        let chunk = n_recv(conn, n - len(out))?;
+        if len(chunk) == 0 {
+            return Err("short read: peer closed mid-message");
+        }
+        for i in 0..len(chunk) {
+            push(out, chunk[i]);
+        }
+    }
+    return Ok(out);
+}
+
+fn serve_conn(conn: int, counts: chan<Result<int, string>>) -> int {
+    counts <- serve_loop(conn);
+    return 0;
+}
+
+fn serve_loop(conn: int) -> Result<int, string> {
+    let mut total = 0;
+    for j in 0..25 {
+        let m = recv_all(conn, 16)?;
+        let n = n_send_all(conn, m)?;
+        total = total + n;
+    }
+    n_close(conn)?;
+    return Ok(total);
+}
+
+fn run_client(id: int, port: int, oks: chan<int>) -> int {
+    let yes: Result<bool, string> = Ok(true);
+    if client_loop(id, port) == yes {
+        oks <- 1;
+    } else {
+        oks <- 0;
+    }
+    return 0;
+}
+
+fn client_loop(id: int, port: int) -> Result<bool, string> {
+    let conn = n_connect(port)?;
+    for j in 0..25 {
+        let m = make_msg(id, j);
+        n_send_all(conn, m)?;
+        let back = recv_all(conn, 16)?;
+        if !eq_bytes(back, m) {
+            n_close(conn)?;
+            return Ok(false);
+        } else {
+        }
+    }
+    n_close(conn)?;
+    return Ok(true);
+}
+
+fn run() -> Result<string, string> {
+    let port = 48220;
+    let listener = n_listen(port)?;
+    let counts = chan<Result<int, string>>(4);
+    let oks = chan<int>(4);
+    for c in 0..4 {
+        go {
+            run_client(c, port, oks);
+        }
+    }
+    for c in 0..4 {
+        let conn = n_accept(listener)?;
+        go {
+            serve_conn(conn, counts);
+        }
+    }
+    let mut served = 0;
+    for c in 0..4 {
+        served = served + (<-counts)?;
+    }
+    let mut ok = 0;
+    for c in 0..4 {
+        ok = ok + (<-oks);
+    }
+    n_close(listener)?;
+    if ok != 4 || served != 1600 {
+        return Err("hammer mismatch: clients " + to_string(ok) + " served " + to_string(served));
+    }
+    return Ok("HAMMER-OK clients=4 rounds=25 bytes=1600 served=1600");
+}
+
+fn main() -> int {
+    println(run());
+    return 0;
+}

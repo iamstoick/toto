@@ -1,0 +1,22 @@
+import "gzv.std/net.gzv";
+
+// Negative conformance (spec §17.3): bad values are runtime `Err`
+// strings, never diagnostics, never panics.
+fn run() -> Result<string, string> {
+    println(net_tcp_listen(0));
+    println(net_tcp_listen(70000));
+    println(net_tcp_connect("localhost", 0));
+    println(net_udp_bind(-1));
+    println(net_recv(-1, 16));
+    let s = net_tcp_listen(48210)?;
+    println(net_close(s));
+    println(net_close(s));
+    println(net_recv(s, 16));
+    println(net_send(s, [1]));
+    return Ok("NEG-DONE");
+}
+
+fn main() -> int {
+    println(run());
+    return 0;
+}

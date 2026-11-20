@@ -1,0 +1,8 @@
+unsafe extern "C" {
+    fn strlen(s: Array<int>) -> c_long;
+    fn strerror(e: c_int) -> Array<int>;
+}
+
+fn main() -> int {
+    return 0;
+}

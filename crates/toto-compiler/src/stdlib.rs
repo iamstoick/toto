@@ -36,6 +36,12 @@ pub const MODULES: &[(&str, &str)] = &[
     std_module!("json"),
     std_module!("ffi"),
     std_module!("ffi_thread"),
+    std_module!("net"),
+    std_module!("crypto"),
+    std_module!("compress"),
+    std_module!("toml"),
+    std_module!("yaml"),
+    std_module!("proto"),
 ];
 
 /// Embedded source for a canonical `gzv.std/...` path, if known.

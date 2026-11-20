@@ -147,18 +147,14 @@ pub fn call_print(
 }
 
 /// Call a builtin. The caller owns `output`; print appends there.
-/// `fns` supplies top-level function declarations for value display
-/// (`<fn name>`). Decoupled from `Interp` so the runtime executor
-/// (Phase 3) can dispatch builtins without a tree-walking interpreter.
-pub fn call_builtin(
-    name: &str,
-    args: Vec<Value>,
-    span: Span,
-    fns: &[FnDecl],
-    output: &mut Vec<u8>,
-) -> BResult {
+/// String builtins. Split out of `call_builtin` (with `#[inline(never)]`)
+/// so the dispatch frame stays small: coroutine stacks are a spec-fixed
+/// 64 KiB, and the merged match temporaries overflowed them on ARM64
+/// (x86_64 debug had ~1 KiB of margin). Behavior is unchanged; the
+/// dispatch below routes by name.
+#[inline(never)]
+fn str_builtin(name: &str, args: Vec<Value>, span: Span) -> BResult {
     match name {
-        "print" | "println" => call_print(args, name == "println", span, fns, output),
         "len" => {
             arity(name, &args, 1, span)?;
             match &args[0] {
@@ -245,6 +241,15 @@ pub fn call_builtin(
                 ))
             }
         }
+        other => Err(fail("E0208", format!("undefined variable `{other}`"), span)),
+    }
+}
+
+/// Numeric builtins. See `str_builtin` for why this is a separate
+/// `#[inline(never)]` function rather than another match arm.
+#[inline(never)]
+fn num_builtin(name: &str, args: Vec<Value>, span: Span) -> BResult {
+    match name {
         "to_int" => {
             arity(name, &args, 1, span)?;
             let f = as_float(&args[0], span, name, 0)?;
@@ -304,6 +309,15 @@ pub fn call_builtin(
             arity(name, &args, 1, span)?;
             Ok(Value::Float(as_float(&args[0], span, name, 0)?.ceil()))
         }
+        other => Err(fail("E0208", format!("undefined variable `{other}`"), span)),
+    }
+}
+
+/// Array builtins. See `str_builtin` for why this is a separate
+/// `#[inline(never)]` function rather than another match arm.
+#[inline(never)]
+fn arr_builtin(name: &str, args: Vec<Value>, span: Span) -> BResult {
+    match name {
         "push" => {
             arity(name, &args, 2, span)?;
             match &args[0] {
@@ -333,6 +347,15 @@ pub fn call_builtin(
                 )),
             }
         }
+        other => Err(fail("E0208", format!("undefined variable `{other}`"), span)),
+    }
+}
+
+/// File builtins. See `str_builtin` for why this is a separate
+/// `#[inline(never)]` function rather than another match arm.
+#[inline(never)]
+fn fs_builtin(name: &str, args: Vec<Value>, span: Span) -> BResult {
+    match name {
         "read_file" => {
             arity(name, &args, 1, span)?;
             let path = as_str(&args[0], span, name, 0)?;
@@ -363,6 +386,34 @@ pub fn call_builtin(
             let path = as_str(&args[0], span, name, 0)?;
             Ok(Value::Bool(std::path::Path::new(path).exists()))
         }
+        other => Err(fail("E0208", format!("undefined variable `{other}`"), span)),
+    }
+}
+
+/// `fns` supplies top-level function declarations for value display
+/// (`<fn name>`). Decoupled from `Interp` so the runtime executor
+/// (Phase 3) can dispatch builtins without a tree-walking interpreter.
+///
+/// The dispatch itself is thin by design: each group lives in its own
+/// `#[inline(never)]` helper so debug frames stay small enough for the
+/// spec-fixed 64 KiB coroutine stacks on every Tier-1 platform.
+pub fn call_builtin(
+    name: &str,
+    args: Vec<Value>,
+    span: Span,
+    fns: &[FnDecl],
+    output: &mut Vec<u8>,
+) -> BResult {
+    match name {
+        "print" | "println" => call_print(args, name == "println", span, fns, output),
+        "len" | "split" | "trim" | "upper" | "lower" | "contains" | "to_string" | "parse_int" => {
+            str_builtin(name, args, span)
+        }
+        "to_int" | "to_float" | "is_nan" | "abs" | "min" | "max" | "sqrt" | "floor" | "ceil" => {
+            num_builtin(name, args, span)
+        }
+        "push" | "pop" => arr_builtin(name, args, span),
+        "read_file" | "write_file" | "file_exists" => fs_builtin(name, args, span),
         // Routing tripwire: the sequential interpreter has no channels.
         // Checked concurrent programs run on the runtime executor, which
         // implements these natively and never calls this dispatch.

@@ -305,6 +305,11 @@ impl Checker {
                 **t,
                 Ty::CChar | Ty::CInt | Ty::CLong | Ty::CDouble | Ty::CVoid
             ),
+            // Byte arrays (Wave 1 amendment 2026-11-19, user-approved):
+            // `Array<int>` crosses as call-duration pinned bytes
+            // (elements must be 0-255; E0308 otherwise). Returns
+            // allocate a fresh array. Only flat int arrays qualify.
+            Ty::Array(inner) => matches!(**inner, Ty::Int),
             Ty::Unit => true,
             Ty::Fn(ps, r) => {
                 ps.iter().all(Self::is_foreign_sig_ty)
@@ -327,12 +332,12 @@ impl Checker {
                         self.error(
                             "E0302",
                             format!(
-                                "foreign parameter `{}` must be a C type, found {}",
+                                "foreign parameter `{}` must be a C type or `Array<int>`, found {}",
                                 p.name, ty
                             ),
                             p.name_span,
                             Some(
-                                "use `c_char`, `c_int`, `c_long`, `c_double`, `*T`, or a `fn` callback type".to_string(),
+                                "use `c_char`, `c_int`, `c_long`, `c_double`, `*T`, `Array<int>`, or a `fn` callback type".to_string(),
                             ),
                         );
                         ok = false;
@@ -367,7 +372,7 @@ impl Checker {
                     self.error(
                         "E0302",
                         format!(
-                            "foreign return type must be a C type, `string`, or `unit`, found {ty}"
+                            "foreign return type must be a C type, `string`, `Array<int>`, or `unit`, found {ty}"
                         ),
                         decl.ret.span,
                         None,

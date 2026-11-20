@@ -96,6 +96,7 @@ fn concurrent_positives_exact_under_gc_pressure() {
         "conc10_select_send",
         "conc11_chan_of_chan",
         "conc19_chan_eq",
+        "conc20_net_hammer",
         "state06_chan_tasks",
         "state07_shared_sum",
     ] {

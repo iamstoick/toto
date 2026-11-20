@@ -64,6 +64,7 @@ fn jit_compile_timings() {
     areas.sort();
     let mut gate_compiled = 0u32;
     let mut task_compiled = 0u32;
+    let mut task_refused_net = 0u32;
     let mut failures = Vec::new();
     println!("program,mode,function,micros");
     for area in areas {
@@ -128,17 +129,32 @@ fn jit_compile_timings() {
                     }
                     task_compiled += 1;
                 }
-                Err(e) => failures.push(format!("{name}: task compile refused: {e}")),
+                Err(e) => {
+                    // Network waits need the executor poller
+                    // (spec §17.5): the task JIT refuses them by
+                    // design. Count the skip deliberately; any
+                    // other refusal is still a failure.
+                    if format!("{e}").contains("needs the M:N poller") {
+                        task_refused_net += 1;
+                    } else {
+                        failures.push(format!("{name}: task compile refused: {e}"))
+                    }
+                }
             }
         }
     }
-    // Exact census (157 cases: 46 sequential checking incl. diag10
-    // (state01-05 joined in Phase 6), 21 concurrent (conc19_chan_eq
-    // joined in Phase 5; state06-07 joined in Phase 6), 90 static
+    // Exact census (160 cases: 47 sequential checking incl. diag10
+    // (state01-05 joined in Phase 6; diag16_ffi_array_sig joined in
+    // Wave 1), 22 concurrent (conc19_chan_eq joined in Phase 5;
+    // state06-07 joined in Phase 6; conc20_net_hammer joined in
+    // Wave 1 but refused by the task JIT — needs the M:N poller —
+    // counted in `task_refused_net`), 91 static
     // (type37_index_range + diag13-15 FFI joined in Phase 5;
-    // 22 Phase-6 negatives joined in Phase 6)).
-    assert_eq!(gate_compiled, 46, "gate-compiled count changed");
-    assert_eq!(task_compiled, 67, "task-compiled count changed");
+    // 22 Phase-6 negatives joined in Phase 6;
+    // diag17_ffi_nonbyte_array joined in Wave 1)).
+    assert_eq!(gate_compiled, 47, "gate-compiled count changed");
+    assert_eq!(task_compiled, 68, "task-compiled count changed");
+    assert_eq!(task_refused_net, 1, "task net-refusal count changed");
     assert!(
         failures.is_empty(),
         "{} timing/compile failure(s):\n{}",

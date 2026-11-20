@@ -1,0 +1,189 @@
+// `gzv.std/net` — networking substrate (Enterprise Wave 1).
+//
+// Toto wrappers over the runtime `toto_rt_net_*` foreign functions
+// (unix-only; see `docs/ffi.md` for the per-binding contract).
+// Bytes cross as `Array<int>` (0–255; out-of-range is E0308 at the
+// boundary). Sockets are opaque `int` handles — never printed
+// (fd numbers are process-unstable). All failures are `Result` `Err`
+// strings (`strerror` discipline via the call-duration error slot);
+// closing twice or using a closed socket is an `Err`, never a
+// panic, never silent.
+//
+// Blocking semantics: connect/accept/send/receive park the task on
+// the M:N poller (network waits never occupy workers); `net_resolve`
+// parks on the dedicated blocking pool (`getaddrinfo` cannot be
+// made nonblocking). See spec §17.
+
+pub struct UdpPacket {
+    data: Array<int>,
+    host: string,
+    port: int,
+}
+
+unsafe extern "C" {
+    // Comma-joined addresses (IPv6 has colons, never commas;
+// NUL bytes impossible in resolved names): split in the wrapper.
+    fn toto_rt_net_resolve(host: *c_char) -> string;
+    fn toto_rt_net_connect_ip(ip: *c_char, port: c_int) -> c_int;
+    fn toto_rt_net_listen(port: c_int) -> c_int;
+    fn toto_rt_net_accept(listener: c_int) -> c_int;
+    fn toto_rt_net_send(conn: c_int, data: Array<int>) -> c_int;
+    fn toto_rt_net_recv(conn: c_int, max: c_int) -> Array<int>;
+    fn toto_rt_net_close(sock: c_int) -> c_int;
+    fn toto_rt_net_udp_bind(port: c_int) -> c_int;
+    fn toto_rt_net_udp_send_to(sock: c_int, data: Array<int>, ip: *c_char, port: c_int) -> c_int;
+    fn toto_rt_net_udp_recv_from(sock: c_int, max: c_int) -> Array<int>;
+    fn toto_rt_net_udp_peer_host(sock: c_int) -> string;
+    fn toto_rt_net_udp_peer_port(sock: c_int) -> c_int;
+    fn toto_rt_net_last_error() -> string;
+}
+
+fn valid_port(port: int) -> bool {
+    return port >= 1 && port <= 65535;
+}
+
+fn last_error() -> string {
+    return toto_rt_net_last_error();
+}
+
+// Resolve `host` (blocking-pool DNS), then connect to the first
+// address (poller-parked handshake). Loopback and LAN names work,
+// as do public names where DNS answers.
+pub fn net_tcp_connect(host: string, port: int) -> Result<int, string> {
+    if !valid_port(port) {
+        return Err("invalid port (want 1-65535)");
+    }
+    let addrs = net_resolve(host)?;
+    // Try each resolved address in order (getaddrinfo order follows
+    // system policy — IPv6 may come first where only IPv4 sockets
+    // exist yet). First success wins; if all fail, report the last
+    // error rather than the first guess.
+    let mut err: string = "could not connect to " + host;
+    for i in 0..len(addrs) {
+        let fd = toto_rt_net_connect_ip(addrs[i], port);
+        if fd < 0 {
+            err = last_error();
+        } else {
+            return Ok(fd);
+        }
+    }
+    return Err(err);
+}
+
+// Bind loopback (`127.0.0.1`) + listen. No all-interfaces bind in
+// v1 (spec §17.4).
+pub fn net_tcp_listen(port: int) -> Result<int, string> {
+    if !valid_port(port) {
+        return Err("invalid port (want 1-65535)");
+    }
+    let fd = toto_rt_net_listen(port);
+    if fd < 0 {
+        return Err(last_error());
+    }
+    return Ok(fd);
+}
+
+pub fn net_accept(listener: int) -> Result<int, string> {
+    let fd = toto_rt_net_accept(listener);
+    if fd < 0 {
+        return Err(last_error());
+    }
+    return Ok(fd);
+}
+
+// One `send` syscall; may short-send. Returns bytes written.
+pub fn net_send(conn: int, data: Array<int>) -> Result<int, string> {
+    let n = toto_rt_net_send(conn, data);
+    if n < 0 {
+        return Err(last_error());
+    }
+    return Ok(n);
+}
+
+// Loop to full delivery (`send` may short-write per call).
+pub fn net_send_all(conn: int, data: Array<int>) -> Result<int, string> {
+    let mut off = 0;
+    while off < len(data) {
+        let rest: Array<int> = [];
+        let mut i = off;
+        while i < len(data) {
+            push(rest, data[i]);
+            i = i + 1;
+        }
+        let n = toto_rt_net_send(conn, rest);
+        if n < 0 {
+            return Err(last_error());
+        }
+        off = off + n;
+    }
+    return Ok(len(data));
+}
+
+// Up to `max` bytes; an empty array is orderly shutdown, NOT an error.
+pub fn net_recv(conn: int, max: int) -> Result<Array<int>, string> {
+    if max < 1 {
+        return Err("invalid max (want >= 1)");
+    }
+    let data = toto_rt_net_recv(conn, max);
+    let e = last_error();
+    if len(data) == 0 && e != "" {
+        return Err(e);
+    }
+    return Ok(data);
+}
+
+pub fn net_close(sock: int) -> Result<int, string> {
+    let rc = toto_rt_net_close(sock);
+    if rc < 0 {
+        return Err(last_error());
+    }
+    return Ok(0);
+}
+
+pub fn net_resolve(host: string) -> Result<Array<string>, string> {
+    let joined = toto_rt_net_resolve(host);
+    if joined == "" {
+        return Err(last_error());
+    }
+    return Ok(split(joined, ","));
+}
+
+pub fn net_udp_bind(port: int) -> Result<int, string> {
+    if !valid_port(port) {
+        return Err("invalid port (want 1-65535)");
+    }
+    let fd = toto_rt_net_udp_bind(port);
+    if fd < 0 {
+        return Err(last_error());
+    }
+    return Ok(fd);
+}
+
+pub fn net_udp_send_to(sock: int, data: Array<int>, host: string, port: int) -> Result<int, string> {
+    if !valid_port(port) {
+        return Err("invalid port (want 1-65535)");
+    }
+    let addrs = net_resolve(host)?;
+    let n = toto_rt_net_udp_send_to(sock, data, addrs[0], port);
+    if n < 0 {
+        return Err(last_error());
+    }
+    return Ok(n);
+}
+
+pub fn net_udp_recv_from(sock: int, max: int) -> Result<UdpPacket, string> {
+    if max < 1 {
+        return Err("invalid max (want >= 1)");
+    }
+    let data = toto_rt_net_udp_recv_from(sock, max);
+    let e = last_error();
+    if len(data) == 0 && e != "" {
+        return Err(e);
+    }
+    let pkt = UdpPacket {
+        data: data,
+        host: toto_rt_net_udp_peer_host(sock),
+        port: toto_rt_net_udp_peer_port(sock),
+    };
+    return Ok(pkt);
+}

@@ -1,0 +1,100 @@
+// stdlib toml tests: run with `toto test` from stdlib/.
+//
+// Sections return `Result<bool, string>`; `main` compares against
+// `Ok(true)` and exits nonzero on failure.
+
+import "gzv.std/toml.gzv";
+
+fn doc() -> string {
+    return "# wave1 sample\ntitle = \"hello\"\ncount = 42\nratio = 1.5\non = true\nnames = [\"a\", \"b\"]\n\n[server]\nhost = \"leaf.local\"\nport = 8080\n\n[server.tls]\nenabled = true\n";
+}
+
+fn t_shapes() -> Result<bool, string> {
+    let root = toml_parse(doc())?;
+    if toml_as_string(toml_table_get(root, "title")?)? != "hello" {
+        return Err("title");
+    }
+    if toml_as_int(toml_table_get(root, "count")?)? != 42 {
+        return Err("count");
+    }
+    if toml_as_float(toml_table_get(root, "ratio")?)? != 1.5 {
+        return Err("ratio");
+    }
+    if toml_as_bool(toml_table_get(root, "on")?)? != true {
+        return Err("on");
+    }
+    let names = toml_table_get_array(root, "names")?;
+    if toml_array_len(names)? != 2 {
+        return Err("names len");
+    }
+    if toml_as_string(toml_array_get(names, 1)?)? != "b" {
+        return Err("names[1]");
+    }
+    let server = toml_table_get(root, "server")?;
+    if toml_as_string(toml_table_get(server, "host")?)? != "leaf.local" {
+        return Err("server.host");
+    }
+    if toml_as_int(toml_table_get(server, "port")?)? != 8080 {
+        return Err("server.port");
+    }
+    let tls = toml_table_get(server, "tls")?;
+    if toml_as_bool(toml_table_get(tls, "enabled")?)? != true {
+        return Err("tls.enabled");
+    }
+    return Ok(true);
+}
+
+fn t_roundtrip() -> Result<bool, string> {
+    let root = toml_parse(doc())?;
+    let once = toml_stringify(root);
+    let root2 = toml_parse(once)?;
+    if toml_stringify(root2) != once {
+        return Err("stringify not stable");
+    }
+    if toml_as_int(toml_table_get(toml_table_get(root2, "server")?, "port")?)? != 8080 {
+        return Err("reparse server.port");
+    }
+    return Ok(true);
+}
+
+fn expect_str(got: Result<TomlVal, string>, want_msg: string) -> Result<bool, string> {
+    let want: Result<TomlVal, string> = Err(want_msg);
+    if got != want {
+        return Err("wrong error, want `" + want_msg + "`");
+    }
+    return Ok(true);
+}
+
+fn t_errors() -> Result<bool, string> {
+    expect_str(toml_parse("a = 1\na = 2"), "duplicate key: a")?;
+    expect_str(toml_parse("a = {b = 1}"), "inline tables are not supported (line 1)")?;
+    expect_str(toml_parse("a = "), "missing value at line 1")?;
+    expect_str(toml_parse("a = \"x"), "unterminated string: \"x")?;
+    expect_str(toml_table_get(toml_parse("a = 1")?, "b"), "missing key: b")?;
+    expect_str(toml_parse("\"a.b\" = 1"), "dotted quoted keys are not supported: \"a.b\"")?;
+    let root = toml_parse(doc())?;
+    expect_str(toml_table_get(toml_table_get(root, "title")?, "x"), "expected table, got str")?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_shapes() != yes {
+        println("FAIL shapes");
+        failures = failures + 1;
+    }
+    if t_roundtrip() != yes {
+        println("FAIL roundtrip");
+        failures = failures + 1;
+    }
+    if t_errors() != yes {
+        println("FAIL errors");
+        failures = failures + 1;
+    }
+    if failures > 0 {
+        println(to_string(failures) + " toml failures");
+        return 1;
+    }
+    return 0;
+}
