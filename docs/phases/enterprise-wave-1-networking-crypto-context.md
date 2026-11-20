@@ -1,5 +1,7 @@
 # Enterprise Wave 1 report — networking substrate, crypto, context
 
+Wave 1 verdict: ACCEPTED-WITH-FLAGS — merged to main as cdfaad56631d6d2559a9c1a8e108eb75dd63d6c3. Networking substrate + crypto + context ADR shipped; poller proven under M:N at workers 2/3/4; macOS Tier-1 green. Verdict, ADR-009, and spec §17 approved by the user 2026-11-21. Gate green (62 result lines, 225 tests, 0 failed); CI green on run PENDING-STEP-3 (check + release-gates + bench + macOS/Linux ARM64 probes; Windows probe informational under continue-on-error). Details in the sections below; earlier section text is preserved verbatim.
+
 Status: ACCEPTED-WITH-FLAGS (fix-forward 2026-11-20 closed
 both red gates; remaining flags: criterion 4 needs user
 approval of ADR-009 at acceptance, Windows stays deferred
@@ -572,4 +574,50 @@ flag value unblocking the echo path, macOS sockets were
 moved to `ioctl(FIONBIO)` (BSD-canonical, value verified
 against the libc crate), after which the full corpus went
 green.
+
+## Merge-hygiene dated notes (2026-11-21, on main; append-only)
+
+Recorded at merge time; no existing section text was modified.
+
+- (a) The tip validation run is uncited above: record run
+  44763961236 (Status Success on tip f4e5775; check 6m45s,
+  release-gates 1m14s, bench 11m52s, macOS probe 1m13s, ARM
+  probe 37s, Windows probe fails exit 101 as informational —
+  the ONLY failing job). The report's latest cited run was
+  44760047668 (on 2c68b09, one commit before the tip).
+- (b) The deferrals list is stale in two places: the
+  multi-worker stall bullet lists the stall as an open
+  follow-up, but Fix 1 closed it (ABBA root-caused, fixed as
+  ac6933c, re-proven by the 18-cell net_hammer_mw test) —
+  the stall is CLOSED, not deferred. And the
+  intermittent-CI-stall bullet's "four consecutive runs green"
+  is stale: run 44641742691's check FAILED (exit 101) after it
+  was written, and the intervening runs were Cancelled, not
+  green.
+- (c) The Fix 3 wording overstates the O_NONBLOCK value:
+  correct it — no O_NONBLOCK candidate stuck on macOS
+  (neither the shared 0x800 nor 0x4/0x10; an 8-value sweep
+  all left sockets blocking), so macOS moved to
+  ioctl(FIONBIO); the 0x4 constant is dead code on the macOS
+  path (set_nonblocking returns early via ioctl). The actual
+  fix is the ioctl bypass.
+- (d) Run 44712863860 is misstated: it was a fast macOS
+  FAILURE (macOS job failed in 27s, exit 101), not the
+  first-pass corpus run to completion. The green macOS
+  verdicts are the later runs 44760047668 and 44763961236.
+- (e) The turn's commit accounting is incomplete: the
+  fix-forward turn added 19 commits on top of aeb34ba, not
+  4 — 15 temporary macOS diagnostic commits (850a3dc,
+  5fc87d5, c6e0e4b, 1fbb58a, 589aaab, abd6fe4, 00904d8,
+  a26dfd6, d7cd287, be80943, 14dad00, c1eeebd, 2640af4,
+  ba093a6, b229d8a) between ecdb46c and 2c68b09, reverted
+  from the tree in d7cd287/f4e5775 (net turn diff only 6
+  files; ci.yml and corpus.rs net-change zero). History was
+  NOT rewritten. The tree state is as claimed; only the
+  commit count in the report was incomplete.
+- (f) Test totals: the Stage 5 body says 61 result lines /
+  224 passed while the fix-forward addendum says 62 / 225.
+  Record the accepted total: 62 result lines / 225 passed /
+  0 failed (toto-runtime 29 → 30 for the new net_hammer_mw
+  binary; 61+1=62, 224+1=225).
 

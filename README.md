@@ -1,5 +1,14 @@
 # Toto (.gzv) — language implementation in Rust
 
+> Enterprise Wave 1 (networking substrate, crypto, context) complete —
+> ACCEPTED-WITH-FLAGS: networking substrate + crypto shipped, context
+> ADR delivered; poller proven under M:N at workers 2/3/4; macOS
+> Tier-1 green, Windows deferred with evidence.
+> Gate green (62 result lines, 225 tests, 0 failed).
+> See [Wave 1 report](docs/phases/enterprise-wave-1-networking-crypto-context.md).
+> ADR-009 and spec §17 approved by the user 2026-11-21.
+> Roadmap: [Implementation Roadmap v2.5](docs/) (D1–D8 + ratified decisions; Enterprise Track gated waves).
+
 > Enterprise Wave 0 (production foundations) complete —
 > CONDITIONAL: Linux x86_64 + macOS ARM64 + Linux ARM64
 > supported, Windows deferred with evidence (POSIX FFI

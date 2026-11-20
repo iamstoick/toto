@@ -1,6 +1,6 @@
-# ADR-009 (PROPOSED): Context propagation — values, deadlines, cancellation
+# ADR-009 (APPROVED): Context propagation — values, deadlines, cancellation
 
-- Status: **PROPOSED — user approval is the Wave 1 exit gate.** No
+- Status: **APPROVED (2026-11-21, user approval at Wave 1 acceptance).** No
   implementation exists; implementation rides with the consuming
   waves (starting Wave 2). Nothing here changes D1–D8, the frozen
   D8 ABI, the 27 frozen builtins, the Phase 5 module model, or spec

@@ -1140,9 +1140,9 @@ are CLI errors (exit 3) carrying the code. `E0401`
 (unresolvable) and `E0311` (cross-package duplicates) reused
 unchanged.
 
-## 17. Networking substrate (Enterprise Wave 1; amendment record 2026-11-19 — DESIGN FOR USER REVIEW)
+## 17. Networking substrate (Enterprise Wave 1; amendment record 2026-11-19 — APPROVED 2026-11-21, user approval at Wave 1 acceptance)
 
-**[Proposal — the whole section]** No socket API existed (v2.5 open
+**[APPROVED 2026-11-21 (user approval at Wave 1 acceptance) — the whole section]** No socket API existed (v2.5 open
 question). This section designs the smallest API that covers TCP/UDP
 sockets + DNS on all supported platforms, with a platform-neutral
 shape so deferred Windows can join later without an API redesign.
