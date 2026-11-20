@@ -590,6 +590,12 @@ impl<'a> Executor<'a> {
 
     /// Allocate on the GC heap behind a safepoint (uniform: every
     /// executor allocation publishes first, then collects on threshold).
+    ///
+    /// Lock-order contract: `f` runs with the heap-state lock held,
+    /// so it must NEVER take the sched lock (nor any lock above
+    /// state) — the drain nests sched -> state, and the reverse
+    /// deadlocks M:N. Take error slots and other sched-owned values
+    /// before calling (see the `*_last_error` arms).
     fn alloc_with<R>(&self, f: impl FnOnce(&mut Heap) -> R) -> R {
         self.maybe_collect();
         f(&mut self.shared.state.lock().expect("shared state lock").heap)
@@ -2177,7 +2183,15 @@ impl<'a> Executor<'a> {
             }
             "toto_rt_net_last_error" => {
                 self.arity(name, args.len(), 0, span)?;
-                let v = self.alloc_with(|h| h.alloc_str(&self.net_take_error()));
+                // Take the error BEFORE allocating: `alloc_with`
+                // holds the heap-state lock, and the drain nests
+                // sched -> state, so taking the sched lock inside the
+                // closure inverts the order and deadlocks M:N (Wave 1
+                // fix-forward: ABBA between this arm and
+                // `drain_completions_locked`). Same shape as the
+                // crypto/gzip last-error arms.
+                let e = self.net_take_error();
+                let v = self.alloc_with(|h| h.alloc_str(&e));
                 self.net_assign(dst, RtVal::Heap(v));
                 Ok(())
             }
