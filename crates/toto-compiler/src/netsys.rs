@@ -411,10 +411,20 @@ pub fn self_pipe() -> (c_int, c_int) {
     (fds[0], fds[1])
 }
 
-/// Drain a self-pipe read end (until `EAGAIN`).
+/// Drain a self-pipe read end. Never blocks: each read is guarded
+/// by a zero-timeout `poll`, so this is correct whether or not the
+/// fd is nonblocking (macOS `fcntl` flag semantics proved
+/// unreliable in practice — the flag bit would not stick — so the
+/// drain does not depend on them).
 pub fn drain_pipe(fd: c_int) {
     let mut buf = [0u8; 64];
     loop {
+        // Zero-timeout probe: stop while empty instead of blocking.
+        match poll_wait(&[(fd, true, false)], 0) {
+            Ok(ready) if ready.is_empty() => return,
+            Err(_) => return,
+            _ => {}
+        }
         // SAFETY: `buf` is owned and outlives the call.
         let r = unsafe { libc_read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
         if r <= 0 {
