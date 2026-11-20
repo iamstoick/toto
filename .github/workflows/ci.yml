@@ -62,7 +62,8 @@ jobs:
       - name: Tier-1 conformance (frozen ADR-008, no codegen needed)
         run: cargo test -p toto-compiler --test mir_conform
       - name: corpus gate
-        run: cargo test -p toto-cli --test corpus
+        # TEMPORARY macOS-stall diagnosis (revert after root cause).
+        run: cargo test -p toto-cli --test corpus -- --nocapture
       - name: one concurrent program end to end
         run: |
           out=$(cargo run -q -p toto-cli -- run tests/corpus/concurrent/conc01_pingpong.gzv)

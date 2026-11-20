@@ -78,6 +78,8 @@ fn corpus() {
             .expect("file name")
             .to_string_lossy()
             .into_owned();
+        // TEMPORARY macOS-stall diagnosis (revert after root cause).
+        eprintln!("T-CASE {}", case.display());
         let dir = case.parent().expect("parent dir").to_path_buf();
         let output = Command::new(toto)
             .arg("run")
