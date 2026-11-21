@@ -8,7 +8,7 @@ budget) and fixed by frame thinning in exec.rs. Verdict,
 the two framework v1 deviations, and the metrics flag
 approved by the user 2026-11-22. Gate green (66 result
 lines, 240 tests, 0 failed); CI green on run
-PENDING-STEP-3 (check + release-gates + bench +
+44915756249 (check + release-gates + bench +
 macOS/Linux ARM64 probes; Windows probe informational
 under continue-on-error). Details in the sections below;
 earlier section text is preserved verbatim.
