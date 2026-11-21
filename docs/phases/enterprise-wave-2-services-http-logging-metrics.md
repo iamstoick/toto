@@ -1,7 +1,7 @@
 # Enterprise Wave 2 report — services, HTTP, logging, metrics
 
-Status: STAGES 1–4 COMPLETE (pending final-verifier `check.sh`).
-Later stages append below; earlier section text is preserved
+Status: STAGES 1–5 COMPLETE (final-verifier `check.sh` scope
+run in Stage 5, §5.4). Earlier section text is preserved
 verbatim.
 
 Branch: `enterprise/wave-2-services-http-logging-metrics`, from
@@ -638,3 +638,284 @@ exemplars and `__`-reservation lifting (spec revisions);
 per-series scrape filtering; bench rows; macOS ARM64 +
 Linux ARM64 legs unrun here (same portable-Rust surface;
 CI tier-1 owns the verdicts).
+
+---
+
+## Stage 5 — reference service + benchmarks + acceptance
+
+Status: STAGE 5 COMPLETE (final verifier — full `check.sh`
+scope run here, not deferred). Earlier section text is
+preserved verbatim.
+
+### 5.1 Reference service (location, does / does-not, client proof)
+
+Location: `tests/corpus/project/proj20_refsvc/` — `main.gzv`
+(the service + client proof in one deterministic driver),
+exact goldens (`main.stdout` 49 lines, `main.stderr` empty,
+`main.status` 0), pinned fixtures (`fixtures/ca.pem`,
+`server-cert.pem`, `server-key.pem`, `other-ca.pem` — byte
+copies of the `proj15`/`proj16` set, `openssl verify` lineage
+recorded in the Stage 1 section). A corpus project, not an
+`apps/` entry, deliberately: every exchange is golden-pinned
+and runs in the CLI corpus gate (3/3 plus `--workers 4`
+byte-identical), so the service is a regression test, not a
+sample.
+
+What it does: serves `GET /hello`, `GET /users/{id}`
+(template capture, pct-decoded at use), `POST /echo`
+(binary echo), and `GET /metrics` over TLS on loopback
+(`http_serve_tls`, port 48522, `server_name "toto-refsvc"`).
+Every request passes the logging middleware (one `info`
+line, method + origin-form target) and each handler
+counts/gauges/observes into one shared registry
+(`refsvc_requests_total{method,route}` counter,
+`refsvc_inflight` gauge bracketed add/sub, fixed 1ms
+`refsvc_latency_ms{route}` observations, buckets
+`[5,25,100,500]`); `/metrics` is `metrics_handler` over
+that registry. The request trace is installed once
+(`ctx_set_current` with `trace_id "refsvc-1"`) and flows by
+spawn inheritance into accept-loop and per-connection
+tasks — every golden log line carries it with no
+per-handler plumbing, which is the observable proof of the
+Stage 3 inheritance rule. The Toto-native client verifies
+the chain against the pinned CA and exercises every route,
+checks the scrape byte-matches a local render with the
+pinned media type, proves wrong-CA rejection and
+post-failure survival, then drains the buffer sink with
+`ts` normalized (same normalizer shape as `proj17`).
+
+What it deliberately does NOT do: no hostname
+verification, no client certificates, no SNI/ALPN/
+resumption (TLS follow-ups, Stage 1); no non-loopback bind
+and no `Host`-based virtual hosting (service waves);
+no auth, no persistence, no graceful in-flight drain on
+`net_close(listener)` (close aborts parked accepts; served
+connections run to close — the abort-then-survival
+semantics are `proj16`'s); no file sink (needs an append
+builtin, Stage 3 follow-up); no wall-clock timestamps in
+logs (`ts` is monotonic ms by design); no float observations
+(bytes story follow-up, Stage 4); no keep-alive on the
+client side (one-shot `Connection: close` — each request
+is a fresh TCP connection, and a fresh TLS handshake for
+`https`); handler latency observations are a fixed 1ms
+stand-in so the exposition golden stays exact (the wiring —
+observe in the live handler path, scrape the shared
+registry — is what is proven; real latencies are
+deployment data, measured in §5.2, never pinned).
+
+Evidence: golden pins `hello=200:hello from refsvc`,
+`user=200:user:42`, `echo=200:ping-bytes`, `neg=yes`,
+`after=200:hello from refsvc`, `metrics=200:match`, the
+full 31-line exposition (2 `GET /hello` samples from the
+survival re-request, gauge `0`), 10 buffer-sink log lines
+(startup + middleware/handler pairs + the bare
+`mw GET /metrics` scrape line), `log-lines=10`, and
+`Ok(REFSVC-OK)`.
+
+### 5.2 Benchmarks + methodology
+
+Machine (all Stage 5 numbers): Linux x86_64, AMD Ryzen 5
+5600G (12 threads), 27 GB RAM, `rustc 1.100.0`, OpenSSL
+3.5.5, debug `toto` binary unless stated. Clocks: shell
+`date +%s%N` wall (precise totals) + in-Toto
+`clock_monotonic_ms` (excludes process startup from RPS).
+Method: sequential one-shot clients (N=200, port series
+48611/48612), one 8×25 concurrent run (port 48711), raw
+substrate control (N=200 echo ping-pong, port 48721),
+`gc_perf` in debug + release, `exec-gc-*` bench workloads
+×3. Probes are scratch (`target/sandbox-tmp/loadproj/`,
+not committed); the golden service itself is never timed.
+
+| workload | N | total | RPS | per-request |
+|---|---|---|---|---|
+| HTTP seq, plain | 200 | 15.791 s | 12.7 | mean 79.0 ms; all 200 in [50,100) ms |
+| HTTP seq, TLS | 200 | 18.552 s | 10.8 | mean 92.8 ms; 199 in [50,100) ms, max 102 ms |
+| HTTP conc 8×25, 1 worker | 200 | 15.200 s wall | 13.2 | worker-sum 118.7 s |
+| HTTP conc 8×25, 4 workers | 200 | 4.893 s wall | 40.9 | worker-sum 38.5 s |
+| raw TCP echo, seq | 200 | 0.112 s | 1786 | mean 0.56 ms |
+
+Stability: the sequential pair repeated 3× (plain
+15775/15776/15791 ms; TLS 18563/18548/18552 ms); the
+127.0.0.1-vs-localhost control is identical (DNS ruled
+out); per-request ms clock is coarse, so percentiles are
+published as bands, not false precision (plain p50 and
+p99 both lie in [50,100) ms; TLS p99 ≈ 100 ms).
+
+Reading: the one-shot client dominates — every request
+pays a fresh TCP connect (plus a fresh TLS handshake for
+`https`, +13.8 ms/req over plain). The raw control
+(0.56 ms/req through the same executor) proves the
+remainder is the interpreted HTTP path: Toto-level
+framing + executor park round-trips per send/recv in the
+debug interpreter, not the substrate. Concurrency scales
+the wall (15.2 s → 4.9 s at 4 workers for the same 200
+requests) while per-request cost rises under contention
+(worker-sum 118.7 s → 38.5 s), the expected M:N
+contention signature in a debug build. No claim is made
+about release/AOT service throughput — see §5.3.
+
+GC pauses vs the Wave 0 budget (p99 ≤ 10 ms at ≤100k
+live, production/release), freshly measured here:
+
+| live set | release med | release p99 | debug med | debug p99 |
+|---|---|---|---|---|
+| ~1k | 24 µs | 34 µs | 115 µs | 175 µs |
+| ~10k | 298 µs | 396 µs | 1146 µs | 1213 µs |
+| ~100k | 5434 µs | 6539 µs | 14156 µs | 15356 µs |
+
+Release p99 at 100k is 6.5 ms against the 10 ms budget
+(1.5× headroom — same standing as the Wave 0 6.8 ms
+measurement, re-derived on this machine); the debug leg
+passes its 30 ms guard bound (15.4 ms p99). Throughput
+under GC pressure, same machine, n=3 medians:
+`exec-gc-alloc` 2766 ms vs baseline 2682 (1.03×),
+`exec-gc-chan` 3670 ms vs baseline 3553 (1.03×) — both
+far below the 5× CI flag.
+
+CI bench rows + flagging rule (unchanged, `bench/baseline.txt`
++ `scripts/bench.sh --baseline`): every timed label is
+compared against its recorded median after the run; any
+median above 5× its baseline prints FLAG and fails the
+suite (exit 1). CI runs `--runs 3` with this flag; the
+manual n=5 run stays the source of published numbers. The
+full `bench.sh` suite (~25 min: cold debug + release AOT
+links) runs in the CI `bench` job, not in this session.
+
+### 5.3 Unbenchmarked-surface decision (recorded, not silent)
+
+Not measured here, with rationale each: (a) full
+`bench.sh` re-run — ~25 min wall, CI `bench` job owns it
+under the 5× rule (§5.2); spot rows re-measured instead.
+(b) Release/AOT service RPS — the service is a
+correctness golden (debug interpreter); release/AOT
+throughput needs a calibrated deployment harness, not a
+corpus driver. (c) TLS handshake throughput in isolation
+— one-shots and handshakes do not fit the calibrated-
+workload methodology (Stage 1 follow-up, still open).
+(d) GC pauses above ~100k live — outside the published
+budget by definition (Wave 0 disposition, carried).
+(e) Reference-parser interop for the exposition — no
+reference parser available offline (Stage 4 gap, still
+open). (f) macOS ARM64 + Linux ARM64 legs of every new
+measurement — same portable surface; CI tier-1 owns the
+verdicts.
+
+### 5.4 Test totals (fresh full run, per-binary + census)
+
+`cargo fmt --all -- --check` clean; `cargo clippy
+--workspace --all-targets -- -D warnings` clean.
+`cargo test --workspace` green: 66 binaries, 240 passed,
+0 failed (full binary→count map retained at
+`target/sandbox-tmp/testmap.txt`, scratch — per-crate
+roll-up below). Overrides used (both proven pre-existing
+on the clean tree): `TMPDIR=target/sandbox-tmp` (`/tmp`
+EDQUOT) and `RUST_MIN_STACK=33554432` (`fmt_equiv`
+stack abort at default 8 MB).
+
+| crate / suite | passed | failed |
+|---|---|---|
+| ffi-smoke-test | 7 | 0 |
+| spikes (1, 1b, 2, 3) | 31 | 0 |
+| toto-cli lib + cli + corpus + http_interop + lsp + packages | 51 | 0 |
+| toto-compiler lib + 9 integration binaries (incl. tls_interop 3, project 15) | 47 | 0 |
+| toto-jit lib + 13 integration binaries | 68 | 0 |
+| toto-runtime (blocking 4, concurrent 3, ctx_stage3 2, fmt_equiv 1, gc 11, gc_perf 3, mn 5, net_hammer 1, sequential 1, stack 1, tls_openssl 3) | 35 | 0 |
+| zero-test harness shells | 1 line each, 0 | 0 |
+| cargo total | 240 | 0 |
+| stdlib `toto test` | 17 | 0 |
+| wordfreq `toto test` + interp==built identity | 1 + identical | 0 |
+
+Corpus census: 181 cases green inside the single corpus
+harness test — 160 top-level `.gzv` (concurrent 22,
+diagnostics 16, interp 30, lexing 5, parsing 9, results
+13, typing 65) + 21 project mains (`proj01`–`proj20`
+plus the second `proj11` net variant; 9 project support
+libs ride along, never run standalone). 181 `.status`
++ 181 `.stderr` + 179 `.stdout` goldens: `conc18_fneq`
+and `int04_modzero` pin only stderr/status (no stdout
+file — pre-existing shape, harness green).
+
+### 5.5 Acceptance checklist (§7 of the brief)
+
+1. Reference service in the repo, served over TLS, with
+   logging + metrics wired (§5.1: location, does/
+   does-not, 49-line golden) — DONE.
+2. Client talks to it as integration proof (chain-verified
+   Toto client over `https`, every route + scrape +
+   wrong-CA + survival in the golden) — DONE.
+3. RPS, latency percentiles, and GC pauses under load vs
+   the Wave 0 budget, with methodology (§5.2: workload,
+   concurrency, duration, machine) — DONE (release p99
+   6.5 ms ≤ 10 ms at 100k; bands published at ms
+   resolution, no false precision).
+4. CI bench rows with the stated flagging rule (5×,
+   fail-closed, §5.2) — RECORDED (suite runs in CI).
+5. Unbenchmarked-surface decision — RECORDED (§5.3,
+   six items with rationale).
+6. Report complete: stage-by-stage (§§1–5), this
+   checklist, TLS choice (Stage 1), API design (Stage 2),
+   context record (Stage 3), benchmarks + methodology
+   (§5.2), every deferral with rationale (§5.6) — DONE.
+7. Test totals re-derived from a fresh run with
+   per-binary account + corpus census (§5.4: 240 + 17 +
+   wordfreq, 181 cases) — DONE.
+
+Hard constraints held (violation = STOP, none
+triggered): D1–D8 frozen; 27 builtins frozen (zero new
+in this wave — TLS/context/log ride linked names +
+pure-Toto modules); Phase 5 module model intact (path
+imports, flat namespace); ADR-009 + spec §17 APPROVED
+as written 2026-11-21, implemented exactly (§17/§18
+untouched); static linking only; no structs-by-value,
+no `dlopen`, no binding generation; no Toto-owned
+crypto/TLS primitives; HTTP/1.1 only; no Waves 3–5
+work; Windows deferred; no release/tag/artifact; no
+force-push; named files staged only; no merge to main;
+no spec-silence encountered (nothing assumed).
+
+### 5.6 Deferrals carried with rationale (consolidated wave close)
+
+- Handler/middleware `Err` → connection abort, not the
+  designed 500 mapping; `expose_errors` reserved
+  (Stage 2) — needs Phase 2 destructuring or a gated
+  builtin; handlers return explicit 500s.
+- `?`-unwrap of `Result`s transitively holding function
+  values panics E0204 (Stage 2) — runtime edge, all
+  framework call sites structured around it.
+- Hostname verification, SNI/ALPN, resumption, client
+  certs (Stage 1); non-loopback bind, `Host` virtual
+  hosting, `getpeername` peer field (Stages 1–3) —
+  service waves each need their own proposal.
+- Preemptive mid-wait deadline wakeups; message-scoped
+  `send_with` (needs user generics — Wave 4); file sink
+  (needs append builtin).
+- Response-side chunked/streaming (needs a streaming
+  handler shape — separate proposal).
+- Float observations, `_total` enforcement, timestamped
+  samples, exemplars, per-series filtering (spec
+  revisions); reference-parser interop (needs network).
+- Release/AOT service throughput + full `bench.sh`
+  here (CI owns both); >100k-live GC (outside budget);
+  per-request ~79 ms uniformity not root-caused beyond
+  the substrate contrast (profiling follow-up, not a
+  claim).
+- macOS ARM64 + Linux ARM64 legs of all new tests and
+  measurements (CI tier-1 owns the verdicts); Windows
+  stays DEFERRED per the POSIX-compat decision.
+- No real release, tag, or artifact publication
+  (forbidden).
+
+## Wave verdict
+
+Wave verdict: ACCEPTED-WITH-FLAGS — all five stages
+landed on `enterprise/wave-2-services-http-logging-metrics`
+(TLS via system libssl, HTTP/1.1 framework, context +
+clock + logging, Prometheus metrics, reference service
++ benchmarks + this report), full gates green locally
+(258 executed checks, 0 failed; corpus 181/181). Flags:
+(a) macOS ARM64 + Linux ARM64 legs unrun here — CI
+tier-1 probe owns the verdict; (b) the full `bench.sh`
+suite and release/AOT service numbers run in CI, not in
+this session (§5.3). No frozen-decision change, no new
+builtin, no spec change, no Waves 3–5 work, no release
+artifact, no merge to `main`.

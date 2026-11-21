@@ -1,0 +1,49 @@
+hello=200:hello from refsvc
+user=200:user:42
+echo=200:ping-bytes
+neg=yes
+after=200:hello from refsvc
+metrics=200:match
+# HELP refsvc_requests_total Reference service requests.
+# TYPE refsvc_requests_total counter
+refsvc_requests_total{method="GET",route="/hello"} 2
+refsvc_requests_total{method="GET",route="/users/{id}"} 1
+refsvc_requests_total{method="POST",route="/echo"} 1
+# HELP refsvc_inflight Reference service inflight.
+# TYPE refsvc_inflight gauge
+refsvc_inflight 0
+# HELP refsvc_latency_ms Reference service latency milliseconds.
+# TYPE refsvc_latency_ms histogram
+refsvc_latency_ms_bucket{le="5",route="/hello"} 2
+refsvc_latency_ms_bucket{le="25",route="/hello"} 2
+refsvc_latency_ms_bucket{le="100",route="/hello"} 2
+refsvc_latency_ms_bucket{le="500",route="/hello"} 2
+refsvc_latency_ms_bucket{le="+Inf",route="/hello"} 2
+refsvc_latency_ms_sum{route="/hello"} 2
+refsvc_latency_ms_count{route="/hello"} 2
+refsvc_latency_ms_bucket{le="5",route="/users/{id}"} 1
+refsvc_latency_ms_bucket{le="25",route="/users/{id}"} 1
+refsvc_latency_ms_bucket{le="100",route="/users/{id}"} 1
+refsvc_latency_ms_bucket{le="500",route="/users/{id}"} 1
+refsvc_latency_ms_bucket{le="+Inf",route="/users/{id}"} 1
+refsvc_latency_ms_sum{route="/users/{id}"} 1
+refsvc_latency_ms_count{route="/users/{id}"} 1
+refsvc_latency_ms_bucket{le="5",route="/echo"} 1
+refsvc_latency_ms_bucket{le="25",route="/echo"} 1
+refsvc_latency_ms_bucket{le="100",route="/echo"} 1
+refsvc_latency_ms_bucket{le="500",route="/echo"} 1
+refsvc_latency_ms_bucket{le="+Inf",route="/echo"} 1
+refsvc_latency_ms_sum{route="/echo"} 1
+refsvc_latency_ms_count{route="/echo"} 1
+{"ts":0,"level":"info","msg":"refsvc starting","ctx":{"trace_id":"refsvc-1"}}
+{"ts":0,"level":"info","msg":"mw GET /hello","ctx":{"trace_id":"refsvc-1"}}
+{"ts":0,"level":"info","msg":"served GET /hello","ctx":{"trace_id":"refsvc-1"}}
+{"ts":0,"level":"info","msg":"mw GET /users/42","ctx":{"trace_id":"refsvc-1"}}
+{"ts":0,"level":"info","msg":"served GET /users/{id}","ctx":{"trace_id":"refsvc-1"}}
+{"ts":0,"level":"info","msg":"mw POST /echo","ctx":{"trace_id":"refsvc-1"}}
+{"ts":0,"level":"info","msg":"served POST /echo","ctx":{"trace_id":"refsvc-1"}}
+{"ts":0,"level":"info","msg":"mw GET /hello","ctx":{"trace_id":"refsvc-1"}}
+{"ts":0,"level":"info","msg":"served GET /hello","ctx":{"trace_id":"refsvc-1"}}
+{"ts":0,"level":"info","msg":"mw GET /metrics","ctx":{"trace_id":"refsvc-1"}}
+log-lines=10
+Ok(REFSVC-OK)
