@@ -1098,3 +1098,138 @@ identifiable artifact: no such file exists in this
 report or on the branch (searched). The claim is
 dropped with this one-line correction; no unnamed gap
 remains.
+
+## Fix-forward second dated addendum (2026-11-22, on branch; append-only)
+
+Earlier text preserved verbatim, including the first
+addendum above. Fix commit on top of `743dd55`: Fix 4
+`04faa4a` (`crates/toto-runtime/src/exec.rs` frame
+thinning, this turn — diagnosis and diff in (e) below).
+Branch still
+`enterprise/wave-2-services-http-logging-metrics` from
+`main` at `bcc0824`, no merge. PDF gate re-verified this
+turn: title exactly "Toto (.gzv) Implementation Roadmap
+v2.5 and Phase 0 Decision Doc (D1-D8)", 41 pages
+(`pdfinfo`).
+
+(a) New failure record. Run 44902121760 (head `743dd55`,
+single attempt, 2026-11-21T12:04:54Z) conclusion failure
+— NOT in the first addendum (it postdates the `743dd55`
+push). Per-job: `check` success (7m32s), `release-gates`
+success, `bench` success, `tier1-probe
+(ubuntu-24.04-arm)` success, `tier1-probe (macos-latest)`
+failure, `tier1-probe (windows-latest)` failure
+(informational under `continue-on-error`). Windows is NOT
+the only failure, so the gate stays violated. macOS job
+136840022937: `build workspace` success (28s), Tier-1
+conformance success, `corpus gate` failure (3s), final
+`conc01` step skipped — a test-RUNTIME failure, not a
+build failure. Fix 1 proved (macOS links clean — the
+failure moved from build time to test runtime) and Fix 2
+proved (`check` green at the default stack, no
+`RUST_MIN_STACK` override); both stay closed, not
+re-opened. Reported shape (relayed account, per-program
+text unconfirmed — see the log note): the six
+serve/listen corpus programs abort identically with want
+exit=0 got exit=-999 (signal 10, SIGBUS) —
+`conc20_net_hammer`, `proj11_net_echo`, `proj15_tls_echo`,
+`proj16_http`, `proj19_metrics`, `proj20_refsvc` — every
+program that serves/listens; pure-compute, crypto,
+logging, and error-path cases green. Regression
+baseline: run 44901038722 (temporary probe branch at
+`bcc0824`, since deleted) concluded success with the
+macOS corpus gate green (2s) — main green, branch red,
+same gate, runs 14 minutes apart (no runner-image drift).
+Log note (honest gap, §1): the CI log text could NOT be
+retrieved with this token — `gh api
+repos/iamstoick/toto/actions/jobs/136840022937/logs` and
+`gh run view --log` return HTTP 403 (admin rights
+required); check-run annotations confirm only `Process
+completed with exit code 101` on `macos arm64` runners.
+The crashing SITE is therefore established by local
+repro + measurement instead (see (e)); the signal (10)
+is the relayed account, consistent with all of it. The
+per-program log-text confirmation stays open and is NOT
+claimed here.
+
+(b) Two slip corrections to the first addendum. (i) (b)
+cites "Wave 1 merge record: 66 result lines" — Wave 1
+was 62 result lines; 66/240 is Wave 2's gate. Corrected:
+62. (ii) (b) dispositions list the E0216 race as "CLOSED
+in Wave 1, no carry" — its root cause is still an open
+Phase 4 follow-up (closed empirically, NOT root-caused).
+Carried by name as an open follow-up; not closed.
+
+(c) §7-mapped checklist updates (nothing else changes
+mark without evidence). Criterion 2's "CI re-proof
+pending" closes: the `check` job went green on run
+44902121760 (recorded in (a)). Criterion 6 stays NOT MET
+until the new (fix-tip) run goes green. Criteria 1, 3, 4,
+5, 7 unchanged.
+
+(d) Totals. The §2 fix changes no test counts (two
+private methods, no new/removed tests), so the (d)
+bridge stands unchanged — verified identical on the
+fixed tip locally: `check.sh` exit 0, 66 result lines,
+240 passed, 0 failed (7 + 32 + 51 + 47 + 68 + 35);
+stdlib `toto test` 17/17; wordfreq `toto test` 1/1 +
+interp==built identical; corpus census unchanged.
+Re-derive only if a later change moves a count.
+
+(e) Diagnosis and fix (this round). Root cause: Wave 2
+Stage 3 grew the executor's serve-path frames past the
+spec-fixed 64 KiB coroutine budget (ADR-002/ADR-008,
+ratified — the budget is unchanged by this fix) on
+ARM64, faulting the guard page (silent abort; Darwin
+reports the protection fault as SIGBUS). Evidence chain
+(all local, x86_64 debug builds):
+- Coroutine high-water probe (the Wave 1 instrument,
+  per-task pattern-fill scan): branch-tip serve programs
+  read 61,160 / 65,536 bytes — 93.3% of budget, identical
+  across conc20/proj11/proj15/proj19/proj20 (a
+  program-independent engine-path peak).
+- Bisection by stage commit (same probe, fresh
+  worktrees): `bcc0824` 60,536; Stage 1 (`9446e60`)
+  60,536; Stage 2 (`4228270`) 60,536; Stage 3
+  (`672af88`) 61,160. The full +624-byte growth is
+  Stage 3 (context/clock/logging).
+- Crash-mode repro (the Wave 1 method — shrink the
+  stack default): conc20 at 56 KiB and 32 KiB coroutine
+  stacks dies with a silent guard fault (SIGSEGV on
+  Linux; the macOS ARM64 equivalent is SIGBUS); 64 KiB
+  passes. Shallower programs are unaffected — hence
+  serve-only. Main-thread stacks excluded by `ulimit -s`
+  sweep on the real binary (8 MB default vs ≤2.2 MB
+  needed — huge margin). No new macOS-only unsafe
+  exists in the plain-TCP path (`set_blocking` is
+  TLS-only); TLS FFI signatures are all long-stable and
+  link-proven; guard math verified (corosensei adds a
+  full page guard on top: 64 KiB usable on both page
+  sizes); link/startup causes ruled out by
+  serve-only-ness.
+Fix (spec-compliant, the Wave 1 pattern — thin the
+frames, never the budget), in
+`crates/toto-runtime/src/exec.rs` only: (1)
+`check_deadline` hot frame thinned — cold expiry
+`format!` outlined to `#[inline(never)]
+deadline_expired`; (2) `exec_foreign` dispatcher thinned
+— generic pool tail outlined to `#[inline(never)]
+exec_foreign_pool`. Behavior identical (code moved, not
+changed). Post-fix high-water: 56,952 bytes on all six
+serve programs — 3,584 bytes UNDER the
+Wave-1-proven-green baseline (60,536), 8.6 KiB of
+headroom to the budget. Local proof: six serve programs
+exit 0; `check.sh` exit 0 (66/240/0, per (d)); release
+`stack_jit` + `timings` green; workspace clippy
+`-D warnings` clean. CI re-proof (macOS gate green on
+the fix tip) is the remaining proof — §4 chat report.
+Wave 1 precedent on record: the identical class (ARM
+guard fault at ~1 KiB margin, 64,512/65,536) was fixed
+the same way (thin `call_builtin` dispatch over
+`#[inline(never)]` group helpers).
+
+(f) Re-proof. CI run on the fix tip (id assigned at
+push; verdict reported in the §4 chat report, recorded
+in the file next turn — the round-1 pattern: this
+addendum records the motivating run 44902121760, the
+re-proof run follows).
