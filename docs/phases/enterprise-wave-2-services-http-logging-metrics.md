@@ -1,5 +1,12 @@
 # Enterprise Wave 2 report — services, HTTP, logging, metrics
 
+Fix-forward correction (2026-11-22): wave verdict is NOT YET
+ACCEPTABLE — STOP. CI run 44886709131 (head `dac9c6a`)
+failed on two non-Windows jobs (`check`, macOS probe);
+Windows is NOT the only failure, so the green gate is
+violated. No merge. Details in the dated addendum at the
+end; earlier section text is preserved verbatim.
+
 Status: STAGES 1–5 COMPLETE (final-verifier `check.sh` scope
 run in Stage 5, §5.4). Earlier section text is preserved
 verbatim.
@@ -919,3 +926,175 @@ suite and release/AOT service numbers run in CI, not in
 this session (§5.3). No frozen-decision change, no new
 builtin, no spec change, no Waves 3–5 work, no release
 artifact, no merge to `main`.
+
+## Fix-forward dated addendum (2026-11-22, on branch; append-only)
+
+Earlier section text is preserved verbatim; the corrections
+below are the record. Stage commits (correct hashes — §9
+conflated Stage 4 with Stage 2): `9446e60` Stage 1 TLS,
+`4228270` Stage 2 HTTP, `672af88` Stage 3 context/logging,
+`56cff63` Stage 4 metrics, `dac9c6a` Stage 5
+refsvc+benchmarks+report; fix-forward commits on top:
+`3c12a8b` Fix 1 (build.rs), `d48a603` Fix 2 (fmt_equiv
+harness). Branch `enterprise/wave-2-services-http-logging-metrics`,
+from `main` at `bcc0824`, no merge.
+
+(a) Verdict. The header status and the wave verdict above
+are corrected to the true state: NOT YET ACCEPTABLE —
+STOP. CI run 44886709131 (head `dac9c6a`, single attempt)
+conclusion failure: `check` failed, macOS probe
+(`tier1-probe macos-latest`) failed; `release-gates`,
+`bench`, Linux ARM64 probe green; Windows probe fails as
+the expected informational failure under
+`continue-on-error` — but Windows is NOT the only
+failure, so the gate is violated. The verdict changes to
+accepted only when both red gates close and the tip check
+is green on a new run (§4 of the brief).
+
+(b) The missing Stage 0 (starting-state verification +
+carry-forward disposition; no Stage 0 section existed).
+`main` at `bcc0824` (verified `git rev-parse main`,
+clean tree pre-branch). `check.sh` exit 0 on `main`
+(Wave 1 merge record: 66 result lines, 0 failed).
+CI run 44832805780 green on its current attempt
+(re-verified this turn: conclusion success, head
+`bcc0824`; only the Windows probe failing, informational).
+PDF verified this turn: title exactly "Toto (.gzv)
+Implementation Roadmap v2.5 and Phase 0 Decision Doc
+(D1-D8)", 41 pages (`pdfinfo`), md5
+`819bece4eb63aa13cd88f164bad94b75`, from
+`/home/gerald/Downloads/toto-implementation-roadmap-v2-5.pdf`.
+Correction: the §9 claim that the corrupt `/tmp` PDF copy
+is "recorded in the report" is false — it appears nowhere
+in this file. The record is made here: the `/tmp` copy
+(53248B) is corrupt (`pdfinfo` exit 1, missing
+trailer/xref); verification used the intact Downloads
+copies. Dispositions (none dropped): CLOSED in Wave 1,
+no carry — E0216 lost-wakeup race (queue-LAST fix),
+`rebuild_cancels_parked_generation` E0216/E0214 race
+(closed empirically), multi-worker ABBA stall (`ac6933c`
++ `net_hammer_mw`). Answered in this wave — bench rows
+for new surfaces (§5.2 reference-service benchmarks;
+remainder in §5.3). Carried by name — intermittent CI
+stall (known open follow-up; harness/checker are frozen
+territory); rendezvous-latency measurement (dedicated
+measurement, not done here); TOML empty-table reporting
+(stdlib scope, needs its own proposal); native AOT
+net/crypto/gzip (executor is the reference,
+refuse-by-design stands); crypto/compression on Windows
+(Windows deferred); all-interfaces bind (lifting
+loopback-only needs a gated proposal/ADR plus
+STOP-and-ask, not smuggled in); Group C raw-sockets /
+packet work / full bytes / WebSockets / HTTP-2 /
+security-toolkit libs (separate gated proposals);
+Windows Tier-1 POSIX-compat; packaged differential
+coverage; GC past 100k + minimal-tunable-set; policy
+approvals, release practice, per-platform matrix,
+dispatch-404s, reproducibility-compare. No
+fix-now-if-small item (no TOML scope change: not
+trivially safe).
+
+(c) Checklist mapped to the brief's §7 (the §5.5 list
+below is Stage-5-internal and stands as historical;
+this mapping is the honest one). 1. Starting state —
+DONE (recorded in (b) above). 2. TLS shipped (server +
+client via FFI to system libssl, X.509 from Wave 1, no
+Toto TLS implementation; interop green both directions)
+— DONE, CI re-proof pending. 3. HTTP framework + server
++ client shipped (routing, middleware, handlers on green
+threads; HTTP/1.1 only; conformance + curl interop
+green) — DONE, with the two v1 deviations flagged for
+user acceptance review (`Err` → connection abort, not
+the designed 500 mapping; `?`-unwrap of `Result`s
+holding function values panics E0204) — NOT redesigned
+here. 4. Context implemented per ADR-009 exactly
+(`gzv.std/context`, spawn inheritance, scope-failure
+cancel, deadlines + Wave 2 clock) + structured logging
+shipped (leveled JSON lines, context values without
+per-call-site plumbing; goldens match) — DONE. 5.
+Metrics shipped (counters, gauges, histograms,
+Prometheus-format exposition, goldens match) — DONE
+WITH FLAG: the exposition was validated with a
+hand-written spec-text checker only; reference
+Prometheus-parser interop was NOT run — no
+`prometheus_client`, empty cargo cache, no network on
+this machine — carried explicitly as a flag, not
+claimed. 6. Reference service over TLS + load
+benchmarks published (RPS, latency percentiles, GC
+pauses vs the Wave 0 budget, methodology in §5.2) —
+DONE; full gates green on all supported platforms —
+NOT MET (run 44886709131 red, see (a)/(e)). 7. Report
+complete with checklist, TLS choice, API design,
+context record, benchmarks, deferrals — NOT YET (this
+addendum corrects it; complete when §4 closes).
+
+(d) Totals bridge. Fresh full run on the fixed tip
+(`d48a603` + `3c12a8b`): `check.sh` exit 0, 66 result
+lines, 240 passed, 0 failed (only override:
+`TMPDIR` redirect for the pre-existing sandbox `/tmp`
+EDQUOT; the `RUST_MIN_STACK` override is no longer
+needed after Fix 2). Per-crate: ffi-smoke-test 7;
+spikes 8 + 6 + 10 + 8 = 32 (the §5.4 "31" is corrected
+— the bridge: 7 + 32 + 51 + 47 + 68 + 35 = 240);
+toto-cli 51; toto-compiler 47; toto-jit 68;
+toto-runtime 35 (attributed per binary from the gate
+log build paths; doc-tests 0 each). 19 zero-test
+result lines (8 doc-test shells + 11 empty
+unit/integration binaries), 0 passed each — part of
+the 66 lines, not additive. Stdlib `toto test` 17/17;
+wordfreq `toto test` 1/1 + interp==built identical.
+Corpus census 181 (160 + 21) checks, unchanged.
+
+(e) Failure record. Run 44886709131 (head `dac9c6a`,
+single attempt): `check` failure, macOS probe failure,
+`release-gates` / `bench` / ARM probe success, Windows
+probe informational failure. Fix 1 cause (Wave 2 code
+defect, confirmed from the file): build.rs lines 46–49
+pair `("libcrypto.dylib", "libcrypto")` /
+`("libssl.dylib", "libssl")` while lines 66–67 symlink
+`libcrypto.dylib` / `libssl.dylib` into OUT_DIR, so
+line 76's `cargo:rustc-link-lib=libcrypto` makes rustc
+pass `-llibcrypto`, which seeks the never-created
+`liblibcrypto.dylib` (precision: those constructed
+strings never literally appear in the file). CI log
+evidence (job 136793446308, build-workspace step):
+`2026-11-21T08:51:01.3756900Z ld: library 'libcrypto'
+not found`. Fix: link names `crypto` / `ssl` (as
+`main` had them), commit `3c12a8b`; proof is the macOS
+probe on the re-run. Scope note kept:
+`spikes/ffi-smoke-test/build.rs` emits no crypto/ssl
+directives — untouched. Fix 2 cause, Step 1 (from the
+CI log, job 136793446111, no assertion without it):
+`2026-11-21T08:56:12.1696497Z fatal runtime error:
+stack overflow, aborting`, `error: test failed, to
+rerun pass '-p toto-runtime --test fmt_equiv'`,
+SIGABRT → exit 101. The failing test is
+`fmt_equiv_concurrent_and_projects` (the single test
+in `tests/fmt_equiv.rs`). Step 2 classification
+(only a CI probe on `main` decides this): temporary
+branch at `bcc0824` (zero commits on top) → run
+44901038722 → conclusion success, `check` success at
+the default stack — so NOT pre-existing (hypothesis
+(a) falsified); the abort is Wave-2-triggered
+(hypothesis (b)): `proj16_http` (`main.gzv` 565
+lines, by far the largest corpus file) overflows the
+test thread inside `project::load_and_check`, bisected
+locally (parse ok, format ok, mirror ok, load aborts).
+Probe branch deleted (local + remote) after the
+verdict. Step 3 fix: the test body now runs on a
+32 MiB harness thread (`std::thread::Builder`,
+panics preserved via `resume_unwind`), commit
+`d48a603` — green locally at the default stack, no CI
+environment change (no `RUST_MIN_STACK` in CI).
+Checker-recursion reduction was rejected as
+disproportionate (frozen-territory-adjacent, riskier).
+Stage 4 hash correction: `56cff63`, not `4228270`
+(the §9 message conflated Stage 2's hash; this file
+names no hashes — recorded correctly here).
+
+(f) The unnamed gap. The §9 message's "derived result
+labels file ... truncated filename" names no
+identifiable artifact: no such file exists in this
+report or on the branch (searched). The claim is
+dropped with this one-line correction; no unnamed gap
+remains.
