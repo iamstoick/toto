@@ -1,5 +1,18 @@
 # Toto (.gzv) — language implementation in Rust
 
+> Enterprise Wave 2 (services, HTTP, logging, metrics) complete —
+> ACCEPTED-WITH-FLAGS: TLS + HTTP/1.1 framework + structured logging
+> (ADR-009) + Prometheus metrics shipped, with benchmarks and
+> acceptance report; macOS serve-path SIGBUS diagnosed and fixed.
+> Gate green (66 result lines, 240 tests, 0 failed).
+> Two framework v1 deviations accepted 2026-11-22 (handler/middleware
+> Err aborts the connection instead of the 500 mapping; ?-unwrap of a
+> Result holding function values panics E0204) and the metrics flag
+> accepted (hand-written spec-text checker, no reference Prometheus
+> parser offline).
+> See [Wave 2 report](docs/phases/enterprise-wave-2-services-http-logging-metrics.md).
+> Roadmap: [Implementation Roadmap v2.5](docs/) (D1–D8 + ratified decisions; Enterprise Track gated waves).
+
 > Enterprise Wave 1 (networking substrate, crypto, context) complete —
 > ACCEPTED-WITH-FLAGS: networking substrate + crypto shipped, context
 > ADR delivered; poller proven under M:N at workers 2/3/4; macOS

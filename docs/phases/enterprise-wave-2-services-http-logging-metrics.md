@@ -1,5 +1,18 @@
 # Enterprise Wave 2 report — services, HTTP, logging, metrics
 
+Wave 2 verdict: ACCEPTED-WITH-FLAGS — merged to main as
+`9ae8d5b`. TLS + HTTP framework + structured logging +
+Prometheus metrics shipped; macOS serve-path SIGBUS
+diagnosed (Stage 3 frame growth past the 64 KiB coroutine
+budget) and fixed by frame thinning in exec.rs. Verdict,
+the two framework v1 deviations, and the metrics flag
+approved by the user 2026-11-22. Gate green (66 result
+lines, 240 tests, 0 failed); CI green on run
+PENDING-STEP-3 (check + release-gates + bench +
+macOS/Linux ARM64 probes; Windows probe informational
+under continue-on-error). Details in the sections below;
+earlier section text is preserved verbatim.
+
 Fix-forward correction (2026-11-22): wave verdict is NOT YET
 ACCEPTABLE — STOP. CI run 44886709131 (head `dac9c6a`)
 failed on two non-Windows jobs (`check`, macOS probe);
@@ -1233,3 +1246,53 @@ push; verdict reported in the §4 chat report, recorded
 in the file next turn — the round-1 pattern: this
 addendum records the motivating run 44902121760, the
 re-proof run follows).
+
+## Merge-hygiene dated notes (2026-11-22, on main; append-only)
+
+Earlier section text preserved verbatim; the corrections
+below are the record. Merge commit `9ae8d5b` (branch tip
+`6b7b87f` onto `main` at `bcc0824`).
+
+(a) The re-proof run is unrecorded: run 44913330359
+(Status Success on tip `6b7b87f`; check 9m30s,
+release-gates 1m26s, bench 12m29s, macOS probe 1m13s —
+job 136873578645: build workspace 42s, Tier-1
+conformance 1s, corpus gate 14s, conc01 under 1s — Linux
+ARM64 probe 43s; the Windows probe job fails exit 101 as
+informational under `continue-on-error`, the ONLY
+failing job). Criterion 6 in the file still reads NOT
+MET ("stays NOT MET until the new (fix-tip) run goes
+green") — it is now MET on this run; closed here. The
+report's latest recorded run was 44902121760.
+
+(b) Unit slip in the second addendum: "8.6 KiB of
+headroom" is wrong — 65,536 − 56,952 = 8,584 bytes =
+8.38 KiB, about 8.4 KiB (8.6 is the decimal KB
+figure). Corrected to ≈8.4 KiB. The other figures
+stand: +624 B Stage 3 growth, 3,584 B under the Wave 1
+baseline (60,536).
+
+(c) The per-program CI log-text confirmation of the
+SIGBUS diagnosis stays open: the CI log endpoints
+return HTTP 403 with the agent's token, so the diagnosis
+rests on repro + measurement + the green re-proof run,
+not on log text. Recorded as an open item; not claimed
+as log-confirmed.
+
+(d) The two framework v1 deviations are user-accepted
+as written 2026-11-22: (1) handler/middleware Err aborts
+the connection instead of the designed 500 mapping (v1
+cannot lift Err payloads into values; handlers return
+Ok(500) explicitly); (2) ?-unwrapping a Result holding
+function values panics E0204 (the framework is
+structured to never do this). The §5/§7 checklist flag
+text is historical — not edited.
+
+(e) The metrics DONE-WITH-FLAG is user-accepted as
+written 2026-11-22: exposition validated with a strict
+hand-written checker from the spec text, NOT a
+reference Prometheus parser (none available offline).
+
+(f) Test totals confirmed: 66 result lines / 240 passed
+/ 0 failed (7+32+51+47+68+35); stdlib 17/17; corpus
+census 181.
