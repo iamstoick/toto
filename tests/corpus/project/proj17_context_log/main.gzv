@@ -1,0 +1,148 @@
+// Wave 2 Stage 3 context + logging pipeline (values, inheritance,
+// levels, format, sinks; the request-scoped trace ID flows from the
+// installed context with no per-call-site plumbing).
+//
+// The buffer sink captures the live records (real clock, real slot
+// inheritance across `go`); each line is re-printed with its
+// nondeterministic `ts` normalized to 0, so the golden stays exact
+// while proving the full live pipeline. Deterministic by
+// construction: no ports, fds, or timing in the output.
+import "gzv.std/context.gzv";
+import "gzv.std/log.gzv";
+import "gzv.std/time.gzv";
+
+fn check(cond: bool, msg: string) -> Result<bool, string> {
+    if cond {
+        return Ok(true);
+    } else {
+        return Err(msg);
+    }
+}
+
+// Normalize the nondeterministic `ts` to 0 using the exact wire
+// format (`{"ts":NNN,"level":...}`). The separator rejoin keeps
+// this exact even if a message ever carried the separator.
+fn strip_ts(line: string) -> Result<string, string> {
+    let parts = split(line, "{\"ts\":");
+    if len(parts) != 2 {
+        return Err("no ts prefix");
+    } else {
+    }
+    let tail = split(parts[1], ",\"level\":\"");
+    if len(tail) < 2 {
+        return Err("no level separator");
+    } else {
+    }
+    let mut rest = tail[1];
+    let mut i = 2;
+    while i < len(tail) {
+        rest = rest + ",\"level\":\"" + tail[i];
+        i = i + 1;
+    }
+    return Ok("{\"ts\":0,\"level\":\"" + rest);
+}
+
+fn t_values() -> Result<bool, string> {
+    let bg = ctx_background();
+    check(ctx_deadline(bg) == -1, "bg deadline")?;
+    let c1 = ctx_with_value(bg, "trace_id", "req-7f3a");
+    check(!ctx_has(bg, "trace_id"), "immutable input")?;
+    check(ctx_get(c1, "trace_id")? == "req-7f3a", "get")?;
+    check(ctx_get_or(c1, "missing", "fb") == "fb", "get_or")?;
+    let t0 = clock_monotonic_ms();
+    check(t0 >= 0, "clock non-negative")?;
+    let d = ctx_with_deadline(bg, 5000);
+    check(ctx_deadline(d) - 5000 <= clock_monotonic_ms(), "deadline stored")?;
+    check(clock_monotonic_ms() <= ctx_deadline(d), "deadline future")?;
+    check(clock_elapsed_since(t0) >= 0, "elapsed")?;
+    // Forged handles fail loudly without harming the scope.
+    let bad = ctx_cancel(999999);
+    let want: Result<int, string> = Err("invalid cancel handle 999999 (no such scope)");
+    check(bad == want, "forged handle")?;
+    println("values-ok");
+    return Ok(true);
+}
+
+fn t_expired() -> Result<bool, string> {
+    ctx_set_current(ctx_background())?;
+    check(!ctx_expired(), "none never expired")?;
+    ctx_set_current(ctx_with_deadline(ctx_background(), -5000))?;
+    check(ctx_expired(), "past expired")?;
+    ctx_set_current(ctx_with_deadline(ctx_background(), 60000))?;
+    check(!ctx_expired(), "future live")?;
+    println("expired-ok");
+    return Ok(true);
+}
+
+fn t_pipeline() -> Result<bool, string> {
+    log_set_sink("buffer")?;
+    log_set_level("debug")?;
+    let c0 = ctx_with_value(ctx_background(), "trace_id", "req-7f3a");
+    let c1 = ctx_with_value(c0, "request_id", "r-42");
+    ctx_set_current(c1)?;
+    // Every record below carries the installed context with no
+    // per-call-site plumbing (handlers take only `msg`).
+    log_info("request received")?;
+    log_debug("cache miss")?;
+    log_trace_edge("db-query")?;
+    log_set_level("warn")?;
+    log_info("filtered-out")?;
+    log_warn("slow query")?;
+    log_error("upstream timeout")?;
+    // Spawned AFTER install: the child inherits the request context.
+    let done = chan<int>(1);
+    go {
+        let r = log_error("child-handler");
+        let want: Result<int, string> = Ok(0);
+        if r != want {
+            println("FAIL child emit");
+        } else {
+        }
+        done <- 1;
+    }
+    let w: int = <-done;
+    check(w == 1, "child sync")?;
+    // Explicit opt-out: the detached child carries nothing.
+    let done2 = chan<int>(1);
+    go_detached(fn() -> unit {
+        let r = log_error("detached-probe");
+        let want: Result<int, string> = Ok(0);
+        if r != want {
+            println("FAIL detached emit");
+        } else {
+        }
+        done2 <- 1;
+    });
+    let w2: int = <-done2;
+    check(w2 == 1, "detached sync")?;
+    let lines = log_drain_lines();
+    check(len(lines) == 7, "seven records, got " + to_string(len(lines)))?;
+    let mut i = 0;
+    while i < len(lines) {
+        println(strip_ts(lines[i])?);
+        i = i + 1;
+    }
+    ctx_set_current(ctx_background())?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let yes: Result<bool, string> = Ok(true);
+    if t_values() != yes {
+        println("FAIL values");
+        return 1;
+    } else {
+    }
+    if t_expired() != yes {
+        println("FAIL expired");
+        return 1;
+    } else {
+    }
+    if t_pipeline() != yes {
+        println("FAIL pipeline");
+        return 1;
+    } else {
+    }
+    println("PIPELINE-OK");
+    return 0;
+}

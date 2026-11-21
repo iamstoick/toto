@@ -1,0 +1,10 @@
+values-ok
+expired-ok
+{"ts":0,"level":"info","msg":"request received","ctx":{"request_id":"r-42","trace_id":"req-7f3a"}}
+{"ts":0,"level":"debug","msg":"cache miss","ctx":{"request_id":"r-42","trace_id":"req-7f3a"}}
+{"ts":0,"level":"debug","msg":"causality: db-query","ctx":{"request_id":"r-42","trace_id":"req-7f3a"}}
+{"ts":0,"level":"warn","msg":"slow query","ctx":{"request_id":"r-42","trace_id":"req-7f3a"}}
+{"ts":0,"level":"error","msg":"upstream timeout","ctx":{"request_id":"r-42","trace_id":"req-7f3a"}}
+{"ts":0,"level":"error","msg":"child-handler","ctx":{"request_id":"r-42","trace_id":"req-7f3a"}}
+{"ts":0,"level":"error","msg":"detached-probe","ctx":{}}
+PIPELINE-OK

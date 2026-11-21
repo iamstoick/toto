@@ -31,6 +31,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use corosensei::stack::{DefaultStack, Stack as _};
 use corosensei::{Coroutine, CoroutineResult, Yielder};
 use toto_compiler::ast::FnDecl;
+use toto_compiler::ctxlog::CtxSlot;
 use toto_compiler::diag::Diag;
 use toto_compiler::hir::Ty;
 use toto_compiler::interp::TraceFrame;
@@ -111,6 +112,21 @@ pub enum ToSched {
     Net {
         op: NetOp,
         span: Span,
+    },
+    /// Cancel a context handle (Wave 2, Stage 3): fail the scope the
+    /// handle names through the standard scope-failure sweep
+    /// (`cancel_scope` hook of ADR-009). Completes inline like the
+    /// other non-parking requests; the caller is `Running`, never a
+    /// release candidate. A forged/out-of-range handle is a loud
+    /// `OpPanic`, never a silent misroute. Carries the caller's
+    /// trace so the panic renders against the issuing call (an empty
+    /// trace would attribute a stdlib-coordinate span to the entry
+    /// file instead).
+    CtxCancel {
+        scope: ScopeId,
+        handle: i64,
+        span: Span,
+        trace: Vec<TraceFrame>,
     },
 }
 
@@ -371,6 +387,12 @@ impl ScopeTable {
 
     pub fn root() -> ScopeId {
         ScopeId(0)
+    }
+
+    /// Live scope count: handle validation bounds-checks against it
+    /// (handles name scope indices; see the `CtxCancel` arm).
+    pub fn scope_count(&self) -> usize {
+        self.scopes.len()
     }
 
     pub fn new_scope(&mut self, parent: ScopeId) -> ScopeId {
@@ -826,6 +848,19 @@ pub struct Slot {
     /// `toto_rt_tls_last_error`. Set on every TLS pool completion.
     #[cfg(unix)]
     pub(crate) tls_error: Option<String>,
+    /// Current context slot (Wave 2, Stage 3): ordered pairs plus
+    /// an optional absolute monotonic-ms deadline, inherited at
+    /// spawn (ADR-009). Plain data — never a heap reference, so no
+    /// GC rooting is needed. The slot is authoritative for logging
+    /// (which reads it without call-site plumbing) and for deadline
+    /// checks (which fail fast at suspension points).
+    pub(crate) ctx: CtxSlot,
+    /// Last context error for this task (`None` = clean). Same
+    /// separate-slot discipline as crypto/gzip: interleaved calls
+    /// never clobber each other's `last_error`; read (and cleared)
+    /// by `toto_rt_ctx_last_error`.
+    #[cfg(unix)]
+    pub(crate) ctx_error: Option<String>,
 }
 
 /// One parked network wait, as the poller sees it. Owned plain data
@@ -1193,6 +1228,9 @@ impl Scheduler {
             gzip_error: None,
             #[cfg(unix)]
             tls_error: None,
+            ctx: CtxSlot::new(),
+            #[cfg(unix)]
+            ctx_error: None,
         });
         sched.tasks_spawned += 1;
         sched.live += 1;
@@ -2208,7 +2246,7 @@ impl Scheduler {
                     .expect("scopes lock")
                     .new_scope(scope);
                 let n = self.shared.sched.lock().expect("sched lock").tasks_spawned;
-                self.spawn_task(
+                let child_task = self.spawn_task(
                     worker,
                     format!("go-{n}"),
                     child,
@@ -2219,6 +2257,25 @@ impl Scheduler {
                     },
                     span,
                 );
+                // ADR-009 spawn inheritance: the child starts with
+                // the spawner's context slot. A pending detach
+                // (`go_detached`) starts empty instead and consumes
+                // the one-shot flag.
+                {
+                    let mut sched = self.shared.sched.lock().expect("sched lock");
+                    let inherited = {
+                        let parent = &mut sched.slots[id.0];
+                        if parent.ctx.detach_once {
+                            parent.ctx.detach_once = false;
+                            CtxSlot::new()
+                        } else {
+                            let mut c = parent.ctx.clone();
+                            c.detach_once = false;
+                            c
+                        }
+                    };
+                    sched.slots[child_task.0].ctx = inherited;
+                }
                 self.enqueue_on(worker, id, ToTask::Unit);
             }
             ToSched::SpawnNative {
@@ -2234,13 +2291,29 @@ impl Scheduler {
                     .expect("scopes lock")
                     .new_scope(scope);
                 let n = self.shared.sched.lock().expect("sched lock").tasks_spawned;
-                self.spawn_task(
+                let child_task = self.spawn_task(
                     worker,
                     format!("go-{n}"),
                     child,
                     Initial::Native { entry, ctx },
                     span,
                 );
+                // Same inheritance as `Spawn` (Phase 4 JIT path).
+                {
+                    let mut sched = self.shared.sched.lock().expect("sched lock");
+                    let inherited = {
+                        let parent = &mut sched.slots[id.0];
+                        if parent.ctx.detach_once {
+                            parent.ctx.detach_once = false;
+                            CtxSlot::new()
+                        } else {
+                            let mut c = parent.ctx.clone();
+                            c.detach_once = false;
+                            c
+                        }
+                    };
+                    sched.slots[child_task.0].ctx = inherited;
+                }
                 self.enqueue_on(worker, id, ToTask::Unit);
             }
             ToSched::ChanNew { cap, elem, span } => {
@@ -2304,6 +2377,57 @@ impl Scheduler {
             #[cfg(unix)]
             ToSched::Net { op, span } => {
                 self.op_net(worker, id, op, span);
+            }
+            ToSched::CtxCancel {
+                scope,
+                handle,
+                span,
+                trace,
+            } => {
+                // The ADR-009 `cancel_scope` hook: fail exactly the
+                // named scope through the standard first-panic-wins
+                // sweep. Parked tasks in its subtree release with
+                // `Cancelled`; running tasks fail fast at their next
+                // suspension point — the same path as a scope panic.
+                let known = self
+                    .shared
+                    .scopes
+                    .lock()
+                    .expect("scopes lock")
+                    .scope_count()
+                    > scope.0;
+                if !known {
+                    self.enqueue_on(
+                        worker,
+                        id,
+                        ToTask::OpPanic {
+                            diag: Diag::new(
+                                "E0210",
+                                format!("invalid cancel handle {handle} (no such scope)"),
+                                span,
+                                None,
+                            ),
+                        },
+                    );
+                    return;
+                }
+                self.fail_scope(
+                    worker,
+                    scope,
+                    Failure {
+                        diag: Diag::new(
+                            "E0214",
+                            format!(
+                                "context cancel: handle {handle} failed scope {} (tasks released by cancellation)",
+                                scope.0
+                            ),
+                            span,
+                            None,
+                        ),
+                        trace,
+                    },
+                );
+                self.enqueue_on(worker, id, ToTask::Unit);
             }
         }
     }

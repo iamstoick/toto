@@ -1,6 +1,6 @@
 # Enterprise Wave 2 report — services, HTTP, logging, metrics
 
-Status: STAGES 1–2 COMPLETE (pending final-verifier `check.sh`).
+Status: STAGES 1–3 COMPLETE (pending final-verifier `check.sh`).
 Later stages append below; earlier section text is preserved
 verbatim.
 
@@ -324,3 +324,186 @@ FFI proposal); response-side chunked/streaming (needs a
 streaming handler shape — separate proposal); bench rows.
 macOS ARM64 + Linux ARM64 legs unrun here (same stable
 surface; CI tier-1 owns the verdicts).
+
+---
+
+## Stage 3 — context propagation, monotonic clock, structured logging
+
+Status: STAGE 3 COMPLETE (pending final-verifier `check.sh`).
+Earlier section text is preserved verbatim.
+
+### API design (ADR-009 implemented exactly)
+
+`gzv.std/context` (new): the `Context` immutable library value
+(`pairs: Array<CtxPair>` plus `deadline: int`, `-1` = none —
+exactly `-1`; negative absolute times are legitimate past
+deadlines and store as immediately expired), built by
+`ctx_background` / `ctx_with_value` (derive-only; inputs never
+modified) and read by `ctx_get` (fixed `Err` on absence) /
+`ctx_get_or` / `ctx_has`. The current task's slot is
+authoritative: `ctx_set_current` installs (values + deadline),
+`ctx_current` reads back, `ctx_expired()` inspects without
+parking (both engines).
+
+Spawn inheritance is the only default that cannot silently drop
+traces: the scheduler copies the spawner's slot into each child
+at `Spawn`/`SpawnNative` (plain-data clone — no heap reference,
+so no GC rooting is needed; the ADR's rooting note is satisfied
+by construction: there is nothing to root). Opt-out is explicit
+and one-shot: `ctx_detach_next()` arms the next `go`
+(`go_detached(f)` wraps it for closures, whose captures still
+cross by value). Contexts never ride channels (receiver scope
+governs); the opt-in edge helper is `log_trace_edge`, and
+message-scoped transfer (`send_with`) awaits user generics, which
+v1 does not have — recorded as a Wave 4 follow-up, not smuggled
+in as partial per-type variants.
+
+Cancellation = scope failure. `ctx_with_cancel()` snapshots the
+caller's CURRENT scope into a `CtxCancel` handle — no scope is
+created and no task moves (the snapshot reading of "fails that
+scope"); `ctx_cancel(h)` raises `ToSched::CtxCancel`, served
+inline by the standard first-panic-wins sweep (the ADR-009
+`cancel_scope` hook — a scheduler request, not an FFI call).
+Parked tasks in the subtree release with fail-fast E0214 at the
+next suspension point; in-flight waits unwind exactly like a
+scope panic; the failure propagates upward like any scope panic,
+so cancellation is program-fatal by design (proven by the
+`proj18` golden: main returns 0, the run still exits 1 with the
+cancellation panic). Forged handles bounds-check loudly
+(`Err`, never silent misroute).
+
+Deadlines = carried values, enforced at suspension points.
+`ctx_with_deadline(ctx, after_ms)` stores an absolute
+monotonic-ms timestamp; every pre-park fail-fast site (`park`
+for send/recv/select, blocking/file/foreign calls, network and
+TLS waits) compares the slot deadline against the Wave 2 clock
+and fails the scope with deadline-exceeded (E0214) when passed —
+the same path as cancellation (the unwind fails the scope
+through the normal panic path). A wait admitted before expiry
+runs to its normal wakeup, then fail-fasts at the next
+suspension; preemptive mid-wait wakeups are a recorded follow-up.
+The sequential interpreter carries deadlines but never enforces
+them (no suspension points exist there). No timeout parameters
+anywhere (§17.5 stands).
+
+`gzv.std/time` gains the Wave 2 clock (no new module — the
+module header anticipated exactly this): `clock_monotonic_ms()`
+(absolute ms since process start, shared with deadline checks
+and log timestamps) plus `clock_elapsed_since`. Still no wall
+clock in v1; values are nondeterministic by construction and
+never pinned in goldens.
+
+`gzv.std/log` (new): levels `debug/info/warn/error/off`
+(runtime gate — filtered calls cost one int compare and never
+format); format is one JSON object per line in exact field order
+`{"ts":..,"level":"..","msg":"..","ctx":{..}}` with sorted ctx
+keys, `ts` monotonic ms, `ctx` the CURRENT task's pairs (request/
+trace IDs flow with no per-call-site plumbing); escaping covers
+`"`/`\`, short forms, and lowercase `\u00xx`; lines never
+contain raw newlines. Sinks: `stdout` (captured output, one
+`println` per record — never interleaved), `stderr` (fd
+directly), `buffer` (retained for `log_drain_lines` — tests and
+golden pipelines). No file sink (no append builtin). Returns
+`Ok(1)` for a produced stdout line, `Ok(0)` otherwise (filtered
+or non-stdout sink), `Err` only on runtime misuse.
+
+Zero new builtins (the 27-name catalog is untouched): the three
+surfaces ride 17 new linked `toto_rt_*` names (1 clock +
+11 context + 5 log; `docs/ffi.md` records the per-binding
+contracts) plus one scheduler request. The `Context` struct
+itself never crosses FFI — only C scalars and strings through
+per-field getters/setters. The multi-file panic renderer gained
+caller-file frame attribution: frame spans are call-site
+coordinates, so attributing them to the callee's file misrendered
+cross-file traces (a stdlib-coordinate span against the entry
+source — found via the cancel golden). Single-file output is
+byte-identical.
+
+### Implementation (runtime + library)
+
+- `crates/toto-compiler/src/ctxlog.rs` (new): process clock
+  (`Instant`-based monotonic ms), task-slot shape (`CtxSlot`:
+  ordered pairs + optional absolute deadline + one-shot detach
+  flag), and the process log gate/sink/buffer plus the exact line
+  formatter and escaper. Pure Rust — no new C symbols, no
+  `dlopen`. Unit-tested (escapes, ordering, gate, drain).
+- `crates/toto-compiler/src/ffi.rs`: +17 linked names (+17
+  `POSIX_ONLY` — unix-gated like the other Wave 2 surfaces);
+  interpreter arms over a thread-local slot (carried, never
+  enforced — the sequential engine has no suspension points;
+  `cancel` validates its handle only).
+- `crates/toto-runtime/src/sched.rs`: per-task `ctx` (+
+  `ctx_error`) slot fields; spawn inheritance (+ one-shot
+  detach) in both `Spawn` arms; `ToSched::CtxCancel` served by
+  the standard sweep with the caller's trace for attribution
+  (empty traces misattribute stdlib spans to the entry file).
+- `crates/toto-runtime/src/exec.rs`: `CTX/CLOCK/LOG_FNS`
+  inline routing (never park, never block); slot access with the
+  Wave 1 ABBA order (slot lock before heap lock, never nested);
+  `check_deadline` at every pre-park fail-fast site; validation
+  failures return `-1` + slot (the wrapper's `Err`), never a
+  panic.
+- `crates/toto-jit/src/compile.rs`: `toto_rt_ctx_/clock_/log_`
+  refuse arms (executor-only surface; verified by hand via
+  `jit_probe` with the workaround message).
+- `stdlib/context.gzv`, `stdlib/log.gzv` (new), `time.gzv`
+  clock extension; `stdlib.rs` 17→19 modules;
+  `project.rs` count test 17→19; `diag13` golden +17 names
+  (deliberate — the allowlist grew); `docs/ffi.md` Stage 3
+  section + contracts; `docs/stdlib.md` `context`/`log` sections
+  + clock paragraph (suite count 8→16, long stale).
+
+### Tests + evidence (all passing at the Stage 3 tip)
+
+- `stdlib/tests/test_context.gzv` (new, executor): values
+  (immutability, order, fixed missing-key message), slot
+  round-trip + clear, inheritance, one-shot detach (incl. the
+  `go_detached` closure form), deadline values + `ctx_expired`
+  inspector, forged-handle message. Fatal paths stay out (a
+  valid `cancel` ends the run — see `proj18`).
+- `stdlib/tests/test_log.gzv` (new, SEQUENTIAL — no `context`
+  import, so it covers the interpreter arms): level gate incl.
+  fixed unknown-name messages, exact wire format rebuilt around
+  the observed `ts`, escaping round-trip, empty `ctx`, edge
+  record, sink returns; restores level/sink globals. stdlib
+  `toto test` 16/16.
+- `tests/corpus/project/proj17_context_log/` (new): the full
+  live pipeline through the buffer sink — values, level filter,
+  format, inheritance into a spawned child (no plumbing in the
+  child), detach, causality edge — with `ts` normalized to 0 at
+  print time, so the golden stays exact while proving the live
+  clock, live slots, and emission order. Exact goldens; green
+  3/3 plus `--workers 4` (byte-identical). The golden pins the
+  request-scoped trace ID (`req-7f3a`, `r-42`) on every
+  inheriting record and `{}` on the detached one.
+- `tests/corpus/project/proj18_ctx_cancel/` (new, exit 1):
+  `with_cancel` in the child + park + main-side `cancel` →
+  `panic[E0214]: context cancel: handle 1 failed scope 1 ...`
+  with a coherent cross-file trace. Exact goldens; green 3/3
+  plus `--workers 4` (byte-identical).
+- `crates/toto-runtime/tests/ctx_stage3.rs` (new): past
+  deadline fail-fasts at park entry with E0214
+  deadline-exceeded (deterministic — nothing is ever sent);
+  future-deadline control parks and wakes normally (the check
+  admits live waits).
+- `ctxlog` unit tests (3): escapes, field order + key sort,
+  gate validation + filter + drain.
+- Package gates at the Stage 3 tip: `cargo fmt --check` clean;
+  `cargo clippy --workspace --all-targets -- -D warnings` clean;
+  `cargo test` green for toto-compiler (incl. 19-module table),
+  toto-runtime (incl. the 2 new deadline tests), toto-cli
+  (corpus incl. `proj17`/`proj18` + `diag13`), toto-jit; stdlib
+  `toto test` 16/16. Full `check.sh` left to the final verifier
+  per the brief. `/tmp` writes fail in this sandbox (EDQUOT),
+  so captures use `target/` and `TMPDIR=target/sandbox-tmp`
+  was set for the affected suites; the one pre-existing
+  environmental failure (blocking seed file) passes with it.
+
+### Follow-ups (recorded, not done)
+
+Preemptive mid-wait deadline wakeups (timer integration, not
+entry checks); message-scoped `send_with` transfer (needs user
+generics — Wave 4); file sink (needs an append builtin);
+`getpeername` for a real log `peer` field; hostname/SNI/ALPN
+(TLS waves); bench rows; macOS ARM64 + Linux ARM64 legs unrun
+here (same portable-Rust surface; CI tier-1 owns the verdicts).

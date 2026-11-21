@@ -314,11 +314,41 @@ impl<'a> Executor<'a> {
         if self.scope_failed() {
             return Err(self.cancelled(op, span));
         }
+        self.check_deadline(span, op)?;
         self.maybe_collect();
         match self.y.suspend(req) {
             ToTask::Cancelled { op } => Err(self.cancelled(op, span)),
             resp => Ok(resp),
         }
+    }
+
+    /// ADR-009 deadline check (Wave 2, Stage 3): when the task's
+    /// slot carries an absolute monotonic-ms deadline that has
+    /// passed, fail fast with E0214 — the same fail-fast path as
+    /// cancellation (the unwind fails the scope through the normal
+    /// panic path, which is exactly "fails the scope with
+    /// deadline-exceeded"). Checked at every pre-park fail-fast
+    /// site (send/recv/select, blocking/file/foreign calls,
+    /// network and TLS waits); running code that never suspends
+    /// keeps running (cooperative limit, documented like drain
+    /// cancellation). Preemptive mid-wait wakeups are a recorded
+    /// follow-up, not this wave.
+    fn check_deadline(&self, span: Span, op: &'static str) -> Result<(), ExecErr> {
+        let expired = {
+            let sched = self.shared.sched.lock().expect("sched lock");
+            match sched.slots[self.task.0].ctx.deadline {
+                Some(d) => toto_compiler::ctxlog::monotonic_ms() > d,
+                None => false,
+            }
+        };
+        if expired {
+            return Err(self.err(
+                "E0214",
+                format!("task cancelled at `{op}`: deadline exceeded (fail-fast)"),
+                span,
+            ));
+        }
+        Ok(())
     }
 
     fn cancelled(&self, op: &'static str, span: Span) -> ExecErr {
@@ -1454,6 +1484,7 @@ impl<'a> Executor<'a> {
         if self.scope_failed() {
             return Err(self.cancelled("blocking", span));
         }
+        self.check_deadline(span, "blocking")?;
         self.maybe_collect();
         // Push the builtin frame BEFORE parking so a pool-reported
         // failure carries the same trace as the inline builtins (the
@@ -1546,6 +1577,23 @@ impl<'a> Executor<'a> {
         if Self::GZIP_FNS.contains(&name) {
             return self.exec_gzip(dst, name, args, span);
         }
+        // Wave 2 Stage 3 context + clock + logging calls run inline
+        // on the worker: slot reads/writes, the process clock, and
+        // line formatting never block and never park. Unix-gated
+        // like the other Wave 2 surfaces (uniformity; the backends
+        // are portable Rust, so lifting is cfg-only).
+        #[cfg(unix)]
+        if Self::CTX_FNS.contains(&name) {
+            return self.exec_ctx(dst, name, args, span);
+        }
+        #[cfg(unix)]
+        if Self::CLOCK_FNS.contains(&name) {
+            return self.exec_clock(dst, name, args, span);
+        }
+        #[cfg(unix)]
+        if Self::LOG_FNS.contains(&name) {
+            return self.exec_log(dst, name, args, span);
+        }
         use crate::sched::{BlockingOp, ForeignArg};
         use toto_compiler::ffi;
         let Some(sig) = self.code.externs.get(name).cloned() else {
@@ -1598,6 +1646,13 @@ impl<'a> Executor<'a> {
                 ffi::release_slot(*s);
             }
             return Err(self.cancelled("blocking", span));
+        }
+        if let Err(e) = self.check_deadline(span, "blocking") {
+            for (_, s) in &slots {
+                self.callbacks.remove(s);
+                ffi::release_slot(*s);
+            }
+            return Err(e);
         }
         self.maybe_collect();
         // Push the foreign frame BEFORE parking so a pool-reported
@@ -1689,6 +1744,7 @@ impl<'a> Executor<'a> {
         if self.scope_failed() {
             return Err(self.cancelled("net", span));
         }
+        self.check_deadline(span, "net")?;
         self.maybe_collect();
         self.trace.push(TraceFrame {
             name: "net wait".to_string(),
@@ -1886,6 +1942,7 @@ impl<'a> Executor<'a> {
                 if self.scope_failed() {
                     return Err(self.cancelled("net", span));
                 }
+                self.check_deadline(span, "net")?;
                 self.maybe_collect();
                 self.trace.push(TraceFrame {
                     name: "net resolve (pool)".to_string(),
@@ -2320,6 +2377,7 @@ impl<'a> Executor<'a> {
         if self.scope_failed() {
             return Err(self.cancelled("tls", span));
         }
+        self.check_deadline(span, "tls")?;
         self.maybe_collect();
         self.trace.push(TraceFrame {
             name: "tls (pool)".to_string(),
@@ -2645,6 +2703,344 @@ impl<'a> Executor<'a> {
                 Ok(())
             }
             _ => Err(self.internal("unknown gzip function", span)),
+        }
+    }
+
+    /// Context slot functions (Wave 2, Stage 3, unix-only): inline
+    /// per-task slot access dispatched by name from `exec_foreign`.
+    ///
+    /// Shape: parse args with the shared `net_*` readers, touch only
+    /// this task's slot (plain data, one short `sched` section —
+    /// never nested inside the heap lock), assign `dst`. Reads stay
+    /// available after expiry; nothing here parks, so no deadline
+    /// check (enforcement is at the suspension points, not the
+    /// slot). `cancel` yields the `CtxCancel` scheduler request,
+    /// which fails the named scope through the standard sweep.
+    #[cfg(unix)]
+    const CTX_FNS: &[&str] = &[
+        "toto_rt_ctx_begin",
+        "toto_rt_ctx_add",
+        "toto_rt_ctx_count",
+        "toto_rt_ctx_key",
+        "toto_rt_ctx_val",
+        "toto_rt_ctx_deadline",
+        "toto_rt_ctx_set_deadline",
+        "toto_rt_ctx_with_cancel",
+        "toto_rt_ctx_cancel",
+        "toto_rt_ctx_detach_next",
+        "toto_rt_ctx_last_error",
+    ];
+
+    /// Clock functions (Wave 2, Stage 3, unix-only): the shared
+    /// monotonic process clock. Observability only — never gated.
+    #[cfg(unix)]
+    const CLOCK_FNS: &[&str] = &["toto_rt_clock_monotonic_ms"];
+
+    /// Structured-logging functions (Wave 2, Stage 3, unix-only):
+    /// inline emission through the process log gate. `emit` returns
+    /// the formatted line for the stdout sink only (the Toto wrapper
+    /// prints it through `println`, keeping one output path); other
+    /// sinks and filtered calls return "" (the error slot tells
+    /// misuse apart from filtering).
+    #[cfg(unix)]
+    const LOG_FNS: &[&str] = &[
+        "toto_rt_log_emit",
+        "toto_rt_log_set_level",
+        "toto_rt_log_set_sink",
+        "toto_rt_log_drain",
+        "toto_rt_log_last_error",
+    ];
+
+    /// Set (or clear) this task's context error slot.
+    #[cfg(unix)]
+    fn ctx_set_error(&mut self, msg: Option<String>) {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        sched.slots[self.task.0].ctx_error = msg;
+    }
+
+    /// Take (read + clear) this task's context error slot.
+    #[cfg(unix)]
+    fn ctx_take_error(&mut self) -> String {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        sched.slots[self.task.0]
+            .ctx_error
+            .take()
+            .unwrap_or_default()
+    }
+
+    /// Assign a fresh heap string to `dst` (single home for the
+    /// read-back arms below: take the plain data first — the
+    /// `sched` lock — then allocate — the heap-state lock — same
+    /// order as the `last_error` arms, never nested).
+    #[cfg(unix)]
+    fn ctx_assign_str(&mut self, dst: Option<usize>, s: &str) {
+        let v = self.alloc_with(|h| h.alloc_str(s));
+        self.net_assign(dst, RtVal::Heap(v));
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    fn exec_ctx(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
+        match name {
+            "toto_rt_ctx_begin" => {
+                self.arity(name, args.len(), 0, span)?;
+                {
+                    let mut sched = self.shared.sched.lock().expect("sched lock");
+                    sched.slots[self.task.0].ctx.clear();
+                }
+                self.ctx_set_error(None);
+                self.net_assign(dst, RtVal::Int(0));
+                Ok(())
+            }
+            "toto_rt_ctx_add" => {
+                self.arity(name, args.len(), 2, span)?;
+                let key = self.net_str(args, 0, name, span)?;
+                let val = self.net_str(args, 1, name, span)?;
+                let n = {
+                    let mut sched = self.shared.sched.lock().expect("sched lock");
+                    let slot = &mut sched.slots[self.task.0].ctx;
+                    slot.add(key, val);
+                    slot.pairs.len() as i64
+                };
+                self.ctx_set_error(None);
+                self.net_assign(dst, RtVal::Int(n));
+                Ok(())
+            }
+            "toto_rt_ctx_count" => {
+                self.arity(name, args.len(), 0, span)?;
+                let n = {
+                    let sched = self.shared.sched.lock().expect("sched lock");
+                    sched.slots[self.task.0].ctx.pairs.len() as i64
+                };
+                self.net_assign(dst, RtVal::Int(n));
+                Ok(())
+            }
+            "toto_rt_ctx_key" => {
+                self.arity(name, args.len(), 1, span)?;
+                let i = self.net_int(args, 0, name, span)?;
+                let got = {
+                    let sched = self.shared.sched.lock().expect("sched lock");
+                    let pairs = &sched.slots[self.task.0].ctx.pairs;
+                    (i >= 0)
+                        .then(|| pairs.get(i as usize))
+                        .flatten()
+                        .map(|(k, _)| k.clone())
+                };
+                match got {
+                    Some(k) => {
+                        self.ctx_set_error(None);
+                        self.ctx_assign_str(dst, &k);
+                    }
+                    None => {
+                        let n = {
+                            let sched = self.shared.sched.lock().expect("sched lock");
+                            sched.slots[self.task.0].ctx.pairs.len()
+                        };
+                        self.ctx_set_error(Some(format!(
+                            "context index out of range (need 0..{n}, got {i})"
+                        )));
+                        self.ctx_assign_str(dst, "");
+                    }
+                }
+                Ok(())
+            }
+            "toto_rt_ctx_val" => {
+                self.arity(name, args.len(), 1, span)?;
+                let i = self.net_int(args, 0, name, span)?;
+                let got = {
+                    let sched = self.shared.sched.lock().expect("sched lock");
+                    let pairs = &sched.slots[self.task.0].ctx.pairs;
+                    (i >= 0)
+                        .then(|| pairs.get(i as usize))
+                        .flatten()
+                        .map(|(_, v)| v.clone())
+                };
+                match got {
+                    Some(v) => {
+                        self.ctx_set_error(None);
+                        self.ctx_assign_str(dst, &v);
+                    }
+                    None => {
+                        let n = {
+                            let sched = self.shared.sched.lock().expect("sched lock");
+                            sched.slots[self.task.0].ctx.pairs.len()
+                        };
+                        self.ctx_set_error(Some(format!(
+                            "context index out of range (need 0..{n}, got {i})"
+                        )));
+                        self.ctx_assign_str(dst, "");
+                    }
+                }
+                Ok(())
+            }
+            "toto_rt_ctx_deadline" => {
+                self.arity(name, args.len(), 0, span)?;
+                let d = {
+                    let sched = self.shared.sched.lock().expect("sched lock");
+                    sched.slots[self.task.0].ctx.deadline.unwrap_or(-1)
+                };
+                self.net_assign(dst, RtVal::Int(d));
+                Ok(())
+            }
+            "toto_rt_ctx_set_deadline" => {
+                self.arity(name, args.len(), 1, span)?;
+                let d = self.net_int(args, 0, name, span)?;
+                {
+                    let mut sched = self.shared.sched.lock().expect("sched lock");
+                    // The none-sentinel is EXACTLY -1 (see the
+                    // interpreter arm): negative absolute times are
+                    // legitimate past deadlines.
+                    sched.slots[self.task.0].ctx.deadline = if d == -1 { None } else { Some(d) };
+                }
+                self.ctx_set_error(None);
+                self.net_assign(dst, RtVal::Int(0));
+                Ok(())
+            }
+            "toto_rt_ctx_with_cancel" => {
+                self.arity(name, args.len(), 0, span)?;
+                // Snapshot design (ADR-009 consequences): the handle
+                // names the caller's CURRENT scope. No scope is
+                // created and no task moves: `cancel` fails exactly
+                // the scope this task was in at `with_cancel` time.
+                self.ctx_set_error(None);
+                self.net_assign(dst, RtVal::Int(self.scope.0 as i64));
+                Ok(())
+            }
+            "toto_rt_ctx_cancel" => {
+                self.arity(name, args.len(), 1, span)?;
+                let h = self.net_int(args, 0, name, span)?;
+                let known = h >= 0
+                    && (h as usize)
+                        < self
+                            .shared
+                            .scopes
+                            .lock()
+                            .expect("scopes lock")
+                            .scope_count();
+                if !known {
+                    // Loud but non-fatal (the net/tls `-1` + slot
+                    // discipline): the wrapper turns this into an
+                    // `Err` value, so validation stays an ordinary
+                    // error, not a scope failure.
+                    self.ctx_set_error(Some(format!("invalid cancel handle {h} (no such scope)")));
+                    self.net_assign(dst, RtVal::Int(-1));
+                    return Ok(());
+                }
+                match self.yield_now(crate::sched::ToSched::CtxCancel {
+                    scope: crate::sched::ScopeId(h as usize),
+                    handle: h,
+                    span,
+                    trace: self.trace.clone(),
+                }) {
+                    ToTask::Unit => {
+                        self.ctx_set_error(None);
+                        self.net_assign(dst, RtVal::Int(0));
+                        Ok(())
+                    }
+                    ToTask::OpPanic { diag } => Err(ExecErr::Toto(diag)),
+                    ToTask::Cancelled { op } => Err(self.cancelled(op, span)),
+                    other => {
+                        let _ = other;
+                        Err(self.internal("cancel response", span))
+                    }
+                }
+            }
+            "toto_rt_ctx_detach_next" => {
+                self.arity(name, args.len(), 0, span)?;
+                {
+                    let mut sched = self.shared.sched.lock().expect("sched lock");
+                    sched.slots[self.task.0].ctx.detach_once = true;
+                }
+                self.ctx_set_error(None);
+                self.net_assign(dst, RtVal::Int(0));
+                Ok(())
+            }
+            "toto_rt_ctx_last_error" => {
+                self.arity(name, args.len(), 0, span)?;
+                let e = self.ctx_take_error();
+                self.ctx_assign_str(dst, &e);
+                Ok(())
+            }
+            _ => Err(self.internal("unknown context function", span)),
+        }
+    }
+
+    #[cfg(unix)]
+    fn exec_clock(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
+        match name {
+            "toto_rt_clock_monotonic_ms" => {
+                self.arity(name, args.len(), 0, span)?;
+                self.net_assign(dst, RtVal::Int(toto_compiler::ctxlog::monotonic_ms()));
+                Ok(())
+            }
+            _ => Err(self.internal("unknown clock function", span)),
+        }
+    }
+
+    #[cfg(unix)]
+    fn exec_log(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
+        match name {
+            "toto_rt_log_emit" => {
+                self.arity(name, args.len(), 2, span)?;
+                let level = self.net_int(args, 0, name, span)? as i32;
+                let msg = self.net_str(args, 1, name, span)?;
+                // Take the pairs BEFORE allocating: `ctx_assign_str`
+                // holds the heap-state lock, and the drain nests
+                // sched -> state, so taking the sched lock inside the
+                // closure inverts the order (Wave 1 fix-forward
+                // ABBA rule, same as the `last_error` arms).
+                let pairs = {
+                    let sched = self.shared.sched.lock().expect("sched lock");
+                    sched.slots[self.task.0].ctx.pairs.clone()
+                };
+                let (_rc, line) = toto_compiler::ctxlog::log_emit(level, &msg, &pairs);
+                self.ctx_assign_str(dst, &line.unwrap_or_default());
+                Ok(())
+            }
+            "toto_rt_log_set_level" => {
+                self.arity(name, args.len(), 1, span)?;
+                let level = self.net_int(args, 0, name, span)? as i32;
+                let rc = toto_compiler::ctxlog::log_set_level(level);
+                self.net_assign(dst, RtVal::Int(rc));
+                Ok(())
+            }
+            "toto_rt_log_set_sink" => {
+                self.arity(name, args.len(), 1, span)?;
+                let sink = self.net_int(args, 0, name, span)? as i32;
+                let rc = toto_compiler::ctxlog::log_set_sink(sink);
+                self.net_assign(dst, RtVal::Int(rc));
+                Ok(())
+            }
+            "toto_rt_log_drain" => {
+                self.arity(name, args.len(), 0, span)?;
+                let drained = toto_compiler::ctxlog::log_drain();
+                self.ctx_assign_str(dst, &drained);
+                Ok(())
+            }
+            "toto_rt_log_last_error" => {
+                self.arity(name, args.len(), 0, span)?;
+                self.ctx_assign_str(dst, &toto_compiler::ctxlog::take_log_error());
+                Ok(())
+            }
+            _ => Err(self.internal("unknown log function", span)),
         }
     }
 

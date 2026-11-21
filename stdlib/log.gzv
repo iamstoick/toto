@@ -1,0 +1,155 @@
+// `gzv.std/log` — leveled machine-readable structured logging
+// (Enterprise Wave 2, Stage 3).
+//
+// LEVELS (least to most severe): `debug`, `info`, `warn`, `error`,
+// plus `off` (disables emission). Set with `log_set_level`; the
+// gate runs in the runtime, so filtered calls cost one int compare
+// and never format. Unknown names are `Err`, never a silent
+// default.
+//
+// FORMAT: one JSON object per line, exact field order, no trailing
+// whitespace:
+//
+//   {"ts":123,"level":"info","msg":"hello","ctx":{"trace_id":"req-7f3a"}}
+//
+// `ts` is Wave 2 monotonic ms since process start (an int; small
+// early, nondeterministic by construction — never pinned in
+// goldens; golden pipelines strip or avoid it, never pin it).
+// `level` is the record's level name. `msg` is the call-site
+// message. `ctx` carries the CURRENT task's context pairs
+// (ADR-009) with sorted keys — request/trace IDs flow to every
+// record with no per-call-site plumbing. Escaping: `"` and `\`
+// backslash-escaped, `\\n \\r \\t \\b \\f` short forms, other
+// control characters below U+0020 as lowercase `\u00xx`; everything
+// else passes through verbatim (valid JSON over UTF-8 output).
+// Lines never contain a raw newline, so `split(line, "\n")` and
+// buffer drains round-trip exactly.
+//
+// SINKS: `stdout` (through the program's captured output — the
+// corpus gate compares it; concurrent lines are each one `println`,
+// so they never interleave), `stderr` (the process fd directly, one
+// write per line), `buffer` (in-memory retention for `log_drain`
+// — tests and golden pipelines). No file sink in v1: there is no
+// append builtin, and overwriting a file per line is not a log.
+// Unknown sink names are `Err`.
+//
+// RETURN DISCIPLINE: `log_debug/info/warn/error` return
+// `Ok(1)` when the call produced a stdout line, `Ok(0)` when it
+// produced no stdout line (filtered by the level gate, or the sink
+// is `stderr`/`buffer` — those sinks are driven by the runtime and
+// need no wrapper print), and `Err` only on runtime misuse (never
+// on valid input). Filter tests assert through `buffer` + drain
+// (exact), not through the return code.
+
+unsafe extern "C" {
+    fn toto_rt_log_emit(level: c_int, msg: *c_char) -> string;
+    fn toto_rt_log_set_level(level: c_int) -> c_int;
+    fn toto_rt_log_set_sink(sink: c_int) -> c_int;
+    fn toto_rt_log_drain() -> string;
+    fn toto_rt_log_last_error() -> string;
+}
+
+fn log_last_error() -> string {
+    return toto_rt_log_last_error();
+}
+
+// Name the level gate: debug/info/warn/error/off.
+pub fn log_set_level(name: string) -> Result<int, string> {
+    let mut lvl = 1;
+    if name == "debug" {
+        lvl = 0;
+    }
+    if name == "info" {
+        lvl = 1;
+    }
+    if name == "warn" {
+        lvl = 2;
+    }
+    if name == "error" {
+        lvl = 3;
+    }
+    if name == "off" {
+        lvl = 4;
+    }
+    if name != "debug" && name != "info" && name != "warn" && name != "error" && name != "off" {
+        return Err("log: unknown level \"" + name + "\" (want debug/info/warn/error/off)");
+    }
+    let rc = toto_rt_log_set_level(lvl);
+    if rc < 0 {
+        return Err(log_last_error());
+    }
+    return Ok(0);
+}
+
+// Name the sink: stdout/stderr/buffer.
+pub fn log_set_sink(name: string) -> Result<int, string> {
+    let mut sink = 0;
+    if name == "stdout" {
+        sink = 0;
+    }
+    if name == "stderr" {
+        sink = 1;
+    }
+    if name == "buffer" {
+        sink = 2;
+    }
+    if name != "stdout" && name != "stderr" && name != "buffer" {
+        return Err("log: unknown sink \"" + name + "\" (want stdout/stderr/buffer)");
+    }
+    let rc = toto_rt_log_set_sink(sink);
+    if rc < 0 {
+        return Err(log_last_error());
+    }
+    return Ok(0);
+}
+
+fn log_emit_at(lvl: int, msg: string) -> Result<int, string> {
+    let line = toto_rt_log_emit(lvl, msg);
+    let e = log_last_error();
+    if e != "" {
+        return Err(e);
+    }
+    if line == "" {
+        return Ok(0);
+    }
+    println(line);
+    return Ok(1);
+}
+
+pub fn log_debug(msg: string) -> Result<int, string> {
+    return log_emit_at(0, msg);
+}
+
+pub fn log_info(msg: string) -> Result<int, string> {
+    return log_emit_at(1, msg);
+}
+
+pub fn log_warn(msg: string) -> Result<int, string> {
+    return log_emit_at(2, msg);
+}
+
+pub fn log_error(msg: string) -> Result<int, string> {
+    return log_emit_at(3, msg);
+}
+
+// Drain the buffer sink: lines in emission order, clearing the
+// buffer. Empty when nothing was buffered (no phantom line: an
+// empty drain is `[]`, not `[""]`).
+pub fn log_drain_lines() -> Array<string> {
+    let raw = toto_rt_log_drain();
+    if raw == "" {
+        let out: Array<string> = [];
+        return out;
+    }
+    return split(raw, "\n");
+}
+
+// The Wave-2 send_with edge: records the cross-task causality edge
+// auditably at `debug` (no tracing store exists yet — Wave 4).
+// The send itself stays a plain `ch <- v` (v1 has no user
+// generics, so no sending helper can be generic); call this beside
+// it to leave the edge in the record stream with the sender's
+// context attached automatically.
+pub fn log_trace_edge(edge: string) -> Result<int, string> {
+    return log_debug("causality: " + edge);
+}

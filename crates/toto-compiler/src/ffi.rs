@@ -351,6 +351,30 @@ pub const LINKED: &[&str] = &[
     "toto_rt_gzip_compress",
     "toto_rt_gzip_decompress",
     "toto_rt_gzip_last_error",
+    // Wave 2 Stage 3 context + clock + structured logging
+    // (unix-only — same gate as sockets/crypto/TLS: the executor
+    // owns the per-task slot, the interpreter a thread-local; the
+    // clock and log globals are shared process state in `ctxlog`).
+    // Context slot ops cross only C scalars and strings: the
+    // `Context` struct itself stays a pure-Toto library value, built
+    // and read through these per-field getters/setters.
+    "toto_rt_clock_monotonic_ms",
+    "toto_rt_ctx_begin",
+    "toto_rt_ctx_add",
+    "toto_rt_ctx_count",
+    "toto_rt_ctx_key",
+    "toto_rt_ctx_val",
+    "toto_rt_ctx_deadline",
+    "toto_rt_ctx_set_deadline",
+    "toto_rt_ctx_with_cancel",
+    "toto_rt_ctx_cancel",
+    "toto_rt_ctx_detach_next",
+    "toto_rt_ctx_last_error",
+    "toto_rt_log_emit",
+    "toto_rt_log_set_level",
+    "toto_rt_log_set_sink",
+    "toto_rt_log_drain",
+    "toto_rt_log_last_error",
 ];
 
 /// POSIX-only FFI names: threads, file descriptors, `errno`, sleep,
@@ -403,6 +427,23 @@ const POSIX_ONLY: &[&str] = &[
     "toto_rt_gzip_compress",
     "toto_rt_gzip_decompress",
     "toto_rt_gzip_last_error",
+    "toto_rt_clock_monotonic_ms",
+    "toto_rt_ctx_begin",
+    "toto_rt_ctx_add",
+    "toto_rt_ctx_count",
+    "toto_rt_ctx_key",
+    "toto_rt_ctx_val",
+    "toto_rt_ctx_deadline",
+    "toto_rt_ctx_set_deadline",
+    "toto_rt_ctx_with_cancel",
+    "toto_rt_ctx_cancel",
+    "toto_rt_ctx_detach_next",
+    "toto_rt_ctx_last_error",
+    "toto_rt_log_emit",
+    "toto_rt_log_set_level",
+    "toto_rt_log_set_sink",
+    "toto_rt_log_drain",
+    "toto_rt_log_last_error",
 ];
 
 pub fn is_linked(name: &str) -> bool {
@@ -1336,6 +1377,145 @@ fn call_inner(
         }
         #[cfg(unix)]
         "toto_rt_gzip_last_error" => Ok(Value::Str(std::rc::Rc::new(take_gzip_error()))),
+        // Wave 2 Stage 3 context + clock + structured logging
+        // (interpreter path: the sequential engine has no scopes
+        // and no suspension points, so deadlines are carried here —
+        // never enforced — and `cancel` only validates its handle.
+        // Enforcement lives in the executor, where suspension
+        // points exist. Same error discipline as net/crypto: scalar
+        // ops return the value or -1, string getters return "" with
+        // the slot set, reads stay available after expiry.)
+        #[cfg(unix)]
+        "toto_rt_clock_monotonic_ms" => Ok(Value::Int(crate::ctxlog::monotonic_ms())),
+        #[cfg(unix)]
+        "toto_rt_ctx_begin" => {
+            CTX_SLOT.with(|s| s.borrow_mut().clear());
+            set_ctx_error(None);
+            Ok(Value::Int(0))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_add" => {
+            let key = ctx_str_arg(&args[0], "a context key string", span)?;
+            let val = ctx_str_arg(&args[1], "a context value string", span)?;
+            let n = CTX_SLOT.with(|s| {
+                let mut slot = s.borrow_mut();
+                slot.add(key, val);
+                slot.pairs.len() as i64
+            });
+            set_ctx_error(None);
+            Ok(Value::Int(n))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_count" => {
+            let n = CTX_SLOT.with(|s| s.borrow().pairs.len() as i64);
+            Ok(Value::Int(n))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_key" => {
+            let i = int_arg(&args[0], &sig.params[0].1, span)?;
+            match CTX_SLOT.with(|s| s.borrow().pairs.get(i as usize).map(|(k, _)| k.clone())) {
+                Some(k) => {
+                    set_ctx_error(None);
+                    Ok(Value::Str(std::rc::Rc::new(k)))
+                }
+                None => {
+                    set_ctx_error(Some(format!(
+                        "context index out of range (need 0..{}, got {i})",
+                        CTX_SLOT.with(|s| s.borrow().pairs.len())
+                    )));
+                    Ok(Value::Str(std::rc::Rc::new(String::new())))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_val" => {
+            let i = int_arg(&args[0], &sig.params[0].1, span)?;
+            match CTX_SLOT.with(|s| s.borrow().pairs.get(i as usize).map(|(_, v)| v.clone())) {
+                Some(v) => {
+                    set_ctx_error(None);
+                    Ok(Value::Str(std::rc::Rc::new(v)))
+                }
+                None => {
+                    set_ctx_error(Some(format!(
+                        "context index out of range (need 0..{}, got {i})",
+                        CTX_SLOT.with(|s| s.borrow().pairs.len())
+                    )));
+                    Ok(Value::Str(std::rc::Rc::new(String::new())))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_deadline" => {
+            let d = CTX_SLOT.with(|s| s.borrow().deadline.unwrap_or(-1));
+            Ok(Value::Int(d))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_set_deadline" => {
+            let d = int_arg(&args[0], &sig.params[0].1, span)?;
+            // The none-sentinel is EXACTLY -1 (the library value for
+            // "no deadline"). Negative absolute times are legitimate
+            // past deadlines (the clock starts near zero), so they
+            // store — and read back as immediately expired.
+            CTX_SLOT.with(|s| s.borrow_mut().deadline = if d == -1 { None } else { Some(d) });
+            set_ctx_error(None);
+            Ok(Value::Int(0))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_with_cancel" => {
+            // Sequential root scope handle: nothing to release, but
+            // the handle is valid so `cancel(0)` round-trips.
+            set_ctx_error(None);
+            Ok(Value::Int(0))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_cancel" => {
+            let h = int_arg(&args[0], &sig.params[0].1, span)?;
+            if h == 0 {
+                set_ctx_error(None);
+                Ok(Value::Int(0))
+            } else {
+                set_ctx_error(Some(format!(
+                    "invalid cancel handle {h} (want 0 in sequential programs)"
+                )));
+                Ok(Value::Int(-1))
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_detach_next" => {
+            CTX_SLOT.with(|s| s.borrow_mut().detach_once = true);
+            set_ctx_error(None);
+            Ok(Value::Int(0))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_last_error" => Ok(Value::Str(std::rc::Rc::new(take_ctx_error()))),
+        #[cfg(unix)]
+        "toto_rt_log_emit" => {
+            let level = int_arg(&args[0], &sig.params[0].1, span)? as i32;
+            let msg = ctx_str_arg(&args[1], "a log message string", span)?;
+            let pairs = CTX_SLOT.with(|s| s.borrow().pairs.clone());
+            let (_rc, line) = crate::ctxlog::log_emit(level, &msg, &pairs);
+            // The line crosses back only for the stdout sink (the
+            // Toto wrapper prints it through `println`, keeping one
+            // output path). Other sinks and filtered calls return ""
+            // (the error slot distinguishes misuse from filtering).
+            Ok(Value::Str(std::rc::Rc::new(line.unwrap_or_default())))
+        }
+        #[cfg(unix)]
+        "toto_rt_log_set_level" => {
+            let level = int_arg(&args[0], &sig.params[0].1, span)? as i32;
+            Ok(Value::Int(crate::ctxlog::log_set_level(level)))
+        }
+        #[cfg(unix)]
+        "toto_rt_log_set_sink" => {
+            let sink = int_arg(&args[0], &sig.params[0].1, span)? as i32;
+            Ok(Value::Int(crate::ctxlog::log_set_sink(sink)))
+        }
+        #[cfg(unix)]
+        "toto_rt_log_drain" => Ok(Value::Str(std::rc::Rc::new(crate::ctxlog::log_drain()))),
+        #[cfg(unix)]
+        "toto_rt_log_last_error" => Ok(Value::Str(std::rc::Rc::new(
+            crate::ctxlog::take_log_error(),
+        ))),
         "toto_rt_read_i32" => {
             let p = ptr_arg(&args[0], span)? as *const c_void;
             Ok(Value::Int(toto_rt_read_i32(p) as i64))
@@ -1539,6 +1719,52 @@ fn set_gzip_error(msg: Option<String>) {
 #[cfg(unix)]
 fn take_gzip_error() -> String {
     GZIP_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
+// Interpreter-side context slot (Wave 2, Stage 3): the sequential
+// engine runs one task, so its "current context" is a thread-local.
+// Same shape as the executor's per-task slot (`ctxlog::CtxSlot`)
+// so both engines share inheritance and deadline semantics; only
+// the storage differs. Plain data, never heap references.
+#[cfg(unix)]
+thread_local! {
+    static CTX_SLOT: std::cell::RefCell<crate::ctxlog::CtxSlot> =
+        const { std::cell::RefCell::new(crate::ctxlog::CtxSlot {
+            pairs: Vec::new(),
+            deadline: None,
+            detach_once: false,
+        }) };
+    static CTX_LAST_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(unix)]
+fn set_ctx_error(msg: Option<String>) {
+    CTX_LAST_ERROR.with(|s| *s.borrow_mut() = msg);
+}
+
+#[cfg(unix)]
+fn take_ctx_error() -> String {
+    CTX_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
+/// A Toto string where a `*c_char` context/log parameter is
+/// declared. Unlike `str_arg` there is no C call, so no NUL-copy is
+/// needed — but the E0308 type error matches the other boundaries.
+#[cfg(unix)]
+fn ctx_str_arg(
+    v: &Value,
+    what: &str,
+    span: Span,
+) -> Result<String, (Diag, Vec<crate::interp::TraceFrame>)> {
+    match v {
+        Value::Str(s) => Ok(s.to_string()),
+        other => Err(fail(
+            "E0308",
+            format!("cannot pass {} where {what} is expected", other.type_name()),
+            span,
+        )),
+    }
 }
 
 /// `Array<int>` to call-duration bytes for gzip (elements 0–255,

@@ -88,6 +88,9 @@ runtime helpers. Ownership, encoding, and thread-safety per binding:
 | `toto_rt_crypto_*` (13 names) | `gzv.std/crypto` wrappers | Wave 1 crypto (unix-only): one-shot OpenSSL/LibreSSL calls through `cryptolib` — no retained contexts or key handles (rooting covers the call); bytes cross as `Array<int>`; `verify`-style ops return 1/0 with a clean slot or -1 plus the slot on malformed input; fixed strings (never library queue wording) wherever goldens pin messages, so error text holds on OpenSSL and LibreSSL alike |
 | `toto_rt_tls_*` (6 names) | `gzv.std/tls` wrappers | Wave 2 Stage 1 TLS (unix-only): handshake upgrades (`connect`/`accept`) plus record I/O (`send`/`recv`) and teardown (`close`) over the system libssl through `tlslib`; sessions are retained under the fd (explicit handle rule — the `SSL*` never crosses into Toto, `tls_close` or any `net_close` frees it); bytes cross as `Array<int>`; scalar ops return the fd/count or -1, array ops the payload or empty, every failure in the per-task slot; blocking calls (interpreter) / blocking pool (executor), never the poller |
 | `toto_rt_gzip_*` (3 names) | `gzv.std/compress` wrappers | Wave 1 compression (unix-only gate; backend is portable pure Rust): one-shot gzip over `flate2`/`miniz_oxide`; same byte/error-slot discipline; failures are one fixed string |
+| `toto_rt_clock_*` (1 name) | `gzv.std/time` (`clock_monotonic_ms`) | Wave 2 Stage 3 monotonic clock (unix-only gate; backend is portable Rust `Instant`): absolute ms since process start (ADR-009 deadline domain, shared with log timestamps); observability only, never gated, never pinned in goldens |
+| `toto_rt_ctx_*` (11 names) | `gzv.std/context` wrappers | Wave 2 Stage 3 context slots (unix-only): per-field getters/setters over the current task's slot (plain `Vec<(String, String)>` + optional absolute deadline, never a heap reference — no GC rooting needed); executor keeps the slot per task (spawn inheritance + one-shot detach at `Spawn`), the sequential interpreter in a thread-local; strings cross as `*c_char`, deadlines as `c_long` (`-1` = none; negative absolute times are legitimate past deadlines); reads stay available after expiry (enforcement is at suspension points, not the slot); `cancel` fails the named scope through the `cancel_scope` sweep and completes inline, forged handles are `-1` plus the slot (the wrapper's `Err`); scalar ops return the value/count or -1, string getters `""` plus the slot |
+| `toto_rt_log_*` (5 names) | `gzv.std/log` wrappers | Wave 2 Stage 3 structured logging (unix-only gate; backend is portable Rust): process-global level gate (0–3, 4=off) and sink (stdout/stderr/buffer) with per-surface error slots; `emit` formats one JSON record (`ts`, `level`, `msg`, sorted-key `ctx` from the CURRENT slot — no call-site plumbing) and returns the line only for the stdout sink (the wrapper prints it through `println`, keeping one output path); other sinks and filtered calls return `""` (the slot tells misuse apart from filtering); lines never contain raw newlines |
 
 Two linked names have no wrapper: `close` cannot be named in an
 `unsafe extern` block (`close` is the channel builtin — reserved
@@ -175,6 +178,30 @@ precedent instead). `SSL_set_tlsext_host_name` is deliberately
 NOT used (upstream it is a C macro, not an exported symbol).
 Licenses: same as the crypto face (Apache-2.0 OpenSSL 3.x /
 OpenSSL+SSLeay+ISC LibreSSL).
+
+## Wave 2 Stage 3 allowlist extension (rationale)
+
+The allowlist grows by 17 more names in this wave (1 clock +
+11 context + 5 log; 35 Wave-1/Stage-1 names stand), within this
+wave's FFI rules (ADR-009: per-task context slots, monotonic
+clock, structured-log emission), each recorded above with its
+per-binding contract. No deferred-FFI work is smuggled in: no
+structs-by-value cross (the `Context` struct itself never crosses
+— only C scalars and strings do, through per-field
+getters/setters; the value stays a pure-Toto library type), no
+`dlopen` (no new C symbols at all — the clock and the log writer
+are pure Rust in `ctxlog`), no binding generation (all `unsafe
+extern` blocks are hand-written). New runtime capabilities ride
+the established linked-name mechanism, not new builtins: the
+27-name builtin catalog is untouched.
+
+The `cancel_scope` hook (the one new runtime capability ADR-009
+names) is not an FFI call at all: it is a scheduler request
+(`ToSched::CtxCancel`) raised by the `toto_rt_ctx_cancel` arm and
+served inline by the scheduler's standard scope-failure sweep —
+first-panic-wins, parked tasks released, running tasks fail-fast
+at the next suspension point. Handles name scope indices, so a
+forged handle bounds-checks loudly instead of misrouting.
 
 ## End-to-end proof dispositions (smoke-test unproven list)
 

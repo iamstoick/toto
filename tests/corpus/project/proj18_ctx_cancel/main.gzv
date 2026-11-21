@@ -1,0 +1,49 @@
+// Wave 2 Stage 3 scope-failure cancellation (fatal by design).
+//
+// The child snapshots its own scope into a handle and parks on a
+// receive that never arrives; main cancels the handle, which fails
+// the child's scope through the `cancel_scope` hook. The child
+// unwinds with fail-fast E0214 at its suspension point, main
+// returns normally — but the scope failure propagates to the root,
+// so the program exits 1 with the cancellation panic (structured
+// concurrency: cancellation is program-fatal, exactly like a scope
+// panic). Deterministic: one parked child, one failure source, no
+// ports, fds, or timing.
+import "gzv.std/context.gzv";
+
+fn t_install() -> Result<bool, string> {
+    let c0 = ctx_with_value(ctx_background(), "trace_id", "req-cancel-1");
+    ctx_set_current(c0)?;
+    return Ok(true);
+}
+
+fn t_cancel(h: int) -> Result<bool, string> {
+    ctx_cancel(h)?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let yes: Result<bool, string> = Ok(true);
+    if t_install() != yes {
+        println("FAIL install");
+        return 1;
+    } else {
+    }
+    let ch = chan<int>(1);
+    let block = chan<int>(1);
+    go {
+        let c = ctx_with_cancel();
+        ch <- c.handle;
+        let v: int = <-block;
+        println(v);
+    }
+    let h: int = <-ch;
+    println("cancelling");
+    if t_cancel(h) != yes {
+        println("FAIL cancel");
+        return 1;
+    } else {
+    }
+    println("cancelled");
+    return 0;
+}

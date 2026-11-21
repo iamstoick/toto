@@ -90,16 +90,23 @@ Exact integer operations beyond the builtins
 
 Pure durations: a duration is an `int` count of milliseconds, and a
 timestamp is an `int` count of milliseconds since an
-application-chosen epoch. **There is no wall clock**: the frozen
-builtins expose no clock, and the catalog stays frozen. Wall-clock
-constructors land with the Stage 3 FFI work; until then this module
-covers timeout math, backoff, and log rendering.
+application-chosen epoch — plus the Wave 2 monotonic clock
+(Stage 3). **There is still no wall clock**: the frozen builtins
+expose no clock, so the clock arrives as a linked foreign function
+(`toto_rt_clock_monotonic_ms`, unix-only), not a builtin — the
+catalog stays frozen. The clock is monotonic ms since process
+start (ADR-009): absolute values compose across fan-out.
+Values are nondeterministic by construction (time passes between
+scheduling points), so they are never pinned in goldens; compare
+differences or inequalities only.
 
 Constructors `duration_from_millis/secs/mins/hours`, projection
 `duration_as_millis/secs` (truncating), `duration_add/sub`,
 three-way `duration_compare` (`-1`/`0`/`1`), `format_duration`
 (`"500ms"`, `"90s"`, `"2m 5s"`, `"3h 4m"`, `"2d 1h"`, `"-"` prefix
-for negatives), and `timestamp_add`/`timestamp_diff` intent markers.
+for negatives), `timestamp_add`/`timestamp_diff` intent markers,
+and the clock: `clock_monotonic_ms()` plus
+`clock_elapsed_since(t0)` (non-negative on both engines).
 
 ## `io`
 
@@ -392,11 +399,73 @@ Strings cross as bytes (the caller maps text). Pinned by
 stated `Person` contract, verified against the encoding rules
 independently of the implementation).
 
+## `context`
+
+Request-scoped values, deadlines, cancellation (Enterprise Wave 2,
+Stage 3; implements ADR-009 exactly). `Context` is an immutable
+library value (`pairs` plus an absolute monotonic-ms `deadline`,
+`-1` = none): `ctx_with_value` derives, never modifies;
+`ctx_get`/`ctx_get_or`/`ctx_has` read; `ctx_with_deadline` stores
+`clock_monotonic_ms() + after_ms` (only exactly `-1` means none —
+negative absolute times are legitimate past deadlines);
+`ctx_no_deadline`/`ctx_deadline` manage the carried value.
+
+The current task's slot is authoritative: `ctx_set_current`
+installs a value (children spawned after inherit it —
+ADR-009 spawn inheritance, recorded at `Spawn`), `ctx_current`
+reads it back, `ctx_expired()` inspects the slot deadline without
+parking (both engines). Contexts never ride channels by default
+(receiver scope governs); the opt-in edge helper is
+`log_trace_edge` (in `gzv.std/log`), and message-scoped transfer
+awaits user generics (Wave 4 — not smuggled in).
+
+Cancellation is scope failure: `ctx_with_cancel()` snapshots the
+caller's current scope into a `CtxCancel` handle (no scope is
+created, no task moves); `ctx_cancel(h)` fails exactly that scope
+through the `cancel_scope` sweep — parked tasks release with
+E0214, running tasks fail fast at the next suspension point, and
+the failure propagates upward like any scope panic (cancellation
+is program-fatal by design). Forged handles are `Err` values
+(`-1` + slot), never silent. `ctx_detach_next()` arms one spawn
+to start empty; `go_detached(f)` wraps the pattern for closures.
+
+Pinned by `test_context.gzv` (values, slot round-trip,
+inheritance, one-shot detach, deadline values + inspector,
+forged-handle message) and the corpus `proj17_context_log`
+(pipeline) / `proj18_ctx_cancel` (fatal golden) pair.
+
+## `log`
+
+Leveled machine-readable structured logging carrying context
+values with no per-call-site plumbing (Enterprise Wave 2,
+Stage 3). Levels `debug`/`info`/`warn`/`error` plus `off`
+(`log_set_level`; the gate runs in the runtime, so filtered calls
+cost one int compare and never format). Format: one JSON object
+per line in exact field order
+`{"ts":..,"level":"..","msg":"..","ctx":{..}}` with sorted ctx
+keys; `ts` is Wave 2 monotonic ms (never pinned — golden
+pipelines strip or avoid it); `ctx` is the CURRENT task's pairs.
+Escaping covers `"`/`\`, `\n \r \t \b \f`, and `\u00xx`
+(lowercase) for other controls; lines never contain raw newlines.
+Sinks: `stdout` (captured output; one `println` per record, never
+interleaved), `stderr` (fd directly, one write per line),
+`buffer` (in-memory retention for `log_drain_lines` — tests and
+golden pipelines). No file sink in v1 (no append builtin).
+`log_debug/info/warn/error` return `Ok(1)` for a produced stdout
+line, `Ok(0)` otherwise (filtered or non-stdout sink), `Err`
+only on runtime misuse. `log_trace_edge` records the Wave-2
+causality edge at `debug` with the sender's context attached.
+
+Pinned by `test_log.gzv` (gate, exact wire format rebuilt around
+the observed `ts`, escaping round-trip, empty ctx, edge
+record, sink returns — sequential, so it covers the interpreter
+arms) and the corpus `proj17_context_log` buffer golden.
+
 ## Execution paths
 
 | Path | Status | Evidence |
 |---|---|---|
-| Interpreter (`toto run` / `toto test`) | Full suite green | `toto: 8 passed, 0 failed` in `stdlib/`; corpus `proj09`/`proj10` goldens |
+| Interpreter (`toto run` / `toto test`) | Full suite green | `toto: 16 passed, 0 failed` in `stdlib/`; corpus `proj09`/`proj10` goldens |
 | Runtime executor (concurrent) | Green | `test_concurrent.gzv` (pipeline over channels) |
 | Built executable (`toto build`) | Output-equivalent | `stdlib` smoke: binary stdout byte-identical to interpreter |
 | JIT via `toto dev` | Unsupported | `dev` is single-file scope (`parse_and_check` only); multi-file dev loop is the known carry-forward |
