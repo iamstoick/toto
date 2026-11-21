@@ -46,7 +46,7 @@ fn main() {
     let names: &[(&str, &str)] = if target.contains("apple") || target.contains("darwin") {
         // (SONAME on disk, link name): LibreSSL ships both libraries
         // as versioned dylibs on every macOS with CLT.
-        &[("libcrypto.dylib", "libcrypto"), ("libssl.dylib", "libssl")]
+        &[("libcrypto.dylib", "crypto"), ("libssl.dylib", "ssl")]
     } else {
         &[
             ("libcrypto.so.3", "crypto"),
