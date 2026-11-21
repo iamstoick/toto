@@ -334,6 +334,12 @@ impl<'a> Executor<'a> {
     /// cancellation). Preemptive mid-wait wakeups are a recorded
     /// follow-up, not this wave.
     fn check_deadline(&self, span: Span, op: &'static str) -> Result<(), ExecErr> {
+        // Hot frame stays thin: this sits inside the deepest
+        // serve-path nest at every suspension, and coroutine stacks
+        // are spec-fixed 64 KiB (ADR-002/ADR-008) — the Wave 1 ARM
+        // guard-fault precedent. The lock + compare inline; the cold
+        // expiry formatting is outlined below so `format!`
+        // temporaries never bloat this frame.
         let expired = {
             let sched = self.shared.sched.lock().expect("sched lock");
             match sched.slots[self.task.0].ctx.deadline {
@@ -342,13 +348,22 @@ impl<'a> Executor<'a> {
             }
         };
         if expired {
-            return Err(self.err(
-                "E0214",
-                format!("task cancelled at `{op}`: deadline exceeded (fail-fast)"),
-                span,
-            ));
+            return Err(self.deadline_expired(span, op));
         }
         Ok(())
+    }
+
+    /// Cold deadline-expiry constructor (`#[inline(never)]` keeps the
+    /// `format!` temporaries out of `check_deadline`'s hot frame —
+    /// see above). Reached only when a deadline actually expired,
+    /// never on the common no-deadline path.
+    #[inline(never)]
+    fn deadline_expired(&self, span: Span, op: &'static str) -> ExecErr {
+        self.err(
+            "E0214",
+            format!("task cancelled at `{op}`: deadline exceeded (fail-fast)"),
+            span,
+        )
     }
 
     fn cancelled(&self, op: &'static str, span: Span) -> ExecErr {
@@ -1594,6 +1609,32 @@ impl<'a> Executor<'a> {
         if Self::LOG_FNS.contains(&name) {
             return self.exec_log(dst, name, args, span);
         }
+        // Generic pool tail lives in its own frame (see below): this
+        // dispatcher stays thin so every inline foreign call on the
+        // serve path (net/crypto/gzip/tls/ctx/clock/log) pays only the
+        // dispatch checks. Coroutine stacks are spec-fixed 64 KiB
+        // (ADR-002/ADR-008) — the Wave 1 ARM guard-fault precedent:
+        // the Stage 3 dispatch growth pushed serve high-water from
+        // ~60.5 KiB to ~61.2 KiB on x86_64, overflowing the guard
+        // under ARM64's larger frames (macOS SIGBUS). Shrink the
+        // frames, never the budget.
+        self.exec_foreign_pool(dst, name, args, span)
+    }
+
+    /// Generic blocking-pool foreign tail of `exec_foreign`
+    /// (`#[inline(never)]` keeps these temporaries out of the hot
+    /// dispatcher frame — see above). Arguments convert to owned
+    /// plain data, the pool runs the call, and callbacks drain on
+    /// this worker after the completion. Behavior is exactly the
+    /// former inline tail; only the frame moved.
+    #[inline(never)]
+    fn exec_foreign_pool(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
         use crate::sched::{BlockingOp, ForeignArg};
         use toto_compiler::ffi;
         let Some(sig) = self.code.externs.get(name).cloned() else {
