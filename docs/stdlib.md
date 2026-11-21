@@ -283,6 +283,60 @@ loopback echo through the real wrappers) and the
 `openssl s_server`/`s_client`, plus the untrusted-chain
 negative).
 
+## `http`
+
+HTTP/1.1 framework (Enterprise Wave 2, Stage 2; unix-only via
+the net/tls surface — this module itself is pure Toto, no new
+FFI). Routing (exact > template > wildcard precedence,
+first-registration tiebreak, `"*"` methods), onion middleware,
+and handlers run on green threads over the Wave 1 substrate:
+each accepted connection gets its own task, waits park on the
+M:N poller, TLS steps on the blocking pool. The client runs over
+the same substrate, upgrading to TLS for `https://`. HTTP/1.1
+only (keep-alive, `Content-Length`, chunked request/response
+bodies); no new builtins — the ASCII framing codec is pure Toto.
+
+| Function | Behavior |
+|---|---|
+| `http_router()` | Empty router (no routes, no middleware) |
+| `route_add(router, method, pattern, handler)` | Register; `Ok(())`, or `Err` on empty method / bad pattern |
+| `use_mw(router, mw)` | Append onion middleware (registration order) |
+| `http_serve(port, router, opts)` | Loopback listen + accept loop; `Ok(listener fd)` |
+| `http_serve_tls(port, router, opts, cert, key)` | Same, with a server TLS upgrade per connection |
+| `http_do(req, opts)` | One exchange + redirects; `Ok(HttpClientResp)` |
+| `http_get(url, opts)` / `http_post(url, headers, body, opts)` | One-shot shorthands (`https` needs `ca_pem`, use `http_do`) |
+| `http_header_get(headers, name)` | Case-insensitive; `Err("http: missing header …")` when absent |
+| `http_header_or(headers, name, dflt)` | Same, with a default (always `Ok`) |
+| `http_param(params, name)` | Path-param lookup; `Err("http: missing param …")` when absent |
+| `http_decode_pct(s)` / `http_parse_query(target)` | Percent-decoding / query pairs; `Err` on malformed input |
+| `http_bytes_to_text(data)` / `http_text_to_bytes(s)` | Framing-text codec; fixed `Err` on unrepresentable bytes |
+| `http_response(status, reason, headers, body)` / `http_text(status, reason, text)` | Response constructors |
+
+Fixed wire mapping (golden-pinned): handler/middleware `Ok`
+serializes as-is; their `Err` closes the connection with no
+response (a v1 language limit — `Err` payloads are not values,
+so the 500 mapping needs Phase-2 destructuring or a gated new
+builtin; `expose_errors` is reserved and inert); unknown route
+→ 404; known path with a wrong method → 405 + `Allow`;
+bad framing/size accounting → 400; other-than-1.x version → 505.
+Oversize/truncated requests map to 400 (handlers never see a
+partial body); a vanished client closes quietly. Redirects:
+`redirects: 0` never follows; otherwise same-scheme/host/port
+(or relative) targets only, method rules 301/302/303/307/308
+fixed, budget overrun is `Err("http: too many redirects")`.
+`host_allow` narrows the loopback set (`localhost`,
+`127.0.0.1`, `::1`); everything else is rejected before
+connecting. `keepalive_ms` is advisory (no clock in v1);
+`peer` is the loopback placeholder until the substrate exposes
+TCP peer addresses.
+
+Pinned by `test_http.gzv` (pure units), `proj16_http` (full
+lifecycle: routing, middleware ordering + short-circuit, error
+paths, close semantics, TLS both directions), and the
+`http_interop` suite (our server vs curl plain + https with
+`--cacert`; our client vs a curl-checked reference and vs
+`openssl s_server`).
+
 ## `compress`
 
 gzip compression (Enterprise Wave 1; unix-gated like the other

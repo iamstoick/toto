@@ -1,0 +1,565 @@
+// Wave 2 Stage 2 HTTP conformance (framework over the Wave 1
+// substrate + Stage 1 TLS): routing (exact > template > wildcard,
+// first-registration tiebreak, `*` methods), middleware ordering +
+// short-circuit, error paths (404/405+Allow/400/505, handler-Err
+// abort with server survival, truncation), close semantics
+// (keep-alive pipelining, orderly EOF, double-close), TLS both
+// directions (Toto https server + Toto https client, wrong-CA
+// negative), and client policy (redirects, host_allow, caps).
+// Sequential clients throughout, so every golden is exact: no
+// ports, fds, or timing in the output.
+
+import "gzv.std/http.gzv";
+import "gzv.std/net.gzv";
+
+// ---------- handlers (pure: no shared state) ----------
+
+fn h_hello(req: HttpRequest) -> Result<HttpResponse, string> {
+    return http_text(200, "OK", "hello");
+}
+
+fn h_head_ok(req: HttpRequest) -> Result<HttpResponse, string> {
+    return http_text(200, "OK", "head-body");
+}
+
+fn h_user(req: HttpRequest) -> Result<HttpResponse, string> {
+    // Captures arrive raw (still-encoded); the handler decodes what
+    // it uses — a garbage capture fails exactly like any handler
+    // error (connection abort, never a partial answer).
+    let raw = http_param(req.params, "id")?;
+    let did = http_decode_pct(raw)?;
+    return http_text(200, "OK", "user:" + did);
+}
+
+fn h_list(req: HttpRequest) -> Result<HttpResponse, string> {
+    return http_text(200, "OK", "user-list");
+}
+
+fn h_static(req: HttpRequest) -> Result<HttpResponse, string> {
+    return http_text(200, "OK", "static");
+}
+
+fn h_any(req: HttpRequest) -> Result<HttpResponse, string> {
+    return http_text(200, "OK", "any:" + req.method);
+}
+
+fn h_echo(req: HttpRequest) -> Result<HttpResponse, string> {
+    let hs: Array<HttpHeader> = [HttpHeader { name: "X-Echo", value: "yes" }];
+    return Ok(http_response(200, "OK", hs, req.body));
+}
+
+fn h_query(req: HttpRequest) -> Result<HttpResponse, string> {
+    let ps = http_parse_query(req.target)?;
+    let mut out: string = "";
+    for p in ps {
+        out = out + p.name + "=" + p.value + ";";
+    }
+    return http_text(200, "OK", out);
+}
+
+fn h_boom(req: HttpRequest) -> Result<HttpResponse, string> {
+    return Err("kaboom");
+}
+
+fn h_short_handler(req: HttpRequest) -> Result<HttpResponse, string> {
+    return http_text(200, "OK", "handler-short");
+}
+
+fn h_explicit_500(req: HttpRequest) -> Result<HttpResponse, string> {
+    // Handlers that must answer 500 with detail do so explicitly —
+    // they hold the string (the framework cannot lift it out of an
+    // `Err` in v1; see the module header).
+    return http_text(500, "Internal Server Error", "explicit-500");
+}
+
+fn h_redir(req: HttpRequest) -> Result<HttpResponse, string> {
+    let hs: Array<HttpHeader> = [HttpHeader { name: "Location", value: "/hello" }];
+    return Ok(http_response(302, "Found", hs, []));
+}
+
+fn h_ext(req: HttpRequest) -> Result<HttpResponse, string> {
+    let hs: Array<HttpHeader> = [HttpHeader { name: "Location", value: "http://example.com/x" }];
+    return Ok(http_response(302, "Found", hs, []));
+}
+
+fn h_loop(req: HttpRequest) -> Result<HttpResponse, string> {
+    let hs: Array<HttpHeader> = [HttpHeader { name: "Location", value: "/loop" }];
+    return Ok(http_response(302, "Found", hs, []));
+}
+
+fn h_large(req: HttpRequest) -> Result<HttpResponse, string> {
+    let mut out: string = "";
+    for i in 0..3000 {
+        out = out + "x";
+    }
+    return http_text(200, "OK", out);
+}
+
+fn h_secure(req: HttpRequest) -> Result<HttpResponse, string> {
+    return http_text(200, "OK", "secure");
+}
+
+// ---------- raw-socket helpers (framing the framework must accept) ----------
+
+// Start index of the head terminator, or -1.
+fn scan_head(buf: Array<int>) -> int {
+    if len(buf) < 4 {
+        return -1;
+    }
+    for i in 0..(len(buf) - 3) {
+        if buf[i] == 13 && buf[i + 1] == 10 && buf[i + 2] == 13 && buf[i + 3] == 10 {
+            return i;
+        } else {
+        }
+    }
+    return -1;
+}
+
+// Send one raw request, return `status:tag` for a framed answer or
+// `EOF:tag` when the server closed without answering (abort paths).
+fn raw_status(port: int, payload: Array<int>, tag: string) -> Result<string, string> {
+    let conn = net_tcp_connect("localhost", port)?;
+    let n = net_send_all(conn, payload)?;
+    if n != len(payload) {
+        net_close(conn)?;
+        return Err("short send");
+    }
+    let mut cbuf: Array<int> = [];
+    while true {
+        let chunk = net_recv(conn, 4096)?;
+        if len(chunk) == 0 {
+            net_close(conn)?;
+            return Ok("EOF:" + tag);
+        }
+        for b in chunk {
+            push(cbuf, b);
+        }
+        if len(cbuf) > 32768 {
+            net_close(conn)?;
+            return Err("head never ended");
+        }
+        let k = scan_head(cbuf);
+        if k >= 0 {
+            let line = http_bytes_to_text(http_slice(cbuf, 0, k))?;
+            net_close(conn)?;
+            let parts: Array<string> = split(line, " ");
+            return Ok(parts[1] + ":" + tag);
+        } else {
+        }
+    }
+    return Err("unreachable");
+}
+
+// (raw_pipeline lives beside raw_take below: buffer-threaded.)
+
+// One full response on an open conn, threading the buffer so
+// pipelined bytes are never dropped: `status + body-bytes`.
+struct RawResp { status: string, nbody: int, rest: Array<int> }
+struct RawTake { body: Array<int>, rest: Array<int> }
+
+// Split `buf` into the first `want` bytes (body) and the leftover.
+fn raw_take(conn: int, buf: Array<int>, want: int) -> Result<RawTake, string> {
+    let mut body: Array<int> = [];
+    let mut rest: Array<int> = [];
+    let mut i: int = 0;
+    while i < len(buf) {
+        if len(body) < want {
+            push(body, buf[i]);
+        } else {
+            push(rest, buf[i]);
+        }
+        i = i + 1;
+    }
+    while len(body) < want {
+        // Capped receive: never over-reads into the next response.
+        let chunk = net_recv(conn, want - len(body))?;
+        if len(chunk) == 0 {
+            return Err("truncated");
+        }
+        for x in chunk {
+            push(body, x);
+        }
+    }
+    return Ok(RawTake { body: body, rest: rest });
+}
+
+fn raw_one(conn: int, buf: Array<int>) -> Result<RawResp, string> {
+    let b = buf;
+    while true {
+        let k = scan_head(b);
+        if k >= 0 {
+            let head = http_bytes_to_text(http_slice(b, 0, k))?;
+            let hlines: Array<string> = split(head, "\r\n");
+            let parts: Array<string> = split(hlines[0], " ");
+            let status = parts[1];
+            let cl = raw_clen(hlines)?;
+            let tail = http_slice(b, k + 4, len(b));
+            let got = raw_take(conn, tail, cl)?;
+            return Ok(RawResp { status: status, nbody: len(got.body), rest: got.rest });
+        } else {
+        }
+        if len(b) > 32768 {
+            return Err("no head");
+        }
+        let chunk = net_recv(conn, 4096)?;
+        if len(chunk) == 0 {
+            return Err("eof");
+        }
+        for x in chunk {
+            push(b, x);
+        }
+    }
+    return Err("unreachable");
+}
+
+// Content-Length of a parsed head (the pipeline server always
+// sends one; absence is a test bug, surfaced loudly).
+fn raw_clen(hlines: Array<string>) -> Result<int, string> {
+    for i in 1..len(hlines) {
+        let ci = index_of(hlines[i], ":");
+        if ci >= 0 {
+            let nm = substring(hlines[i], 0, ci);
+            if lower(nm) == "content-length" {
+                return Ok(parse_int(trim(substring(hlines[i], ci + 1, len(hlines[i])))));
+            } else {
+            }
+        } else {
+        }
+    }
+    return Err("no content-length");
+}
+
+// Two pipelined requests on one connection: proves the keep-alive
+// loop serves successive exchanges on the same green thread.
+fn raw_pipeline(port: int) -> Result<string, string> {
+    let conn = net_tcp_connect("localhost", port)?;
+    let q = http_text_to_bytes("GET /hello HTTP/1.1\r\nHost: x\r\n\r\nGET /missing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")?;
+    let n = net_send_all(conn, q)?;
+    if n != len(q) {
+        net_close(conn)?;
+        return Err("short send");
+    }
+    let empty: Array<int> = [];
+    let a = raw_one(conn, empty)?;
+    let b = raw_one(conn, a.rest)?;
+    net_close(conn)?;
+    return Ok(a.status + "+" + to_string(a.nbody) + ";" + b.status + "+" + to_string(b.nbody));
+}
+
+// ---------- driver ----------
+
+fn tx_text(r: Result<HttpClientResp, string>) -> Result<string, string> {
+    let resp = r?;
+    let t = http_bytes_to_text(resp.body)?;
+    return Ok(t);
+}
+
+fn clear_log(log: Array<string>) -> int {
+    while len(log) > 0 {
+        pop(log);
+    }
+    return 0;
+}
+
+fn log_text(log: Array<string>) -> string {
+    let mut out: string = "";
+    let mut first: bool = true;
+    for e in log {
+        if first {
+            first = false;
+        } else {
+            out = out + ",";
+        }
+        out = out + e;
+    }
+    return out;
+}
+
+// NOTE (runtime edge, not framework logic): returning a `Result`
+// whose payload transitively holds function values (routes,
+// middleware) and unwrapping it with `?` panics E0204 in v1
+// ("function from builtin") — so the builder takes the router as a
+// parameter (param-direction crossing is fine) and returns only
+// `Result<unit>`. Bare `?` statements unwrap to `unit`, which
+// carries no functions. See the Stage 2 report.
+fn build_router(router: HttpRouter, mwlog: Array<string>) -> Result<unit, string> {
+    route_add(router, "GET", "/users/{id}", h_user)?;
+    route_add(router, "GET", "/users/list", h_list)?;
+    route_add(router, "GET", "/static/*", h_static)?;
+    route_add(router, "*", "/any", h_any)?;
+    route_add(router, "GET", "/hello", h_hello)?;
+    route_add(router, "HEAD", "/hello", h_head_ok)?;
+    route_add(router, "POST", "/echo", h_echo)?;
+    route_add(router, "GET", "/q", h_query)?;
+    route_add(router, "GET", "/boom", h_boom)?;
+    route_add(router, "GET", "/short", h_short_handler)?;
+    route_add(router, "GET", "/redir", h_redir)?;
+    route_add(router, "GET", "/ext", h_ext)?;
+    route_add(router, "GET", "/loop", h_loop)?;
+    route_add(router, "GET", "/large", h_large)?;
+    route_add(router, "GET", "/e500", h_explicit_500)?;
+    let mw1 = fn(req: HttpRequest, next: fn(HttpRequest) -> Result<HttpResponse, string>) -> Result<HttpResponse, string> {
+        push(mwlog, "m1-in");
+        let r = next(req)?;
+        push(mwlog, "m1-out");
+        return Ok(r);
+    };
+    let mw2 = fn(req: HttpRequest, next: fn(HttpRequest) -> Result<HttpResponse, string>) -> Result<HttpResponse, string> {
+        push(mwlog, "m2-in");
+        let r = next(req)?;
+        push(mwlog, "m2-out");
+        return Ok(r);
+    };
+    let mw_short = fn(req: HttpRequest, next: fn(HttpRequest) -> Result<HttpResponse, string>) -> Result<HttpResponse, string> {
+        let hv = http_header_or(req.headers, "x-short", "")?;
+        if hv == "1" {
+            return http_text(200, "OK", "mw-short");
+        } else {
+        }
+        return next(req);
+    };
+    use_mw(router, mw1);
+    use_mw(router, mw2);
+    use_mw(router, mw_short);
+    return Ok(());
+}
+
+// Any-Err-is-good probe: the exchange must FAIL (wrong CA,
+// refused port, redirect budget, truncated peer). Failures
+// propagate untouched (fixed or transport wording — never
+// compared); an unexpected success becomes the FIXED
+// `"http: unexpected success"`, which the caller CAN compare
+// against. So `== unexpected` means the negative failed (BAD),
+// anything else means the expected `Err` arrived.
+fn neg_probe(make_bad: fn() -> Result<HttpClientResp, string>) -> Result<string, string> {
+    // Bare `?` statement: success unwraps to a discarded response
+    // (not a `Result`, so no E0307); failure propagates.
+    make_bad()?;
+    return Err("http: unexpected success");
+}
+
+fn phase_plain(port: int, mwlog: Array<string>) -> Result<string, string> {
+    let copts = HttpClientOpts { max_body: 65536, redirects: 3, host_allow: [] };
+    let h1 = tx_text(http_get("http://localhost:" + to_string(port) + "/hello", copts))?;
+    let h2 = tx_text(http_get("http://localhost:" + to_string(port) + "/users/%34%32", copts))?;
+    let h3 = tx_text(http_get("http://localhost:" + to_string(port) + "/users/list", copts))?;
+    let h4 = tx_text(http_get("http://localhost:" + to_string(port) + "/static/css/x", copts))?;
+    let h5 = tx_text(http_get("http://localhost:" + to_string(port) + "/any", copts))?;
+    let h6 = tx_text(http_do(HttpClientReq { method: "POST", url: "http://localhost:" + to_string(port) + "/any", headers: [], body: [], ca_pem: "" }, copts))?;
+    let q = tx_text(http_get("http://localhost:" + to_string(port) + "/q?a=1&b=%42", copts))?;
+    let eb: Array<int> = [0, 200, 255];
+    let er = http_post("http://localhost:" + to_string(port) + "/echo", [], eb, copts)?;
+    let mut ebin = "no";
+    if er.body == eb {
+        ebin = "yes";
+    } else {
+    }
+    let ev = http_header_get(er.headers, "x-echo")?;
+    // middleware order on one clean request
+    clear_log(mwlog);
+    let oh = tx_text(http_get("http://localhost:" + to_string(port) + "/hello", copts))?;
+    let order = log_text(mwlog) + ":" + oh;
+    // short-circuit: same URL, different header, handler bypassed
+    clear_log(mwlog);
+    let sh = http_do(HttpClientReq { method: "GET", url: "http://localhost:" + to_string(port) + "/short", headers: [HttpHeader { name: "X-Short", value: "1" }], body: [], ca_pem: "" }, copts)?;
+    let st = http_bytes_to_text(sh.body)?;
+    let hh = tx_text(http_get("http://localhost:" + to_string(port) + "/short", copts))?;
+    // redirect follow / no-follow / cross-host
+    let rf = tx_text(http_get("http://localhost:" + to_string(port) + "/redir", copts))?;
+    let copts0 = HttpClientOpts { max_body: 65536, redirects: 0, host_allow: [] };
+    let rn = http_get("http://localhost:" + to_string(port) + "/redir", copts0)?;
+    let rx = http_get("http://localhost:" + to_string(port) + "/ext", copts)?;
+    let copts1 = HttpClientOpts { max_body: 65536, redirects: 1, host_allow: [] };
+    let rl = neg_probe(fn() -> Result<HttpClientResp, string> {
+        return http_get("http://localhost:" + to_string(port) + "/loop", copts1);
+    });
+    let w_many: Result<string, string> = Err("http: too many redirects");
+    let w_bad: Result<string, string> = Err("http: unexpected success");
+    let mut many = "no";
+    if rl == w_many {
+        many = "yes";
+    } else {
+        if rl == w_bad {
+            many = "BAD";
+        } else {
+        }
+    }
+    // statuses: 404, 405+Allow, explicit 500, HEAD
+    let r404 = http_get("http://localhost:" + to_string(port) + "/missing", copts)?;
+    let r405 = http_do(HttpClientReq { method: "POST", url: "http://localhost:" + to_string(port) + "/hello", headers: [], body: [], ca_pem: "" }, copts)?;
+    let allow = http_header_get(r405.headers, "allow")?;
+    let r500 = http_get("http://localhost:" + to_string(port) + "/e500", copts)?;
+    let t500 = http_bytes_to_text(r500.body)?;
+    let rh = http_do(HttpClientReq { method: "HEAD", url: "http://localhost:" + to_string(port) + "/hello", headers: [], body: [], ca_pem: "" }, copts)?;
+    // policy errors (no server contact or pre-connect rejection)
+    let copts_allow = HttpClientOpts { max_body: 65536, redirects: 0, host_allow: ["example.com"] };
+    let e_allow = http_get("http://localhost:" + to_string(port) + "/hello", copts_allow);
+    let w_allow: Result<HttpClientResp, string> = Err("http: host not allowed");
+    let mut p_allow = "no";
+    if e_allow == w_allow {
+        p_allow = "yes";
+    } else {
+    }
+    let e_scheme = http_get("gopher://localhost:" + to_string(port) + "/x", copts);
+    let w_scheme: Result<HttpClientResp, string> = Err("http: bad scheme");
+    let mut p_scheme = "no";
+    if e_scheme == w_scheme {
+        p_scheme = "yes";
+    } else {
+    }
+    // client-side cap vs the 3000-byte body
+    let copts_cap = HttpClientOpts { max_body: 1024, redirects: 0, host_allow: [] };
+    let e_cap = http_get("http://localhost:" + to_string(port) + "/large", copts_cap);
+    let w_cap: Result<HttpClientResp, string> = Err("http: body too large");
+    let mut p_cap = "no";
+    if e_cap == w_cap {
+        p_cap = "yes";
+    } else {
+    }
+    // server-side cap: 8192 bytes vs 4096
+    let big: Array<int> = [];
+    for i in 0..8192 {
+        push(big, 65);
+    }
+    let rb = http_post("http://localhost:" + to_string(port) + "/echo", [], big, copts)?;
+    // refused port: bound-then-closed listener refuses deterministically
+    let tmp = net_tcp_listen(48519)?;
+    net_close(tmp)?;
+    let e_ref = neg_probe(fn() -> Result<HttpClientResp, string> {
+        return http_get("http://localhost:48519/", copts);
+    });
+    let mut p_ref = "yes";
+    if e_ref == w_bad {
+        p_ref = "BAD";
+    } else {
+    }
+    return Ok("hello=" + h1 + " user=" + h2 + " list=" + h3 + " static=" + h4 + " any=" + h5 + "," + h6 + " query=" + q + " echo=" + ebin + ":" + ev + " order=" + order + " short=" + st + "," + hh + " redir=" + rf + "," + to_string(rn.status) + "," + to_string(rx.status) + " many=" + many + " http=" + to_string(r404.status) + "," + to_string(r405.status) + ":" + allow + "," + to_string(r500.status) + ":" + t500 + " head=" + to_string(len(rh.body)) + " policy=" + p_allow + "," + p_scheme + "," + p_cap + " srvcap=" + to_string(rb.status) + " refused=" + p_ref);
+}
+
+fn phase_raw(port: int) -> Result<string, string> {
+    // keep-alive pipelining on one connection
+    let pipe = raw_pipeline(port)?;
+    // framing errors with fixed answers
+    let bad = raw_status(port, http_text_to_bytes("GARBAGE!!!\r\n\r\n")?, "bad")?;
+    let ver = raw_status(port, http_text_to_bytes("GET / HTTP/9.9\r\nHost: x\r\n\r\n")?, "ver")?;
+    // handler-Err aborts the connection (EOF, no 500 in v1 — see the
+    // module header), then the server keeps serving
+    let ab = raw_status(port, http_text_to_bytes("GET /boom HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")?, "abort")?;
+    let after = raw_status(port, http_text_to_bytes("GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")?, "after")?;
+    // chunked upload through a raw socket
+    let cu = raw_status(port, http_text_to_bytes("POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n8\r\n-chunked\r\n0\r\n\r\n")?, "chunked")?;
+    return Ok("pipe=" + pipe + " bad=" + bad + " ver=" + ver + " abort=" + ab + " after=" + after + " chunked=" + cu);
+}
+
+fn trunc_responder(listener: int, done: chan<string>) -> int {
+    let r = trunc_responder_inner(listener, done);
+    let want: Result<string, string> = Ok("done");
+    if r != want {
+        done <- "server-failed";
+    } else {
+    }
+    return 0;
+}
+
+fn trunc_responder_inner(listener: int, done: chan<string>) -> Result<string, string> {
+    // Promise 100 bytes, deliver 10, close: the client must fail
+    // with the fixed truncated-body error (never silent, never a
+    // partial body).
+    let acc = net_accept(listener)?;
+    let c = HttpConn { fd: acc, buf: [] };
+    let req = http_read_request(c, net_recv, net_send_all, 65536, "t")?;
+    let rb = http_bytes_to_text(req.body)?;
+    if rb != "" {
+        return Err("expected empty request body");
+    }
+    let head = http_text_to_bytes("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789")?;
+    let s = net_send_all(acc, head)?;
+    if s != len(head) {
+        return Err("short");
+    }
+    net_close(acc)?;
+    net_close(listener)?;
+    done <- "truncated-by-peer";
+    return Ok("done");
+}
+
+fn phase_trunc() -> Result<string, string> {
+    let done = chan<string>(1);
+    let l2 = net_tcp_listen(48518)?;
+    go {
+        trunc_responder(l2, done);
+    }
+    let copts = HttpClientOpts { max_body: 65536, redirects: 0, host_allow: [] };
+    let r = neg_probe(fn() -> Result<HttpClientResp, string> {
+        return http_get("http://localhost:48518/x", copts);
+    });
+    let w_trunc: Result<string, string> = Err("http: truncated body");
+    let w_bad: Result<string, string> = Err("http: unexpected success");
+    let mut out = "no";
+    if r == w_trunc {
+        out = "yes";
+    } else {
+        if r == w_bad {
+            out = "BAD";
+        } else {
+        }
+    }
+    let served = <-done;
+    return Ok("trunc=" + out + " " + served);
+}
+
+fn phase_tls(port: int) -> Result<string, string> {
+    let mwlog: Array<string> = [];
+    let router = http_router();
+    build_router(router, mwlog)?;
+    let opts = HttpServeOpts { expose_errors: false, max_body: 65536, keepalive_ms: 0, server_name: "toto-test" };
+    let cert = read_file("fixtures/server-cert.pem");
+    let key = read_file("fixtures/server-key.pem");
+    let ca = read_file("fixtures/ca.pem");
+    let listener = http_serve_tls(port, router, opts, cert, key)?;
+    let copts = HttpClientOpts { max_body: 65536, redirects: 0, host_allow: [] };
+    let r = http_do(HttpClientReq { method: "GET", url: "https://localhost:" + to_string(port) + "/hello", headers: [], body: [], ca_pem: ca }, copts)?;
+    let t = http_bytes_to_text(r.body)?;
+    // wrong CA: the handshake must fail (any error); an unexpected
+    // success becomes the fixed BAD marker via neg_probe.
+    let other_ca = read_file("fixtures/other-ca.pem");
+    let n = neg_probe(fn() -> Result<HttpClientResp, string> {
+        return http_do(HttpClientReq { method: "GET", url: "https://localhost:" + to_string(port) + "/hello", headers: [], body: [], ca_pem: other_ca }, copts);
+    });
+    let w_bad: Result<string, string> = Err("http: unexpected success");
+    let mut neg = "yes";
+    if n == w_bad {
+        neg = "BAD";
+    } else {
+    }
+    // the failed handshake leaves the server serving
+    let r2 = http_do(HttpClientReq { method: "GET", url: "https://localhost:" + to_string(port) + "/hello", headers: [], body: [], ca_pem: ca }, copts)?;
+    let t2 = http_bytes_to_text(r2.body)?;
+    net_close(listener)?;
+    return Ok("tls=" + t + ":" + to_string(r.status) + " neg=" + neg + " after=" + t2);
+}
+
+fn run_all() -> Result<string, string> {
+    // One plain server spans the client-policy phase and the raw
+    // framing phase (both target port 48511).
+    let mwlog: Array<string> = [];
+    let router = http_router();
+    build_router(router, mwlog)?;
+    let opts = HttpServeOpts { expose_errors: false, max_body: 4096, keepalive_ms: 0, server_name: "toto-test" };
+    let listener = http_serve(48511, router, opts)?;
+    let p1 = phase_plain(48511, mwlog)?;
+    println(p1);
+    let p2 = phase_raw(48511)?;
+    println(p2);
+    net_close(listener)?;
+    let p3 = phase_trunc()?;
+    println(p3);
+    let p4 = phase_tls(48512)?;
+    println(p4);
+    return Ok("HTTP-OK");
+}
+
+fn main() -> int {
+    println(run_all());
+    return 0;
+}

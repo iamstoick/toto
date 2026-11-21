@@ -1,0 +1,5 @@
+hello=hello user=user:42 list=user-list static=static any=any:GET,any:POST query=a=1;b=B; echo=yes:yes order=m1-in,m2-in,m2-out,m1-out:hello short=mw-short,handler-short redir=hello,302,302 many=yes http=404,405:GET, HEAD,500:explicit-500 head=0 policy=yes,yes,yes srvcap=400 refused=yes
+pipe=200+5;404+9 bad=400:bad ver=505:ver abort=EOF:abort after=200:after chunked=200:chunked
+trunc=yes truncated-by-peer
+tls=hello:200 neg=yes after=hello
+Ok(HTTP-OK)

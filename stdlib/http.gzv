@@ -1,0 +1,2093 @@
+// `gzv.std/http` — HTTP/1.1 framework (Enterprise Wave 2, Stage 2).
+//
+// Routing, middleware, and handlers on green threads over the Wave 1
+// substrate (`gzv.std/net` poller waits + `go`/channels); HTTP/1.1
+// only (keep-alive, Content-Length, chunked request/response bodies).
+// The client runs over the same substrate, upgrading to TLS through
+// `gzv.std/tls` for `https://`. HTTP/2, WebSockets, raw sockets, and
+// the full bytes story are separately gated proposals — NOT here.
+//
+// Constraints honored: D1–D8 frozen; 27 builtins frozen (no new
+// builtin — the ASCII codec below is pure Toto); Phase 5 module
+// model (path imports, flat namespace — every name here is
+// `http_*`/`Http*`, `route_add`, or `use_mw`); ADR-009 + spec §17
+// APPROVED-as-written (no timeout params — `keepalive_ms` is
+// advisory/recorded only; loopback only — `host_allow` can only
+// narrow the loopback set in v1); static linking only (no new FFI —
+// this module is pure Toto over `net_*`/`tls_*`); no Toto-owned
+// TLS/crypto; Windows gets check-time `E0301` via the net/tls
+// surface (this module adds no new platform surface).
+//
+// Green-thread boundary (§17.5 rule): every network wait
+// (accept/recv/send/connect-handshake) parks the task on `ToSched::Net`
+// with the fd nonblocking; the poller runs the one nonblocking
+// syscall; the worker stays free. One connection = one green thread.
+// TLS handshake/record steps run on the dedicated blocking pool
+// (interpreter: blocking calls) — never on the poller. DNS parks on
+// the blocking pool via `net_resolve` (inside `net_tcp_connect`).
+//
+// Text model (frozen builtins have no bytes<->string conversion, and
+// the full bytes story is gated out): HTTP framing text (request
+// line, header block, reason phrases) is printable ASCII plus
+// HT/LF/CR, mapped explicitly below. Bodies stay `Array<int>`
+// end to end and may carry any bytes (binary round-trips). A header
+// block that is not representable text is a framing error (400),
+// never silent acceptance — the same loud-rejection rule the json
+// module applies to `\uXXXX`. Consequences recorded as v1 limits:
+// header values are ASCII-only; obs-text/extended bytes in framing
+// are rejected; `decode_pct` fails on unrepresentable bytes.
+//
+// Status surface (FIXED — one choice each, golden-pinned):
+// handler/middleware `Ok(resp)` -> serialized as-is (including an
+// explicit `Ok` 500 a handler builds itself); handler or middleware
+// `Err` -> the connection closes with NO response (v1 language
+// limit — see `http_respond`: `Err` payloads are not values in v1
+// Toto, so the design's 500 mapping is unimplementable without
+// Phase-2 destructuring or a gated new builtin; `expose_errors` is
+// reserved). Unknown route -> 404; path known but method not
+// allowed -> 405 (+ `Allow`); bad framing/size/version ->
+// 400/505 as below; request version other than HTTP/1.0/1.1 -> 505.
+// Oversize headers/body and truncation also map to 400 (the request
+// is never served partially — the handler never sees a partial
+// body). A client that went away silently (EOF before any bytes,
+// recv error) closes quietly with no response attempt.
+//
+// Redirects (client): `redirects: 0` never follows (the 3xx is
+// returned as-is). Otherwise at most `redirects` hops; each hop
+// re-checks `host_allow`; only relative (`/...`) or absolute
+// same-scheme/same-host/same-port targets are followed —
+// cross-host/port/scheme 3xx responses are returned as-is, NEVER
+// followed silently. 301/302 rewrite non-GET/HEAD to GET (dropping
+// the body); 303 rewrites to GET (except HEAD); 307/308 keep method
+// and body. Exceeding the budget is `Err("http: too many redirects")`.
+//
+// `host_allow`: every request/redirect target host must be loopback
+// (`localhost`, `127.0.0.1`, `::1`) AND, when the list is non-empty,
+// a member of it. External hosts are rejected before connecting.
+import "gzv.std/net.gzv";
+import "gzv.std/tls.gzv";
+import "gzv.std/strings.gzv";
+
+// --- ASCII codec (private) ---
+
+// The 95 printable ASCII characters (bytes 32..126) in order, so a
+// character's index + 32 is its byte. Tab/LF/CR are handled
+// separately; anything else has no Toto-string form.
+fn http_print_str() -> string {
+    return " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+}
+
+// Single-character string -> byte value, or -1 when the character has
+// no HTTP-text form (caller fails loudly). Pure comparisons — no
+// allocation — so multi-KB heads stay linear (an earlier
+// table-scan revision was O(n*m^2) and stalled past ~3 KB).
+fn http_char_byte(c: string) -> int {
+    if c == "\t" {
+        return 9;
+    }
+    if c == "\n" {
+        return 10;
+    }
+    if c == "\r" {
+        return 13;
+    }
+    if c >= "0" && c <= "9" {
+        if c == "0" {
+            return 48;
+        }
+        if c == "1" {
+            return 49;
+        }
+        if c == "2" {
+            return 50;
+        }
+        if c == "3" {
+            return 51;
+        }
+        if c == "4" {
+            return 52;
+        }
+        if c == "5" {
+            return 53;
+        }
+        if c == "6" {
+            return 54;
+        }
+        if c == "7" {
+            return 55;
+        }
+        if c == "8" {
+            return 56;
+        }
+        return 57;
+    }
+    if c >= "A" && c <= "Z" {
+        if c == "A" {
+            return 65;
+        }
+        if c == "B" {
+            return 66;
+        }
+        if c == "C" {
+            return 67;
+        }
+        if c == "D" {
+            return 68;
+        }
+        if c == "E" {
+            return 69;
+        }
+        if c == "F" {
+            return 70;
+        }
+        if c == "G" {
+            return 71;
+        }
+        if c == "H" {
+            return 72;
+        }
+        if c == "I" {
+            return 73;
+        }
+        if c == "J" {
+            return 74;
+        }
+        if c == "K" {
+            return 75;
+        }
+        if c == "L" {
+            return 76;
+        }
+        if c == "M" {
+            return 77;
+        }
+        if c == "N" {
+            return 78;
+        }
+        if c == "O" {
+            return 79;
+        }
+        if c == "P" {
+            return 80;
+        }
+        if c == "Q" {
+            return 81;
+        }
+        if c == "R" {
+            return 82;
+        }
+        if c == "S" {
+            return 83;
+        }
+        if c == "T" {
+            return 84;
+        }
+        if c == "U" {
+            return 85;
+        }
+        if c == "V" {
+            return 86;
+        }
+        if c == "W" {
+            return 87;
+        }
+        if c == "X" {
+            return 88;
+        }
+        if c == "Y" {
+            return 89;
+        }
+        return 90;
+    }
+    if c >= "a" && c <= "z" {
+        if c == "a" {
+            return 97;
+        }
+        if c == "b" {
+            return 98;
+        }
+        if c == "c" {
+            return 99;
+        }
+        if c == "d" {
+            return 100;
+        }
+        if c == "e" {
+            return 101;
+        }
+        if c == "f" {
+            return 102;
+        }
+        if c == "g" {
+            return 103;
+        }
+        if c == "h" {
+            return 104;
+        }
+        if c == "i" {
+            return 105;
+        }
+        if c == "j" {
+            return 106;
+        }
+        if c == "k" {
+            return 107;
+        }
+        if c == "l" {
+            return 108;
+        }
+        if c == "m" {
+            return 109;
+        }
+        if c == "n" {
+            return 110;
+        }
+        if c == "o" {
+            return 111;
+        }
+        if c == "p" {
+            return 112;
+        }
+        if c == "q" {
+            return 113;
+        }
+        if c == "r" {
+            return 114;
+        }
+        if c == "s" {
+            return 115;
+        }
+        if c == "t" {
+            return 116;
+        }
+        if c == "u" {
+            return 117;
+        }
+        if c == "v" {
+            return 118;
+        }
+        if c == "w" {
+            return 119;
+        }
+        if c == "x" {
+            return 120;
+        }
+        if c == "y" {
+            return 121;
+        }
+        return 122;
+    }
+    if c == " " {
+        return 32;
+    }
+    if c == "!" {
+        return 33;
+    }
+    if c == "\"" {
+        return 34;
+    }
+    if c == "#" {
+        return 35;
+    }
+    if c == "$" {
+        return 36;
+    }
+    if c == "%" {
+        return 37;
+    }
+    if c == "&" {
+        return 38;
+    }
+    if c == "'" {
+        return 39;
+    }
+    if c == "(" {
+        return 40;
+    }
+    if c == ")" {
+        return 41;
+    }
+    if c == "*" {
+        return 42;
+    }
+    if c == "+" {
+        return 43;
+    }
+    if c == "," {
+        return 44;
+    }
+    if c == "-" {
+        return 45;
+    }
+    if c == "." {
+        return 46;
+    }
+    if c == "/" {
+        return 47;
+    }
+    if c == ":" {
+        return 58;
+    }
+    if c == ";" {
+        return 59;
+    }
+    if c == "<" {
+        return 60;
+    }
+    if c == "=" {
+        return 61;
+    }
+    if c == ">" {
+        return 62;
+    }
+    if c == "?" {
+        return 63;
+    }
+    if c == "@" {
+        return 64;
+    }
+    if c == "[" {
+        return 91;
+    }
+    if c == "\\" {
+        return 92;
+    }
+    if c == "]" {
+        return 93;
+    }
+    if c == "^" {
+        return 94;
+    }
+    if c == "_" {
+        return 95;
+    }
+    if c == "`" {
+        return 96;
+    }
+    if c == "{" {
+        return 123;
+    }
+    if c == "|" {
+        return 124;
+    }
+    if c == "}" {
+        return 125;
+    }
+    if c == "~" {
+        return 126;
+    }
+    return -1;
+}
+
+// Byte value -> one-character string, or "" when unrepresentable.
+// The table splits once per call site (callers hoist it); the per
+// byte step is a plain index.
+fn http_print_table() -> Array<string> {
+    return split(http_print_str(), "");
+}
+
+// Bytes -> text (request heads we parse, response heads the client
+// parses). Fails naming the first unrepresentable byte.
+pub fn http_bytes_to_text(data: Array<int>) -> Result<string, string> {
+    let tbl = http_print_table();
+    let mut out: string = "";
+    for i in 0..len(data) {
+        let b = data[i];
+        if b == 9 {
+            out = out + "\t";
+        } else {
+            if b == 10 {
+                out = out + "\n";
+            } else {
+                if b == 13 {
+                    out = out + "\r";
+                } else {
+                    if b < 32 || b > 126 {
+                        return Err("http: byte " + to_string(b) + " at index " + to_string(i) + " is not HTTP text");
+                    }
+                    out = out + tbl[b - 32];
+                }
+            }
+        }
+    }
+    return Ok(out);
+}
+
+// Text -> bytes (responses/requests we serialize). Fails naming the
+// first unrepresentable character index (never echoes the char, so
+// control text cannot leak into goldens).
+pub fn http_text_to_bytes(s: string) -> Result<Array<int>, string> {
+    let chars: Array<string> = split(s, "");
+    let mut out: Array<int> = [];
+    for i in 0..len(chars) {
+        let b = http_char_byte(chars[i]);
+        if b < 0 {
+            return Err("http: char at index " + to_string(i) + " is not HTTP text");
+        }
+        push(out, b);
+    }
+    return Ok(out);
+}
+
+// --- Types ---
+
+pub struct HttpHeader {
+    name: string,
+    value: string
+}
+
+pub struct HttpParam {
+    name: string,
+    value: string
+}
+
+// Server-side request. `params` holds the decoded `{name}` captures
+// of the matched route template (empty when the route has none);
+// `peer` is the loopback peer placeholder in v1 (the substrate
+// exposes no TCP peer address yet — recorded follow-up).
+pub struct HttpRequest {
+    method: string,
+    target: string,
+    version: string,
+    headers: Array<HttpHeader>,
+    body: Array<int>,
+    peer: string,
+    params: Array<HttpParam>
+}
+
+pub struct HttpResponse {
+    status: int,
+    reason: string,
+    headers: Array<HttpHeader>,
+    body: Array<int>
+}
+
+pub struct HttpRoute {
+    method: string,
+    pattern: string,
+    handler: fn(HttpRequest) -> Result<HttpResponse, string>
+}
+
+pub struct HttpRouter {
+    routes: Array<HttpRoute>,
+    middlewares: Array<fn(HttpRequest, fn(HttpRequest) -> Result<HttpResponse, string>) -> Result<HttpResponse, string>>
+}
+
+pub struct HttpServeOpts {
+    expose_errors: bool,
+    max_body: int,
+    keepalive_ms: int,
+    server_name: string
+}
+
+pub struct HttpClientOpts {
+    max_body: int,
+    redirects: int,
+    host_allow: Array<string>
+}
+
+pub struct HttpClientReq {
+    method: string,
+    url: string,
+    headers: Array<HttpHeader>,
+    body: Array<int>,
+    ca_pem: string
+}
+
+pub struct HttpClientResp {
+    status: int,
+    reason: string,
+    headers: Array<HttpHeader>,
+    body: Array<int>
+}
+
+// Match carrier (private): `matched` selects `params`.
+struct HttpMatch {
+    matched: bool,
+    params: Array<HttpParam>
+}
+
+// Route-lookup carrier (private): `status` is 200 (handler + decoded
+// params), 400 (template matched but a capture is not decodable),
+// 404, or 405 (`allow` filled). The handler slot always holds a
+// function (a never-called dummy off the 200 path).
+struct HttpFound {
+    status: int,
+    handler: fn(HttpRequest) -> Result<HttpResponse, string>,
+    params: Array<HttpParam>,
+    allow: Array<string>
+}
+
+// One connection's unread bytes (private). The array is shared by
+// reference, so readers append in place and advance by field
+// reassignment (`c.buf = rest`).
+struct HttpConn {
+    fd: int,
+    buf: Array<int>
+}
+
+// Parsed client URL (private).
+struct HttpUrl {
+    scheme: string,
+    host: string,
+    port: int,
+    target: string
+}
+
+// Empty router: no routes, no middleware.
+pub fn http_router() -> HttpRouter {
+    let routes: Array<HttpRoute> = [];
+    let mws: Array<fn(HttpRequest, fn(HttpRequest) -> Result<HttpResponse, string>) -> Result<HttpResponse, string>> = [];
+    return HttpRouter { routes: routes, middlewares: mws };
+}
+
+// Response constructor (pure): status is range-checked at send time
+// (out-of-range becomes 500 rather than a partial write).
+pub fn http_response(status: int, reason: string, headers: Array<HttpHeader>, body: Array<int>) -> HttpResponse {
+    return HttpResponse { status: status, reason: reason, headers: headers, body: body };
+}
+
+// Text-body response constructor: the body text must be HTTP text.
+pub fn http_text(status: int, reason: string, text: string) -> Result<HttpResponse, string> {
+    let body = http_text_to_bytes(text)?;
+    let headers: Array<HttpHeader> = [];
+    return Ok(HttpResponse { status: status, reason: reason, headers: headers, body: body });
+}
+
+// --- Header / query / pct helpers ---
+
+// Index of `name` (case-insensitive) or -1.
+fn http_header_find(headers: Array<HttpHeader>, name: string) -> int {
+    let want = lower(name);
+    for i in 0..len(headers) {
+        if lower(headers[i].name) == want {
+            return i;
+        } else {
+        }
+    }
+    return -1;
+}
+
+// First value of `name` (case-insensitive), or `Err` when absent.
+// Absent and present-but-empty stay distinct (`Ok("")` vs `Err`).
+pub fn http_header_get(headers: Array<HttpHeader>, name: string) -> Result<string, string> {
+    let i = http_header_find(headers, name);
+    if i < 0 {
+        return Err("http: missing header " + name);
+    }
+    return Ok(headers[i].value);
+}
+
+// Path-param lookup on a request's decoded captures.
+pub fn http_param(params: Array<HttpParam>, name: string) -> Result<string, string> {
+    for p in params {
+        if p.name == name {
+            return Ok(p.value);
+        } else {
+        }
+    }
+    return Err("http: missing param " + name);
+}
+
+// RFC 9110 token characters (header field names).
+fn http_is_token(s: string) -> bool {
+    if len(s) == 0 {
+        return false;
+    }
+    let chars: Array<string> = split(s, "");
+    for c in chars {
+        let b = http_char_byte(c);
+        if b < 0 {
+            return false;
+        }
+        if b >= 48 && b <= 57 {
+            continue;
+        }
+        if b >= 65 && b <= 90 {
+            continue;
+        }
+        if b >= 97 && b <= 122 {
+            continue;
+        }
+        if c == "!" || c == "#" || c == "$" || c == "%" || c == "&" {
+            continue;
+        }
+        if c == "'" || c == "*" || c == "+" || c == "-" || c == "." {
+            continue;
+        }
+        if c == "^" || c == "_" || c == "`" || c == "|" || c == "~" {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+fn http_hex_val(c: string) -> int {
+    let b = http_char_byte(c);
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55;
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87;
+    }
+    return -1;
+}
+
+// Percent-decode to text. `%XX` must be two hex digits resolving to
+// an HTTP-text byte, else `Err` (never silent mojibake).
+pub fn http_decode_pct(s: string) -> Result<string, string> {
+    let tbl = http_print_table();
+    let chars: Array<string> = split(s, "");
+    let mut out: string = "";
+    let mut i: int = 0;
+    while i < len(chars) {
+        if chars[i] == "%" {
+            if i + 2 >= len(chars) {
+                return Err("http: truncated percent encoding");
+            }
+            let hi = http_hex_val(chars[i + 1]);
+            let lo = http_hex_val(chars[i + 2]);
+            if hi < 0 || lo < 0 {
+                return Err("http: bad percent encoding");
+            }
+            let v = hi * 16 + lo;
+            if v == 9 {
+                out = out + "\t";
+            } else {
+                if v == 10 {
+                    out = out + "\n";
+                } else {
+                    if v == 13 {
+                        out = out + "\r";
+                    } else {
+                        if v < 32 || v > 126 {
+                            return Err("http: percent-encoded byte is not HTTP text");
+                        } else {
+                        }
+                        out = out + tbl[v - 32];
+                    }
+                }
+            }
+            i = i + 3;
+        } else {
+            out = out + chars[i];
+            i = i + 1;
+        }
+    }
+    return Ok(out);
+}
+
+// Split `target` into path (before the first `?`) for routing.
+fn http_path_of(target: string) -> string {
+    let parts: Array<string> = split(target, "?");
+    return parts[0];
+}
+
+// Query pairs of `target` (`path?query`), percent-decoded. No `?`
+// means no params. Empty pairs are skipped; a pair without `=`
+// decodes with an empty value.
+pub fn http_parse_query(target: string) -> Result<Array<HttpParam>, string> {
+    let out: Array<HttpParam> = [];
+    let tq: Array<string> = split(target, "?");
+    if len(tq) < 2 {
+        return Ok(out);
+    }
+    let mut query = tq[1];
+    for k in 2..len(tq) {
+        query = query + "?" + tq[k];
+    }
+    let pairs: Array<string> = split(query, "&");
+    for pair in pairs {
+        if pair == "" {
+            continue;
+        }
+        let kv: Array<string> = split(pair, "=");
+        let name = http_decode_pct(kv[0])?;
+        let mut value: string = "";
+        if len(kv) > 1 {
+            let mut rest = kv[1];
+            for k in 2..len(kv) {
+                rest = rest + "=" + kv[k];
+            }
+            value = http_decode_pct(rest)?;
+        }
+        push(out, HttpParam { name: name, value: value });
+    }
+    return Ok(out);
+}
+
+// --- Routing ---
+
+// Register `handler` for `method` + `pattern`. `method` `"*"` matches
+// all methods. Patterns are `/`-separated segment templates:
+// exact segments match literally, `{name}` captures one segment,
+// a trailing `*` matches the remaining prefix. `pattern` must start
+// with `/`; captures must be well-formed `{name}` (non-empty, no
+// nested braces). Registration order is the tiebreak for equally
+// specific routes.
+pub fn route_add(router: HttpRouter, method: string, pattern: string, handler: fn(HttpRequest) -> Result<HttpResponse, string>) -> Result<unit, string> {
+    if method == "" {
+        return Err("http: method is empty (use \"*\" for all methods)");
+    }
+    if pattern == "" || char_at(pattern, 0) != "/" {
+        return Err("http: pattern must start with \"/\"");
+    }
+    let parts: Array<string> = split(pattern, "/");
+    for seg in parts {
+        if seg == "" || seg == "*" {
+            continue;
+        }
+        let has_open = contains(seg, "{");
+        let has_close = contains(seg, "}");
+        if has_open || has_close {
+            if !(starts_with(seg, "{")) || !(ends_with(seg, "}")) || len(seg) < 3 {
+                return Err("http: bad capture in pattern " + pattern);
+            }
+            let inner = substring(seg, 1, len(seg) - 1);
+            if contains(inner, "{") || contains(inner, "}") {
+                return Err("http: bad capture in pattern " + pattern);
+            } else {
+            }
+        } else {
+        }
+    }
+    push(router.routes, HttpRoute { method: method, pattern: pattern, handler: handler });
+    return Ok(());
+}
+
+// Append middleware (runs in registration order, onion-style: each
+// middleware runs before and after `next`). Closures capture by
+// value, so route state is snapshotted at composition time.
+pub fn use_mw(router: HttpRouter, mw: fn(HttpRequest, fn(HttpRequest) -> Result<HttpResponse, string>) -> Result<HttpResponse, string>) -> unit {
+    push(router.middlewares, mw);
+}
+
+// Path split for matching: `/`-separated, empties dropped (so a
+// trailing `/` matches the bare path — documented normalization).
+fn http_split_segs(path: string) -> Array<string> {
+    let parts: Array<string> = split(path, "/");
+    let mut out: Array<string> = [];
+    for p in parts {
+        if p != "" {
+            push(out, p);
+        } else {
+        }
+    }
+    return out;
+}
+
+// Raw (still-encoded) match of `pattern` against `path`.
+fn http_route_match(pattern: string, path: string) -> HttpMatch {
+    let none: Array<HttpParam> = [];
+    let pats = http_split_segs(pattern);
+    let segs = http_split_segs(path);
+    let mut star: bool = false;
+    if len(pats) > 0 && pats[len(pats) - 1] == "*" {
+        star = true;
+    }
+    if star {
+        if len(segs) < len(pats) - 1 {
+            return HttpMatch { matched: false, params: none };
+        } else {
+        }
+    } else {
+        if len(segs) != len(pats) {
+            return HttpMatch { matched: false, params: none };
+        } else {
+        }
+    }
+    let mut params: Array<HttpParam> = [];
+    for i in 0..len(pats) {
+        if star && i == len(pats) - 1 {
+            break;
+        }
+        let p = pats[i];
+        if starts_with(p, "{") && ends_with(p, "}") {
+            push(params, HttpParam { name: substring(p, 1, len(p) - 1), value: segs[i] });
+        } else {
+            if p != segs[i] {
+                return HttpMatch { matched: false, params: none };
+            } else {
+            }
+        }
+    }
+    return HttpMatch { matched: true, params: params };
+}
+
+// A never-called placeholder for the lookup carrier's handler slot
+// (every `HttpFound` carries a function; only `status == 200` slots
+// are invoked).
+fn http_dummy_handler(req: HttpRequest) -> Result<HttpResponse, string> {
+    let body = http_text_to_bytes("unreachable")?;
+    return Ok(HttpResponse { status: 500, reason: "Internal Server Error", headers: [], body: body });
+}
+
+// Best-match lookup: exact segments (3) beat templates (2) beat the
+// trailing wildcard (1); ties go to the first registration.
+// `status` is 200 (handler + raw captures), 404, or 405 (`allow`
+// lists the registered methods for the path, in registration order,
+// deduplicated). Captures stay raw (still percent-encoded) — the
+// handler decodes what it uses via `http_decode_pct` (its `?`
+// propagates a failure exactly like any other handler error).
+fn http_find(router: HttpRouter, method: string, path: string) -> HttpFound {
+    let none: Array<HttpParam> = [];
+    let no_allow: Array<string> = [];
+    let mut best: int = 0;
+    let mut found = HttpFound { status: 404, handler: http_dummy_handler, params: none, allow: no_allow };
+    let mut allow: Array<string> = [];
+    for r in router.routes {
+        let m = http_route_match(r.pattern, path);
+        if !(m.matched) {
+            continue;
+        }
+        let pats = http_split_segs(r.pattern);
+        let mut score: int = 3;
+        for seg in pats {
+            if seg == "*" {
+                score = 1;
+                break;
+            }
+            if starts_with(seg, "{") {
+                score = 2;
+            } else {
+            }
+        }
+        if r.method != "*" && r.method != method {
+            let mut seen: bool = false;
+            for a in allow {
+                if a == r.method {
+                    seen = true;
+                } else {
+                }
+            }
+            if !(seen) {
+                push(allow, r.method);
+            }
+            continue;
+        }
+        if score > best {
+            best = score;
+            found = HttpFound { status: 200, handler: r.handler, params: m.params, allow: no_allow };
+        } else {
+        }
+    }
+    if found.status == 200 {
+        return found;
+    }
+    if len(allow) > 0 {
+        return HttpFound { status: 405, handler: http_dummy_handler, params: none, allow: allow };
+    }
+    return found;
+}
+
+// --- Dispatch ---
+
+// Compose the middleware onion around `handler` (first-registered is
+// outermost) and run it. Each closure captures its `(mw, next)` pair
+// by value — later registrations cannot disturb the chain.
+fn http_run_chain(router: HttpRouter, req: HttpRequest, handler: fn(HttpRequest) -> Result<HttpResponse, string>, params: Array<HttpParam>) -> Result<HttpResponse, string> {
+    let full = HttpRequest { method: req.method, target: req.target, version: req.version, headers: req.headers, body: req.body, peer: req.peer, params: params };
+    let mut h = handler;
+    let mut i = len(router.middlewares) - 1;
+    while i >= 0 {
+        let mw = router.middlewares[i];
+        let nxt = h;
+        h = fn(r: HttpRequest) -> Result<HttpResponse, string> { return mw(r, nxt); };
+        i = i - 1;
+    }
+    return h(full);
+}
+
+// Fixed error responses (total for the five framework statuses — the
+// literals are pure ASCII, so the codec cannot fail; `?` is the
+// honest carrier, never taken in practice).
+fn http_fixed(status: int) -> Result<HttpResponse, string> {
+    if status == 404 {
+        return http_text(404, "Not Found", "not found");
+    }
+    if status == 405 {
+        return http_text(405, "Method Not Allowed", "method not allowed");
+    }
+    if status == 500 {
+        return http_text(500, "Internal Server Error", "internal error");
+    }
+    if status == 505 {
+        return http_text(505, "Version Not Supported", "version not supported");
+    }
+    return http_text(400, "Bad Request", "bad request");
+}
+
+// Full dispatch for one request: routing, middleware, handler, and
+// the framework-owned error mapping. Returns `Ok(response)` for
+// every framework-decided path (404/405); the handler/middleware
+// result passes through untouched — an `Err` there propagates to
+// the connection loop, which closes the connection without a
+// response (v1 language limit, documented below), while `Ok(resp)`
+// is serialized.
+//
+// v1 LIMIT (flagged for user review): mapping handler/middleware
+// `Err(s)` to a 500 response — and the `expose_errors` selection of
+// its body — needs the `Err` payload as a value, but v1 Toto has no
+// `Err` destructuring (`match` is Phase 2 per spec §11; `?` only
+// propagates). The same wall hides the string from framework-side
+// logging. So `expose_errors` is accepted and RESERVED (no effect in
+// v1 — the secure default, fixed bodies, holds either way), and
+// handlers that must answer 500 with detail return
+// `Ok(http_text(500, ...))` explicitly — they hold the string.
+// Full design behavior needs Phase-2 destructuring (or a gated new
+// builtin) and is recorded as a follow-up.
+fn http_respond(router: HttpRouter, req: HttpRequest, expose_errors: bool) -> Result<HttpResponse, string> {
+    // `expose_errors` is reserved in v1 (see above): no branch reads
+    // it yet, so both settings behave identically and securely
+    // (unused non-`Result` bindings are legal).
+    let f = http_find(router, req.method, http_path_of(req.target));
+    if f.status == 404 {
+        let r404 = http_fixed(404)?;
+        return Ok(r404);
+    }
+    if f.status == 405 {
+        let mut r405 = http_fixed(405)?;
+        let mut allow_v: string = "";
+        let mut first: bool = true;
+        for a in f.allow {
+            if first {
+                first = false;
+            } else {
+                allow_v = allow_v + ", ";
+            }
+            allow_v = allow_v + a;
+        }
+        push(r405.headers, HttpHeader { name: "Allow", value: allow_v });
+        return Ok(r405);
+    }
+    let h = f.handler;
+    return http_run_chain(router, req, h, f.params);
+}
+
+// --- Framing ---
+
+// `headers` lookup with a default: always `Ok` (absent -> `dflt`,
+// present -> lowercased+trimmed value). The `Result` carrier lets
+// `?` deliver the plain string at use sites.
+pub fn http_header_or(headers: Array<HttpHeader>, name: string, dflt: string) -> Result<string, string> {
+    let v = http_header_get(headers, name);
+    let absent: Result<string, string> = Err("http: missing header " + name);
+    if v == absent {
+        return Ok(dflt);
+    }
+    return v;
+}
+
+// Lowercased+trimmed `Connection` view for keep-alive decisions.
+fn http_conn_token(headers: Array<HttpHeader>) -> Result<string, string> {
+    let v = http_header_or(headers, "connection", "")?;
+    return Ok(lower(trim(v)));
+}
+
+// Keep-alive decision: explicit `close` always wins; HTTP/1.0
+// defaults to close unless `keep-alive` is named; HTTP/1.1 defaults
+// to keep. Unknown tokens fall back to the version default.
+fn http_should_keep(req: HttpRequest) -> Result<bool, string> {
+    let t = http_conn_token(req.headers)?;
+    if contains(t, "close") {
+        return Ok(false);
+    }
+    if req.version == "HTTP/1.0" {
+        if contains(t, "keep-alive") {
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    return Ok(true);
+}
+
+// Serialize one response to bytes. Out-of-range statuses become a
+// fixed 500 (never a partial write); unrepresentable reason/header
+// text is `Err` (the caller maps it — server: abort, no partial).
+fn http_serialize(resp: HttpResponse, version: string, keep: bool, server_name: string, is_head: bool) -> Result<Array<int>, string> {
+    let mut status = resp.status;
+    let mut reason = resp.reason;
+    if status < 100 || status > 599 {
+        status = 500;
+        reason = "Internal Server Error";
+    }
+    let mut head: string = version + " " + to_string(status) + " " + reason + "\r\n";
+    // Validate the reason phrase (unrepresentable text fails here,
+    // before anything is written).
+    let reason_bytes = http_text_to_bytes(reason)?;
+    let reason_len = len(reason_bytes) + len(head);
+    if reason_len < 0 {
+        return Err("http: unreachable");
+    }
+    for h in resp.headers {
+        if !(http_is_token(h.name)) {
+            return Err("http: bad response header name");
+        }
+        head = head + h.name + ": " + h.value + "\r\n";
+    }
+    head = head + "Content-Length: " + to_string(len(resp.body)) + "\r\n";
+    if keep {
+        head = head + "Connection: keep-alive\r\n";
+    } else {
+        head = head + "Connection: close\r\n";
+    }
+    if server_name != "" {
+        head = head + "Server: " + server_name + "\r\n";
+    }
+    head = head + "\r\n";
+    let hb = http_text_to_bytes(head)?;
+    let mut out: Array<int> = [];
+    for b in hb {
+        push(out, b);
+    }
+    if is_head {
+        return Ok(out);
+    }
+    for b in resp.body {
+        push(out, b);
+    }
+    return Ok(out);
+}
+
+// Send already-serialized bytes; `Ok("sent")` or the send error.
+fn http_send_bytes(send_all: fn(int, Array<int>) -> Result<int, string>, fd: int, data: Array<int>) -> Result<string, string> {
+    let n = send_all(fd, data)?;
+    if n != len(data) {
+        return Err("http: short send");
+    }
+    return Ok("sent");
+}
+
+// Fixed-status send used before dispatch exists (400/505 paths):
+// serialize the fixed response for `code` and send it.
+fn http_send_fixed(send_all: fn(int, Array<int>) -> Result<int, string>, fd: int, code: int, server_name: string) -> Result<string, string> {
+    let r = http_fixed(code)?;
+    let b = http_serialize(r, "HTTP/1.1", false, server_name, false)?;
+    return http_send_bytes(send_all, fd, b);
+}
+
+// Slice `[from, to)` of a byte array.
+fn http_slice(a: Array<int>, from: int, to: int) -> Array<int> {
+    let mut out: Array<int> = [];
+    for i in from..to {
+        push(out, a[i]);
+    }
+    return out;
+}
+
+// Start index of the head terminator `\r\n\r\n` in `buf`, or -1.
+fn http_head_end(buf: Array<int>) -> int {
+    if len(buf) < 4 {
+        return -1;
+    }
+    for i in 0..(len(buf) - 3) {
+        if buf[i] == 13 && buf[i + 1] == 10 && buf[i + 2] == 13 && buf[i + 3] == 10 {
+            return i;
+        } else {
+        }
+    }
+    return -1;
+}
+
+// Index of `\r\n` at/after `from`, or -1.
+fn http_line_end(buf: Array<int>, from: int) -> int {
+    if from + 1 >= len(buf) {
+        return -1;
+    }
+    for i in from..(len(buf) - 1) {
+        if buf[i] == 13 && buf[i + 1] == 10 {
+            return i;
+        } else {
+        }
+    }
+    return -1;
+}
+
+// Read until the head terminator, leaving body bytes in `c.buf`.
+// Returns the head text. Transport errors (`recv` failing) and
+// `"http: client closed"` (EOF with zero head bytes) propagate for
+// a silent close — no response is possible or attempted. Every
+// other failure (oversize, truncation, non-text head) is a framing
+// error the CALLER answers with a fixed 400 (the dynamic detail, if
+// any, is never echoed to the peer).
+// `http_is_text` precheck + infallible `?` pattern: every failure
+// site below sends exactly one fixed response itself (creators send,
+// propagators never do), then returns a FIXED error string — so the
+// caller answers 400/505 with one comparison-free pass-through and
+// the silent `"http: client closed"` stays exact-matchable.
+fn http_is_text(raw: Array<int>) -> bool {
+    for b in raw {
+        let ok = b == 9 || b == 10 || b == 13 || (b >= 32 && b <= 126);
+        if ok {
+            continue;
+        } else {
+        }
+        return false;
+    }
+    return true;
+}
+
+fn http_note_sent(s: Result<string, string>) -> bool {
+    let want: Result<string, string> = Ok("sent");
+    if s == want {
+        return true;
+    }
+    return false;
+}
+
+// Discard-a-close-result helper (bare `http_note_close(cr);` keeps a
+// close outcome used without branching on it).
+fn http_note_close(r: Result<int, string>) -> bool {
+    let want: Result<int, string> = Ok(0);
+    if r == want {
+        return true;
+    }
+    return false;
+}
+
+fn http_read_head_text(c: HttpConn, recv: fn(int, int) -> Result<Array<int>, string>) -> Result<string, string> {
+    while true {
+        let k = http_head_end(c.buf);
+        if k >= 0 {
+            let raw = http_slice(c.buf, 0, k);
+            c.buf = http_slice(c.buf, k + 4, len(c.buf));
+            if !(http_is_text(raw)) {
+                return Err("http: head not text");
+            }
+            // Infallible after the precheck: every byte is text.
+            let tt = http_bytes_to_text(raw)?;
+            return Ok(tt);
+        }
+        if len(c.buf) > 16384 {
+            return Err("http: head too large");
+        }
+        let chunk = recv(c.fd, 4096)?;
+        if len(chunk) == 0 {
+            if len(c.buf) == 0 {
+                return Err("http: client closed");
+            }
+            return Err("http: truncated head");
+        }
+        for b in chunk {
+            push(c.buf, b);
+        }
+    }
+    return Err("http: unreachable");
+}
+
+// All-decimal, 1..18 digits (18 caps below i64 range so `parse_int`
+// cannot panic).
+fn http_is_clen(s: string) -> bool {
+    if len(s) == 0 || len(s) > 18 {
+        return false;
+    }
+    let chars: Array<string> = split(s, "");
+    for ch in chars {
+        let b = http_char_byte(ch);
+        if b < 48 || b > 57 {
+            return false;
+        } else {
+        }
+    }
+    return true;
+}
+
+// Read exactly `n` body bytes (buffered first), appending to `out`.
+// EOF before `n` is `Err("http: truncated body")` — the design's
+// truncated-body error, never a silent partial body.
+fn http_read_exact(c: HttpConn, recv: fn(int, int) -> Result<Array<int>, string>, n: int, out: Array<int>) -> Result<string, string> {
+    // Progress is a local counter: `out` may already hold earlier
+    // chunks (multi-chunk bodies share it), so `len(out)` is not the
+    // position in THIS read.
+    let mut got: int = 0;
+    while got < n {
+        if len(c.buf) > 0 {
+            let mut take = n - got;
+            if take > len(c.buf) {
+                take = len(c.buf);
+            }
+            for i in 0..take {
+                push(out, c.buf[i]);
+            }
+            c.buf = http_slice(c.buf, take, len(c.buf));
+            got = got + take;
+            continue;
+        }
+        let chunk = recv(c.fd, 4096)?;
+        if len(chunk) == 0 {
+            return Err("http: truncated body");
+        }
+        for b in chunk {
+            push(c.buf, b);
+        }
+    }
+    return Ok("ok");
+}
+
+// One `\r\n`-terminated line from the buffered stream (terminator
+// consumed, not included). Fixed errors; EOF is truncation.
+fn http_read_line(c: HttpConn, recv: fn(int, int) -> Result<Array<int>, string>) -> Result<string, string> {
+    while true {
+        let k = http_line_end(c.buf, 0);
+        if k >= 0 {
+            let raw = http_slice(c.buf, 0, k);
+            c.buf = http_slice(c.buf, k + 2, len(c.buf));
+            let t = http_bytes_to_text(raw)?;
+            return Ok(t);
+        }
+        if len(c.buf) > 8192 {
+            return Err("http: line too long");
+        }
+        let chunk = recv(c.fd, 4096)?;
+        if len(chunk) == 0 {
+            return Err("http: truncated body");
+        }
+        for b in chunk {
+            push(c.buf, b);
+        }
+    }
+    return Err("http: unreachable");
+}
+
+// Answer-and-fail for request errors created while parsing (the
+// caller IS the creator here, so exactly one response goes out):
+// send the fixed `code`, then fail with the FIXED `msg`.
+fn http_fail_req(send_all: fn(int, Array<int>) -> Result<int, string>, fd: int, server_name: string, code: int, msg: string) -> Result<HttpRequest, string> {
+    http_note_sent(http_send_fixed(send_all, fd, code, server_name));
+    return Err(msg);
+}
+
+// Read + parse one request. Silent (`"http: client closed"` or a
+// transport error) iff no response was or could be attempted — the
+// caller closes quietly. Every other failure sent exactly one fixed
+// 400 (or 505 for the version) before returning.
+fn http_read_request(c: HttpConn, recv: fn(int, int) -> Result<Array<int>, string>, send_all: fn(int, Array<int>) -> Result<int, string>, max_body: int, server_name: string) -> Result<HttpRequest, string> {
+    let head = http_read_head_text(c, recv);
+    let e_closed: Result<string, string> = Err("http: client closed");
+    if head == e_closed {
+        return Err("http: client closed");
+    }
+    let e_trunc: Result<string, string> = Err("http: truncated head");
+    let e_big: Result<string, string> = Err("http: head too large");
+    let e_text: Result<string, string> = Err("http: head not text");
+    if head == e_trunc {
+        return http_fail_req(send_all, c.fd, server_name, 400, "http: truncated head");
+    }
+    if head == e_big {
+        return http_fail_req(send_all, c.fd, server_name, 400, "http: head too large");
+    }
+    if head == e_text {
+        return http_fail_req(send_all, c.fd, server_name, 400, "http: head not text");
+    }
+    // Anything left is `Ok(text)` (transport errors fell through to
+    // the silent path above by never matching: the send is skipped
+    // and the error propagates).
+    let text = head?;
+    let lines: Array<string> = split(text, "\r\n");
+    // Bare CR/LF inside the head is a framing attack (RFC 9112 §2.2:
+    // servers MUST reject with 400) — the terminator scan only
+    // honors strict CRLF, so any survivor here is lone.
+    for ln in lines {
+        if contains(ln, "\n") {
+            return http_fail_req(send_all, c.fd, server_name, 400, "http: bad framing");
+        } else {
+        }
+    }
+    let parts: Array<string> = split(lines[0], " ");
+    if len(parts) != 3 {
+        return http_fail_req(send_all, c.fd, server_name, 400, "http: bad request line");
+    }
+    let method = parts[0];
+    let target = parts[1];
+    let version = parts[2];
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return http_fail_req(send_all, c.fd, server_name, 505, "http: bad version");
+    }
+    if method == "" {
+        return http_fail_req(send_all, c.fd, server_name, 400, "http: bad method");
+    }
+    if target == "" {
+        return http_fail_req(send_all, c.fd, server_name, 400, "http: bad target");
+    }
+    if char_at(target, 0) != "/" {
+        return http_fail_req(send_all, c.fd, server_name, 400, "http: bad target");
+    }
+    let mut headers: Array<HttpHeader> = [];
+    for i in 1..len(lines) {
+        let ln = lines[i];
+        let ci = index_of(ln, ":");
+        if ci < 0 {
+            return http_fail_req(send_all, c.fd, server_name, 400, "http: bad header");
+        }
+        let nm = substring(ln, 0, ci);
+        let val = trim(substring(ln, ci + 1, len(ln)));
+        if !(http_is_token(nm)) {
+            return http_fail_req(send_all, c.fd, server_name, 400, "http: bad header name");
+        }
+        push(headers, HttpHeader { name: nm, value: val });
+    }
+    // Length accounting: at most one Content-Length (strict — a
+    // second line is 400), Transfer-Encoding only as exactly
+    // `chunked`, and never both together (RFC 9112 §6.3).
+    let mut clen: int = -1;
+    let mut n_clen: int = 0;
+    let mut chunked: bool = false;
+    let mut n_te: int = 0;
+    for h in headers {
+        if lower(h.name) == "content-length" {
+            n_clen = n_clen + 1;
+            if n_clen > 1 {
+                return http_fail_req(send_all, c.fd, server_name, 400, "http: bad length");
+            }
+            if !(http_is_clen(h.value)) {
+                return http_fail_req(send_all, c.fd, server_name, 400, "http: bad length");
+            }
+            clen = parse_int(h.value);
+        }
+        if lower(h.name) == "transfer-encoding" {
+            n_te = n_te + 1;
+            if n_te > 1 {
+                return http_fail_req(send_all, c.fd, server_name, 400, "http: bad coding");
+            }
+            let codings: Array<string> = split(lower(trim(h.value)), ",");
+            if len(codings) != 1 {
+                return http_fail_req(send_all, c.fd, server_name, 400, "http: bad coding");
+            }
+            if trim(codings[0]) != "chunked" {
+                return http_fail_req(send_all, c.fd, server_name, 400, "http: bad coding");
+            }
+            chunked = true;
+        } else {
+        }
+    }
+    if chunked && n_clen > 0 {
+        return http_fail_req(send_all, c.fd, server_name, 400, "http: bad length");
+    }
+    let mut body: Array<int> = [];
+    if chunked {
+        let total = http_read_chunked(c, recv, send_all, server_name, max_body, body)?;
+        if total < 0 {
+            return Err("http: unreachable");
+        } else {
+        }
+    } else {
+        if clen >= 0 {
+            if clen > max_body {
+                return http_fail_req(send_all, c.fd, server_name, 400, "http: body too large");
+            }
+            let ex = http_read_exact(c, recv, clen, body);
+            let e_body_trunc: Result<string, string> = Err("http: truncated body");
+            if ex == e_body_trunc {
+                return Err("http: truncated body");
+            }
+            let ex_ok = ex?;
+            if ex_ok != "ok" {
+                return Err("http: unreachable");
+            } else {
+            }
+        } else {
+        }
+    }
+    let no_params: Array<HttpParam> = [];
+    return Ok(HttpRequest { method: method, target: target, version: version, headers: headers, body: body, peer: "127.0.0.1", params: no_params });
+}
+
+// Chunked request body into `out` (cap `max_body`). Truncation is the
+// bare `"http: truncated body"` (peer gone — no response attempted);
+// oversize/malformed sends exactly one fixed 400 here (creator
+// sends), then fails fixed.
+fn http_read_chunked(c: HttpConn, recv: fn(int, int) -> Result<Array<int>, string>, send_all: fn(int, Array<int>) -> Result<int, string>, server_name: string, max_body: int, out: Array<int>) -> Result<int, string> {
+    let mut total: int = 0;
+    while true {
+        let line = http_read_line(c, recv);
+        let e_trunc: Result<string, string> = Err("http: truncated body");
+        if line == e_trunc {
+            return Err("http: truncated body");
+        }
+        let e_long: Result<string, string> = Err("http: line too long");
+        if line == e_long {
+            http_note_sent(http_send_fixed(send_all, c.fd, 400, server_name));
+            return Err("http: line too long");
+        }
+        let size_text = line?;
+        let semi: Array<string> = split(size_text, ";");
+        let hexs = trim(semi[0]);
+        if len(hexs) == 0 || len(hexs) > 15 {
+            http_note_sent(http_send_fixed(send_all, c.fd, 400, server_name));
+            return Err("http: bad chunk");
+        }
+        let mut size: int = 0;
+        let hexchars: Array<string> = split(hexs, "");
+        for ch in hexchars {
+            let v = http_hex_val(ch);
+            if v < 0 {
+                http_note_sent(http_send_fixed(send_all, c.fd, 400, server_name));
+                return Err("http: bad chunk");
+            }
+            size = size * 16 + v;
+        }
+        if size == 0 {
+            // Trailers: read and discard through the empty line.
+            while true {
+                let tr = http_read_line(c, recv);
+                if tr == e_trunc {
+                    return Err("http: truncated body");
+                }
+                if tr == e_long {
+                    http_note_sent(http_send_fixed(send_all, c.fd, 400, server_name));
+                    return Err("http: line too long");
+                }
+                let tls = tr?;
+                if tls == "" {
+                    break;
+                } else {
+                }
+            }
+            return Ok(total);
+        }
+        if total + size > max_body {
+            http_note_sent(http_send_fixed(send_all, c.fd, 400, server_name));
+            return Err("http: body too large");
+        }
+        let ex = http_read_exact(c, recv, size, out);
+        if ex == e_trunc {
+            return Err("http: truncated body");
+        }
+        let ex_ok = ex?;
+        if ex_ok != "ok" {
+            return Err("http: unreachable");
+        }
+        total = total + size;
+        // Each chunk is followed by CRLF.
+        let crlf: Array<int> = [];
+        let cr = http_read_exact(c, recv, 2, crlf);
+        if cr == e_trunc {
+            return Err("http: truncated body");
+        }
+        let cr_ok = cr?;
+        if cr_ok != "ok" {
+            return Err("http: unreachable");
+        }
+        if len(crlf) != 2 || crlf[0] != 13 || crlf[1] != 10 {
+            http_note_sent(http_send_fixed(send_all, c.fd, 400, server_name));
+            return Err("http: bad chunk");
+        } else {
+        }
+    }
+    return Err("http: unreachable");
+}
+
+// --- Server ---
+
+// One request/response exchange on an open connection: read (fixed
+// 400/505 inside on framing errors), dispatch, serialize, send.
+// Returns `Ok("keep")` / `Ok("close")`; any `Err` (silent transport
+// loss, truncation, handler-error propagation) means close quietly.
+fn http_conn_step(c: HttpConn, router: HttpRouter, opts: HttpServeOpts, send_all: fn(int, Array<int>) -> Result<int, string>, recv: fn(int, int) -> Result<Array<int>, string>) -> Result<string, string> {
+    let req = http_read_request(c, recv, send_all, opts.max_body, opts.server_name)?;
+    let rr = http_respond(router, req, opts.expose_errors);
+    let resp = rr?;
+    let keep = http_should_keep(req)?;
+    let head_only = req.method == "HEAD";
+    let sent = http_send_response(send_all, c.fd, resp, req.version, keep, opts.server_name, head_only)?;
+    if sent != "sent" {
+        return Err("http: unreachable");
+    }
+    if keep {
+        return Ok("keep");
+    }
+    return Ok("close");
+}
+
+// Serialize + send one response (server side).
+fn http_send_response(send_all: fn(int, Array<int>) -> Result<int, string>, fd: int, resp: HttpResponse, version: string, keep: bool, server_name: string, is_head: bool) -> Result<string, string> {
+    let bytes = http_serialize(resp, version, keep, server_name, is_head)?;
+    return http_send_bytes(send_all, fd, bytes);
+}
+
+// Connection task: keep-alive exchanges until close/error, then
+// exactly one close. Never fails loudly — every failure path ends
+// here (the client observes EOF, possibly after a fixed 400/505).
+fn http_conn_loop(c: HttpConn, router: HttpRouter, opts: HttpServeOpts, send_all: fn(int, Array<int>) -> Result<int, string>, recv: fn(int, int) -> Result<Array<int>, string>, close_fn: fn(int) -> Result<int, string>) -> int {
+    while true {
+        let s = http_conn_step(c, router, opts, send_all, recv);
+        let keep_m: Result<string, string> = Ok("keep");
+        if s != keep_m {
+            break;
+        } else {
+        }
+    }
+    let cr = close_fn(c.fd);
+    http_note_close(cr);
+    return 0;
+}
+
+// Plain-TCP connection task.
+fn http_conn_plain(conn: int, router: HttpRouter, opts: HttpServeOpts) -> int {
+    let c = HttpConn { fd: conn, buf: [] };
+    http_conn_loop(c, router, opts, net_send_all, net_recv, net_close);
+    return 0;
+}
+
+// TLS connection task (handshake already done by the accept step).
+fn http_conn_tls(conn: int, router: HttpRouter, opts: HttpServeOpts) -> int {
+    let c = HttpConn { fd: conn, buf: [] };
+    http_conn_loop(c, router, opts, tls_send_all, tls_recv, tls_close);
+    return 0;
+}
+
+// Accept one plain connection and hand it to its green thread.
+// `Err` (listener closed) stops the loop; anything else serves.
+fn http_accept_one(listener: int, router: HttpRouter, opts: HttpServeOpts) -> Result<string, string> {
+    let conn = net_accept(listener)?;
+    go {
+        http_conn_plain(conn, router, opts);
+    }
+    return Ok("ok");
+}
+
+fn http_accept_loop(listener: int, router: HttpRouter, opts: HttpServeOpts) -> int {
+    while true {
+        let r = http_accept_one(listener, router, opts);
+        let want: Result<string, string> = Ok("ok");
+        if r != want {
+            break;
+        } else {
+        }
+    }
+    return 0;
+}
+
+// Accept one connection and upgrade it to TLS before handing it to
+// its green thread. A failed handshake closes the conn and KEEPS
+// serving (only a dead listener stops the loop).
+fn http_accept_one_tls(listener: int, router: HttpRouter, opts: HttpServeOpts, cert_pem: string, key_pem: string) -> Result<string, string> {
+    let conn = net_accept(listener)?;
+    let t = tls_server_accept(conn, cert_pem, key_pem);
+    let up: Result<int, string> = Ok(conn);
+    if t == up {
+        go {
+            http_conn_tls(conn, router, opts);
+        }
+        return Ok("ok");
+    }
+    let cr: Result<int, string> = net_close(conn);
+    http_note_close(cr);
+    return Ok("ok");
+}
+
+fn http_accept_loop_tls(listener: int, router: HttpRouter, opts: HttpServeOpts, cert_pem: string, key_pem: string) -> int {
+    while true {
+        let r = http_accept_one_tls(listener, router, opts, cert_pem, key_pem);
+        let want: Result<string, string> = Ok("ok");
+        if r != want {
+            break;
+        } else {
+        }
+    }
+    return 0;
+}
+
+// Bind loopback + listen, spawn the accept loop on its own green
+// thread, and return the listener fd. `net_close(listener)` stops
+// the loop (a parked accept wakes with `Err`). `max_body < 1` and an
+// unrepresentable `server_name` fail fast here, not per connection.
+pub fn http_serve(port: int, router: HttpRouter, opts: HttpServeOpts) -> Result<int, string> {
+    if opts.max_body < 1 {
+        return Err("http: max_body must be >= 1");
+    }
+    if opts.server_name != "" {
+        let sn = http_text_to_bytes(opts.server_name)?;
+    }
+    let listener = net_tcp_listen(port)?;
+    go {
+        http_accept_loop(listener, router, opts);
+    }
+    return Ok(listener);
+}
+
+// TLS twin of http_serve: each accepted connection completes the
+// server handshake (proving cert_pem/key_pem) before serving.
+// Clients verify the chain against their CA (tls_client_connect
+// funneled through http_do with ca_pem).
+pub fn http_serve_tls(port: int, router: HttpRouter, opts: HttpServeOpts, cert_pem: string, key_pem: string) -> Result<int, string> {
+    if opts.max_body < 1 {
+        return Err("http: max_body must be >= 1");
+    }
+    if opts.server_name != "" {
+        let sn = http_text_to_bytes(opts.server_name)?;
+    }
+    if cert_pem == "" || key_pem == "" {
+        return Err("http: cert_pem and key_pem must be non-empty");
+    }
+    let listener = net_tcp_listen(port)?;
+    go {
+        http_accept_loop_tls(listener, router, opts, cert_pem, key_pem);
+    }
+    return Ok(listener);
+}
+
+// --- Client ---
+
+// The client never answers: creator-sends routed here fail, and the
+// fixed error propagates. (Keeps the chunked decoder byte-identical
+// between server and client.)
+fn http_no_send(fd: int, data: Array<int>) -> Result<int, string> {
+    return Err("http: no send");
+}
+
+fn http_is_port(s: string) -> bool {
+    if len(s) == 0 || len(s) > 5 {
+        return false;
+    }
+    if !(http_is_clen(s)) {
+        return false;
+    }
+    let p = parse_int(s);
+    return p >= 1 && p <= 65535;
+}
+
+// `http://host[:port][/target]` / `https://...` only (the framework
+// is loopback HTTP/1.1). Absolute-form, userinfo, and exotic hosts
+// are loud errors, never silent rewrites.
+fn http_parse_url(url: string) -> Result<HttpUrl, string> {
+    let mut scheme: string = "";
+    let mut rest: string = "";
+    let mut dflt: int = 0;
+    if starts_with(url, "https://") {
+        scheme = "https";
+        rest = substring(url, 8, len(url));
+        dflt = 443;
+    } else {
+        if starts_with(url, "http://") {
+            scheme = "http";
+            rest = substring(url, 7, len(url));
+            dflt = 80;
+        } else {
+            return Err("http: bad scheme");
+        }
+    }
+    let auth_end = index_of(rest, "/");
+    let mut authority = rest;
+    let mut target: string = "/";
+    if auth_end >= 0 {
+        authority = substring(rest, 0, auth_end);
+        target = substring(rest, auth_end, len(rest));
+    }
+    if contains(authority, "@") {
+        return Err("http: userinfo not supported");
+    }
+    if authority == "" {
+        return Err("http: bad host");
+    }
+    let mut host = authority;
+    let mut port = dflt;
+    if starts_with(authority, "[") {
+        let close_bracket = index_of(authority, "]");
+        if close_bracket < 0 {
+            return Err("http: bad host");
+        }
+        host = substring(authority, 1, close_bracket);
+        if host == "" {
+            return Err("http: bad host");
+        }
+        let tail = substring(authority, close_bracket + 1, len(authority));
+        if tail != "" {
+            if !(starts_with(tail, ":")) {
+                return Err("http: bad port");
+            }
+            let ps = substring(tail, 1, len(tail));
+            if !(http_is_port(ps)) {
+                return Err("http: bad port");
+            }
+            port = parse_int(ps);
+        } else {
+        }
+    } else {
+        if contains(authority, ":") {
+            let ap: Array<string> = split(authority, ":");
+            if len(ap) != 2 {
+                return Err("http: bad host");
+            }
+            host = ap[0];
+            if host == "" {
+                return Err("http: bad host");
+            }
+            if !(http_is_port(ap[1])) {
+                return Err("http: bad port");
+            }
+            port = parse_int(ap[1]);
+        } else {
+        }
+    }
+    return Ok(HttpUrl { scheme: scheme, host: host, port: port, target: target });
+}
+
+fn http_url_string(u: HttpUrl) -> string {
+    let mut host = u.host;
+    if contains(host, ":") && !(starts_with(host, "[")) {
+        host = "[" + host + "]";
+    }
+    return u.scheme + "://" + host + ":" + to_string(u.port) + u.target;
+}
+
+// Loopback set AND the allowlist (empty list = every loopback name).
+fn http_host_allowed(host: string, allow: Array<string>) -> bool {
+    let h = lower(host);
+    if h != "localhost" && h != "127.0.0.1" && h != "::1" {
+        return false;
+    }
+    if len(allow) == 0 {
+        return true;
+    }
+    for a in allow {
+        if lower(a) == h {
+            return true;
+        } else {
+        }
+    }
+    return false;
+}
+
+fn http_is_redirect_status(status: int) -> bool {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+// Next hop: relative targets stay on the current origin; absolute
+// targets must match scheme+host+port exactly. Anything else is the
+// single fixed `"http: cross-host redirect"` — the caller returns
+// the 3xx as-is, NEVER following silently.
+fn http_next_url(loc: string, cur: HttpUrl) -> Result<HttpUrl, string> {
+    if starts_with(loc, "/") {
+        return Ok(HttpUrl { scheme: cur.scheme, host: cur.host, port: cur.port, target: loc });
+    }
+    let u = http_parse_url(loc);
+    let e_scheme: Result<HttpUrl, string> = Err("http: bad scheme");
+    let e_host: Result<HttpUrl, string> = Err("http: bad host");
+    let e_port: Result<HttpUrl, string> = Err("http: bad port");
+    let e_user: Result<HttpUrl, string> = Err("http: userinfo not supported");
+    if u == e_scheme || u == e_host || u == e_port || u == e_user {
+        return Err("http: cross-host redirect");
+    }
+    // Infallible now: every `http_parse_url` error is enumerated
+    // above (a new parse error later would propagate here instead of
+    // following — fail-closed, never a silent cross).
+    let uu = u?;
+    if uu.scheme != cur.scheme || lower(uu.host) != lower(cur.host) || uu.port != cur.port {
+        return Err("http: cross-host redirect");
+    }
+    return Ok(uu);
+}
+
+// 301/302 rewrite non-GET/HEAD to GET (body dropped by the caller);
+// 303 rewrites to GET (HEAD stays HEAD); 307/308 keep both.
+fn http_redirect_method(status: int, method: string) -> string {
+    if status == 303 {
+        if method == "HEAD" {
+            return "HEAD";
+        }
+        return "GET";
+    }
+    if status == 301 || status == 302 {
+        if method == "GET" || method == "HEAD" {
+            return method;
+        }
+        return "GET";
+    }
+    return method;
+}
+
+// Response body for the client: 204/304 and HEAD requests never have
+// one (lengths ignored, nothing read); Content-Length, chunked, or
+// close-delimited otherwise. All failures propagate (`Err`); the
+// client never answers.
+fn http_client_body(c: HttpConn, recv: fn(int, int) -> Result<Array<int>, string>, status: int, has_clen: bool, clen: int, chunked: bool, max_body: int, out: Array<int>) -> Result<string, string> {
+    if chunked {
+        let total = http_read_chunked(c, recv, http_no_send, "", max_body, out)?;
+        if total < 0 {
+            return Err("http: unreachable");
+        }
+        return Ok("ok");
+    }
+    if has_clen {
+        if clen > max_body {
+            return Err("http: body too large");
+        }
+        let ex = http_read_exact(c, recv, clen, out)?;
+        return Ok(ex);
+    }
+    // Close-delimited: buffered bytes first, then to EOF.
+    while true {
+        if len(c.buf) > 0 {
+            if len(out) + len(c.buf) > max_body {
+                return Err("http: body too large");
+            }
+            for b in c.buf {
+                push(out, b);
+            }
+            c.buf = [];
+            continue;
+        }
+        let chunk = recv(c.fd, 4096)?;
+        if len(chunk) == 0 {
+            return Ok("ok");
+        }
+        if len(out) + len(chunk) > max_body {
+            return Err("http: body too large");
+        }
+        for b in chunk {
+            push(c.buf, b);
+        }
+    }
+    return Err("http: unreachable");
+}
+
+// Read + parse one response.
+fn http_client_read(c: HttpConn, recv: fn(int, int) -> Result<Array<int>, string>, max_body: int, is_head: bool) -> Result<HttpClientResp, string> {
+    let head = http_read_head_text(c, recv);
+    let e_closed: Result<string, string> = Err("http: client closed");
+    if head == e_closed {
+        return Err("http: server closed connection");
+    }
+    let text = head?;
+    let lines: Array<string> = split(text, "\r\n");
+    for ln in lines {
+        if contains(ln, "\n") {
+            return Err("http: bad framing");
+        } else {
+        }
+    }
+    let parts: Array<string> = split(lines[0], " ");
+    if len(parts) < 2 {
+        return Err("http: bad status line");
+    }
+    let version = parts[0];
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err("http: bad version");
+    }
+    let code = parts[1];
+    if len(code) != 3 || !(http_is_clen(code)) {
+        return Err("http: bad status");
+    }
+    let status = parse_int(code);
+    if status < 100 || status > 599 {
+        return Err("http: bad status");
+    }
+    if status >= 100 && status < 200 {
+        return Err("http: unexpected informational response");
+    }
+    let mut reason: string = "";
+    if len(parts) > 2 {
+        reason = parts[2];
+        for k in 3..len(parts) {
+            reason = reason + " " + parts[k];
+        }
+    }
+    let mut headers: Array<HttpHeader> = [];
+    for i in 1..len(lines) {
+        let ln = lines[i];
+        let ci = index_of(ln, ":");
+        if ci < 0 {
+            return Err("http: bad header");
+        }
+        let nm = substring(ln, 0, ci);
+        let val = trim(substring(ln, ci + 1, len(ln)));
+        if !(http_is_token(nm)) {
+            return Err("http: bad header name");
+        }
+        push(headers, HttpHeader { name: nm, value: val });
+    }
+    let mut body: Array<int> = [];
+    if is_head || status == 204 || status == 304 {
+    } else {
+        let mut clen: int = -1;
+        let mut has_clen: bool = false;
+        let mut chunked: bool = false;
+        for h in headers {
+            if lower(h.name) == "content-length" {
+                if has_clen {
+                    return Err("http: bad length");
+                }
+                if !(http_is_clen(h.value)) {
+                    return Err("http: bad length");
+                }
+                clen = parse_int(h.value);
+                has_clen = true;
+            }
+            if lower(h.name) == "transfer-encoding" {
+                if chunked {
+                    return Err("http: bad coding");
+                }
+                let codings: Array<string> = split(lower(trim(h.value)), ",");
+                if len(codings) != 1 || trim(codings[0]) != "chunked" {
+                    return Err("http: bad coding");
+                }
+                chunked = true;
+            } else {
+            }
+        }
+        if chunked && has_clen {
+            return Err("http: bad length");
+        }
+        let done = http_client_body(c, recv, status, has_clen, clen, chunked, max_body, body)?;
+        if done != "ok" {
+            return Err("http: unreachable");
+        } else {
+        }
+    }
+    return Ok(HttpClientResp { status: status, reason: reason, headers: headers, body: body });
+}
+
+// One request/response exchange on an open connection, then exactly
+// one close (close errors are dropped — the response already
+// determines the outcome).
+fn http_exchange(fd: int, req: HttpClientReq, url: HttpUrl, opts: HttpClientOpts, send_all: fn(int, Array<int>) -> Result<int, string>, recv: fn(int, int) -> Result<Array<int>, string>, close_fn: fn(int) -> Result<int, string>) -> Result<HttpClientResp, string> {
+    let mut head: string = req.method + " " + url.target + " HTTP/1.1\r\n";
+    for h in req.headers {
+        if lower(h.name) == "host" {
+            continue;
+        }
+        if !(http_is_token(h.name)) {
+            let cr = close_fn(fd);
+            http_note_close(cr);
+            return Err("http: bad request header name");
+        }
+        let hb = http_text_to_bytes(h.value)?;
+        let hblen = len(hb) + len(head);
+        if hblen < 0 {
+            return Err("http: unreachable");
+        }
+        head = head + h.name + ": " + h.value + "\r\n";
+    }
+    // `Host` is always set by the client (a user value is replaced),
+    // with the explicit port — deterministic on every hop.
+    head = head + "Host: " + url.host + ":" + to_string(url.port) + "\r\n";
+    if len(req.body) > 0 {
+        head = head + "Content-Length: " + to_string(len(req.body)) + "\r\n";
+    } else {
+        if req.method == "POST" || req.method == "PUT" || req.method == "PATCH" {
+            head = head + "Content-Length: 0\r\n";
+        } else {
+        }
+    }
+    head = head + "Connection: close\r\n\r\n";
+    let hb = http_text_to_bytes(head)?;
+    let is_head = req.method == "HEAD";
+    let r = http_roundtrip(fd, hb, req, url, opts, is_head, send_all, recv);
+    let cr = close_fn(fd);
+    http_note_close(cr);
+    return r;
+}
+
+fn http_roundtrip(fd: int, head: Array<int>, req: HttpClientReq, url: HttpUrl, opts: HttpClientOpts, is_head: bool, send_all: fn(int, Array<int>) -> Result<int, string>, recv: fn(int, int) -> Result<Array<int>, string>) -> Result<HttpClientResp, string> {
+    let sr = http_send_bytes(send_all, fd, head);
+    http_note_sent(sr);
+    let s = sr?;
+    if s != "sent" {
+        return Err("http: unreachable");
+    }
+    let br = http_send_bytes(send_all, fd, req.body);
+    http_note_sent(br);
+    let bs = br?;
+    if bs != "sent" {
+        return Err("http: unreachable");
+    }
+    let c = HttpConn { fd: fd, buf: [] };
+    return http_client_read(c, recv, opts.max_body, is_head);
+}
+
+// Full client: connect, optional TLS upgrade, one exchange per hop,
+// following same-origin redirects up to `opts.redirects`.
+pub fn http_do(req: HttpClientReq, opts: HttpClientOpts) -> Result<HttpClientResp, string> {
+    if opts.max_body < 1 {
+        return Err("http: max_body must be >= 1");
+    }
+    if opts.redirects < 0 {
+        return Err("http: redirects must be >= 0");
+    }
+    if req.method == "" {
+        return Err("http: empty method");
+    }
+    if req.url == "" {
+        return Err("http: empty url");
+    }
+    let first = http_parse_url(req.url)?;
+    if !(http_host_allowed(first.host, opts.host_allow)) {
+        return Err("http: host not allowed");
+    }
+    if first.scheme == "https" && req.ca_pem == "" {
+        return Err("http: https needs ca_pem");
+    }
+    let mut cur = req;
+    let mut hops: int = 0;
+    while true {
+        let u = http_parse_url(cur.url)?;
+        if !(http_host_allowed(u.host, opts.host_allow)) {
+            return Err("http: host not allowed");
+        }
+        let use_tls = u.scheme == "https";
+        if use_tls && cur.ca_pem == "" {
+            return Err("http: https needs ca_pem");
+        }
+        let conn = net_tcp_connect(u.host, u.port)?;
+        let mut fd = conn;
+        if use_tls {
+            let t = tls_client_connect(conn, cur.ca_pem)?;
+            fd = t;
+        }
+        let mut send_all: fn(int, Array<int>) -> Result<int, string> = net_send_all;
+        let mut recv: fn(int, int) -> Result<Array<int>, string> = net_recv;
+        let mut close_fn: fn(int) -> Result<int, string> = net_close;
+        if use_tls {
+            send_all = tls_send_all;
+            recv = tls_recv;
+            close_fn = tls_close;
+        }
+        let resp = http_exchange(fd, cur, u, opts, send_all, recv, close_fn)?;
+        if opts.redirects > 0 && http_is_redirect_status(resp.status) {
+            let loc = http_header_or(resp.headers, "location", "")?;
+            if loc != "" {
+                let nx = http_next_url(loc, u);
+                let e_cross: Result<HttpUrl, string> = Err("http: cross-host redirect");
+                if nx == e_cross {
+                    return Ok(resp);
+                }
+                if hops >= opts.redirects {
+                    return Err("http: too many redirects");
+                }
+                // Infallible now: un-followable targets became
+                // `cross-host` above (fail-closed, never silent).
+                let nu = nx?;
+                let nm = http_redirect_method(resp.status, cur.method);
+                let mut nb = cur.body;
+                if nm != cur.method {
+                    nb = [];
+                }
+                cur = HttpClientReq { method: nm, url: http_url_string(nu), headers: cur.headers, body: nb, ca_pem: cur.ca_pem };
+                hops = hops + 1;
+                continue;
+            } else {
+            }
+        }
+        return Ok(resp);
+    }
+    return Err("http: unreachable");
+}
+
+// One-shot GET (plain HTTP, or HTTPS via `http_do` with `ca_pem`).
+pub fn http_get(url: string, opts: HttpClientOpts) -> Result<HttpClientResp, string> {
+    let hs: Array<HttpHeader> = [];
+    let b: Array<int> = [];
+    let req = HttpClientReq { method: "GET", url: url, headers: hs, body: b, ca_pem: "" };
+    return http_do(req, opts);
+}
+
+// One-shot POST.
+pub fn http_post(url: string, headers: Array<HttpHeader>, body: Array<int>, opts: HttpClientOpts) -> Result<HttpClientResp, string> {
+    let req = HttpClientReq { method: "POST", url: url, headers: headers, body: body, ca_pem: "" };
+    return http_do(req, opts);
+}

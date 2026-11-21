@@ -1,0 +1,181 @@
+// stdlib http tests: run with `toto test` from stdlib/.
+//
+// Pure-unit coverage only (no sockets — lifecycle, framing, and
+// policy over real connections live in the `proj16_http` corpus
+// project and the `http_interop` suite): the ASCII codec, URL/query
+// helpers, header/param accessors, router validation, response
+// constructors, and every client validation that fires before any
+// connection is opened. First failure aborts with its tag (`Err`
+// fails the test file loudly, like the other suites' counters).
+import "gzv.std/http.gzv";
+
+fn h_ok(req: HttpRequest) -> Result<HttpResponse, string> {
+    return http_text(200, "OK", "ok");
+}
+
+fn fail(tag: string) -> Result<string, string> {
+    return Err("FAIL http " + tag);
+}
+
+// `http_text_to_bytes` error as a `Result<string, string>` carrier
+// (its native `Result<Array<int>, string>` cannot `==` a string
+// error): success becomes a fixed unexpected marker.
+fn text_err(s: string) -> Result<string, string> {
+    let b = http_text_to_bytes(s)?;
+    return Err("http: unexpectedly encodable len " + to_string(len(b)));
+}
+
+fn run() -> Result<string, string> {
+    // codec round-trips
+    let rt = http_bytes_to_text([72, 105, 13, 10, 9, 32, 126])?;
+    if rt != "Hi\r\n\t ~" {
+        return fail("codec-roundtrip");
+    } else {
+    }
+    let back = http_text_to_bytes(rt)?;
+    let want_back: Array<int> = [72, 105, 13, 10, 9, 32, 126];
+    if back != want_back {
+        return fail("codec-bytes");
+    } else {
+    }
+    // codec rejections (fixed strings, never echo input)
+    let e_byte: Result<string, string> = Err("http: byte 200 at index 0 is not HTTP text");
+    if http_bytes_to_text([200]) != e_byte {
+        return fail("codec-byte-err");
+    } else {
+    }
+    // The char error names the index but never echoes the char
+    // (safe even with control input).
+    let e_char: Result<string, string> = Err("http: char at index 0 is not HTTP text");
+    if text_err("é") != e_char {
+        return fail("codec-char-err");
+    } else {
+    }
+    // pct + query
+    let pct = http_decode_pct("a%41%7a+%25")?;
+    if pct != "aAZ+%25" {
+        return fail("pct");
+    } else {
+    }
+    let qs = http_parse_query("/x?a=1&b=%42&c=&d")?;
+    if len(qs) != 4 {
+        return fail("query-len");
+    } else {
+    }
+    if qs[0].name != "a" || qs[0].value != "1" {
+        return fail("query-0");
+    } else {
+    }
+    if qs[1].value != "B" {
+        return fail("query-decode");
+    } else {
+    }
+    if qs[2].value != "" {
+        return fail("query-empty");
+    } else {
+    }
+    if qs[3].name != "d" || qs[3].value != "" {
+        return fail("query-novalue");
+    } else {
+    }
+    let qp = http_parse_query("/plain")?;
+    if len(qp) != 0 {
+        return fail("query-absent");
+    } else {
+    }
+    let qbad = http_decode_pct("%zz");
+    let e_pct: Result<string, string> = Err("http: bad percent encoding");
+    if qbad != e_pct {
+        return fail("pct-bad");
+    } else {
+    }
+    // headers (absent vs present-but-empty) + params
+    let hs: Array<HttpHeader> = [HttpHeader { name: "Content-Type", value: "text" }, HttpHeader { name: "X-Empty", value: "" }];
+    let ct = http_header_get(hs, "content-type")?;
+    if ct != "text" {
+        return fail("header-case");
+    } else {
+    }
+    let xe = http_header_get(hs, "X-EMPTY")?;
+    if xe != "" {
+        return fail("header-empty");
+    } else {
+    }
+    let miss = http_header_get(hs, "nope");
+    let e_miss: Result<string, string> = Err("http: missing header nope");
+    if miss != e_miss {
+        return fail("header-missing");
+    } else {
+    }
+    let dflt = http_header_or(hs, "nope", "d")?;
+    if dflt != "d" {
+        return fail("header-or");
+    } else {
+    }
+    let ps: Array<HttpParam> = [HttpParam { name: "id", value: "7" }];
+    let pv = http_param(ps, "id")?;
+    if pv != "7" {
+        return fail("param");
+    } else {
+    }
+    // router validation
+    let r = http_router();
+    let ok_unit: Result<unit, string> = Ok(());
+    if route_add(r, "GET", "/a", h_ok) != ok_unit {
+        return fail("route-add");
+    } else {
+    }
+    if route_add(r, "", "/a", h_ok) == ok_unit {
+        return fail("route-empty-method");
+    } else {
+    }
+    if route_add(r, "GET", "nope", h_ok) == ok_unit {
+        return fail("route-pattern");
+    } else {
+    }
+    if route_add(r, "GET", "/a/{x", h_ok) == ok_unit {
+        return fail("route-capture");
+    } else {
+    }
+    // constructors
+    let t1 = http_text(200, "OK", "hi")?;
+    if t1.status != 200 || len(t1.body) != 2 {
+        return fail("text");
+    } else {
+    }
+    // client pre-connect validation (no server contacted)
+    let copts = HttpClientOpts { max_body: 65536, redirects: 0, host_allow: [] };
+    let w_scheme: Result<HttpClientResp, string> = Err("http: bad scheme");
+    if http_get("gopher://x/", copts) != w_scheme {
+        return fail("bad-scheme");
+    } else {
+    }
+    let copts_allow = HttpClientOpts { max_body: 65536, redirects: 0, host_allow: ["example.com"] };
+    let w_host: Result<HttpClientResp, string> = Err("http: host not allowed");
+    if http_get("http://localhost/", copts_allow) != w_host {
+        return fail("host-allow");
+    } else {
+    }
+    let w_ca: Result<HttpClientResp, string> = Err("http: https needs ca_pem");
+    if http_get("https://localhost/", copts) != w_ca {
+        return fail("https-ca");
+    } else {
+    }
+    let w_port: Result<HttpClientResp, string> = Err("http: bad port");
+    if http_get("http://localhost:99999/", copts) != w_port {
+        return fail("bad-port");
+    } else {
+    }
+    let copts_bad = HttpClientOpts { max_body: 0, redirects: 0, host_allow: [] };
+    let w_max: Result<HttpClientResp, string> = Err("http: max_body must be >= 1");
+    if http_get("http://localhost/", copts_bad) != w_max {
+        return fail("max-body");
+    } else {
+    }
+    return Ok("HTTP-UNIT-OK");
+}
+
+fn main() -> int {
+    println(run());
+    return 0;
+}

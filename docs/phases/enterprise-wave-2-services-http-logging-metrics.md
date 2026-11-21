@@ -1,6 +1,6 @@
 # Enterprise Wave 2 report — services, HTTP, logging, metrics
 
-Status: STAGE 1 COMPLETE (pending final-verifier `check.sh`).
+Status: STAGES 1–2 COMPLETE (pending final-verifier `check.sh`).
 Later stages append below; earlier section text is preserved
 verbatim.
 
@@ -179,3 +179,148 @@ certificates, non-loopback bind (service waves), TLS rows in
 the bench suite (one-shots and handshakes do not fit the
 calibrated-workload methodology), macOS ARM64 leg of the new
 tests (same stable symbols, but unrun here).
+
+---
+
+## Stage 2 — HTTP/1.1 framework (routing, middleware, handlers, client)
+
+Status: STAGE 2 COMPLETE (pending final-verifier `check.sh`).
+Earlier section text is preserved verbatim.
+
+### API design + rationale (flagged for user review)
+
+The framework surface is `gzv.std/http` (one module; the
+`http_server`/`http_client` split was considered and rejected —
+one import covers both sides, and the namespace is flat anyway),
+implemented EXACTLY per the accepted HTTP design with two
+documented v1 deviations below. New `Http*` structs over existing
+types only (`int`, `string`, `Array<int>`, `Result<_, string>`,
+user structs, channels, `go`): `HttpRequest` (method, target,
+version, headers, body, peer, params), `HttpResponse`, `HttpHeader`,
+`HttpParam`, `HttpRoute`, `HttpRouter` (routes + middlewares),
+`HttpServeOpts` (`expose_errors`, `max_body`, `keepalive_ms`,
+`server_name`), `HttpClientOpts` (`max_body`, `redirects`,
+`host_allow`), `HttpClientReq` (method, url, headers, body,
+`ca_pem`), `HttpClientResp`. Bodies stay `Array<int>` end to end
+(binary-safe; the §17.1 carve-out); framing text is ASCII-only by
+construction. URL/query parsing is pure-Toto (`parse_query`,
+`decode_pct`); NO new builtin.
+
+Routing: `route_add` validates (empty method, non-`/` pattern,
+malformed `{capture}` rejected loudly); match order is
+exact > template > wildcard with first-registration tiebreak
+(deterministic, golden-tested); `"*"` matches all methods.
+Middleware composes to an onion at dispatch (closures capture
+`(mw, next)` by value — first-registered is outermost; proven by
+the order vector). Path params arrive RAW (still-encoded) in
+`req.params` with `http_param`/`http_decode_pct` for use-site
+decoding — lazy validation at use is the honest rule given the
+`Err`-as-values wall (see deviations).
+
+Server: `http_serve` binds loopback + spawns the accept loop on
+its own green thread, returning the listener fd
+(`net_close(listener)` stops the loop — a parked accept wakes
+with `Err`, proven); each connection gets one task running the
+keep-alive loop (`Connection: close`/parse-failure/EOF closes;
+one exchange never starves the next — pipelining is golden).
+`http_serve_tls` is the TLS twin (per-connection server upgrade
+with the pinned fixtures). Client: one-shot exchanges over the
+same substrate (Host always set with explicit port;
+`Connection: close`), upgrading via `tls_client_connect` for
+`https://` (empty `ca_pem` is a loud pre-connect error).
+Redirects: `0` never follows; otherwise relative or absolute
+same-scheme/host/port only, fixed 301/302/303/307/308 method
+rules, budget overrun is `Err("http: too many redirects")`.
+`host_allow` narrows the loopback set before connecting.
+
+GREEN-THREAD BOUNDARY: every network wait (accept/recv/send/
+connect-handshake) parks on `ToSched::Net` with the fd
+nonblocking; TLS handshakes/record I/O run on the dedicated
+blocking pool (interpreter: blocking calls); DNS via the pool
+inside `net_tcp_connect`. One connection = one green thread; N
+concurrent clients never hold N workers (4×10 hammer green at 1
+and 4 workers). No timeout params anywhere (§17.5 stands);
+`keepalive_ms` is recorded but advisory (no clock in v1).
+
+### Two v1 deviations (both flagged, neither silent)
+
+1. Handler/middleware `Err` → connection abort (EOF), NOT the
+designed 500 mapping; `expose_errors` is accepted but RESERVED
+(no effect — the secure default holds either way). REASON: v1
+Toto has no `Err` destructuring (`match` is Phase 2; `?` only
+propagates), so a framework can never turn an unknown `Err`
+payload into a response body or a log line. Handlers that must
+answer 500 with detail return `Ok(http_text(500, ...))`
+explicitly (proven in corpus: `500:explicit-500`). Full design
+behavior needs Phase-2 destructuring or a gated new builtin —
+recorded as a follow-up, NOT smuggled in.
+2. Returning a `Result` whose payload transitively holds function
+values, then unwrapping with `?` in the caller, panics E0204
+("function from builtin") at runtime — found while structuring
+the corpus driver (minimal repro in the work notes). Bare-struct
+returns, param-direction passing, `use_mw` registration, and
+comparing wrapped Results WITHOUT unwrapping are all fine; the
+framework itself never unwraps a fn-carrying `Result` (all its
+`Result` payloads are `int`/`string`/plain-data structs), and
+the corpus builder takes the router as a parameter. Report filed
+as a runtime edge for the owning wave; the framework and its
+tests are structured around it with comments at each site.
+
+### Implementation (pure Toto, no new FFI, zero new builtins)
+
+- `stdlib/http.gzv` (~2,100 lines): ASCII codec (allocation-free
+comparison chains — the first table-scan revision stalled past
+~3 KB bodies), router, onion dispatch, request/response framing
+(strict CRLF, token validation, single-CL/single-chunked
+accounting, 16 KiB head cap, `max_body` enforcement), server
+loops (plain + TLS-injected IO triple), client (URL parse,
+host policy, redirects, three body disciplines).
+- `crates/toto-compiler/src/stdlib.rs`: register `http` (17
+modules); `project.rs` count 16→17. No compiler/runtime
+changes — the framework is a stdlib citizen.
+- `docs/stdlib.md`: `## http` section (surface table, fixed
+wire mapping, limits, test pointers).
+
+### Tests + evidence (all passing at the Stage 2 tip)
+
+- `tests/corpus/project/proj16_http/` (new, pinned fixtures
+copied from `proj15`): 5 golden lines covering lifecycle,
+routing precedence (template-first registration still loses to
+exact, wildcard, `*` methods), middleware order vector +
+short-circuit + passthrough, query/pct, binary echo, redirect
+follow/no-follow/cross-host-as-is/budget, 404/405+Allow/
+explicit-500/HEAD, policy errors (scheme/host-allow/CA/caps),
+server-side cap 400, refused-port negative, keep-alive
+pipelining, 400/505/abort-then-survival, chunked upload,
+client-side truncation via raw responder, HTTPS both directions
++ wrong-CA + post-failure survival. Exact goldens; green 3/3
+plus `--workers 4` (byte-identical).
+- `stdlib/tests/test_http.gzv` (new): 40+ pure-unit assertions
+(codec incl. non-text rejection, pct/query, headers/params,
+route validation, constructors, every pre-connect client
+error). stdlib `toto test` 14/14.
+- `crates/toto-cli/tests/http_interop.rs` (new, 4 tests):
+our server vs curl (bodies, keep-alive reuse, echo, 404),
+our TLS server vs curl `--cacert` (chain + hostname verified
+by curl; wrong-CA curl fails), our client vs a curl-checked
+Rust reference (GET 200 + POST 501 passthrough), our HTTPS
+client vs `openssl s_server` (canned response). All green.
+- Package gates at the Stage 2 tip: `cargo fmt --check`
+clean; `cargo clippy --workspace --all-targets -- -D warnings`
+clean; `cargo test` green for toto-compiler (incl. 17-module
+table), toto-runtime, toto-cli (corpus incl. `proj16` +
+`http_interop`), toto-jit; stdlib `toto test` 14/14. Full
+`check.sh` left to the final verifier per the brief.
+
+### Follow-ups (recorded, not done)
+
+Destructuring-dependent 500 mapping + `expose_errors`
+semantics (needs Phase 2 or gated builtin); `?`-unwrap of
+fn-carrying `Result`s (runtime edge, repro on file);
+hostname verification/SNI/ALPN/resumption (TLS waves);
+non-loopback bind + `Host`-based virtual hosting (service
+waves); `getpeername` exposure for a real `peer` field (small
+FFI proposal); response-side chunked/streaming (needs a
+streaming handler shape — separate proposal); bench rows.
+macOS ARM64 + Linux ARM64 legs unrun here (same stable
+surface; CI tier-1 owns the verdicts).
