@@ -1,6 +1,6 @@
 # Enterprise Wave 2 report — services, HTTP, logging, metrics
 
-Status: STAGES 1–3 COMPLETE (pending final-verifier `check.sh`).
+Status: STAGES 1–4 COMPLETE (pending final-verifier `check.sh`).
 Later stages append below; earlier section text is preserved
 verbatim.
 
@@ -507,3 +507,134 @@ generics — Wave 4); file sink (needs an append builtin);
 `getpeername` for a real log `peer` field; hostname/SNI/ALPN
 (TLS waves); bench rows; macOS ARM64 + Linux ARM64 legs unrun
 here (same portable-Rust surface; CI tier-1 owns the verdicts).
+
+---
+
+## Stage 4 — Prometheus metrics (counters, gauges, histograms)
+
+Status: STAGE 4 COMPLETE (pending final-verifier `check.sh`).
+Earlier section text is preserved verbatim.
+
+### API design (no spec change — §17/§18 implemented exactly)
+
+`gzv.std/metrics` (new, pure Toto over `gzv.std/http` — zero new
+builtins, zero new FFI names, `diag13` golden untouched): counters,
+gauges, and histograms with Prometheus text-exposition 0.0.4
+rendering plus a scrape responder for the framework.
+
+State types (FIXED — one choice each, golden-pinned): a
+`MetricsRegistry` holds `counters`, `gauges`, and `histograms`
+(registration-ordered definition arrays). Every definition
+carries `name`, `help`, and `label_names`; every observation is
+a sample under one label-value set (first-observation order).
+`MetricsSample` pairs label values with the current total;
+`MetricsHistoSample` pairs them with cumulative per-bucket
+`counts` plus `sum`/`count`. Counters hold monotonic `int`
+totals (`metrics_inc` rejects negative deltas loudly); gauges
+hold `int` values set or added to (`metrics_gauge_set/add` —
+deltas may be negative); histograms observe `int` values into
+cumulative `le` buckets. Values are ints (request counts,
+millisecond latencies) — float observations are a follow-up
+with the full bytes story.
+
+Registration (FIXED): every metric registers before use; the
+name must match `[a-zA-Z_:][a-zA-Z0-9_:]*` and be unique across
+ALL kinds (Prometheus forbids a counter and gauge sharing a
+name); label names follow the same grammar, must be unique
+within the metric, must not start with `__` (reserved), and `le`
+is reserved on histograms (the renderer owns it); histogram
+bounds must be non-empty and strictly increasing. Unknown
+metrics, wrong-arity label sets, and non-HTTP-text help/label
+values are all fixed-`Err` (never silent, never echoing input).
+Stored state copies caller arrays (arrays are shared by
+reference — registration/observation must not alias them).
+
+Format version (FIXED): `metrics_exposition_version()` returns
+`"0.0.4"`; `metrics_content_type()` returns
+`text/plain; version=0.0.4; charset=utf-8`. Render order is
+counters, gauges, histograms, samples in first-observation
+order, labels in declaration order (`le` first on bucket lines,
+as the reference clients emit). HELP escapes `\`/LF, label
+values escape `\`/`"`/LF — exactly the reference escaping; a
+registered-but-unobserved metric still emits HELP/TYPE; no
+timestamps, no `# EOF` (OpenMetrics, not 0.0.4). The scrape
+endpoint is `route_add(router, "GET", "/metrics",
+metrics_handler(reg))` + `http_serve` (loopback rule rides
+along; no timeout parameters); the handler closure shares the
+registry arrays (the `mwlog` pattern), so scrapes see every
+observation. Returning a bare `fn` from `metrics_handler` is
+sound — only `Result`-wrapped function values hit the v1 E0204
+unwrap edge (Stage 2 report), and the router builder still takes
+the router as a parameter for that reason.
+
+### Implementation (library only)
+
+- `stdlib/metrics.gzv` (new): state types, ASCII name grammar
+  (comparison-based, mirroring the http codec's acceptance),
+  registration/observation with fixed errors, reference-matching
+  escapers, the 0.0.4 renderer, `metrics_respond` (200 +
+  pinned media type via `http_response`/`http_text_to_bytes`)
+  and `metrics_handler` (closure over the registry).
+- `crates/toto-compiler/src/stdlib.rs`: 19→20 modules;
+  `crates/toto-compiler/tests/project.rs`: 19→20 count pin.
+  No `toto-jit` refuse arms (pure Toto — the JIT suite stays
+  green unmodified); no `docs/ffi.md` change (no new linked
+  names); `docs/stdlib.md`: new `metrics` section + suite
+  count 16→17.
+- `stdlib/tests/test_metrics.gzv` (new, sequential): version
+  pins, empty/unobserved renders, exact multi-series render
+  (counters/gauges/two histograms), escaping round-trip,
+  alias isolation (mutating caller arrays post-registration
+  changes nothing), the handler value over a synthetic
+  `HttpRequest` (status + media type + body byte-match), and
+  every fixed error string. stdlib `toto test` 17/17.
+- `tests/corpus/project/proj19_metrics/` (new): the stated
+  scenario — fixed direct observations seed the series, two
+  live `/work` requests add handler-side observations, and a
+  scrape of `/metrics` through the running service must
+  byte-match a local render with the pinned media type
+  (lowercase lookup proves case-insensitivity). Exact goldens;
+  green 3/3 plus `--workers 4` byte-identical.
+
+### Tests + evidence (all passing at the Stage 4 tip)
+
+- Exposition validation: no reference Prometheus parser is
+  available offline (`prometheus_client` absent; offline cargo
+  cannot fetch a crate) — so the golden's 21-line exposition
+  (3 metrics, 5 series) was validated with a strict checker
+  written from the 0.0.4 spec text (name grammar, HELP-before-
+  TYPE, HELP/TYPE per metric, label grammar + no-duplicates +
+  `le`-first on bucket lines only, cumulative counts,
+  terminal `+Inf`, one `_sum`/`_count` per series, value
+  grammar, escape validity). It accepts the golden and rejects
+  three structural mutations (non-cumulative counts, dropped
+  `+Inf`, bad label escape). Recorded gap: spec-text
+  validation, NOT reference-parser interop — no interop
+  invented. The checker is a scratch probe
+  (`target/sandbox-tmp/check_exposition.py`), not committed.
+- Package gates at the Stage 4 tip: `cargo fmt --check`
+  clean; `cargo clippy --workspace --all-targets -- -D
+  warnings` clean; `cargo test` green for toto-compiler
+  (incl. the 20-module table), toto-runtime (incl.
+  `fmt_equiv`, which formats and runs `proj19` under GC
+  pressure), toto-cli (corpus incl. `proj19` + `diag13`
+  unchanged + `http_interop`), toto-jit; stdlib `toto test`
+  17/17. Full `check.sh` left to the final verifier per the
+  brief. Two environmental notes (both proven pre-existing on
+  the clean tree): `/tmp` writes fail in this sandbox
+  (EDQUOT — captures use `target/`, `TMPDIR=target/sandbox-tmp`
+  set for the suites) and `fmt_equiv` needs
+  `RUST_MIN_STACK=33554432` here (stack-overflow abort at the
+  default 8 MB thread stack on the pristine base too;
+  green with the override, with and without Stage 4).
+
+### Follow-ups (recorded, not done)
+
+Float observations (needs the bytes story); `_total` suffix
+convention enforcement (allowed but not required in v1);
+timestamped samples (omitted — 0.0.4 parsers ignore them);
+reference-parser interop run (needs network/crate);
+exemplars and `__`-reservation lifting (spec revisions);
+per-series scrape filtering; bench rows; macOS ARM64 +
+Linux ARM64 legs unrun here (same portable-Rust surface;
+CI tier-1 owns the verdicts).

@@ -1,0 +1,23 @@
+Ok(errors-ok)
+# HELP demo_requests_total Total demo requests.
+# TYPE demo_requests_total counter
+demo_requests_total{method="POST"} 2
+demo_requests_total{method="GET"} 2
+# HELP demo_inflight Inflight demo requests.
+# TYPE demo_inflight gauge
+demo_inflight 3
+# HELP demo_latency_ms Demo latency milliseconds.
+# TYPE demo_latency_ms histogram
+demo_latency_ms_bucket{le="10",route="/other"} 1
+demo_latency_ms_bucket{le="50",route="/other"} 1
+demo_latency_ms_bucket{le="100",route="/other"} 1
+demo_latency_ms_bucket{le="+Inf",route="/other"} 2
+demo_latency_ms_sum{route="/other"} 125
+demo_latency_ms_count{route="/other"} 2
+demo_latency_ms_bucket{le="10",route="/work"} 2
+demo_latency_ms_bucket{le="50",route="/work"} 3
+demo_latency_ms_bucket{le="100",route="/work"} 3
+demo_latency_ms_bucket{le="+Inf",route="/work"} 3
+demo_latency_ms_sum{route="/work"} 56
+demo_latency_ms_count{route="/work"} 3
+Ok(live-ok)

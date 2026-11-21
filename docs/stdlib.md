@@ -461,11 +461,51 @@ the observed `ts`, escaping round-trip, empty ctx, edge
 record, sink returns — sequential, so it covers the interpreter
 arms) and the corpus `proj17_context_log` buffer golden.
 
+## `metrics`
+
+Prometheus metrics (Enterprise Wave 2, Stage 4; pure Toto over
+the `http` framework — no new builtins, no new FFI). `MetricsRegistry`
+holds `counters`, `gauges`, and `histograms` (registration order);
+every definition carries `name`, `help`, and `label_names`, and
+each observation adds to the sample under its label-value set
+(first-observation order). Counters hold monotonic `int` totals
+(`metrics_inc` rejects negative deltas); gauges hold `int` values
+(`metrics_gauge_set`/`metrics_gauge_add`, the delta may be
+negative); histograms hold cumulative per-bucket `counts` over
+`int` bounds plus `sum`/`count`. Values are ints (counts,
+millisecond latencies); float observations are a follow-up.
+
+| Function | Behavior |
+|---|---|
+| `metrics_registry()` | Empty registry |
+| `metrics_exposition_version()` / `metrics_content_type()` | `"0.0.4"` / `text/plain; version=0.0.4; charset=utf-8` pins |
+| `metrics_register_counter/gauge/histogram(reg, name, help, labels[, buckets])` | Register; `Err` on bad/duplicate name, bad/reserved label, bad buckets |
+| `metrics_inc(reg, name, labels, delta)` | Counter add; `delta >= 0`, `Err` otherwise |
+| `metrics_gauge_set` / `metrics_gauge_add(reg, name, labels, v)` | Absolute set / signed add |
+| `metrics_observe(reg, name, labels, value)` | Histogram observation (cumulative buckets) |
+| `metrics_render(reg)` | Full 0.0.4 exposition (`HELP`/`TYPE` + samples, `\n`-terminated) |
+| `metrics_respond(reg)` / `metrics_handler(reg)` | 200 response / `GET`-ready handler closing over the registry |
+
+Registration is mandatory and unique across all kinds (a counter
+and a gauge may never share a name); names match
+`[a-zA-Z_:][a-zA-Z0-9_:]*`, label names add the `__`-prefix and
+histogram-`le` reservations. Render order is counters, gauges,
+histograms (samples in first-observation order); HELP escapes `\`
+and LF, label values escape `\`, `"`, and LF. The scrape endpoint
+is `route_add(router, "GET", "/metrics", metrics_handler(reg))`
+plus `http_serve` (loopback rule rides along); the handler closure
+shares the registry arrays, so scrapes see every observation.
+
+Pinned by `test_metrics.gzv` (version pins, exact renders incl.
+escaping and cumulative math, every fixed error, alias isolation,
+handler over a synthetic request) and the corpus `proj19_metrics`
+golden (error paths + a live serve/scrape byte-match).
+
 ## Execution paths
 
 | Path | Status | Evidence |
 |---|---|---|
-| Interpreter (`toto run` / `toto test`) | Full suite green | `toto: 16 passed, 0 failed` in `stdlib/`; corpus `proj09`/`proj10` goldens |
+| Interpreter (`toto run` / `toto test`) | Full suite green | `toto: 17 passed, 0 failed` in `stdlib/`; corpus `proj09`/`proj10` goldens |
 | Runtime executor (concurrent) | Green | `test_concurrent.gzv` (pipeline over channels) |
 | Built executable (`toto build`) | Output-equivalent | `stdlib` smoke: binary stdout byte-identical to interpreter |
 | JIT via `toto dev` | Unsupported | `dev` is single-file scope (`parse_and_check` only); multi-file dev loop is the known carry-forward |

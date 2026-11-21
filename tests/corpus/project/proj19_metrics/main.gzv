@@ -1,0 +1,243 @@
+// Wave 2 Stage 4 metrics: registry, Prometheus 0.0.4 exposition, the
+// scrape endpoint through the framework, and the fixed error paths.
+//
+// The stated scenario: a service counts requests per method, tracks
+// inflight work with a gauge, and observes millisecond latencies
+// per route; fixed direct observations seed the series, two live
+// `/work` requests add handler-side observations, and a scrape of
+// `/metrics` must byte-match a local render with the pinned media
+// type. Deterministic by construction: request counts and fixed
+// observations only — no ports, fds, or timing in the output.
+import "gzv.std/metrics.gzv";
+import "gzv.std/http.gzv";
+import "gzv.std/net.gzv";
+
+// Error paths first (every `Err` is a fixed string, never silent).
+fn t_errors() -> Result<string, string> {
+    let reg = metrics_registry();
+    metrics_register_counter(reg, "demo_requests_total", "Total demo requests.", ["method"])?;
+    metrics_register_gauge(reg, "demo_inflight", "Inflight demo requests.", [])?;
+    metrics_register_histogram(reg, "demo_latency_ms", "Demo latency milliseconds.", ["route"], [10, 50, 100])?;
+    // The version and media type are pinned.
+    if metrics_exposition_version() != "0.0.4" {
+        return Err("version");
+    } else {
+    }
+    if metrics_content_type() != "text/plain; version=0.0.4; charset=utf-8" {
+        return Err("content-type");
+    } else {
+    }
+    // Same-kind duplicate.
+    let d1 = metrics_register_counter(reg, "demo_requests_total", "x", []);
+    let w1: Result<unit, string> = Err("metrics: duplicate metric \"demo_requests_total\"");
+    if d1 != w1 {
+        return Err("dup-counter");
+    } else {
+    }
+    // Cross-kind duplicate (Prometheus forbids shared names).
+    let d2 = metrics_register_gauge(reg, "demo_requests_total", "x", []);
+    if d2 != w1 {
+        return Err("dup-cross");
+    } else {
+    }
+    let d3 = metrics_register_histogram(reg, "demo_inflight", "x", [], [1]);
+    let w3: Result<unit, string> = Err("metrics: duplicate metric \"demo_inflight\"");
+    if d3 != w3 {
+        return Err("dup-cross-histo");
+    } else {
+    }
+    // Unknown metrics.
+    let u1 = metrics_inc(reg, "nope", [], 1);
+    let wu: Result<unit, string> = Err("metrics: unknown metric \"nope\"");
+    if u1 != wu {
+        return Err("unknown-inc");
+    } else {
+    }
+    let u2 = metrics_gauge_set(reg, "nope", [], 1);
+    if u2 != wu {
+        return Err("unknown-gauge");
+    } else {
+    }
+    let u3 = metrics_observe(reg, "nope", [], 1);
+    if u3 != wu {
+        return Err("unknown-observe");
+    } else {
+    }
+    // Counters never go down.
+    let n = metrics_inc(reg, "demo_requests_total", ["GET"], -3);
+    let wn: Result<unit, string> = Err("metrics: counter increment must be >= 0 (got -3)");
+    if n != wn {
+        return Err("neg");
+    } else {
+    }
+    // Bad metric names.
+    let b1 = metrics_register_counter(reg, "9bad", "x", []);
+    let wb: Result<unit, string> = Err("metrics: bad metric name \"9bad\" (want [a-zA-Z_:][a-zA-Z0-9_:]*)");
+    if b1 != wb {
+        return Err("bad-name");
+    } else {
+    }
+    let b2 = metrics_register_counter(reg, "", "x", []);
+    let wb2: Result<unit, string> = Err("metrics: bad metric name \"\" (want [a-zA-Z_:][a-zA-Z0-9_:]*)");
+    if b2 != wb2 {
+        return Err("bad-empty-name");
+    } else {
+    }
+    // Bad label names.
+    let l1 = metrics_register_counter(reg, "ok_name", "x", ["9x"]);
+    let wl: Result<unit, string> = Err("metrics: bad label name \"9x\" (want [a-zA-Z_:][a-zA-Z0-9_:]*)");
+    if l1 != wl {
+        return Err("bad-label");
+    } else {
+    }
+    let l2 = metrics_register_counter(reg, "ok_name", "x", ["a", "a"]);
+    let wl2: Result<unit, string> = Err("metrics: duplicate label name \"a\"");
+    if l2 != wl2 {
+        return Err("dup-label");
+    } else {
+    }
+    let l3 = metrics_register_counter(reg, "ok_name", "x", ["__private"]);
+    let wl3: Result<unit, string> = Err("metrics: label name \"__private\" is reserved (\"__\" prefix)");
+    if l3 != wl3 {
+        return Err("reserved-label");
+    } else {
+    }
+    // `le` is reserved on histograms only.
+    let l4 = metrics_register_histogram(reg, "h_le", "x", ["le"], [10]);
+    let wl4: Result<unit, string> = Err("metrics: label \"le\" is reserved on histograms");
+    if l4 != wl4 {
+        return Err("le-histo");
+    } else {
+    }
+    metrics_register_counter(reg, "ok_le", "x", ["le"])?;
+    // Label arity.
+    let a = metrics_inc(reg, "demo_requests_total", [], 1);
+    let wa: Result<unit, string> = Err("metrics: want 1 label values (got 0)");
+    if a != wa {
+        return Err("arity");
+    } else {
+    }
+    // Bucket rules.
+    let h1 = metrics_register_histogram(reg, "h_empty", "x", [], []);
+    let wh: Result<unit, string> = Err("metrics: buckets must be non-empty and strictly increasing");
+    if h1 != wh {
+        return Err("buckets-empty");
+    } else {
+    }
+    let h2 = metrics_register_histogram(reg, "h_flat", "x", [], [50, 50]);
+    if h2 != wh {
+        return Err("buckets-flat");
+    } else {
+    }
+    let h3 = metrics_register_histogram(reg, "h_desc", "x", [], [50, 10]);
+    if h3 != wh {
+        return Err("buckets-desc");
+    } else {
+    }
+    // Non-text help and label values are loud, never echoed.
+    let nh = metrics_register_counter(reg, "h_text", "has é", []);
+    let wnh: Result<unit, string> = Err("metrics: help is not HTTP text");
+    if nh != wnh {
+        return Err("help-text");
+    } else {
+    }
+    let nv = metrics_inc(reg, "demo_requests_total", ["GÉT"], 1);
+    let wnv: Result<unit, string> = Err("metrics: label value is not HTTP text");
+    if nv != wnv {
+        return Err("label-text");
+    } else {
+    }
+    return Ok("errors-ok");
+}
+
+// The served `/work` handler: counts the request, observes a fixed
+// 7ms latency, and brackets a gauge add/sub pair (net zero, but
+// both signs exercised through the live path).
+fn h_work(reg: MetricsRegistry) -> fn(HttpRequest) -> Result<HttpResponse, string> {
+    return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        metrics_inc(reg, "demo_requests_total", ["GET"], 1)?;
+        metrics_gauge_add(reg, "demo_inflight", [], 1)?;
+        metrics_observe(reg, "demo_latency_ms", ["/work"], 7)?;
+        metrics_gauge_add(reg, "demo_inflight", [], -1)?;
+        return http_text(200, "OK", "ok");
+    };
+}
+
+// NOTE (runtime edge, not framework logic): like the `proj16`
+// builder, this takes the router as a parameter and returns only
+// `Result<unit>` — a `Result` holding function values cannot be
+// unwrapped with `?` in v1 (E0204), so routers cross by parameter.
+fn build_metrics_router(router: HttpRouter, reg: MetricsRegistry) -> Result<unit, string> {
+    route_add(router, "GET", "/metrics", metrics_handler(reg))?;
+    let work = h_work(reg);
+    route_add(router, "GET", "/work", work)?;
+    return Ok(());
+}
+
+fn t_live() -> Result<string, string> {
+    let reg = metrics_registry();
+    metrics_register_counter(reg, "demo_requests_total", "Total demo requests.", ["method"])?;
+    metrics_register_gauge(reg, "demo_inflight", "Inflight demo requests.", [])?;
+    metrics_register_histogram(reg, "demo_latency_ms", "Demo latency milliseconds.", ["route"], [10, 50, 100])?;
+    // Fixed direct observations seed the series order.
+    metrics_inc(reg, "demo_requests_total", ["POST"], 2)?;
+    metrics_gauge_set(reg, "demo_inflight", [], 3)?;
+    metrics_observe(reg, "demo_latency_ms", ["/other"], 5)?;
+    metrics_observe(reg, "demo_latency_ms", ["/other"], 120)?;
+    metrics_observe(reg, "demo_latency_ms", ["/work"], 42)?;
+    let router = http_router();
+    build_metrics_router(router, reg)?;
+    let opts = HttpServeOpts { expose_errors: false, max_body: 65536, keepalive_ms: 0, server_name: "toto-test" };
+    let listener = http_serve(48521, router, opts)?;
+    let copts = HttpClientOpts { max_body: 65536, redirects: 0, host_allow: [] };
+    // Two served requests: each counts GET once and observes 7ms.
+    let w1 = http_get("http://localhost:48521/work", copts)?;
+    if w1.status != 200 {
+        net_close(listener)?;
+        return Err("work status 1");
+    } else {
+    }
+    let t1 = http_bytes_to_text(w1.body)?;
+    if t1 != "ok" {
+        net_close(listener)?;
+        return Err("work body 1");
+    } else {
+    }
+    let w2 = http_get("http://localhost:48521/work", copts)?;
+    if w2.status != 200 {
+        net_close(listener)?;
+        return Err("work status 2");
+    } else {
+    }
+    // Scrape: 200, the pinned media type (lowercase lookup proves
+    // case-insensitivity), and a body byte-identical to the local
+    // render of the same shared registry.
+    let sc = http_get("http://localhost:48521/metrics", copts)?;
+    if sc.status != 200 {
+        net_close(listener)?;
+        return Err("scrape status");
+    } else {
+    }
+    let ct = http_header_get(sc.headers, "content-type")?;
+    if ct != metrics_content_type() {
+        net_close(listener)?;
+        return Err("scrape content-type");
+    } else {
+    }
+    let body = http_bytes_to_text(sc.body)?;
+    let want = metrics_render(reg)?;
+    if body != want {
+        net_close(listener)?;
+        return Err("scrape mismatch");
+    } else {
+    }
+    print(body);
+    net_close(listener)?;
+    return Ok("live-ok");
+}
+
+fn main() -> int {
+    println(t_errors());
+    println(t_live());
+    return 0;
+}

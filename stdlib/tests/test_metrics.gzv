@@ -1,0 +1,224 @@
+// stdlib metrics tests: run with `toto test` from stdlib/.
+//
+// Pure-unit coverage only (no sockets — the live scrape through a
+// real server is the `proj19_metrics` corpus project): version and
+// media-type pins, registry rules, accumulation, exact 0.0.4
+// rendering (ordering, escaping, cumulative histogram math), every
+// fixed error string, alias isolation, and the handler value over
+// a synthetic request. First failure aborts with its tag (`Err`
+// fails the test file loudly, like the other suites' counters).
+import "gzv.std/metrics.gzv";
+import "gzv.std/http.gzv";
+
+fn fail(tag: string) -> Result<string, string> {
+    return Err("FAIL metrics " + tag);
+}
+
+fn run() -> Result<string, string> {
+    if metrics_exposition_version() != "0.0.4" {
+        return fail("version");
+    } else {
+    }
+    if metrics_content_type() != "text/plain; version=0.0.4; charset=utf-8" {
+        return fail("content-type");
+    } else {
+    }
+    // An empty registry renders empty (no HELP/TYPE for nothing).
+    let reg = metrics_registry();
+    let empty = metrics_render(reg)?;
+    if empty != "" {
+        return fail("empty-render");
+    } else {
+    }
+    // A registered-but-unobserved metric emits HELP/TYPE only.
+    metrics_register_counter(reg, "fresh_total", "Fresh.", [])?;
+    let fresh = metrics_render(reg)?;
+    if fresh != "# HELP fresh_total Fresh.\n# TYPE fresh_total counter\n" {
+        return fail("unobserved");
+    } else {
+    }
+    // Counters accumulate across series in first-observation order.
+    metrics_register_counter(reg, "hits_total", "Hits.", ["method"])?;
+    metrics_inc(reg, "hits_total", ["GET"], 2)?;
+    metrics_inc(reg, "hits_total", ["POST"], 1)?;
+    metrics_inc(reg, "hits_total", ["GET"], 3)?;
+    metrics_inc(reg, "hits_total", ["GET"], 0)?;
+    // Gauges set and add (signed), unlabelled and labelled.
+    metrics_register_gauge(reg, "temp", "Temp.", [])?;
+    metrics_gauge_set(reg, "temp", [], 7)?;
+    metrics_gauge_add(reg, "temp", [], -10)?;
+    metrics_register_gauge(reg, "queue", "Queue.", ["name"])?;
+    metrics_gauge_set(reg, "queue", ["a"], 4)?;
+    metrics_gauge_add(reg, "queue", ["b"], 2)?;
+    // Histograms: cumulative bounds, +Inf, sum, count — two series.
+    metrics_register_histogram(reg, "lat_ms", "Lat.", [], [10, 50])?;
+    metrics_observe(reg, "lat_ms", [], 5)?;
+    metrics_observe(reg, "lat_ms", [], 50)?;
+    metrics_observe(reg, "lat_ms", [], 500)?;
+    metrics_register_histogram(reg, "sz", "Sz.", ["op"], [1])?;
+    metrics_observe(reg, "sz", ["read"], 0)?;
+    metrics_observe(reg, "sz", ["read"], 9)?;
+    let got = metrics_render(reg)?;
+    let mut want = "# HELP fresh_total Fresh.\n# TYPE fresh_total counter\n";
+    want = want + "# HELP hits_total Hits.\n# TYPE hits_total counter\nhits_total{method=\"GET\"} 5\nhits_total{method=\"POST\"} 1\n";
+    want = want + "# HELP temp Temp.\n# TYPE temp gauge\ntemp -3\n";
+    want = want + "# HELP queue Queue.\n# TYPE queue gauge\nqueue{name=\"a\"} 4\nqueue{name=\"b\"} 2\n";
+    want = want + "# HELP lat_ms Lat.\n# TYPE lat_ms histogram\nlat_ms_bucket{le=\"10\"} 1\nlat_ms_bucket{le=\"50\"} 2\nlat_ms_bucket{le=\"+Inf\"} 3\nlat_ms_sum 510\nlat_ms_count 3\n";
+    want = want + "# HELP sz Sz.\n# TYPE sz histogram\nsz_bucket{le=\"1\",op=\"read\"} 1\nsz_bucket{le=\"+Inf\",op=\"read\"} 2\nsz_sum{op=\"read\"} 9\nsz_count{op=\"read\"} 2\n";
+    if got != want {
+        return fail("render");
+    } else {
+    }
+    // Escaping: label values escape backslash, quote, LF;
+    // HELP escapes backslash and LF only (a quote passes through).
+    let reg2 = metrics_registry();
+    metrics_register_counter(reg2, "esc", "a\\\\b\nc\"d", ["k"])?;
+    metrics_inc(reg2, "esc", ["q\"u\\ote\nNL"], 1)?;
+    let got2 = metrics_render(reg2)?;
+    let want2 = "# HELP esc a\\\\b\\nc\"d\n# TYPE esc counter\nesc{k=\"q\\\"u\\\\ote\\nNL\"} 1\n";
+    if got2 != want2 {
+        return fail("escaping");
+    } else {
+    }
+    // Stored state never aliases caller arrays.
+    let reg3 = metrics_registry();
+    let names: Array<string> = ["m"];
+    metrics_register_counter(reg3, "alias_c", "h.", names)?;
+    push(names, "late");
+    metrics_inc(reg3, "alias_c", [], 1)?;
+    let got3 = metrics_render(reg3)?;
+    if !contains(got3, "alias_c 1\n") {
+        return fail("alias-names");
+    } else {
+    }
+    let labs: Array<string> = ["a"];
+    metrics_register_counter(reg3, "alias_c2", "h.", ["k"])?;
+    metrics_inc(reg3, "alias_c2", labs, 1)?;
+    push(labs, "late");
+    let got3b = metrics_render(reg3)?;
+    if !contains(got3b, "alias_c2{k=\"a\"} 1\n") {
+        return fail("alias-labels");
+    } else {
+    }
+    // The handler value answers a synthetic request directly.
+    let hreg = metrics_registry();
+    metrics_register_gauge(hreg, "up", "Up.", [])?;
+    metrics_gauge_set(hreg, "up", [], 1)?;
+    let h = metrics_handler(hreg);
+    let no_headers: Array<HttpHeader> = [];
+    let no_body: Array<int> = [];
+    let no_params: Array<HttpParam> = [];
+    let req = HttpRequest { method: "GET", target: "/metrics", version: "HTTP/1.1", headers: no_headers, body: no_body, peer: "", params: no_params };
+    let resp = h(req)?;
+    if resp.status != 200 {
+        return fail("handler-status");
+    } else {
+    }
+    let ct = http_header_get(resp.headers, "Content-Type")?;
+    if ct != metrics_content_type() {
+        return fail("handler-ct");
+    } else {
+    }
+    let text = http_bytes_to_text(resp.body)?;
+    let want_text = metrics_render(hreg)?;
+    if text != want_text {
+        return fail("handler-body");
+    } else {
+    }
+    if text != "# HELP up Up.\n# TYPE up gauge\nup 1\n" {
+        return fail("handler-exact");
+    } else {
+    }
+    // Every fixed error string.
+    let ereg = metrics_registry();
+    metrics_register_counter(ereg, "c", "h.", [])?;
+    let e1 = metrics_register_counter(ereg, "c", "h.", []);
+    let w1: Result<unit, string> = Err("metrics: duplicate metric \"c\"");
+    if e1 != w1 {
+        return fail("err-dup");
+    } else {
+    }
+    let e2 = metrics_register_gauge(ereg, "c", "h.", []);
+    if e2 != w1 {
+        return fail("err-dup-kind");
+    } else {
+    }
+    let e3 = metrics_inc(ereg, "missing", [], 1);
+    let w3: Result<unit, string> = Err("metrics: unknown metric \"missing\"");
+    if e3 != w3 {
+        return fail("err-unknown");
+    } else {
+    }
+    let e4 = metrics_gauge_set(ereg, "missing", [], 1);
+    if e4 != w3 {
+        return fail("err-unknown-gauge");
+    } else {
+    }
+    let e5 = metrics_observe(ereg, "missing", [], 1);
+    if e5 != w3 {
+        return fail("err-unknown-histo");
+    } else {
+    }
+    let e6 = metrics_inc(ereg, "c", [], -1);
+    let w6: Result<unit, string> = Err("metrics: counter increment must be >= 0 (got -1)");
+    if e6 != w6 {
+        return fail("err-neg");
+    } else {
+    }
+    let e7 = metrics_register_counter(ereg, "has space", "h.", []);
+    let w7: Result<unit, string> = Err("metrics: bad metric name \"has space\" (want [a-zA-Z_:][a-zA-Z0-9_:]*)");
+    if e7 != w7 {
+        return fail("err-name");
+    } else {
+    }
+    let e8 = metrics_register_counter(ereg, "ok2", "h.", ["0"]);
+    let w8: Result<unit, string> = Err("metrics: bad label name \"0\" (want [a-zA-Z_:][a-zA-Z0-9_:]*)");
+    if e8 != w8 {
+        return fail("err-label-name");
+    } else {
+    }
+    let e9 = metrics_register_counter(ereg, "ok2", "h.", ["x", "x"]);
+    let w9: Result<unit, string> = Err("metrics: duplicate label name \"x\"");
+    if e9 != w9 {
+        return fail("err-label-dup");
+    } else {
+    }
+    let e10 = metrics_register_counter(ereg, "ok2", "h.", ["__x"]);
+    let w10: Result<unit, string> = Err("metrics: label name \"__x\" is reserved (\"__\" prefix)");
+    if e10 != w10 {
+        return fail("err-label-reserved");
+    } else {
+    }
+    let e11 = metrics_register_histogram(ereg, "okh", "h.", ["le"], [1]);
+    let w11: Result<unit, string> = Err("metrics: label \"le\" is reserved on histograms");
+    if e11 != w11 {
+        return fail("err-le");
+    } else {
+    }
+    // ...but `le` is an ordinary label elsewhere.
+    metrics_register_counter(ereg, "ok_le", "h.", ["le"])?;
+    metrics_inc(ereg, "ok_le", ["v"], 1)?;
+    let e12 = metrics_inc(ereg, "c", ["extra"], 1);
+    let w12: Result<unit, string> = Err("metrics: want 0 label values (got 1)");
+    if e12 != w12 {
+        return fail("err-arity");
+    } else {
+    }
+    let e13 = metrics_register_histogram(ereg, "h0", "h.", [], []);
+    let w13: Result<unit, string> = Err("metrics: buckets must be non-empty and strictly increasing");
+    if e13 != w13 {
+        return fail("err-buckets-empty");
+    } else {
+    }
+    let e14 = metrics_register_histogram(ereg, "h0", "h.", [], [3, 3]);
+    if e14 != w13 {
+        return fail("err-buckets-flat");
+    } else {
+    }
+    return Ok("METRICS-UNIT-OK");
+}
+
+fn main() -> int {
+    println(run());
+    return 0;
+}

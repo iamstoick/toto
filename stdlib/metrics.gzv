@@ -1,0 +1,654 @@
+// `gzv.std/metrics` — Prometheus metrics (Enterprise Wave 2, Stage 4).
+//
+// Counters, gauges, and histograms with Prometheus text-exposition
+// rendering (format version 0.0.4) plus a scrape responder for the
+// `gzv.std/http` framework. Pure Toto: no new builtins, no new FFI,
+// no spec change — the registry is ordinary structs and arrays over
+// the frozen surface, served through `http_serve` like any handler.
+//
+// Constraints honored: D1–D8 frozen; 27 builtins frozen (the ASCII
+// checks below are comparisons, not a codec builtin); Phase 5
+// module model (path imports, flat namespace — every name here is
+// `metrics_*`/`Metrics*`, `gzv.std/` prefix); ADR-009 + spec §17
+// APPROVED-as-written (loopback only — the scrape endpoint binds
+// through `http_serve`, so the loopback rule rides along; no
+// timeout parameters — `keepalive_ms` stays advisory in the
+// framework); static linking only (no new FFI — this module calls
+// back into `gzv.std/http` only); no Toto-owned TLS/crypto; no
+// Waves 3–5 work; Windows gets check-time `E0301` via the net/tls
+// surface this module rides on.
+//
+// State types (FIXED — one choice each, golden-pinned): a
+// `MetricsRegistry` holds `counters`, `gauges`, and `histograms`
+// (each a registration-ordered array of definitions). Every
+// definition carries `name`, `help`, and `label_names`; every
+// observation is a sample under one label-value set
+// (first-observation order). Counters hold monotonic `int` totals
+// (`metrics_inc` rejects negative deltas loudly); gauges hold
+// `int` values set or added to (`metrics_gauge_set/add` — the
+// delta may be negative); histograms hold cumulative per-bucket
+// `counts` over `int` upper bounds plus `sum` and `count`.
+// Values are ints (request counts, millisecond latencies) — float
+// observations are a follow-up with the full bytes story.
+//
+// Registration (FIXED): every metric must be registered before
+// use; the name must match `[a-zA-Z_:][a-zA-Z0-9_:]*`; the name
+// must be unique across ALL kinds (a counter and a gauge may never
+// share a name — Prometheus forbids it); label names follow the
+// same grammar, must be unique within the metric, must not start
+// with `__` (reserved), and `le` is reserved on histograms (the
+// renderer owns it); histogram bounds must be non-empty and
+// strictly increasing. Unknown-metric observations, wrong-arity
+// label sets, and unrepresentable help/label text are all `Err`
+// (fixed strings, never silent defaults). `help` and label values
+// must be HTTP text (printable ASCII plus HT/LF/CR — the same
+// acceptance as `http_text_to_bytes`, which performs the final
+// encode at serve time).
+//
+// Format version (FIXED): `metrics_exposition_version()` returns
+// `"0.0.4"`, and `metrics_content_type()` returns the scrape
+// media type `text/plain; version=0.0.4; charset=utf-8`. Render
+// order is registration order (counters, then gauges, then
+// histograms; samples in first-observation order) with label
+// names in declaration order (`le` first on bucket lines, as the
+// reference clients emit). HELP docstrings escape `\` and LF;
+// label values escape `\`, `"`, and LF — exactly the reference
+// escaping; anything else passes through verbatim. A registered
+// metric with no observations still emits its HELP/TYPE pair.
+// No timestamps, no `# EOF` (that marker is OpenMetrics, not
+// the 0.0.4 text format).
+//
+// Concurrency: arrays and structs are shared by reference, so a
+// handler closure capturing the registry observes the same state
+// the main task mutates (the `mwlog` pattern from `proj16`) —
+// one connection task per scrape, values exact under the
+// executor. No locks in v1: increments are single green-thread
+// steps, and scrapes interleave at suspension points exactly like
+// any other handler read.
+import "gzv.std/http.gzv";
+import "gzv.std/strings.gzv";
+
+// --- State types ---
+
+// One counter/gauge series: the label values (parallel to the
+// definition's `label_names`) plus the current total.
+pub struct MetricsSample {
+    labels: Array<string>,
+    value: int,
+}
+
+// One histogram series: cumulative per-bucket counts (parallel to
+// the definition's `buckets`), plus the running sum and count.
+pub struct MetricsHistoSample {
+    labels: Array<string>,
+    counts: Array<int>,
+    sum: int,
+    count: int,
+}
+
+// A registered counter definition plus its series.
+pub struct MetricsCounter {
+    name: string,
+    help: string,
+    label_names: Array<string>,
+    samples: Array<MetricsSample>,
+}
+
+// A registered gauge definition plus its series.
+pub struct MetricsGauge {
+    name: string,
+    help: string,
+    label_names: Array<string>,
+    samples: Array<MetricsSample>,
+}
+
+// A registered histogram definition plus its series.
+pub struct MetricsHistogram {
+    name: string,
+    help: string,
+    label_names: Array<string>,
+    buckets: Array<int>,
+    samples: Array<MetricsHistoSample>,
+}
+
+// The registry: every definition ever registered, in
+// registration order per kind. Mutated in place through the
+// shared arrays (the `route_add` pattern).
+pub struct MetricsRegistry {
+    counters: Array<MetricsCounter>,
+    gauges: Array<MetricsGauge>,
+    histograms: Array<MetricsHistogram>,
+}
+
+// An empty registry: no metrics of any kind.
+pub fn metrics_registry() -> MetricsRegistry {
+    let c: Array<MetricsCounter> = [];
+    let g: Array<MetricsGauge> = [];
+    let h: Array<MetricsHistogram> = [];
+    return MetricsRegistry { counters: c, gauges: g, histograms: h };
+}
+
+// --- Format version ---
+
+// The Prometheus text-exposition format this module renders.
+pub fn metrics_exposition_version() -> string {
+    return "0.0.4";
+}
+
+// The scrape media type: version pinned, UTF-8 declared.
+pub fn metrics_content_type() -> string {
+    return "text/plain; version=0.0.4; charset=utf-8";
+}
+
+// --- Name + text validation (private) ---
+
+fn metrics_is_name_start(c: string) -> bool {
+    if c == "_" || c == ":" {
+        return true;
+    } else {
+    }
+    if c >= "a" && c <= "z" {
+        return true;
+    } else {
+    }
+    if c >= "A" && c <= "Z" {
+        return true;
+    } else {
+    }
+    return false;
+}
+
+fn metrics_is_name_char(c: string) -> bool {
+    if metrics_is_name_start(c) {
+        return true;
+    } else {
+    }
+    if c >= "0" && c <= "9" {
+        return true;
+    } else {
+    }
+    return false;
+}
+
+// Prometheus metric/label grammar: `[a-zA-Z_:][a-zA-Z0-9_:]*`.
+fn metrics_valid_name(s: string) -> bool {
+    if len(s) == 0 {
+        return false;
+    } else {
+    }
+    let chars: Array<string> = split(s, "");
+    if !(metrics_is_name_start(chars[0])) {
+        return false;
+    } else {
+    }
+    for i in 1..len(chars) {
+        if !(metrics_is_name_char(chars[i])) {
+            return false;
+        } else {
+        }
+    }
+    return true;
+}
+
+// HTTP-text acceptance: printable ASCII plus HT/LF/CR — the same
+// rule `http_text_to_bytes` enforces at encode time, checked here
+// so the responsible call fails instead of a later scrape.
+fn metrics_require_text(s: string, err: string) -> Result<unit, string> {
+    let chars: Array<string> = split(s, "");
+    for c in chars {
+        if c == "\t" || c == "\n" || c == "\r" {
+            continue;
+        } else {
+        }
+        if c >= " " && c <= "~" {
+            continue;
+        } else {
+        }
+        return Err(err);
+    }
+    return Ok(());
+}
+
+// Label-name rules shared by all three kinds (`le` reserved only
+// on histograms, where the renderer owns it).
+fn metrics_check_label_names(label_names: Array<string>, for_histogram: bool) -> Result<unit, string> {
+    for i in 0..len(label_names) {
+        let nm = label_names[i];
+        if !(metrics_valid_name(nm)) {
+            return Err("metrics: bad label name \"" + nm + "\" (want [a-zA-Z_:][a-zA-Z0-9_:]*)");
+        } else {
+        }
+        if starts_with(nm, "__") {
+            return Err("metrics: label name \"" + nm + "\" is reserved (\"__\" prefix)");
+        } else {
+        }
+        if for_histogram && nm == "le" {
+            return Err("metrics: label \"le\" is reserved on histograms");
+        } else {
+        }
+        for j in 0..i {
+            if label_names[j] == nm {
+                return Err("metrics: duplicate label name \"" + nm + "\"");
+            } else {
+            }
+        }
+    }
+    return Ok(());
+}
+
+// Histogram bounds: non-empty, strictly increasing.
+fn metrics_check_buckets(buckets: Array<int>) -> Result<unit, string> {
+    if len(buckets) == 0 {
+        return Err("metrics: buckets must be non-empty and strictly increasing");
+    } else {
+    }
+    for i in 1..len(buckets) {
+        if buckets[i] <= buckets[i - 1] {
+            return Err("metrics: buckets must be non-empty and strictly increasing");
+        } else {
+        }
+    }
+    return Ok(());
+}
+
+// --- Lookup (private) ---
+
+// True when any kind already carries `name`.
+fn metrics_known(reg: MetricsRegistry, name: string) -> bool {
+    for i in 0..len(reg.counters) {
+        if reg.counters[i].name == name {
+            return true;
+        } else {
+        }
+    }
+    for i in 0..len(reg.gauges) {
+        if reg.gauges[i].name == name {
+            return true;
+        } else {
+        }
+    }
+    for i in 0..len(reg.histograms) {
+        if reg.histograms[i].name == name {
+            return true;
+        } else {
+        }
+    }
+    return false;
+}
+
+fn metrics_counter_at(reg: MetricsRegistry, name: string) -> int {
+    for i in 0..len(reg.counters) {
+        if reg.counters[i].name == name {
+            return i;
+        } else {
+        }
+    }
+    return -1;
+}
+
+fn metrics_gauge_at(reg: MetricsRegistry, name: string) -> int {
+    for i in 0..len(reg.gauges) {
+        if reg.gauges[i].name == name {
+            return i;
+        } else {
+        }
+    }
+    return -1;
+}
+
+fn metrics_histogram_at(reg: MetricsRegistry, name: string) -> int {
+    for i in 0..len(reg.histograms) {
+        if reg.histograms[i].name == name {
+            return i;
+        } else {
+        }
+    }
+    return -1;
+}
+
+fn metrics_labels_equal(a: Array<string>, b: Array<string>) -> bool {
+    if len(a) != len(b) {
+        return false;
+    } else {
+    }
+    for i in 0..len(a) {
+        if a[i] != b[i] {
+            return false;
+        } else {
+        }
+    }
+    return true;
+}
+
+fn metrics_sample_at(samples: Array<MetricsSample>, labels: Array<string>) -> int {
+    for i in 0..len(samples) {
+        if metrics_labels_equal(samples[i].labels, labels) {
+            return i;
+        } else {
+        }
+    }
+    return -1;
+}
+
+fn metrics_histo_at(samples: Array<MetricsHistoSample>, labels: Array<string>) -> int {
+    for i in 0..len(samples) {
+        if metrics_labels_equal(samples[i].labels, labels) {
+            return i;
+        } else {
+        }
+    }
+    return -1;
+}
+
+// Label values must match the declaration arity and be HTTP text
+// (fixed errors, never echoing the value).
+fn metrics_require_labels(label_names: Array<string>, labels: Array<string>) -> Result<unit, string> {
+    if len(labels) != len(label_names) {
+        return Err("metrics: want " + to_string(len(label_names)) + " label values (got " + to_string(len(labels)) + ")");
+    } else {
+    }
+    for v in labels {
+        metrics_require_text(v, "metrics: label value is not HTTP text")?;
+    }
+    return Ok(());
+}
+
+// --- Copies (private) ---
+
+// Copies (arrays are shared by reference — stored state must not
+// alias caller arrays).
+fn metrics_copy_strings(xs: Array<string>) -> Array<string> {
+    let out: Array<string> = [];
+    for x in xs {
+        push(out, x);
+    }
+    return out;
+}
+
+fn metrics_copy_ints(xs: Array<int>) -> Array<int> {
+    let out: Array<int> = [];
+    for x in xs {
+        push(out, x);
+    }
+    return out;
+}
+
+// --- Exposition (private escaping + public render) ---
+
+// Label values escape `\`, `"`, and LF — exactly the reference.
+fn metrics_escape_label(s: string) -> string {
+    let mut out: string = "";
+    let chars: Array<string> = split(s, "");
+    for c in chars {
+        if c == "\\" {
+            out = out + "\\\\";
+        } else {
+            if c == "\"" {
+                out = out + "\\\"";
+            } else {
+                if c == "\n" {
+                    out = out + "\\n";
+                } else {
+                    out = out + c;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// HELP docstrings escape `\` and LF only (0.0.4).
+fn metrics_escape_help(s: string) -> string {
+    let mut out: string = "";
+    let chars: Array<string> = split(s, "");
+    for c in chars {
+        if c == "\\" {
+            out = out + "\\\\";
+        } else {
+            if c == "\n" {
+                out = out + "\\n";
+            } else {
+                out = out + c;
+            }
+        }
+    }
+    return out;
+}
+
+// `{name="value",...}` (declaration order) or "" when unlabelled.
+fn metrics_label_suffix(label_names: Array<string>, labels: Array<string>) -> string {
+    if len(label_names) == 0 {
+        return "";
+    } else {
+    }
+    let mut out: string = "{";
+    for i in 0..len(label_names) {
+        if i > 0 {
+            out = out + ",";
+        } else {
+        }
+        out = out + label_names[i] + "=\"" + metrics_escape_label(labels[i]) + "\"";
+    }
+    return out + "}";
+}
+
+// Bucket lines carry `le` first, then the series labels.
+fn metrics_bucket_suffix(label_names: Array<string>, labels: Array<string>, le: string) -> string {
+    let mut out: string = "{le=\"" + le + "\"";
+    for i in 0..len(label_names) {
+        out = out + "," + label_names[i] + "=\"" + metrics_escape_label(labels[i]) + "\"";
+    }
+    return out + "}";
+}
+
+// The full 0.0.4 exposition: HELP/TYPE per metric in registration
+// order (counters, gauges, histograms), then every sample line.
+// Each line ends with `\n`, including the last.
+pub fn metrics_render(reg: MetricsRegistry) -> Result<string, string> {
+    let mut out: string = "";
+    for i in 0..len(reg.counters) {
+        let m = reg.counters[i];
+        out = out + "# HELP " + m.name + " " + metrics_escape_help(m.help) + "\n";
+        out = out + "# TYPE " + m.name + " counter\n";
+        for s in m.samples {
+            out = out + m.name + metrics_label_suffix(m.label_names, s.labels) + " " + to_string(s.value) + "\n";
+        }
+    }
+    for i in 0..len(reg.gauges) {
+        let m = reg.gauges[i];
+        out = out + "# HELP " + m.name + " " + metrics_escape_help(m.help) + "\n";
+        out = out + "# TYPE " + m.name + " gauge\n";
+        for s in m.samples {
+            out = out + m.name + metrics_label_suffix(m.label_names, s.labels) + " " + to_string(s.value) + "\n";
+        }
+    }
+    for i in 0..len(reg.histograms) {
+        let m = reg.histograms[i];
+        out = out + "# HELP " + m.name + " " + metrics_escape_help(m.help) + "\n";
+        out = out + "# TYPE " + m.name + " histogram\n";
+        for s in m.samples {
+            for b in 0..len(m.buckets) {
+                out = out + m.name + "_bucket" + metrics_bucket_suffix(m.label_names, s.labels, to_string(m.buckets[b])) + " " + to_string(s.counts[b]) + "\n";
+            }
+            out = out + m.name + "_bucket" + metrics_bucket_suffix(m.label_names, s.labels, "+Inf") + " " + to_string(s.count) + "\n";
+            out = out + m.name + "_sum" + metrics_label_suffix(m.label_names, s.labels) + " " + to_string(s.sum) + "\n";
+            out = out + m.name + "_count" + metrics_label_suffix(m.label_names, s.labels) + " " + to_string(s.count) + "\n";
+        }
+    }
+    // Labels were checked at observation time and bounds are ints,
+    // so this only re-states the serve-time invariant loudly.
+    metrics_require_text(out, "metrics: exposition is not HTTP text")?;
+    return Ok(out);
+}
+
+// --- Scrape endpoint via the framework ---
+
+// A 200 response carrying the current exposition with the pinned
+// media type. Handlers close over the registry (shared arrays, so
+// the scrape sees every observation to date).
+pub fn metrics_respond(reg: MetricsRegistry) -> Result<HttpResponse, string> {
+    let text = metrics_render(reg)?;
+    let body = http_text_to_bytes(text)?;
+    let hs: Array<HttpHeader> = [HttpHeader { name: "Content-Type", value: metrics_content_type() }];
+    return Ok(http_response(200, "OK", hs, body));
+}
+
+// A `GET`-ready handler value for `route_add(router, "GET",
+// "/metrics", metrics_handler(reg))`.
+pub fn metrics_handler(reg: MetricsRegistry) -> fn(HttpRequest) -> Result<HttpResponse, string> {
+    return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        return metrics_respond(reg);
+    };
+}
+
+// --- Registration ---
+
+// Register a counter. `label_names` declares the series key;
+// observations carry the values positionally.
+pub fn metrics_register_counter(reg: MetricsRegistry, name: string, help: string, label_names: Array<string>) -> Result<unit, string> {
+    if !(metrics_valid_name(name)) {
+        return Err("metrics: bad metric name \"" + name + "\" (want [a-zA-Z_:][a-zA-Z0-9_:]*)");
+    } else {
+    }
+    if metrics_known(reg, name) {
+        return Err("metrics: duplicate metric \"" + name + "\"");
+    } else {
+    }
+    metrics_check_label_names(label_names, false)?;
+    metrics_require_text(help, "metrics: help is not HTTP text")?;
+    let samples: Array<MetricsSample> = [];
+    push(reg.counters, MetricsCounter { name: name, help: help, label_names: metrics_copy_strings(label_names), samples: samples });
+    return Ok(());
+}
+
+// Register a gauge (same rules as a counter).
+pub fn metrics_register_gauge(reg: MetricsRegistry, name: string, help: string, label_names: Array<string>) -> Result<unit, string> {
+    if !(metrics_valid_name(name)) {
+        return Err("metrics: bad metric name \"" + name + "\" (want [a-zA-Z_:][a-zA-Z0-9_:]*)");
+    } else {
+    }
+    if metrics_known(reg, name) {
+        return Err("metrics: duplicate metric \"" + name + "\"");
+    } else {
+    }
+    metrics_check_label_names(label_names, false)?;
+    metrics_require_text(help, "metrics: help is not HTTP text")?;
+    let samples: Array<MetricsSample> = [];
+    push(reg.gauges, MetricsGauge { name: name, help: help, label_names: metrics_copy_strings(label_names), samples: samples });
+    return Ok(());
+}
+
+// Register a histogram with `int` upper bounds (cumulative
+// `le` series plus `_sum`/`_count`, all in observation units).
+pub fn metrics_register_histogram(reg: MetricsRegistry, name: string, help: string, label_names: Array<string>, buckets: Array<int>) -> Result<unit, string> {
+    if !(metrics_valid_name(name)) {
+        return Err("metrics: bad metric name \"" + name + "\" (want [a-zA-Z_:][a-zA-Z0-9_:]*)");
+    } else {
+    }
+    if metrics_known(reg, name) {
+        return Err("metrics: duplicate metric \"" + name + "\"");
+    } else {
+    }
+    metrics_check_label_names(label_names, true)?;
+    metrics_check_buckets(buckets)?;
+    metrics_require_text(help, "metrics: help is not HTTP text")?;
+    let samples: Array<MetricsHistoSample> = [];
+    push(reg.histograms, MetricsHistogram { name: name, help: help, label_names: metrics_copy_strings(label_names), buckets: metrics_copy_ints(buckets), samples: samples });
+    return Ok(());
+}
+
+// --- Observation ---
+
+// Add `delta` to a counter series (must be >= 0 — counters never
+// go down). First observation for a label set creates the series.
+pub fn metrics_inc(reg: MetricsRegistry, name: string, labels: Array<string>, delta: int) -> Result<unit, string> {
+    let ci = metrics_counter_at(reg, name);
+    if ci < 0 {
+        return Err("metrics: unknown metric \"" + name + "\"");
+    } else {
+    }
+    if delta < 0 {
+        return Err("metrics: counter increment must be >= 0 (got " + to_string(delta) + ")");
+    } else {
+    }
+    let m = reg.counters[ci];
+    metrics_require_labels(m.label_names, labels)?;
+    let si = metrics_sample_at(m.samples, labels);
+    if si < 0 {
+        push(m.samples, MetricsSample { labels: metrics_copy_strings(labels), value: delta });
+    } else {
+        m.samples[si].value = m.samples[si].value + delta;
+    }
+    return Ok(());
+}
+
+// Set a gauge series to an absolute value.
+pub fn metrics_gauge_set(reg: MetricsRegistry, name: string, labels: Array<string>, value: int) -> Result<unit, string> {
+    let gi = metrics_gauge_at(reg, name);
+    if gi < 0 {
+        return Err("metrics: unknown metric \"" + name + "\"");
+    } else {
+    }
+    let m = reg.gauges[gi];
+    metrics_require_labels(m.label_names, labels)?;
+    let si = metrics_sample_at(m.samples, labels);
+    if si < 0 {
+        push(m.samples, MetricsSample { labels: metrics_copy_strings(labels), value: value });
+    } else {
+        m.samples[si].value = value;
+    }
+    return Ok(());
+}
+
+// Add a (signed) delta to a gauge series.
+pub fn metrics_gauge_add(reg: MetricsRegistry, name: string, labels: Array<string>, delta: int) -> Result<unit, string> {
+    let gi = metrics_gauge_at(reg, name);
+    if gi < 0 {
+        return Err("metrics: unknown metric \"" + name + "\"");
+    } else {
+    }
+    let m = reg.gauges[gi];
+    metrics_require_labels(m.label_names, labels)?;
+    let si = metrics_sample_at(m.samples, labels);
+    if si < 0 {
+        push(m.samples, MetricsSample { labels: metrics_copy_strings(labels), value: delta });
+    } else {
+        m.samples[si].value = m.samples[si].value + delta;
+    }
+    return Ok(());
+}
+
+// Observe one histogram value: every bound >= the value counts
+// one more (cumulative), and `sum`/`count` grow by the value/one.
+pub fn metrics_observe(reg: MetricsRegistry, name: string, labels: Array<string>, value: int) -> Result<unit, string> {
+    let hi = metrics_histogram_at(reg, name);
+    if hi < 0 {
+        return Err("metrics: unknown metric \"" + name + "\"");
+    } else {
+    }
+    let m = reg.histograms[hi];
+    metrics_require_labels(m.label_names, labels)?;
+    let si = metrics_histo_at(m.samples, labels);
+    if si < 0 {
+        let counts: Array<int> = [];
+        for b in m.buckets {
+            if value <= b {
+                push(counts, 1);
+            } else {
+                push(counts, 0);
+            }
+        }
+        push(m.samples, MetricsHistoSample { labels: metrics_copy_strings(labels), counts: counts, sum: value, count: 1 });
+    } else {
+        let s = m.samples[si];
+        for b in 0..len(m.buckets) {
+            if value <= m.buckets[b] {
+                s.counts[b] = s.counts[b] + 1;
+            } else {
+            }
+        }
+        s.sum = s.sum + value;
+        s.count = s.count + 1;
+    }
+    return Ok(());
+}
