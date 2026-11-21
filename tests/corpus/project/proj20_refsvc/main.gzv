@@ -1,0 +1,211 @@
+// Wave 2 Stage 5 reference service: the framework + TLS + logging +
+// metrics wired as one loopback HTTPS service, with a Toto-native
+// client as the integration proof.
+//
+// What it does: serves `GET /hello`, `GET /users/{id}`, `POST /echo`
+// (binary echo), and `GET /metrics` over TLS on loopback; every
+// request passes the logging middleware (method + target at info)
+// and each handler counts/gauges/observes into the shared registry;
+// the client verifies the chain against the pinned CA, exercises
+// every route, checks the scrape byte-matches a local render with
+// the pinned media type, proves wrong-CA rejection + post-failure
+// survival, and drains the buffer-sink logs with `ts` normalized.
+//
+// Deterministic by construction (proj19 precedent): no ports, fds,
+// or timing in the output. Handler latency observations are a fixed
+// 1ms stand-in so the exposition golden stays exact — the wiring
+// (observe in the live handler path, scrape the shared registry)
+// is what is proven here; real latencies are deployment data and
+// are measured by the Stage 5 load probe, not pinned.
+import "gzv.std/http.gzv";
+import "gzv.std/net.gzv";
+import "gzv.std/metrics.gzv";
+import "gzv.std/log.gzv";
+import "gzv.std/context.gzv";
+import "gzv.std/time.gzv";
+
+// Normalize the nondeterministic `ts` to 0 using the exact wire
+// format (`{"ts":NNN,"level":...}`) — same shape as proj17.
+fn strip_ts(line: string) -> Result<string, string> {
+    let parts = split(line, "{\"ts\":");
+    if len(parts) != 2 {
+        return Err("no ts prefix");
+    } else {
+    }
+    let tail = split(parts[1], ",\"level\":\"");
+    if len(tail) < 2 {
+        return Err("no level separator");
+    } else {
+    }
+    let mut rest = tail[1];
+    let mut i = 2;
+    while i < len(tail) {
+        rest = rest + ",\"level\":\"" + tail[i];
+        i = i + 1;
+    }
+    return Ok("{\"ts\":0,\"level\":\"" + rest);
+}
+
+fn h_hello_factory(reg: MetricsRegistry) -> fn(HttpRequest) -> Result<HttpResponse, string> {
+    return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        metrics_inc(reg, "refsvc_requests_total", ["GET", "/hello"], 1)?;
+        metrics_gauge_add(reg, "refsvc_inflight", [], 1)?;
+        metrics_observe(reg, "refsvc_latency_ms", ["/hello"], 1)?;
+        metrics_gauge_add(reg, "refsvc_inflight", [], -1)?;
+        log_info("served GET /hello")?;
+        return http_text(200, "OK", "hello from refsvc");
+    };
+}
+
+fn h_user_factory(reg: MetricsRegistry) -> fn(HttpRequest) -> Result<HttpResponse, string> {
+    return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        metrics_inc(reg, "refsvc_requests_total", ["GET", "/users/{id}"], 1)?;
+        metrics_gauge_add(reg, "refsvc_inflight", [], 1)?;
+        metrics_observe(reg, "refsvc_latency_ms", ["/users/{id}"], 1)?;
+        metrics_gauge_add(reg, "refsvc_inflight", [], -1)?;
+        let raw = http_param(req.params, "id")?;
+        let did = http_decode_pct(raw)?;
+        log_info("served GET /users/{id}")?;
+        return http_text(200, "OK", "user:" + did);
+    };
+}
+
+fn h_echo_factory(reg: MetricsRegistry) -> fn(HttpRequest) -> Result<HttpResponse, string> {
+    return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        metrics_inc(reg, "refsvc_requests_total", ["POST", "/echo"], 1)?;
+        metrics_gauge_add(reg, "refsvc_inflight", [], 1)?;
+        metrics_observe(reg, "refsvc_latency_ms", ["/echo"], 1)?;
+        metrics_gauge_add(reg, "refsvc_inflight", [], -1)?;
+        log_info("served POST /echo")?;
+        return Ok(http_response(200, "OK", [], req.body));
+    };
+}
+
+// NOTE (runtime edge, not framework logic): like the proj16/proj19
+// builders, this takes the router as a parameter and returns only
+// `Result<unit>` — a `Result` holding function values cannot be
+// unwrapped with `?` in v1 (E0204), so routers cross by parameter.
+fn build_refsvc_router(router: HttpRouter, reg: MetricsRegistry) -> Result<unit, string> {
+    let hello = h_hello_factory(reg);
+    route_add(router, "GET", "/hello", hello)?;
+    let user = h_user_factory(reg);
+    route_add(router, "GET", "/users/{id}", user)?;
+    let echo = h_echo_factory(reg);
+    route_add(router, "POST", "/echo", echo)?;
+    route_add(router, "GET", "/metrics", metrics_handler(reg))?;
+    return Ok(());
+}
+
+fn mw_log(req: HttpRequest, next: fn(HttpRequest) -> Result<HttpResponse, string>) -> Result<HttpResponse, string> {
+    log_info("mw " + req.method + " " + req.target)?;
+    let r = next(req)?;
+    return Ok(r);
+}
+
+// Any-Err-is-good probe (proj16 shape): the exchange must FAIL;
+// an unexpected success becomes the fixed marker the caller CAN
+// compare against.
+fn neg_probe(make_bad: fn() -> Result<HttpClientResp, string>) -> Result<string, string> {
+    make_bad()?;
+    return Err("http: unexpected success");
+}
+
+fn run() -> Result<string, string> {
+    log_set_sink("buffer")?;
+    log_set_level("info")?;
+    // Request-scoped trace installed once; every spawned handler
+    // task inherits it (spawn inheritance), so no per-handler
+    // plumbing is needed for the log `ctx`.
+    ctx_set_current(ctx_with_value(ctx_background(), "trace_id", "refsvc-1"))?;
+    log_info("refsvc starting")?;
+    let reg = metrics_registry();
+    metrics_register_counter(reg, "refsvc_requests_total", "Reference service requests.", ["method", "route"])?;
+    metrics_register_gauge(reg, "refsvc_inflight", "Reference service inflight.", [])?;
+    metrics_register_histogram(reg, "refsvc_latency_ms", "Reference service latency milliseconds.", ["route"], [5, 25, 100, 500])?;
+    let router = http_router();
+    build_refsvc_router(router, reg)?;
+    use_mw(router, mw_log);
+    let opts = HttpServeOpts { expose_errors: false, max_body: 65536, keepalive_ms: 0, server_name: "toto-refsvc" };
+    let cert = read_file("fixtures/server-cert.pem");
+    let key = read_file("fixtures/server-key.pem");
+    let ca = read_file("fixtures/ca.pem");
+    let listener = http_serve_tls(48522, router, opts, cert, key)?;
+    let copts = HttpClientOpts { max_body: 65536, redirects: 0, host_allow: [] };
+    let base = "https://localhost:48522";
+    let r1 = http_do(HttpClientReq { method: "GET", url: base + "/hello", headers: [], body: [], ca_pem: ca }, copts)?;
+    if r1.status != 200 {
+        net_close(listener)?;
+        return Err("hello status");
+    } else {
+    }
+    println("hello=" + to_string(r1.status) + ":" + http_bytes_to_text(r1.body)?);
+    let r2 = http_do(HttpClientReq { method: "GET", url: base + "/users/42", headers: [], body: [], ca_pem: ca }, copts)?;
+    if r2.status != 200 {
+        net_close(listener)?;
+        return Err("user status");
+    } else {
+    }
+    println("user=" + to_string(r2.status) + ":" + http_bytes_to_text(r2.body)?);
+    let eb = http_text_to_bytes("ping-bytes")?;
+    let r3 = http_do(HttpClientReq { method: "POST", url: base + "/echo", headers: [], body: eb, ca_pem: ca }, copts)?;
+    if r3.status != 200 {
+        net_close(listener)?;
+        return Err("echo status");
+    } else {
+    }
+    println("echo=" + to_string(r3.status) + ":" + http_bytes_to_text(r3.body)?);
+    // Wrong CA: the handshake must fail; survival is proven by the
+    // request after it.
+    let other_ca = read_file("fixtures/other-ca.pem");
+    let n = neg_probe(fn() -> Result<HttpClientResp, string> {
+        return http_do(HttpClientReq { method: "GET", url: base + "/hello", headers: [], body: [], ca_pem: other_ca }, copts);
+    });
+    let w_bad: Result<string, string> = Err("http: unexpected success");
+    let mut neg = "yes";
+    if n == w_bad {
+        neg = "BAD";
+    } else {
+    }
+    println("neg=" + neg);
+    let r4 = http_do(HttpClientReq { method: "GET", url: base + "/hello", headers: [], body: [], ca_pem: ca }, copts)?;
+    if r4.status != 200 {
+        net_close(listener)?;
+        return Err("after status");
+    } else {
+    }
+    println("after=" + to_string(r4.status) + ":" + http_bytes_to_text(r4.body)?);
+    // Scrape last so the exposition covers every served request.
+    let sc = http_do(HttpClientReq { method: "GET", url: base + "/metrics", headers: [], body: [], ca_pem: ca }, copts)?;
+    if sc.status != 200 {
+        net_close(listener)?;
+        return Err("scrape status");
+    } else {
+    }
+    let ct = http_header_get(sc.headers, "content-type")?;
+    if ct != metrics_content_type() {
+        net_close(listener)?;
+        return Err("scrape content-type");
+    } else {
+    }
+    let body = http_bytes_to_text(sc.body)?;
+    let want = metrics_render(reg)?;
+    if body != want {
+        net_close(listener)?;
+        return Err("scrape mismatch");
+    } else {
+    }
+    println("metrics=" + to_string(sc.status) + ":match");
+    print(body);
+    net_close(listener)?;
+    let lines = log_drain_lines();
+    for line in lines {
+        println(strip_ts(line)?);
+    }
+    println("log-lines=" + to_string(len(lines)));
+    return Ok("REFSVC-OK");
+}
+
+fn main() -> int {
+    println(run());
+    return 0;
+}

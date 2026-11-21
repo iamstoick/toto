@@ -2453,6 +2453,42 @@ impl<'a> FnCx<'a> {
                         ),
                     });
                 }
+                // TLS lowers through the executor's blocking pool (a
+                // handshake/record step blocks on the network); the
+                // JIT task runtime has no pool integration, so refuse
+                // with the workaround like the net surface, never
+                // miscompile or stall in generated code. AOT shares
+                // this lowering, so the same refusal covers `toto
+                // build` (native TLS in AOT is a recorded follow-up;
+                // the executor is the reference).
+                if name.starts_with("toto_rt_tls_") {
+                    return Err(SubsetError {
+                        func: self.func.clone(),
+                        message: format!(
+                            "foreign function `{name}` is a blocking TLS wait, which needs the executor pool (run with `toto run`/`toto test`)"
+                        ),
+                    });
+                }
+                // Context, clock, and logging calls lower through the
+                // executor (per-task slots, spawn inheritance,
+                // suspension-point deadline checks); the JIT task
+                // runtime has no slot integration, so refuse with the
+                // workaround like the other Wave 2 surfaces, never
+                // miscompile. AOT shares this lowering, so the same
+                // refusal covers `toto build` (native context in AOT
+                // is a recorded follow-up; the executor is the
+                // reference).
+                if name.starts_with("toto_rt_ctx_")
+                    || name.starts_with("toto_rt_clock_")
+                    || name.starts_with("toto_rt_log_")
+                {
+                    return Err(SubsetError {
+                        func: self.func.clone(),
+                        message: format!(
+                            "foreign function `{name}` needs the executor context runtime (run with `toto run`/`toto test`)"
+                        ),
+                    });
+                }
                 let idx = Self::extern_index(prog, name).ok_or_else(|| SubsetError {
                     func: self.func.clone(),
                     message: format!(

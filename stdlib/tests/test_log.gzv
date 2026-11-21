@@ -1,0 +1,199 @@
+// stdlib log tests: run with `toto test` from stdlib/.
+//
+// This file intentionally imports NEITHER `gzv.std/context.gzv`
+// (which contains a `go`, forcing the executor) NOR anything
+// concurrent: it runs on the SEQUENTIAL interpreter, covering the
+// interpreter-side clock/context/log arms. The three context slot
+// externs below are declared locally for slot setup (no duplicate:
+// `context.gzv` is not imported here). Level/sink globals are
+// process-wide: they are restored to `info`/`stdout` at the end.
+import "gzv.std/log.gzv";
+import "gzv.std/json.gzv";
+import "gzv.std/time.gzv";
+
+unsafe extern "C" {
+    fn toto_rt_ctx_begin() -> c_int;
+    fn toto_rt_ctx_add(key: *c_char, val: *c_char) -> c_int;
+    fn toto_rt_ctx_set_deadline(d: c_long) -> c_int;
+}
+
+fn check(cond: bool, msg: string) -> Result<bool, string> {
+    if cond {
+        return Ok(true);
+    } else {
+        return Err(msg);
+    }
+}
+
+fn install_test_ctx() -> Result<bool, string> {
+    toto_rt_ctx_begin();
+    toto_rt_ctx_add("trace_id", "req-7f3a");
+    toto_rt_ctx_add("request_id", "r-42");
+    toto_rt_ctx_set_deadline(-1);
+    return Ok(true);
+}
+
+fn clear_test_ctx() -> Result<bool, string> {
+    toto_rt_ctx_begin();
+    return Ok(true);
+}
+
+fn t_gate() -> Result<bool, string> {
+    log_set_sink("buffer")?;
+    log_set_level("debug")?;
+    // Emitted at debug (buffer sink returns no stdout line).
+    check(log_debug("d1")? == 0, "debug rc")?;
+    check(log_info("i1")? == 0, "info rc")?;
+    check(len(log_drain_lines()) == 2, "debug count")?;
+    // Warn gate filters info, keeps warn+.
+    log_set_level("warn")?;
+    check(log_info("i-filtered")? == 0, "filtered rc")?;
+    check(log_warn("w1")? == 0, "warn rc")?;
+    check(log_error("e1")? == 0, "error rc")?;
+    let lines = log_drain_lines();
+    check(len(lines) == 2, "warn count")?;
+    // Unknown names are Err with fixed messages; the gate is
+    // unchanged by the rejection.
+    let bad_level = log_set_level("verbose");
+    let want_level: Result<int, string> = Err("log: unknown level \"verbose\" (want debug/info/warn/error/off)");
+    check(bad_level == want_level, "bad level message")?;
+    let bad_sink = log_set_sink("file");
+    let want_sink: Result<int, string> = Err("log: unknown sink \"file\" (want stdout/stderr/buffer)");
+    check(bad_sink == want_sink, "bad sink message")?;
+    check(log_warn("w2")? == 0, "gate kept")?;
+    check(len(log_drain_lines()) == 1, "gate kept count")?;
+    return Ok(true);
+}
+
+fn t_format() -> Result<bool, string> {
+    install_test_ctx()?;
+    log_set_sink("buffer")?;
+    log_set_level("info")?;
+    log_info("say \"hi\"")?;
+    let lines = log_drain_lines();
+    check(len(lines) == 1, "one line")?;
+    let v: JsonVal = json_parse(lines[0])?;
+    check(json_as_string(json_object_get(v, "level")?)? == "info", "level field")?;
+    check(json_as_string(json_object_get(v, "msg")?)? == "say \"hi\"", "msg field")?;
+    let ctx: JsonVal = json_object_get(v, "ctx")?;
+    check(json_as_string(json_object_get(ctx, "trace_id")?)? == "req-7f3a", "trace field")?;
+    check(json_as_string(json_object_get(ctx, "request_id")?)? == "r-42", "request field")?;
+    let ts = json_as_int(json_object_get(v, "ts")?)?;
+    check(ts >= 0, "ts non-negative")?;
+    // Exact wire format (field order + sorted ctx keys + escaping),
+    // rebuilt around the observed ts — the ts itself is never pinned.
+    let want = "{\"ts\":" + to_string(ts) + ",\"level\":\"info\",\"msg\":\"say \\\"hi\\\"\",\"ctx\":{\"request_id\":\"r-42\",\"trace_id\":\"req-7f3a\"}}";
+    check(lines[0] == want, "exact line")?;
+    clear_test_ctx()?;
+    return Ok(true);
+}
+
+fn t_escaping() -> Result<bool, string> {
+    install_test_ctx()?;
+    log_set_sink("buffer")?;
+    log_set_level("info")?;
+    log_info("a\nb\tc\rd\"e\\f")?;
+    let lines = log_drain_lines();
+    check(len(lines) == 1, "escape one line")?;
+    // No raw newline: the record is exactly one line.
+    check(len(split(lines[0], "\n")) == 1, "single line")?;
+    let v: JsonVal = json_parse(lines[0])?;
+    check(json_as_string(json_object_get(v, "msg")?)? == "a\nb\tc\rd\"e\\f", "roundtrip")?;
+    clear_test_ctx()?;
+    return Ok(true);
+}
+
+fn t_empty_ctx() -> Result<bool, string> {
+    clear_test_ctx()?;
+    log_set_sink("buffer")?;
+    log_set_level("info")?;
+    log_info("bare")?;
+    let lines = log_drain_lines();
+    check(len(lines) == 1, "bare one line")?;
+    let v: JsonVal = json_parse(lines[0])?;
+    let ctx: JsonVal = json_object_get(v, "ctx")?;
+    check(json_kind(ctx) == "obj", "ctx obj")?;
+    check(json_as_string(json_object_get(v, "msg")?)? == "bare", "bare msg")?;
+    return Ok(true);
+}
+
+fn t_trace_edge() -> Result<bool, string> {
+    install_test_ctx()?;
+    log_set_sink("buffer")?;
+    log_set_level("debug")?;
+    log_trace_edge("db-query")?;
+    let lines = log_drain_lines();
+    check(len(lines) == 1, "edge one line")?;
+    let v: JsonVal = json_parse(lines[0])?;
+    check(json_as_string(json_object_get(v, "msg")?)? == "causality: db-query", "edge msg")?;
+    check(json_as_string(json_object_get(json_object_get(v, "ctx")?, "trace_id")?)? == "req-7f3a", "edge ctx")?;
+    clear_test_ctx()?;
+    return Ok(true);
+}
+
+fn t_stdout_sink() -> Result<bool, string> {
+    // Stdout lines go through the captured output (ignored on test
+    // success) and report Ok(1); the buffer stays empty.
+    log_set_sink("stdout")?;
+    log_set_level("info")?;
+    // The line below is intentional stdout traffic: the runner only
+    // compares stdout on failure.
+    check(log_info("stdout-probe")? == 1, "stdout rc")?;
+    log_set_sink("buffer")?;
+    check(len(log_drain_lines()) == 0, "buffer untouched")?;
+    return Ok(true);
+}
+
+fn t_restore() -> Result<bool, string> {
+    // Process globals outlive this file in a `toto test` run.
+    log_set_sink("stdout")?;
+    log_set_level("info")?;
+    clear_test_ctx()?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_gate() != yes {
+        println("FAIL gate");
+        failures = failures + 1;
+    } else {
+    }
+    if t_format() != yes {
+        println("FAIL format");
+        failures = failures + 1;
+    } else {
+    }
+    if t_escaping() != yes {
+        println("FAIL escaping");
+        failures = failures + 1;
+    } else {
+    }
+    if t_empty_ctx() != yes {
+        println("FAIL empty_ctx");
+        failures = failures + 1;
+    } else {
+    }
+    if t_trace_edge() != yes {
+        println("FAIL trace_edge");
+        failures = failures + 1;
+    } else {
+    }
+    if t_stdout_sink() != yes {
+        println("FAIL stdout_sink");
+        failures = failures + 1;
+    } else {
+    }
+    if t_restore() != yes {
+        println("FAIL restore");
+        failures = failures + 1;
+    } else {
+    }
+    if failures > 0 {
+        println(to_string(failures) + " log failures");
+        return 1;
+    } else {
+    }
+    return 0;
+}

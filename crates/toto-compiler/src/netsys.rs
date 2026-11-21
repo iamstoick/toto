@@ -480,6 +480,40 @@ fn socket_of(ty: c_int) -> Result<c_int, String> {
     if fd < 0 { Err(last_error()) } else { Ok(fd) }
 }
 
+/// Mark a socket blocking (TLS path: handshakes and record I/O run
+/// as blocking steps on the interpreter or the dedicated blocking
+/// pool, never on the poller — so blocking is the session mode.
+/// Idempotent: clearing an already-clear flag is a no-op success).
+pub fn set_blocking(fd: c_int) -> Result<(), String> {
+    // Mirror image of `set_nonblocking` (same constants, same
+    // platform split): Linux clears `O_NONBLOCK` via fcntl; macOS
+    // drives `FIONBIO` with a zero argument.
+    #[cfg(target_os = "macos")]
+    {
+        let mut zero: c_int = 0;
+        // SAFETY: FIONBIO takes a pointer to int; `zero` outlives it.
+        let r = unsafe { libc_ioctl(fd, 0x8004667e, &mut zero as *mut c_int) };
+        if r < 0 {
+            return Err(last_error());
+        }
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    const O_NONBLOCK_FLAG: c_int = 0x800;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    const O_NONBLOCK_FLAG: c_int = 0;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let flags = unsafe { libc_fcntl(fd, 3, 0) };
+        if flags < 0 {
+            return Err(last_error());
+        }
+        // SAFETY: clearing the nonblocking bit of the live flags.
+        let r = unsafe { libc_fcntl(fd, 4, flags & !O_NONBLOCK_FLAG) };
+        if r < 0 { Err(last_error()) } else { Ok(()) }
+    }
+}
+
 /// Mark a socket nonblocking (executor path; the interpreter uses
 /// blocking sockets and never calls this).
 pub fn set_nonblocking(fd: c_int) -> Result<(), String> {

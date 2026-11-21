@@ -1,0 +1,112 @@
+// `gzv.std/tls` — TLS upgrades for loopback TCP (Enterprise Wave 2, Stage 1).
+//
+// Toto wrappers over the runtime `toto_rt_tls_*` foreign functions
+// (unix-only; see `docs/ffi.md` for the per-binding contract). The
+// state machine itself runs in the linked system libssl (OpenSSL 3
+// on Linux, LibreSSL on macOS) — this module binds, never
+// implements. Bytes cross as `Array<int>` (0–255; out-of-range is
+// E0308 at the boundary). Connections keep their `int` handles —
+// TLS upgrades an already-connected TCP fd in place (client:
+// `net_tcp_connect` then `tls_client_connect`; server:
+// `net_tcp_listen`/`net_accept` then `tls_server_accept`), so no
+// new socket layer exists and the Wave 1 loopback rule carries
+// over unchanged (no address parameter anywhere here). Every
+// fallible function returns `Result<_, string>` with the library
+// message via the call-duration slot; closing twice or operating
+// on a non-TLS socket is an `Err`, never a panic, never silent.
+//
+// Blocking semantics: handshake/record steps run as blocking calls
+// (interpreter) or on the runtime's dedicated blocking pool
+// (executor) — never on the poller, which only serves `poll()`able
+// readiness waits (spec §17.5 rule: an SSL step is not one).
+//
+// Trust model (Wave 1 reuse): the client verifies the server chain
+// against the given CA PEM (`fixtures/ca.pem` in tests) with the
+// same `X509_STORE` semantics as `crypto_x509_verify`, enforced by
+// the library at handshake time. No hostname check (as in Wave 1),
+// no client certificates, no session resumption, no ALPN — one-way
+// loopback TLS only (recorded follow-ups in the Wave 2 report).
+
+unsafe extern "C" {
+    fn toto_rt_tls_connect(conn: c_int, ca_pem: *c_char) -> c_int;
+    fn toto_rt_tls_accept(conn: c_int, cert_pem: *c_char, key_pem: *c_char) -> c_int;
+    fn toto_rt_tls_send(conn: c_int, data: Array<int>) -> c_int;
+    fn toto_rt_tls_recv(conn: c_int, max: c_int) -> Array<int>;
+    fn toto_rt_tls_close(sock: c_int) -> c_int;
+    fn toto_rt_tls_last_error() -> string;
+}
+
+fn tls_last_error() -> string {
+    return toto_rt_tls_last_error();
+}
+
+// Upgrade a connected TCP fd to TLS, verifying the server chain
+// against `ca_pem`. Returns the same fd on success.
+pub fn tls_client_connect(conn: int, ca_pem: string) -> Result<int, string> {
+    let fd = toto_rt_tls_connect(conn, ca_pem);
+    if fd < 0 {
+        return Err(tls_last_error());
+    }
+    return Ok(fd);
+}
+
+// Upgrade an accepted TCP fd to TLS with `cert_pem`/`key_pem`.
+// Returns the same fd on success.
+pub fn tls_server_accept(conn: int, cert_pem: string, key_pem: string) -> Result<int, string> {
+    let fd = toto_rt_tls_accept(conn, cert_pem, key_pem);
+    if fd < 0 {
+        return Err(tls_last_error());
+    }
+    return Ok(fd);
+}
+
+// One record write; may short-write. Returns bytes written.
+pub fn tls_send(conn: int, data: Array<int>) -> Result<int, string> {
+    let n = toto_rt_tls_send(conn, data);
+    if n < 0 {
+        return Err(tls_last_error());
+    }
+    return Ok(n);
+}
+
+// Loop to full delivery (`tls_send` may short-write per call).
+pub fn tls_send_all(conn: int, data: Array<int>) -> Result<int, string> {
+    let mut off = 0;
+    while off < len(data) {
+        let rest: Array<int> = [];
+        let mut i = off;
+        while i < len(data) {
+            push(rest, data[i]);
+            i = i + 1;
+        }
+        let n = toto_rt_tls_send(conn, rest);
+        if n < 0 {
+            return Err(tls_last_error());
+        }
+        off = off + n;
+    }
+    return Ok(len(data));
+}
+
+// Up to `max` bytes; an empty array is orderly shutdown
+// (peer `close_notify`/TCP FIN), NOT an error.
+pub fn tls_recv(conn: int, max: int) -> Result<Array<int>, string> {
+    if max < 1 {
+        return Err("invalid max (want >= 1)");
+    }
+    let data = toto_rt_tls_recv(conn, max);
+    let e = tls_last_error();
+    if len(data) == 0 && e != "" {
+        return Err(e);
+    }
+    return Ok(data);
+}
+
+// Full teardown (`close_notify` + free + close). `Ok(0)`.
+pub fn tls_close(sock: int) -> Result<int, string> {
+    let rc = toto_rt_tls_close(sock);
+    if rc < 0 {
+        return Err(tls_last_error());
+    }
+    return Ok(0);
+}

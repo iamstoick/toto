@@ -1,12 +1,35 @@
-// gzv.std/time — pure durations and timestamps (Phase 5, Stage 2).
+// gzv.std/time — pure durations and timestamps (Phase 5, Stage 2),
+// plus the Wave 2 monotonic clock (Stage 3).
 //
 // A duration is an int count of milliseconds; a timestamp is an int
-// count of milliseconds since an application-chosen epoch. There is
-// deliberately no wall clock here: the frozen builtins expose no
-// clock, and adding one would need a new builtin (frozen catalog).
-// Wall-clock constructors land with the Stage 3 FFI work; until
-// then, compare/arithmetic/formatting over int timestamps covers
-// timeouts, backoff math, and log rendering.
+// count of milliseconds since an application-chosen epoch. The
+// frozen builtins expose no clock, so the clock arrives as a linked
+// foreign function (`toto_rt_clock_monotonic_ms`, unix-only — see
+// `docs/ffi.md`), not a builtin: the catalog stays frozen.
+//
+// The clock is MONOTONIC milliseconds since process start
+// (ADR-009): absolute values compose across fan-out, durations do
+// not. There is still no wall clock in v1 — timestamps are
+// process-relative. Values are small ints early in the run but
+// nondeterministic by construction (time passes between scheduling
+// points), so they are never pinned in goldens. Durations and the
+// pure timestamp arithmetic below stay exact and deterministic.
+
+unsafe extern "C" {
+    fn toto_rt_clock_monotonic_ms() -> c_long;
+}
+
+// Monotonic ms since process start. Never equal-pinned; compare
+// differences (elapsed) or inequalities only.
+pub fn clock_monotonic_ms() -> int {
+    return toto_rt_clock_monotonic_ms();
+}
+
+// Milliseconds elapsed since `t0` (a `clock_monotonic_ms()` read).
+// Non-negative on both engines (the clock never runs backward).
+pub fn clock_elapsed_since(t0: int) -> int {
+    return clock_monotonic_ms() - t0;
+}
 
 pub fn millis_per_sec() -> int {
     return 1000;

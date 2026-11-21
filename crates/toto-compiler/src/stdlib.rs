@@ -38,10 +38,15 @@ pub const MODULES: &[(&str, &str)] = &[
     std_module!("ffi_thread"),
     std_module!("net"),
     std_module!("crypto"),
+    std_module!("tls"),
+    std_module!("http"),
     std_module!("compress"),
     std_module!("toml"),
     std_module!("yaml"),
     std_module!("proto"),
+    std_module!("context"),
+    std_module!("log"),
+    std_module!("metrics"),
 ];
 
 /// Embedded source for a canonical `gzv.std/...` path, if known.

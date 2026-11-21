@@ -165,6 +165,24 @@ const NEGATIVES: &[&str] = &[
 
 #[test]
 fn fmt_equiv_concurrent_and_projects() {
+    // The formatted corpus (notably the large Wave 2 project files)
+    // needs more than the default thread stack during load+check, so
+    // the harness provisions it explicitly (scoped to this test, not
+    // via environment). 32 MiB matches the proven-sufficient value.
+    match std::thread::Builder::new()
+        .name("fmt_equiv_main".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(run_fmt_equiv)
+    {
+        Ok(handle) => match handle.join() {
+            Ok(()) => {}
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+        Err(e) => panic!("fmt_equiv: cannot spawn worker thread: {e}"),
+    }
+}
+
+fn run_fmt_equiv() {
     let root = corpus_root();
     let mut failures = Vec::new();
     let mut ran = 0usize;

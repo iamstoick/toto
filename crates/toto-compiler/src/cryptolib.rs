@@ -27,6 +27,10 @@ mod inner {
     use std::os::raw::{c_char, c_int, c_uchar, c_uint, c_void};
 
     // Opaque OpenSSL types: pointers only, never constructed here.
+    // `Bio`/`X509`/`X509Store`/`EvpPkey` are `pub(crate)` — the Wave 2
+    // TLS bridge (`tlslib`) shares these declaration sites instead of
+    // redeclaring the same C symbols (which would trip
+    // `clashing_extern_declarations` and split the contract in two).
     enum EvpMd {}
     enum EvpMdCtx {}
     enum EvpCipher {}
@@ -35,9 +39,10 @@ mod inner {
     enum EcGroup {}
     enum EcPoint {}
     enum BigNum {}
-    enum Bio {}
-    enum X509 {}
-    enum X509Store {}
+    pub(crate) enum Bio {}
+    pub(crate) enum X509 {}
+    pub(crate) enum X509Store {}
+    pub(crate) enum EvpPkey {}
     enum X509StoreCtx {}
 
     #[link(name = "crypto")]
@@ -640,6 +645,8 @@ mod inner {
     }
 
     // -- X.509 chain verification --
+    // `pub(crate)` items are the shared declaration site for the
+    // Wave 2 TLS bridge (see the opaque-type note above).
     unsafe extern "C" {
         fn BIO_new_mem_buf(buf: *const c_void, len: c_int) -> *mut Bio;
         fn BIO_free(b: *mut Bio) -> c_int;
@@ -649,10 +656,10 @@ mod inner {
             cb: Option<unsafe extern "C" fn(*mut c_char, c_int, c_int, *mut c_void) -> c_int>,
             u: *mut c_void,
         ) -> *mut X509;
-        fn X509_free(x: *mut X509);
+        pub(crate) fn X509_free(x: *mut X509);
         fn X509_STORE_new() -> *mut X509Store;
         fn X509_STORE_free(s: *mut X509Store);
-        fn X509_STORE_add_cert(s: *mut X509Store, x: *mut X509) -> c_int;
+        pub(crate) fn X509_STORE_add_cert(s: *mut X509Store, x: *mut X509) -> c_int;
         fn X509_STORE_CTX_new() -> *mut X509StoreCtx;
         fn X509_STORE_CTX_free(c: *mut X509StoreCtx);
         fn X509_STORE_CTX_init(
@@ -663,11 +670,20 @@ mod inner {
         ) -> c_int;
         fn X509_verify_cert(ctx: *mut X509StoreCtx) -> c_int;
         fn OpenSSL_version(t: c_int) -> *const c_char;
+        pub(crate) fn PEM_read_bio_PrivateKey(
+            bp: *mut Bio,
+            x: *mut *mut EvpPkey,
+            cb: Option<unsafe extern "C" fn(*mut c_char, c_int, c_int, *mut c_void) -> c_int>,
+            u: *mut c_void,
+        ) -> *mut EvpPkey;
+        pub(crate) fn EVP_PKEY_free(k: *mut EvpPkey);
     }
 
     /// Safe wrapper: the slice outlives the call, the BIO is freed
-    /// on every path, and the parsed cert is null-checked.
-    fn pem_to_x509(pem: &str, what: &str) -> Result<*mut X509, String> {
+    /// on every path, and the parsed cert is null-checked. Shared
+    /// with the TLS bridge (`pub(crate)` — same declaration-site
+    /// rule as the types above).
+    pub(crate) fn pem_to_x509(pem: &str, what: &str) -> Result<*mut X509, String> {
         // SAFETY: borrowed slice outlives the call; BIO freed on
         // every path; result null-checked; never retained.
         unsafe {
@@ -687,6 +703,28 @@ mod inner {
                 return Err(format!("{what}: unparseable PEM"));
             }
             Ok(x)
+        }
+    }
+
+    /// Parse one PEM private key (same contract as `pem_to_x509`).
+    /// Shared with the TLS bridge (`pub(crate)`).
+    pub(crate) fn pem_to_pkey(pem: &str, what: &str) -> Result<*mut EvpPkey, String> {
+        // SAFETY: borrowed slice outlives the call; BIO freed on
+        // every path; result null-checked; never retained.
+        unsafe {
+            if pem.len() > c_int::MAX as usize {
+                return Err(format!("{what}: PEM too long"));
+            }
+            let bio = BIO_new_mem_buf(pem.as_ptr() as *const c_void, pem.len() as c_int);
+            if bio.is_null() {
+                return Err(format!("{what}: BIO allocation failed"));
+            }
+            let k = PEM_read_bio_PrivateKey(bio, std::ptr::null_mut(), None, std::ptr::null_mut());
+            BIO_free(bio);
+            if k.is_null() {
+                return Err(format!("{what}: unparseable PEM"));
+            }
+            Ok(k)
         }
     }
 

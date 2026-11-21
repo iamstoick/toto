@@ -9,6 +9,7 @@ pub mod check;
 pub mod compress;
 #[cfg(unix)]
 pub mod cryptolib;
+pub mod ctxlog;
 pub mod diag;
 pub mod ffi;
 pub mod fmt;
@@ -24,6 +25,8 @@ pub mod parser;
 pub mod project;
 pub mod span;
 pub mod stdlib;
+#[cfg(unix)]
+pub mod tlslib;
 pub mod token;
 
 use std::collections::HashMap;
@@ -130,12 +133,15 @@ const TRACE_HEAD: usize = 20;
 const TRACE_TAIL: usize = 2;
 
 /// Innermost-first visible frames plus the omission count, if truncated.
-fn visible_frames(trace: &[TraceFrame]) -> (Vec<&TraceFrame>, Option<usize>) {
+/// Each entry carries its index in the full trace so multi-file
+/// rendering can attribute a frame's call-site span to its caller.
+fn visible_frames(trace: &[TraceFrame]) -> (Vec<(usize, &TraceFrame)>, Option<usize>) {
     if trace.len() <= TRACE_HEAD + TRACE_TAIL {
-        (trace.iter().rev().collect(), None)
+        (trace.iter().enumerate().rev().collect(), None)
     } else {
-        let mut v: Vec<&TraceFrame> = trace.iter().rev().take(TRACE_HEAD).collect();
-        v.extend(trace.iter().take(TRACE_TAIL));
+        let mut v: Vec<(usize, &TraceFrame)> =
+            trace.iter().enumerate().rev().take(TRACE_HEAD).collect();
+        v.extend(trace.iter().enumerate().take(TRACE_TAIL));
         (v, Some(trace.len() - TRACE_HEAD - TRACE_TAIL))
     }
 }
@@ -147,7 +153,7 @@ pub fn render_panic(diag: &Diag, trace: &[TraceFrame], src: &str, filename: &str
     let mut out = diag.render(src, filename, true);
     out.push_str("stack trace:\n");
     let (frames, omitted) = visible_frames(trace);
-    for (i, frame) in frames.iter().enumerate() {
+    for (i, (_orig, frame)) in frames.iter().enumerate() {
         if let Some(n) = omitted
             && i == TRACE_HEAD
         {
@@ -180,13 +186,23 @@ pub fn render_panic_multi(
     );
     out.push_str("stack trace:\n");
     let (frames, omitted) = visible_frames(trace);
-    for (i, frame) in frames.iter().enumerate() {
+    for (i, (orig, frame)) in frames.iter().enumerate() {
         if let Some(n) = omitted
             && i == TRACE_HEAD
         {
             out.push_str(&format!("  ... ({n} frames omitted) ...\n"));
         }
-        let f = project.file_of_fn(&frame.name);
+        // Frame spans are call-site coordinates in the CALLER's file
+        // (each frame is pushed with the call's span), so attributing
+        // them to the callee's file misrenders cross-file traces —
+        // e.g. a stdlib-coordinate span against the entry source.
+        // The outermost frame's span is its own (main/go spawn span).
+        let owner = if *orig == 0 {
+            &frame.name
+        } else {
+            &trace[*orig - 1].name
+        };
+        let f = project.file_of_fn(owner);
         let (line, col) = frame.span.line_col(&project.files[f].src);
         out.push_str(&format!(
             "  in {} at {}:{line}:{col}\n",

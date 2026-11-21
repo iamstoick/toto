@@ -335,17 +335,53 @@ pub const LINKED: &[&str] = &[
     "toto_rt_crypto_x509_verify",
     "toto_rt_crypto_last_error",
     "toto_rt_crypto_version",
+    // Wave 2 Stage 1 TLS (unix-only — same gate as sockets/crypto):
+    // handshake upgrades of already-connected TCP fds, record I/O,
+    // and teardown, over the system libssl. Sessions are retained
+    // under the fd (explicit handle rule in `tlslib`); Toto sees
+    // only `int` handles and `Array<int>` bytes.
+    "toto_rt_tls_connect",
+    "toto_rt_tls_accept",
+    "toto_rt_tls_send",
+    "toto_rt_tls_recv",
+    "toto_rt_tls_close",
+    "toto_rt_tls_last_error",
     // Wave 1 compression (platform-independent pure-Rust gzip: no
     // cfg gate, works on every platform including Windows).
     "toto_rt_gzip_compress",
     "toto_rt_gzip_decompress",
     "toto_rt_gzip_last_error",
+    // Wave 2 Stage 3 context + clock + structured logging
+    // (unix-only — same gate as sockets/crypto/TLS: the executor
+    // owns the per-task slot, the interpreter a thread-local; the
+    // clock and log globals are shared process state in `ctxlog`).
+    // Context slot ops cross only C scalars and strings: the
+    // `Context` struct itself stays a pure-Toto library value, built
+    // and read through these per-field getters/setters.
+    "toto_rt_clock_monotonic_ms",
+    "toto_rt_ctx_begin",
+    "toto_rt_ctx_add",
+    "toto_rt_ctx_count",
+    "toto_rt_ctx_key",
+    "toto_rt_ctx_val",
+    "toto_rt_ctx_deadline",
+    "toto_rt_ctx_set_deadline",
+    "toto_rt_ctx_with_cancel",
+    "toto_rt_ctx_cancel",
+    "toto_rt_ctx_detach_next",
+    "toto_rt_ctx_last_error",
+    "toto_rt_log_emit",
+    "toto_rt_log_set_level",
+    "toto_rt_log_set_sink",
+    "toto_rt_log_drain",
+    "toto_rt_log_last_error",
 ];
 
 /// POSIX-only FFI names: threads, file descriptors, `errno`, sleep,
-/// sockets, crypto. No MSVC equivalents; naming one on Windows is a clean
-/// E0301 at check time (the dispatch arms are `cfg(unix)` to match,
-/// so the `unreachable!("linkage checked above")` tail stays sound).
+/// sockets, crypto, TLS. No MSVC equivalents; naming one on Windows
+/// is a clean E0301 at check time (the dispatch arms are `cfg(unix)`
+/// to match, so the `unreachable!("linkage checked above")` tail
+/// stays sound).
 #[cfg(windows)]
 const POSIX_ONLY: &[&str] = &[
     "open",
@@ -382,9 +418,32 @@ const POSIX_ONLY: &[&str] = &[
     "toto_rt_crypto_x509_verify",
     "toto_rt_crypto_last_error",
     "toto_rt_crypto_version",
+    "toto_rt_tls_connect",
+    "toto_rt_tls_accept",
+    "toto_rt_tls_send",
+    "toto_rt_tls_recv",
+    "toto_rt_tls_close",
+    "toto_rt_tls_last_error",
     "toto_rt_gzip_compress",
     "toto_rt_gzip_decompress",
     "toto_rt_gzip_last_error",
+    "toto_rt_clock_monotonic_ms",
+    "toto_rt_ctx_begin",
+    "toto_rt_ctx_add",
+    "toto_rt_ctx_count",
+    "toto_rt_ctx_key",
+    "toto_rt_ctx_val",
+    "toto_rt_ctx_deadline",
+    "toto_rt_ctx_set_deadline",
+    "toto_rt_ctx_with_cancel",
+    "toto_rt_ctx_cancel",
+    "toto_rt_ctx_detach_next",
+    "toto_rt_ctx_last_error",
+    "toto_rt_log_emit",
+    "toto_rt_log_set_level",
+    "toto_rt_log_set_sink",
+    "toto_rt_log_drain",
+    "toto_rt_log_last_error",
 ];
 
 pub fn is_linked(name: &str) -> bool {
@@ -867,6 +926,10 @@ fn call_inner(
         "toto_rt_net_close" => {
             let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
             crate::netsys::forget_peer(fd);
+            // A TLS session names this fd: free it first so a plain
+            // `net_close` of a TLS connection never leaks the `SSL*`
+            // nor leaves a stale entry for a recycled fd number.
+            crate::tlslib::free_session(fd);
             match crate::netsys::close(fd) {
                 Ok(()) => {
                     set_net_error(None);
@@ -1164,6 +1227,123 @@ fn call_inner(
         "toto_rt_crypto_version" => Ok(Value::Str(std::rc::Rc::new(
             crate::cryptolib::openssl_version(),
         ))),
+        // Wave 2 Stage 1 TLS (interpreter path: blocking libssl
+        // calls — the tree-walker has no scheduler to integrate
+        // with, so blocking calls are the reference semantics; the
+        // runtime executor parks these on the blocking pool instead.
+        // Same error discipline as net/crypto (scalar ops return the
+        // fd/count or -1; array ops return the payload or an empty
+        // array; the message lands in the call-duration slot read by
+        // `toto_rt_tls_last_error`). The `gzv.std/tls` wrappers turn
+        // this into `Result<_, string>`.
+        #[cfg(unix)]
+        "toto_rt_tls_connect" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let ca = match &args[1] {
+                Value::Str(s) => s.to_string(),
+                other => {
+                    return Err(fail(
+                        "E0308",
+                        format!(
+                            "cannot verify against {} (need a CA PEM string)",
+                            other.type_name()
+                        ),
+                        span,
+                    ));
+                }
+            };
+            match crate::tlslib::client_connect(fd, &ca) {
+                Ok(()) => {
+                    set_tls_error(None);
+                    Ok(Value::Int(fd as i64))
+                }
+                Err(e) => {
+                    set_tls_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_tls_accept" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let (cert, key) = match (&args[1], &args[2]) {
+                (Value::Str(c), Value::Str(k)) => (c.to_string(), k.to_string()),
+                (other, _) if !matches!(other, Value::Str(_)) => {
+                    return Err(fail(
+                        "E0308",
+                        format!(
+                            "cannot serve {} (need a certificate PEM string)",
+                            other.type_name()
+                        ),
+                        span,
+                    ));
+                }
+                (_, other) => {
+                    return Err(fail(
+                        "E0308",
+                        format!("cannot use {} (need a key PEM string)", other.type_name()),
+                        span,
+                    ));
+                }
+            };
+            match crate::tlslib::server_accept(fd, &cert, &key) {
+                Ok(()) => {
+                    set_tls_error(None);
+                    Ok(Value::Int(fd as i64))
+                }
+                Err(e) => {
+                    set_tls_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_tls_send" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let buf = bytes_arg(&args[1], span)?;
+            match crate::tlslib::send(fd, &buf) {
+                Ok(n) => {
+                    set_tls_error(None);
+                    Ok(Value::Int(n as i64))
+                }
+                Err(e) => {
+                    set_tls_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_tls_recv" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let max = size_arg(&args[1], span)?;
+            match crate::tlslib::recv(fd, max) {
+                Ok(bytes) => {
+                    set_tls_error(None);
+                    Ok(bytes_value(bytes))
+                }
+                Err(e) => {
+                    set_tls_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_tls_close" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            crate::netsys::forget_peer(fd);
+            match crate::tlslib::shutdown_close(fd) {
+                Ok(()) => {
+                    set_tls_error(None);
+                    Ok(Value::Int(0))
+                }
+                Err(e) => {
+                    set_tls_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_tls_last_error" => Ok(Value::Str(std::rc::Rc::new(take_tls_error()))),
         // Wave 1 compression (interpreter path: one-shot gzip over
         // the pure-Rust backend — same call-duration error-slot
         // discipline as net/crypto; unix-gated like them).
@@ -1197,6 +1377,145 @@ fn call_inner(
         }
         #[cfg(unix)]
         "toto_rt_gzip_last_error" => Ok(Value::Str(std::rc::Rc::new(take_gzip_error()))),
+        // Wave 2 Stage 3 context + clock + structured logging
+        // (interpreter path: the sequential engine has no scopes
+        // and no suspension points, so deadlines are carried here —
+        // never enforced — and `cancel` only validates its handle.
+        // Enforcement lives in the executor, where suspension
+        // points exist. Same error discipline as net/crypto: scalar
+        // ops return the value or -1, string getters return "" with
+        // the slot set, reads stay available after expiry.)
+        #[cfg(unix)]
+        "toto_rt_clock_monotonic_ms" => Ok(Value::Int(crate::ctxlog::monotonic_ms())),
+        #[cfg(unix)]
+        "toto_rt_ctx_begin" => {
+            CTX_SLOT.with(|s| s.borrow_mut().clear());
+            set_ctx_error(None);
+            Ok(Value::Int(0))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_add" => {
+            let key = ctx_str_arg(&args[0], "a context key string", span)?;
+            let val = ctx_str_arg(&args[1], "a context value string", span)?;
+            let n = CTX_SLOT.with(|s| {
+                let mut slot = s.borrow_mut();
+                slot.add(key, val);
+                slot.pairs.len() as i64
+            });
+            set_ctx_error(None);
+            Ok(Value::Int(n))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_count" => {
+            let n = CTX_SLOT.with(|s| s.borrow().pairs.len() as i64);
+            Ok(Value::Int(n))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_key" => {
+            let i = int_arg(&args[0], &sig.params[0].1, span)?;
+            match CTX_SLOT.with(|s| s.borrow().pairs.get(i as usize).map(|(k, _)| k.clone())) {
+                Some(k) => {
+                    set_ctx_error(None);
+                    Ok(Value::Str(std::rc::Rc::new(k)))
+                }
+                None => {
+                    set_ctx_error(Some(format!(
+                        "context index out of range (need 0..{}, got {i})",
+                        CTX_SLOT.with(|s| s.borrow().pairs.len())
+                    )));
+                    Ok(Value::Str(std::rc::Rc::new(String::new())))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_val" => {
+            let i = int_arg(&args[0], &sig.params[0].1, span)?;
+            match CTX_SLOT.with(|s| s.borrow().pairs.get(i as usize).map(|(_, v)| v.clone())) {
+                Some(v) => {
+                    set_ctx_error(None);
+                    Ok(Value::Str(std::rc::Rc::new(v)))
+                }
+                None => {
+                    set_ctx_error(Some(format!(
+                        "context index out of range (need 0..{}, got {i})",
+                        CTX_SLOT.with(|s| s.borrow().pairs.len())
+                    )));
+                    Ok(Value::Str(std::rc::Rc::new(String::new())))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_deadline" => {
+            let d = CTX_SLOT.with(|s| s.borrow().deadline.unwrap_or(-1));
+            Ok(Value::Int(d))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_set_deadline" => {
+            let d = int_arg(&args[0], &sig.params[0].1, span)?;
+            // The none-sentinel is EXACTLY -1 (the library value for
+            // "no deadline"). Negative absolute times are legitimate
+            // past deadlines (the clock starts near zero), so they
+            // store — and read back as immediately expired.
+            CTX_SLOT.with(|s| s.borrow_mut().deadline = if d == -1 { None } else { Some(d) });
+            set_ctx_error(None);
+            Ok(Value::Int(0))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_with_cancel" => {
+            // Sequential root scope handle: nothing to release, but
+            // the handle is valid so `cancel(0)` round-trips.
+            set_ctx_error(None);
+            Ok(Value::Int(0))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_cancel" => {
+            let h = int_arg(&args[0], &sig.params[0].1, span)?;
+            if h == 0 {
+                set_ctx_error(None);
+                Ok(Value::Int(0))
+            } else {
+                set_ctx_error(Some(format!(
+                    "invalid cancel handle {h} (want 0 in sequential programs)"
+                )));
+                Ok(Value::Int(-1))
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_detach_next" => {
+            CTX_SLOT.with(|s| s.borrow_mut().detach_once = true);
+            set_ctx_error(None);
+            Ok(Value::Int(0))
+        }
+        #[cfg(unix)]
+        "toto_rt_ctx_last_error" => Ok(Value::Str(std::rc::Rc::new(take_ctx_error()))),
+        #[cfg(unix)]
+        "toto_rt_log_emit" => {
+            let level = int_arg(&args[0], &sig.params[0].1, span)? as i32;
+            let msg = ctx_str_arg(&args[1], "a log message string", span)?;
+            let pairs = CTX_SLOT.with(|s| s.borrow().pairs.clone());
+            let (_rc, line) = crate::ctxlog::log_emit(level, &msg, &pairs);
+            // The line crosses back only for the stdout sink (the
+            // Toto wrapper prints it through `println`, keeping one
+            // output path). Other sinks and filtered calls return ""
+            // (the error slot distinguishes misuse from filtering).
+            Ok(Value::Str(std::rc::Rc::new(line.unwrap_or_default())))
+        }
+        #[cfg(unix)]
+        "toto_rt_log_set_level" => {
+            let level = int_arg(&args[0], &sig.params[0].1, span)? as i32;
+            Ok(Value::Int(crate::ctxlog::log_set_level(level)))
+        }
+        #[cfg(unix)]
+        "toto_rt_log_set_sink" => {
+            let sink = int_arg(&args[0], &sig.params[0].1, span)? as i32;
+            Ok(Value::Int(crate::ctxlog::log_set_sink(sink)))
+        }
+        #[cfg(unix)]
+        "toto_rt_log_drain" => Ok(Value::Str(std::rc::Rc::new(crate::ctxlog::log_drain()))),
+        #[cfg(unix)]
+        "toto_rt_log_last_error" => Ok(Value::Str(std::rc::Rc::new(
+            crate::ctxlog::take_log_error(),
+        ))),
         "toto_rt_read_i32" => {
             let p = ptr_arg(&args[0], span)? as *const c_void;
             Ok(Value::Int(toto_rt_read_i32(p) as i64))
@@ -1362,6 +1681,26 @@ fn take_crypto_error() -> String {
     CRYPTO_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
 }
 
+// Interpreter-side TLS error slot (Wave 2, Stage 1): same
+// discipline as the net/crypto slots, kept separate so interleaved
+// net/TLS calls in one task never clobber each other's
+// `last_error`.
+#[cfg(unix)]
+thread_local! {
+    static TLS_LAST_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(unix)]
+fn set_tls_error(msg: Option<String>) {
+    TLS_LAST_ERROR.with(|s| *s.borrow_mut() = msg);
+}
+
+#[cfg(unix)]
+fn take_tls_error() -> String {
+    TLS_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
 // Interpreter-side gzip error slot (Wave 1): same discipline as
 // the net/crypto slots. (The backend is pure Rust and could run
 // anywhere; it rides the unix gate for uniformity with the other
@@ -1380,6 +1719,52 @@ fn set_gzip_error(msg: Option<String>) {
 #[cfg(unix)]
 fn take_gzip_error() -> String {
     GZIP_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
+// Interpreter-side context slot (Wave 2, Stage 3): the sequential
+// engine runs one task, so its "current context" is a thread-local.
+// Same shape as the executor's per-task slot (`ctxlog::CtxSlot`)
+// so both engines share inheritance and deadline semantics; only
+// the storage differs. Plain data, never heap references.
+#[cfg(unix)]
+thread_local! {
+    static CTX_SLOT: std::cell::RefCell<crate::ctxlog::CtxSlot> =
+        const { std::cell::RefCell::new(crate::ctxlog::CtxSlot {
+            pairs: Vec::new(),
+            deadline: None,
+            detach_once: false,
+        }) };
+    static CTX_LAST_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(unix)]
+fn set_ctx_error(msg: Option<String>) {
+    CTX_LAST_ERROR.with(|s| *s.borrow_mut() = msg);
+}
+
+#[cfg(unix)]
+fn take_ctx_error() -> String {
+    CTX_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
+/// A Toto string where a `*c_char` context/log parameter is
+/// declared. Unlike `str_arg` there is no C call, so no NUL-copy is
+/// needed — but the E0308 type error matches the other boundaries.
+#[cfg(unix)]
+fn ctx_str_arg(
+    v: &Value,
+    what: &str,
+    span: Span,
+) -> Result<String, (Diag, Vec<crate::interp::TraceFrame>)> {
+    match v {
+        Value::Str(s) => Ok(s.to_string()),
+        other => Err(fail(
+            "E0308",
+            format!("cannot pass {} where {what} is expected", other.type_name()),
+            span,
+        )),
+    }
 }
 
 /// `Array<int>` to call-duration bytes for gzip (elements 0–255,

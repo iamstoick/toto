@@ -1,0 +1,186 @@
+// stdlib context tests: run with `toto test` from stdlib/.
+// Covers the ADR-009 library surface: immutable values, slot
+// round-trips, inheritance, detach, deadlines (values + inspector),
+// cancel handles (validation only — firing a valid handle fails the
+// scope and ends the run, so the fatal path lives in the corpus
+// `proj18_ctx_cancel` golden, not here).
+import "gzv.std/context.gzv";
+import "gzv.std/time.gzv";
+
+fn check(cond: bool, msg: string) -> Result<bool, string> {
+    if cond {
+        return Ok(true);
+    } else {
+        return Err(msg);
+    }
+}
+
+fn t_values() -> Result<bool, string> {
+    let bg = ctx_background();
+    check(ctx_deadline(bg) == -1, "background deadline")?;
+    check(!ctx_has(bg, "a"), "background has")?;
+    let c1 = ctx_with_value(bg, "a", "1");
+    // Immutability: the input is never modified.
+    check(!ctx_has(bg, "a"), "input modified")?;
+    check(ctx_get(c1, "a")? == "1", "get")?;
+    check(ctx_get_or(c1, "missing", "fb") == "fb", "get_or")?;
+    check(ctx_has(c1, "a"), "has")?;
+    let c2 = ctx_with_value(c1, "b", "2");
+    let c3 = ctx_with_value(c2, "a", "3");
+    check(ctx_get(c3, "a")? == "3", "replace")?;
+    check(ctx_get(c3, "b")? == "2", "sibling")?;
+    // First-insertion order, last-write-wins on replacement.
+    check(len(c3.pairs) == 2, "pair count")?;
+    check(c3.pairs[0].key == "a", "order 0")?;
+    check(c3.pairs[0].value == "3", "order 0 val")?;
+    check(c3.pairs[1].key == "b", "order 1")?;
+    // Absent keys are Err with the fixed message.
+    let missing = ctx_get(c3, "nope");
+    let want: Result<string, string> = Err("context: missing key \"nope\"");
+    check(missing == want, "missing message")?;
+    return Ok(true);
+}
+
+fn t_deadline_values() -> Result<bool, string> {
+    let bg = ctx_background();
+    let t0 = clock_monotonic_ms();
+    let d = ctx_with_deadline(bg, 5000);
+    // Absolute: stored = t0 + 5000, so stored - 5000 <= now.
+    check(ctx_deadline(d) - 5000 <= clock_monotonic_ms(), "deadline stored")?;
+    check(clock_monotonic_ms() <= ctx_deadline(d), "deadline future")?;
+    check(ctx_deadline(ctx_no_deadline(d)) == -1, "no_deadline")?;
+    // The input keeps its own deadline (immutability intact).
+    check(ctx_deadline(bg) == -1, "input deadline kept")?;
+    return Ok(true);
+}
+
+fn t_slot_roundtrip() -> Result<bool, string> {
+    let c0 = ctx_with_value(ctx_background(), "trace_id", "req-7f3a");
+    let c1 = ctx_with_value(c0, "request_id", "r-42");
+    let now = clock_monotonic_ms();
+    let c = Context { pairs: c1.pairs, deadline: now + 60000 };
+    ctx_set_current(c)?;
+    let cur = ctx_current();
+    check(len(cur.pairs) == 2, "slot count")?;
+    check(ctx_get(cur, "trace_id")? == "req-7f3a", "slot trace")?;
+    check(ctx_get(cur, "request_id")? == "r-42", "slot request")?;
+    check(ctx_deadline(cur) == now + 60000, "slot deadline")?;
+    ctx_set_current(ctx_background())?;
+    let cleared = ctx_current();
+    check(len(cleared.pairs) == 0, "slot cleared")?;
+    check(ctx_deadline(cleared) == -1, "deadline cleared")?;
+    return Ok(true);
+}
+
+fn t_expired() -> Result<bool, string> {
+    ctx_set_current(ctx_background())?;
+    check(!ctx_expired(), "no deadline never expired")?;
+    let past = ctx_with_deadline(ctx_background(), -5000);
+    ctx_set_current(past)?;
+    check(ctx_expired(), "past deadline expired")?;
+    let fut = ctx_with_deadline(ctx_background(), 60000);
+    ctx_set_current(fut)?;
+    check(!ctx_expired(), "future not expired")?;
+    ctx_set_current(ctx_background())?;
+    return Ok(true);
+}
+
+fn t_cancel_handle() -> Result<bool, string> {
+    ctx_set_current(ctx_with_value(ctx_background(), "k", "v"))?;
+    let c = ctx_with_cancel();
+    check(c.handle >= 0, "handle non-negative")?;
+    check(ctx_get(c.ctx, "k")? == "v", "cancel ctx snapshot")?;
+    // Forged handles fail loudly (never a silent misroute); the
+    // scope is unharmed, so this stays non-fatal.
+    let bad = ctx_cancel(999999);
+    let want: Result<int, string> = Err("invalid cancel handle 999999 (no such scope)");
+    check(bad == want, "forged handle message")?;
+    ctx_set_current(ctx_background())?;
+    return Ok(true);
+}
+
+fn t_inherit() -> Result<bool, string> {
+    ctx_set_current(ctx_with_value(ctx_background(), "trace_id", "req-inherit"))?;
+    let ch = chan<string>(1);
+    go {
+        ch <- ctx_get_or(ctx_current(), "trace_id", "EMPTY");
+    }
+    let got: string = <-ch;
+    check(got == "req-inherit", "spawn inherits")?;
+    ctx_set_current(ctx_background())?;
+    return Ok(true);
+}
+
+fn t_detach() -> Result<bool, string> {
+    ctx_set_current(ctx_with_value(ctx_background(), "trace_id", "req-detach"))?;
+    // Explicit opt-out: the next `go` starts empty, and the flag is
+    // one-shot (the following spawn inherits again).
+    ctx_detach_next();
+    let ch = chan<string>(1);
+    go {
+        ch <- ctx_get_or(ctx_current(), "trace_id", "EMPTY");
+    }
+    let got: string = <-ch;
+    check(got == "EMPTY", "detached starts empty")?;
+    let ch2 = chan<string>(1);
+    go {
+        ch2 <- ctx_get_or(ctx_current(), "trace_id", "EMPTY");
+    }
+    let got2: string = <-ch2;
+    check(got2 == "req-detach", "flag is one-shot")?;
+    // The closure form runs its body detached too.
+    let ch3 = chan<string>(1);
+    go_detached(fn() -> unit {
+        ch3 <- ctx_get_or(ctx_current(), "trace_id", "EMPTY");
+    });
+    let got3: string = <-ch3;
+    check(got3 == "EMPTY", "go_detached empty")?;
+    ctx_set_current(ctx_background())?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_values() != yes {
+        println("FAIL values");
+        failures = failures + 1;
+    } else {
+    }
+    if t_deadline_values() != yes {
+        println("FAIL deadline_values");
+        failures = failures + 1;
+    } else {
+    }
+    if t_slot_roundtrip() != yes {
+        println("FAIL slot_roundtrip");
+        failures = failures + 1;
+    } else {
+    }
+    if t_expired() != yes {
+        println("FAIL expired");
+        failures = failures + 1;
+    } else {
+    }
+    if t_cancel_handle() != yes {
+        println("FAIL cancel_handle");
+        failures = failures + 1;
+    } else {
+    }
+    if t_inherit() != yes {
+        println("FAIL inherit");
+        failures = failures + 1;
+    } else {
+    }
+    if t_detach() != yes {
+        println("FAIL detach");
+        failures = failures + 1;
+    } else {
+    }
+    if failures > 0 {
+        println(to_string(failures) + " context failures");
+        return 1;
+    } else {
+    }
+    return 0;
+}

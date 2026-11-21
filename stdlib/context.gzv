@@ -1,0 +1,255 @@
+// `gzv.std/context` — request-scoped values, deadlines, cancellation
+// (Enterprise Wave 2, Stage 3; implements ADR-009 exactly).
+//
+// A `Context` is an IMMUTABLE library value: a string→string map
+// plus an optional absolute monotonic-ms deadline (`-1` = none).
+// `ctx_with_value` returns a DERIVED context; the input is never
+// modified. No new builtin, no type-system change — plain structs,
+// arrays, and ints over the frozen surface.
+//
+// Flow through `go` blocks: SPAWN INHERITANCE. A child task starts
+// with its parent's slot (a runtime task-slot copy at spawn —
+// recorded in the wave report). The task tree IS the request tree,
+// so tracing values cannot be silently dropped. Opting out is
+// explicit: `ctx_detach_next()` arms the next `go` only
+// (`go_detached(f)` wraps the pattern), and the flag is one-shot.
+//
+// Flow through channels: NOT implicit. A message received under
+// context B by a task spawned under context A is governed by A —
+// contexts never ride messages by default. The opt-in edge helper
+// is `log_trace_edge` (in `gzv.std/log`): it records the causality
+// edge auditably without a tracing store (Wave 4). A message-scoped
+// transfer (`send_with`) needs user generics, which v1 does not
+// have — recorded as a Wave 4 follow-up, not smuggled in.
+//
+// Cancellation = scope failure. `ctx_with_cancel()` snapshots the
+// caller's CURRENT scope into a handle (`CtxCancel.ctx` carries the
+// current values for convenience); `ctx_cancel(h)` fails that scope
+// through the runtime `cancel_scope` hook. Parked tasks in the
+// subtree release with fail-fast E0214 at the next suspension
+// point; in-flight channel/poller waits unwind exactly like a scope
+// panic. Handles name scope indices: forging one fails loudly
+// (E0210), never silently.
+//
+// Deadlines = carried values, enforced at suspension points.
+// `ctx_with_deadline(ctx, after_ms)` stores an ABSOLUTE
+// monotonic-millisecond value (`clock_monotonic_ms() + after_ms`)
+// in the VALUE; `ctx_set_current` installs it into the slot; every
+// suspension point (send/recv/select, blocking/file/foreign calls,
+// network and TLS waits) compares the slot deadline against the
+// Wave 2 clock and fails the scope with deadline-exceeded (E0214)
+// when passed. A wait admitted BEFORE its deadline runs to its
+// normal wakeup, then fail-fasts at the next suspension —
+// preemptive mid-wait wakeups are a recorded follow-up. The
+// sequential interpreter carries deadlines but never enforces them
+// (no suspension points exist there); `ctx_expired()` inspects the
+// slot without parking, on both engines. No timeout parameters on
+// `net_*` (spec §17.5 stands): timeouts arrive as context deadlines.
+//
+// The slot is authoritative for logging: `gzv.std/log` reads the
+// CURRENT task's pairs at emit time, so request/trace IDs flow to
+// every record with no per-call-site plumbing.
+
+import "gzv.std/time.gzv";
+
+unsafe extern "C" {
+    fn toto_rt_ctx_begin() -> c_int;
+    fn toto_rt_ctx_add(key: *c_char, val: *c_char) -> c_int;
+    fn toto_rt_ctx_count() -> c_int;
+    fn toto_rt_ctx_key(i: c_int) -> string;
+    fn toto_rt_ctx_val(i: c_int) -> string;
+    fn toto_rt_ctx_deadline() -> c_long;
+    fn toto_rt_ctx_set_deadline(d: c_long) -> c_int;
+    fn toto_rt_ctx_with_cancel() -> c_long;
+    fn toto_rt_ctx_cancel(h: c_long) -> c_int;
+    fn toto_rt_ctx_detach_next() -> c_int;
+    fn toto_rt_ctx_last_error() -> string;
+}
+
+fn ctx_last_error() -> string {
+    return toto_rt_ctx_last_error();
+}
+
+// One map entry. Keys need not be unique in the array — the
+// constructors below keep first-insertion order with last-write-wins
+// on replacement, matching the runtime slot.
+pub struct CtxPair {
+    key: string,
+    value: string,
+}
+
+// The immutable library value. `deadline` is an absolute
+// monotonic-ms timestamp, or -1 for none.
+pub struct Context {
+    pairs: Array<CtxPair>,
+    deadline: int,
+}
+
+// A cancel scope: the values at `with_cancel` time plus the handle
+// that fails the snapshotted scope.
+pub struct CtxCancel {
+    ctx: Context,
+    handle: int,
+}
+
+// The empty context: no values, no deadline.
+pub fn ctx_background() -> Context {
+    let empty: Array<CtxPair> = [];
+    return Context { pairs: empty, deadline: -1 };
+}
+
+// Derive a context with `key` set to `val` (append-or-replace; the
+// input is never modified).
+pub fn ctx_with_value(ctx: Context, key: string, val: string) -> Context {
+    let mut out: Array<CtxPair> = [];
+    let mut replaced: bool = false;
+    for p in ctx.pairs {
+        if p.key == key {
+            push(out, CtxPair { key: key, value: val });
+            replaced = true;
+        } else {
+            push(out, p);
+        }
+    }
+    if !replaced {
+        push(out, CtxPair { key: key, value: val });
+    }
+    return Context { pairs: out, deadline: ctx.deadline };
+}
+
+// Read a value. Absent keys are `Err`, never a silent "".
+pub fn ctx_get(ctx: Context, key: string) -> Result<string, string> {
+    let mut i = 0;
+    while i < len(ctx.pairs) {
+        if ctx.pairs[i].key == key {
+            return Ok(ctx.pairs[i].value);
+        }
+        i = i + 1;
+    }
+    return Err("context: missing key \"" + key + "\"");
+}
+
+// Read a value with a fallback (no `Result` wrangling at the call
+// site when absence is routine).
+pub fn ctx_get_or(ctx: Context, key: string, fallback: string) -> string {
+    let mut i = 0;
+    while i < len(ctx.pairs) {
+        if ctx.pairs[i].key == key {
+            return ctx.pairs[i].value;
+        }
+        i = i + 1;
+    }
+    return fallback;
+}
+
+pub fn ctx_has(ctx: Context, key: string) -> bool {
+    let mut i = 0;
+    while i < len(ctx.pairs) {
+        if ctx.pairs[i].key == key {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Derive a context with an absolute deadline `after_ms` from now.
+// Negative `after_ms` is already passed (deterministic enforcement
+// tests use it: the next suspension fails immediately). The stored
+// absolute time may itself be negative early in the run — only
+// exactly -1 means "none", so past deadlines store and read back
+// as immediately expired.
+pub fn ctx_with_deadline(ctx: Context, after_ms: int) -> Context {
+    let now = clock_monotonic_ms();
+    return Context { pairs: ctx.pairs, deadline: now + after_ms };
+}
+
+// Derive a context with no deadline.
+pub fn ctx_no_deadline(ctx: Context) -> Context {
+    return Context { pairs: ctx.pairs, deadline: -1 };
+}
+
+// The carried deadline (-1 = none). Pure value read, no slot.
+pub fn ctx_deadline(ctx: Context) -> int {
+    return ctx.deadline;
+}
+
+// Non-fatal inspector: true when the CURRENT slot carries a passed
+// deadline. Only exactly -1 means "none" (negative absolute times
+// are legitimate past deadlines). Works on both engines; never
+// parks, never fails.
+pub fn ctx_expired() -> bool {
+    let d = toto_rt_ctx_deadline();
+    if d == -1 {
+        return false;
+    }
+    return clock_monotonic_ms() > d;
+}
+
+// Read the current task's slot as a value (round-trips through
+// `ctx_set_current`).
+pub fn ctx_current() -> Context {
+    let n = toto_rt_ctx_count();
+    let mut out: Array<CtxPair> = [];
+    let mut i = 0;
+    while i < n {
+        let k = toto_rt_ctx_key(i);
+        let v = toto_rt_ctx_val(i);
+        push(out, CtxPair { key: k, value: v });
+        i = i + 1;
+    }
+    let d = toto_rt_ctx_deadline();
+    return Context { pairs: out, deadline: d };
+}
+
+// Install a value as the current task's slot (values + deadline).
+// Children spawned after this inherit the installed slot.
+pub fn ctx_set_current(ctx: Context) -> Result<int, string> {
+    toto_rt_ctx_begin();
+    for p in ctx.pairs {
+        toto_rt_ctx_add(p.key, p.value);
+    }
+    toto_rt_ctx_set_deadline(ctx.deadline);
+    return Ok(0);
+}
+
+// Snapshot the caller's current scope into a cancel handle, also
+// returning the current values for convenience.
+pub fn ctx_with_cancel() -> CtxCancel {
+    let cur = ctx_current();
+    let h = toto_rt_ctx_with_cancel();
+    return CtxCancel { ctx: cur, handle: h };
+}
+
+// Fail the scope named by `handle` (the `cancel_scope` hook):
+// parked tasks in its subtree release with E0214; running tasks
+// fail fast at their next suspension point. A forged handle is a
+// loud `Err`, never a silent misroute.
+pub fn ctx_cancel(handle: int) -> Result<int, string> {
+    let rc = toto_rt_ctx_cancel(handle);
+    if rc < 0 {
+        return Err(ctx_last_error());
+    }
+    return Ok(0);
+}
+
+pub fn ctx_cancel_scope(c: CtxCancel) -> Result<int, string> {
+    return ctx_cancel(c.handle);
+}
+
+// Arm the NEXT `go` from this task to start detached (empty slot).
+// One-shot: the flag consumes at the next spawn either way.
+pub fn ctx_detach_next() -> int {
+    return toto_rt_ctx_detach_next();
+}
+
+// Spawn `f` detached from the current context (explicit opt-out of
+// spawn inheritance — the child slot starts empty). The closure's
+// CAPTURED VALUES still cross (captures are by value); only the
+// context slot does not.
+pub fn go_detached(f: fn() -> unit) -> unit {
+    ctx_detach_next();
+    go {
+        f();
+    }
+}

@@ -90,16 +90,23 @@ Exact integer operations beyond the builtins
 
 Pure durations: a duration is an `int` count of milliseconds, and a
 timestamp is an `int` count of milliseconds since an
-application-chosen epoch. **There is no wall clock**: the frozen
-builtins expose no clock, and the catalog stays frozen. Wall-clock
-constructors land with the Stage 3 FFI work; until then this module
-covers timeout math, backoff, and log rendering.
+application-chosen epoch — plus the Wave 2 monotonic clock
+(Stage 3). **There is still no wall clock**: the frozen builtins
+expose no clock, so the clock arrives as a linked foreign function
+(`toto_rt_clock_monotonic_ms`, unix-only), not a builtin — the
+catalog stays frozen. The clock is monotonic ms since process
+start (ADR-009): absolute values compose across fan-out.
+Values are nondeterministic by construction (time passes between
+scheduling points), so they are never pinned in goldens; compare
+differences or inequalities only.
 
 Constructors `duration_from_millis/secs/mins/hours`, projection
 `duration_as_millis/secs` (truncating), `duration_add/sub`,
 three-way `duration_compare` (`-1`/`0`/`1`), `format_duration`
 (`"500ms"`, `"90s"`, `"2m 5s"`, `"3h 4m"`, `"2d 1h"`, `"-"` prefix
-for negatives), and `timestamp_add`/`timestamp_diff` intent markers.
+for negatives), `timestamp_add`/`timestamp_diff` intent markers,
+and the clock: `clock_monotonic_ms()` plus
+`clock_elapsed_since(t0)` (non-negative on both engines).
 
 ## `io`
 
@@ -245,6 +252,98 @@ with `toto run`/`toto test`). Pinned by `proj13_crypto_kat`
 (published/pinned vectors per primitive) and
 `proj14_crypto_errors` (every malformed input is `Err`).
 
+## `tls`
+
+TLS upgrades for loopback TCP (Enterprise Wave 2, Stage 1;
+unix-only — see [ffi.md](ffi.md) for the per-binding
+contract). The state machine runs in the linked system libssl
+(OpenSSL 3 on Linux, LibreSSL on macOS) — bound, never
+implemented. Connections keep their `int` handles: TLS upgrades
+an already-connected TCP fd in place (client: `net_tcp_connect`
+then `tls_client_connect`; server: `net_tcp_listen`/`net_accept`
+then `tls_server_accept`), so the Wave 1 loopback rule carries
+over unchanged and no new socket layer exists. Bytes cross as
+`Array<int>` (0–255, `E0308` otherwise); every function returns
+`Result<_, string>`, closing twice or using a non-TLS socket is
+an `Err`. Trust model (Wave 1 reuse): the client verifies the
+server chain against the given CA PEM with the same
+`X509_STORE` semantics as `crypto_x509_verify`, enforced at
+handshake time — no hostname check (as in Wave 1), no client
+certificates, one-way loopback TLS only.
+
+| Function | Behavior |
+|---|---|
+| `tls_client_connect(conn, ca_pem)` | Upgrade a connected fd, verifying the chain; `Ok(fd)` |
+| `tls_server_accept(conn, cert_pem, key_pem)` | Upgrade an accepted fd; `Ok(fd)` |
+| `tls_send(conn, data)` | One record write; may short-write (`Ok(n)`) |
+| `tls_send_all(conn, data)` | Toto-level loop to full delivery; `Ok(len(data))` |
+| `tls_recv(conn, max)` | Up to `max` bytes; empty array is orderly shutdown, not an error |
+| `tls_close(sock)` | `close_notify` + free + close; `Ok(0)` |
+
+Handshake/record steps are blocking calls (interpreter) or
+blocking-pool waits (executor) — never the poller, which serves
+only `poll()`able readiness waits (spec §17.5 rule: an SSL step
+is not one). JIT/AOT refuse like the net surface (run with
+`toto run`/`toto test`). Pinned by `proj15_tls_echo` (Toto
+loopback echo through the real wrappers) and the
+`tls_interop`/`tls_openssl` suites (both directions against
+`openssl s_server`/`s_client`, plus the untrusted-chain
+negative).
+
+## `http`
+
+HTTP/1.1 framework (Enterprise Wave 2, Stage 2; unix-only via
+the net/tls surface — this module itself is pure Toto, no new
+FFI). Routing (exact > template > wildcard precedence,
+first-registration tiebreak, `"*"` methods), onion middleware,
+and handlers run on green threads over the Wave 1 substrate:
+each accepted connection gets its own task, waits park on the
+M:N poller, TLS steps on the blocking pool. The client runs over
+the same substrate, upgrading to TLS for `https://`. HTTP/1.1
+only (keep-alive, `Content-Length`, chunked request/response
+bodies); no new builtins — the ASCII framing codec is pure Toto.
+
+| Function | Behavior |
+|---|---|
+| `http_router()` | Empty router (no routes, no middleware) |
+| `route_add(router, method, pattern, handler)` | Register; `Ok(())`, or `Err` on empty method / bad pattern |
+| `use_mw(router, mw)` | Append onion middleware (registration order) |
+| `http_serve(port, router, opts)` | Loopback listen + accept loop; `Ok(listener fd)` |
+| `http_serve_tls(port, router, opts, cert, key)` | Same, with a server TLS upgrade per connection |
+| `http_do(req, opts)` | One exchange + redirects; `Ok(HttpClientResp)` |
+| `http_get(url, opts)` / `http_post(url, headers, body, opts)` | One-shot shorthands (`https` needs `ca_pem`, use `http_do`) |
+| `http_header_get(headers, name)` | Case-insensitive; `Err("http: missing header …")` when absent |
+| `http_header_or(headers, name, dflt)` | Same, with a default (always `Ok`) |
+| `http_param(params, name)` | Path-param lookup; `Err("http: missing param …")` when absent |
+| `http_decode_pct(s)` / `http_parse_query(target)` | Percent-decoding / query pairs; `Err` on malformed input |
+| `http_bytes_to_text(data)` / `http_text_to_bytes(s)` | Framing-text codec; fixed `Err` on unrepresentable bytes |
+| `http_response(status, reason, headers, body)` / `http_text(status, reason, text)` | Response constructors |
+
+Fixed wire mapping (golden-pinned): handler/middleware `Ok`
+serializes as-is; their `Err` closes the connection with no
+response (a v1 language limit — `Err` payloads are not values,
+so the 500 mapping needs Phase-2 destructuring or a gated new
+builtin; `expose_errors` is reserved and inert); unknown route
+→ 404; known path with a wrong method → 405 + `Allow`;
+bad framing/size accounting → 400; other-than-1.x version → 505.
+Oversize/truncated requests map to 400 (handlers never see a
+partial body); a vanished client closes quietly. Redirects:
+`redirects: 0` never follows; otherwise same-scheme/host/port
+(or relative) targets only, method rules 301/302/303/307/308
+fixed, budget overrun is `Err("http: too many redirects")`.
+`host_allow` narrows the loopback set (`localhost`,
+`127.0.0.1`, `::1`); everything else is rejected before
+connecting. `keepalive_ms` is advisory (no clock in v1);
+`peer` is the loopback placeholder until the substrate exposes
+TCP peer addresses.
+
+Pinned by `test_http.gzv` (pure units), `proj16_http` (full
+lifecycle: routing, middleware ordering + short-circuit, error
+paths, close semantics, TLS both directions), and the
+`http_interop` suite (our server vs curl plain + https with
+`--cacert`; our client vs a curl-checked reference and vs
+`openssl s_server`).
+
 ## `compress`
 
 gzip compression (Enterprise Wave 1; unix-gated like the other
@@ -300,11 +399,113 @@ Strings cross as bytes (the caller maps text). Pinned by
 stated `Person` contract, verified against the encoding rules
 independently of the implementation).
 
+## `context`
+
+Request-scoped values, deadlines, cancellation (Enterprise Wave 2,
+Stage 3; implements ADR-009 exactly). `Context` is an immutable
+library value (`pairs` plus an absolute monotonic-ms `deadline`,
+`-1` = none): `ctx_with_value` derives, never modifies;
+`ctx_get`/`ctx_get_or`/`ctx_has` read; `ctx_with_deadline` stores
+`clock_monotonic_ms() + after_ms` (only exactly `-1` means none —
+negative absolute times are legitimate past deadlines);
+`ctx_no_deadline`/`ctx_deadline` manage the carried value.
+
+The current task's slot is authoritative: `ctx_set_current`
+installs a value (children spawned after inherit it —
+ADR-009 spawn inheritance, recorded at `Spawn`), `ctx_current`
+reads it back, `ctx_expired()` inspects the slot deadline without
+parking (both engines). Contexts never ride channels by default
+(receiver scope governs); the opt-in edge helper is
+`log_trace_edge` (in `gzv.std/log`), and message-scoped transfer
+awaits user generics (Wave 4 — not smuggled in).
+
+Cancellation is scope failure: `ctx_with_cancel()` snapshots the
+caller's current scope into a `CtxCancel` handle (no scope is
+created, no task moves); `ctx_cancel(h)` fails exactly that scope
+through the `cancel_scope` sweep — parked tasks release with
+E0214, running tasks fail fast at the next suspension point, and
+the failure propagates upward like any scope panic (cancellation
+is program-fatal by design). Forged handles are `Err` values
+(`-1` + slot), never silent. `ctx_detach_next()` arms one spawn
+to start empty; `go_detached(f)` wraps the pattern for closures.
+
+Pinned by `test_context.gzv` (values, slot round-trip,
+inheritance, one-shot detach, deadline values + inspector,
+forged-handle message) and the corpus `proj17_context_log`
+(pipeline) / `proj18_ctx_cancel` (fatal golden) pair.
+
+## `log`
+
+Leveled machine-readable structured logging carrying context
+values with no per-call-site plumbing (Enterprise Wave 2,
+Stage 3). Levels `debug`/`info`/`warn`/`error` plus `off`
+(`log_set_level`; the gate runs in the runtime, so filtered calls
+cost one int compare and never format). Format: one JSON object
+per line in exact field order
+`{"ts":..,"level":"..","msg":"..","ctx":{..}}` with sorted ctx
+keys; `ts` is Wave 2 monotonic ms (never pinned — golden
+pipelines strip or avoid it); `ctx` is the CURRENT task's pairs.
+Escaping covers `"`/`\`, `\n \r \t \b \f`, and `\u00xx`
+(lowercase) for other controls; lines never contain raw newlines.
+Sinks: `stdout` (captured output; one `println` per record, never
+interleaved), `stderr` (fd directly, one write per line),
+`buffer` (in-memory retention for `log_drain_lines` — tests and
+golden pipelines). No file sink in v1 (no append builtin).
+`log_debug/info/warn/error` return `Ok(1)` for a produced stdout
+line, `Ok(0)` otherwise (filtered or non-stdout sink), `Err`
+only on runtime misuse. `log_trace_edge` records the Wave-2
+causality edge at `debug` with the sender's context attached.
+
+Pinned by `test_log.gzv` (gate, exact wire format rebuilt around
+the observed `ts`, escaping round-trip, empty ctx, edge
+record, sink returns — sequential, so it covers the interpreter
+arms) and the corpus `proj17_context_log` buffer golden.
+
+## `metrics`
+
+Prometheus metrics (Enterprise Wave 2, Stage 4; pure Toto over
+the `http` framework — no new builtins, no new FFI). `MetricsRegistry`
+holds `counters`, `gauges`, and `histograms` (registration order);
+every definition carries `name`, `help`, and `label_names`, and
+each observation adds to the sample under its label-value set
+(first-observation order). Counters hold monotonic `int` totals
+(`metrics_inc` rejects negative deltas); gauges hold `int` values
+(`metrics_gauge_set`/`metrics_gauge_add`, the delta may be
+negative); histograms hold cumulative per-bucket `counts` over
+`int` bounds plus `sum`/`count`. Values are ints (counts,
+millisecond latencies); float observations are a follow-up.
+
+| Function | Behavior |
+|---|---|
+| `metrics_registry()` | Empty registry |
+| `metrics_exposition_version()` / `metrics_content_type()` | `"0.0.4"` / `text/plain; version=0.0.4; charset=utf-8` pins |
+| `metrics_register_counter/gauge/histogram(reg, name, help, labels[, buckets])` | Register; `Err` on bad/duplicate name, bad/reserved label, bad buckets |
+| `metrics_inc(reg, name, labels, delta)` | Counter add; `delta >= 0`, `Err` otherwise |
+| `metrics_gauge_set` / `metrics_gauge_add(reg, name, labels, v)` | Absolute set / signed add |
+| `metrics_observe(reg, name, labels, value)` | Histogram observation (cumulative buckets) |
+| `metrics_render(reg)` | Full 0.0.4 exposition (`HELP`/`TYPE` + samples, `\n`-terminated) |
+| `metrics_respond(reg)` / `metrics_handler(reg)` | 200 response / `GET`-ready handler closing over the registry |
+
+Registration is mandatory and unique across all kinds (a counter
+and a gauge may never share a name); names match
+`[a-zA-Z_:][a-zA-Z0-9_:]*`, label names add the `__`-prefix and
+histogram-`le` reservations. Render order is counters, gauges,
+histograms (samples in first-observation order); HELP escapes `\`
+and LF, label values escape `\`, `"`, and LF. The scrape endpoint
+is `route_add(router, "GET", "/metrics", metrics_handler(reg))`
+plus `http_serve` (loopback rule rides along); the handler closure
+shares the registry arrays, so scrapes see every observation.
+
+Pinned by `test_metrics.gzv` (version pins, exact renders incl.
+escaping and cumulative math, every fixed error, alias isolation,
+handler over a synthetic request) and the corpus `proj19_metrics`
+golden (error paths + a live serve/scrape byte-match).
+
 ## Execution paths
 
 | Path | Status | Evidence |
 |---|---|---|
-| Interpreter (`toto run` / `toto test`) | Full suite green | `toto: 8 passed, 0 failed` in `stdlib/`; corpus `proj09`/`proj10` goldens |
+| Interpreter (`toto run` / `toto test`) | Full suite green | `toto: 17 passed, 0 failed` in `stdlib/`; corpus `proj09`/`proj10` goldens |
 | Runtime executor (concurrent) | Green | `test_concurrent.gzv` (pipeline over channels) |
 | Built executable (`toto build`) | Output-equivalent | `stdlib` smoke: binary stdout byte-identical to interpreter |
 | JIT via `toto dev` | Unsupported | `dev` is single-file scope (`parse_and_check` only); multi-file dev loop is the known carry-forward |
