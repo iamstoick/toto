@@ -2453,6 +2453,22 @@ impl<'a> FnCx<'a> {
                         ),
                     });
                 }
+                // TLS lowers through the executor's blocking pool (a
+                // handshake/record step blocks on the network); the
+                // JIT task runtime has no pool integration, so refuse
+                // with the workaround like the net surface, never
+                // miscompile or stall in generated code. AOT shares
+                // this lowering, so the same refusal covers `toto
+                // build` (native TLS in AOT is a recorded follow-up;
+                // the executor is the reference).
+                if name.starts_with("toto_rt_tls_") {
+                    return Err(SubsetError {
+                        func: self.func.clone(),
+                        message: format!(
+                            "foreign function `{name}` is a blocking TLS wait, which needs the executor pool (run with `toto run`/`toto test`)"
+                        ),
+                    });
+                }
                 let idx = Self::extern_index(prog, name).ok_or_else(|| SubsetError {
                     func: self.func.clone(),
                     message: format!(

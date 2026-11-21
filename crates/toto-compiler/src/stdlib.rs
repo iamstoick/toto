@@ -38,6 +38,7 @@ pub const MODULES: &[(&str, &str)] = &[
     std_module!("ffi_thread"),
     std_module!("net"),
     std_module!("crypto"),
+    std_module!("tls"),
     std_module!("compress"),
     std_module!("toml"),
     std_module!("yaml"),

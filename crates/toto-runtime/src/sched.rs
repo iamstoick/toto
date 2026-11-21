@@ -149,6 +149,45 @@ pub enum BlockingOp {
     DnsResolve {
         host: String,
     },
+    /// Blocking TLS steps (Wave 2, Stage 1): handshakes and record
+    /// I/O run on the dedicated pool — never inline on a worker
+    /// (they block on the network), never on the poller (an SSL step
+    /// is not a `poll()` readiness wait; see §17.5). Unix only
+    /// (same gate as the socket surface).
+    #[cfg(unix)]
+    Tls {
+        op: TlsOp,
+    },
+}
+
+/// One blocking TLS step, as the pool thread sees it. Owned plain
+/// data only: pool threads never touch the GC heap, channel tables,
+/// or scheduler state beyond pushing completions. Unix-only.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub enum TlsOp {
+    /// Client handshake on a connected TCP fd (chain verified
+    /// against the CA PEM).
+    Connect {
+        fd: std::os::fd::RawFd,
+        ca_pem: String,
+    },
+    /// Server handshake on an accepted TCP fd (cert chain + key).
+    Accept {
+        fd: std::os::fd::RawFd,
+        cert_pem: String,
+        key_pem: String,
+    },
+    /// One record write (may short-write; the Toto `tls_send_all`
+    /// wrapper loops).
+    Send {
+        fd: std::os::fd::RawFd,
+        bytes: Vec<u8>,
+    },
+    /// One record read (empty is orderly shutdown, not an error).
+    Recv { fd: std::os::fd::RawFd, max: usize },
+    /// Full teardown (`close_notify` + free + close).
+    Close { fd: std::os::fd::RawFd },
 }
 
 /// Owned plain data crossing to pool threads: no `Rc`, no heap refs,
@@ -225,6 +264,22 @@ pub enum BlockingResult {
     /// DNS failure: like `NetFail` but for the blocking path.
     #[cfg(unix)]
     DnsFail(String),
+    /// TLS results (Wave 2, Stage 1, unix-only): same conversion
+    /// discipline as the poller variants, but posted by the blocking
+    /// POOL (see `BlockingOp::Tls`) and accepted only by tasks parked
+    /// on `"blocking"` with a matching `blocking_seq`. The drain sets
+    /// the task's `tls_error` slot from these (never `net_error`, so
+    /// interleaved net/TLS calls never clobber each other).
+    #[cfg(unix)]
+    TlsInt(i64),
+    /// Received TLS bytes (empty = orderly shutdown when the error
+    /// slot stays clean; empty + error = failure — see the slot rule).
+    #[cfg(unix)]
+    TlsBytes(Vec<u8>),
+    /// Loud TLS failure: the drain sets `tls_error` and resumes with
+    /// `Unit`; the executor's `tls_last_error` reads the slot.
+    #[cfg(unix)]
+    TlsFail(String),
 }
 
 /// A finished pool job awaiting pickup. The scheduler turns it into
@@ -765,6 +820,12 @@ pub struct Slot {
     /// `toto_rt_gzip_last_error`.
     #[cfg(unix)]
     pub(crate) gzip_error: Option<String>,
+    /// Last TLS error for this task (`None` = clean). Separate from
+    /// `net_error` so interleaved net/TLS calls in one task never
+    /// clobber each other's `last_error`; read (and cleared) by
+    /// `toto_rt_tls_last_error`. Set on every TLS pool completion.
+    #[cfg(unix)]
+    pub(crate) tls_error: Option<String>,
 }
 
 /// One parked network wait, as the poller sees it. Owned plain data
@@ -1130,6 +1191,8 @@ impl Scheduler {
             crypto_error: None,
             #[cfg(unix)]
             gzip_error: None,
+            #[cfg(unix)]
+            tls_error: None,
         });
         sched.tasks_spawned += 1;
         sched.live += 1;
@@ -1627,13 +1690,21 @@ impl Scheduler {
                     | B::NetBytes(_)
                     | B::NetFail(_)
                     | B::DnsAddrs(_)
-                    | B::DnsFail(_) => Some(matches!(
+                    | B::DnsFail(_)
+                    | B::TlsInt(_)
+                    | B::TlsBytes(_)
+                    | B::TlsFail(_) => Some(matches!(
                         c.result,
                         B::NetInt(_) | B::NetBytes(_) | B::NetFail(_)
                     )),
                     _ => None,
                 };
                 if let Some(is_poller) = net_kind {
+                    // TLS completions ride the pool (`TlsOp`), never
+                    // the poller — but they take the same pre-pass so
+                    // a stale pool completion can never satisfy a
+                    // poller wait or vice versa.
+                    let is_tls = matches!(c.result, B::TlsInt(_) | B::TlsBytes(_) | B::TlsFail(_));
                     let Completion {
                         task,
                         result,
@@ -1642,6 +1713,7 @@ impl Scheduler {
                     } = c;
                     let (resp, err): (ToTask, Option<String>) = match result {
                         B::NetInt(n) => (ToTask::Value(RtVal::Int(n)), None),
+                        B::TlsInt(n) => (ToTask::Value(RtVal::Int(n)), None),
                         B::NetBytes(bytes) => {
                             let r = {
                                 let mut st = self.shared.state.lock().expect("shared state lock");
@@ -1651,7 +1723,17 @@ impl Scheduler {
                             };
                             (ToTask::Value(RtVal::Heap(r)), None)
                         }
+                        B::TlsBytes(bytes) => {
+                            let r = {
+                                let mut st = self.shared.state.lock().expect("shared state lock");
+                                let elems: Vec<RtVal> =
+                                    bytes.into_iter().map(|b| RtVal::Int(b as i64)).collect();
+                                st.heap.alloc_array(elems)
+                            };
+                            (ToTask::Value(RtVal::Heap(r)), None)
+                        }
                         B::NetFail(m) => (ToTask::Value(RtVal::Unit), Some(m)),
+                        B::TlsFail(m) => (ToTask::Value(RtVal::Unit), Some(m)),
                         B::DnsAddrs(addrs) => {
                             // Comma-joined contract (see `gzv.std/net`):
                             // IPv6 has colons, never commas, so the
@@ -1684,7 +1766,11 @@ impl Scheduler {
                             && slot.blocking_seq == seq
                     };
                     if live {
-                        slot.net_error = err;
+                        if is_tls {
+                            slot.tls_error = err;
+                        } else {
+                            slot.net_error = err;
+                        }
                         Self::enqueue_locked(sched, worker, task, resp);
                         enqueued = true;
                     } else {
@@ -1812,6 +1898,45 @@ impl Scheduler {
         }
     }
 
+    /// Run one TLS step on a pool thread (Wave 2, Stage 1): the fd is
+    /// forced blocking on entry (harmless when already blocking), the
+    /// handshake/record call runs to completion, and the result posts
+    /// as a `Tls*` completion for the drain pre-pass. No heap, no
+    /// scheduler state — owned plain data only.
+    #[cfg(unix)]
+    fn run_tls(op: &TlsOp) -> BlockingResult {
+        use toto_compiler::tlslib as tt;
+        match op {
+            TlsOp::Connect { fd, ca_pem } => match tt::client_connect(*fd, ca_pem) {
+                Ok(()) => BlockingResult::TlsInt(*fd as i64),
+                Err(e) => BlockingResult::TlsFail(e),
+            },
+            TlsOp::Accept {
+                fd,
+                cert_pem,
+                key_pem,
+            } => match tt::server_accept(*fd, cert_pem, key_pem) {
+                Ok(()) => BlockingResult::TlsInt(*fd as i64),
+                Err(e) => BlockingResult::TlsFail(e),
+            },
+            TlsOp::Send { fd, bytes } => match tt::send(*fd, bytes) {
+                Ok(n) => BlockingResult::TlsInt(n as i64),
+                Err(e) => BlockingResult::TlsFail(e),
+            },
+            TlsOp::Recv { fd, max } => match tt::recv(*fd, *max) {
+                Ok(bytes) => BlockingResult::TlsBytes(bytes),
+                Err(e) => BlockingResult::TlsFail(e),
+            },
+            TlsOp::Close { fd } => {
+                toto_compiler::netsys::forget_peer(*fd);
+                match tt::shutdown_close(*fd) {
+                    Ok(()) => BlockingResult::TlsInt(0),
+                    Err(e) => BlockingResult::TlsFail(e),
+                }
+            }
+        }
+    }
+
     /// Dedicated blocking-pool thread: run file-system jobs, post
     /// completions, never touch the heap or scheduler state directly.
     /// Exits once the last worker sets `shutdown`.
@@ -1858,6 +1983,20 @@ impl Scheduler {
                         Ok(addrs) => BlockingResult::DnsAddrs(addrs),
                         Err(e) => BlockingResult::DnsFail(e),
                     }
+                }
+                #[cfg(unix)]
+                BlockingOp::Tls { op } => {
+                    // Closing unregisters first (same order as
+                    // `net_close` on workers): a parked wait on a
+                    // recycled fd number fails loudly instead of
+                    // operating on the new socket. TLS fds never park
+                    // on the poller, so this is a no-op sweep today —
+                    // kept for the fd-reuse invariant, not the common
+                    // case.
+                    if let TlsOp::Close { fd } = &op {
+                        Self::net_unregister_fd(shared, *fd, "socket closed");
+                    }
+                    Self::run_tls(&op)
                 }
             };
             {

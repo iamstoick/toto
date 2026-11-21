@@ -335,6 +335,17 @@ pub const LINKED: &[&str] = &[
     "toto_rt_crypto_x509_verify",
     "toto_rt_crypto_last_error",
     "toto_rt_crypto_version",
+    // Wave 2 Stage 1 TLS (unix-only — same gate as sockets/crypto):
+    // handshake upgrades of already-connected TCP fds, record I/O,
+    // and teardown, over the system libssl. Sessions are retained
+    // under the fd (explicit handle rule in `tlslib`); Toto sees
+    // only `int` handles and `Array<int>` bytes.
+    "toto_rt_tls_connect",
+    "toto_rt_tls_accept",
+    "toto_rt_tls_send",
+    "toto_rt_tls_recv",
+    "toto_rt_tls_close",
+    "toto_rt_tls_last_error",
     // Wave 1 compression (platform-independent pure-Rust gzip: no
     // cfg gate, works on every platform including Windows).
     "toto_rt_gzip_compress",
@@ -343,9 +354,10 @@ pub const LINKED: &[&str] = &[
 ];
 
 /// POSIX-only FFI names: threads, file descriptors, `errno`, sleep,
-/// sockets, crypto. No MSVC equivalents; naming one on Windows is a clean
-/// E0301 at check time (the dispatch arms are `cfg(unix)` to match,
-/// so the `unreachable!("linkage checked above")` tail stays sound).
+/// sockets, crypto, TLS. No MSVC equivalents; naming one on Windows
+/// is a clean E0301 at check time (the dispatch arms are `cfg(unix)`
+/// to match, so the `unreachable!("linkage checked above")` tail
+/// stays sound).
 #[cfg(windows)]
 const POSIX_ONLY: &[&str] = &[
     "open",
@@ -382,6 +394,12 @@ const POSIX_ONLY: &[&str] = &[
     "toto_rt_crypto_x509_verify",
     "toto_rt_crypto_last_error",
     "toto_rt_crypto_version",
+    "toto_rt_tls_connect",
+    "toto_rt_tls_accept",
+    "toto_rt_tls_send",
+    "toto_rt_tls_recv",
+    "toto_rt_tls_close",
+    "toto_rt_tls_last_error",
     "toto_rt_gzip_compress",
     "toto_rt_gzip_decompress",
     "toto_rt_gzip_last_error",
@@ -867,6 +885,10 @@ fn call_inner(
         "toto_rt_net_close" => {
             let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
             crate::netsys::forget_peer(fd);
+            // A TLS session names this fd: free it first so a plain
+            // `net_close` of a TLS connection never leaks the `SSL*`
+            // nor leaves a stale entry for a recycled fd number.
+            crate::tlslib::free_session(fd);
             match crate::netsys::close(fd) {
                 Ok(()) => {
                     set_net_error(None);
@@ -1164,6 +1186,123 @@ fn call_inner(
         "toto_rt_crypto_version" => Ok(Value::Str(std::rc::Rc::new(
             crate::cryptolib::openssl_version(),
         ))),
+        // Wave 2 Stage 1 TLS (interpreter path: blocking libssl
+        // calls — the tree-walker has no scheduler to integrate
+        // with, so blocking calls are the reference semantics; the
+        // runtime executor parks these on the blocking pool instead.
+        // Same error discipline as net/crypto (scalar ops return the
+        // fd/count or -1; array ops return the payload or an empty
+        // array; the message lands in the call-duration slot read by
+        // `toto_rt_tls_last_error`). The `gzv.std/tls` wrappers turn
+        // this into `Result<_, string>`.
+        #[cfg(unix)]
+        "toto_rt_tls_connect" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let ca = match &args[1] {
+                Value::Str(s) => s.to_string(),
+                other => {
+                    return Err(fail(
+                        "E0308",
+                        format!(
+                            "cannot verify against {} (need a CA PEM string)",
+                            other.type_name()
+                        ),
+                        span,
+                    ));
+                }
+            };
+            match crate::tlslib::client_connect(fd, &ca) {
+                Ok(()) => {
+                    set_tls_error(None);
+                    Ok(Value::Int(fd as i64))
+                }
+                Err(e) => {
+                    set_tls_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_tls_accept" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let (cert, key) = match (&args[1], &args[2]) {
+                (Value::Str(c), Value::Str(k)) => (c.to_string(), k.to_string()),
+                (other, _) if !matches!(other, Value::Str(_)) => {
+                    return Err(fail(
+                        "E0308",
+                        format!(
+                            "cannot serve {} (need a certificate PEM string)",
+                            other.type_name()
+                        ),
+                        span,
+                    ));
+                }
+                (_, other) => {
+                    return Err(fail(
+                        "E0308",
+                        format!("cannot use {} (need a key PEM string)", other.type_name()),
+                        span,
+                    ));
+                }
+            };
+            match crate::tlslib::server_accept(fd, &cert, &key) {
+                Ok(()) => {
+                    set_tls_error(None);
+                    Ok(Value::Int(fd as i64))
+                }
+                Err(e) => {
+                    set_tls_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_tls_send" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let buf = bytes_arg(&args[1], span)?;
+            match crate::tlslib::send(fd, &buf) {
+                Ok(n) => {
+                    set_tls_error(None);
+                    Ok(Value::Int(n as i64))
+                }
+                Err(e) => {
+                    set_tls_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_tls_recv" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            let max = size_arg(&args[1], span)?;
+            match crate::tlslib::recv(fd, max) {
+                Ok(bytes) => {
+                    set_tls_error(None);
+                    Ok(bytes_value(bytes))
+                }
+                Err(e) => {
+                    set_tls_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_tls_close" => {
+            let fd = int_arg(&args[0], &sig.params[0].1, span)? as c_int;
+            crate::netsys::forget_peer(fd);
+            match crate::tlslib::shutdown_close(fd) {
+                Ok(()) => {
+                    set_tls_error(None);
+                    Ok(Value::Int(0))
+                }
+                Err(e) => {
+                    set_tls_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_tls_last_error" => Ok(Value::Str(std::rc::Rc::new(take_tls_error()))),
         // Wave 1 compression (interpreter path: one-shot gzip over
         // the pure-Rust backend — same call-duration error-slot
         // discipline as net/crypto; unix-gated like them).
@@ -1360,6 +1499,26 @@ fn set_crypto_error(msg: Option<String>) {
 #[cfg(unix)]
 fn take_crypto_error() -> String {
     CRYPTO_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
+// Interpreter-side TLS error slot (Wave 2, Stage 1): same
+// discipline as the net/crypto slots, kept separate so interleaved
+// net/TLS calls in one task never clobber each other's
+// `last_error`.
+#[cfg(unix)]
+thread_local! {
+    static TLS_LAST_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(unix)]
+fn set_tls_error(msg: Option<String>) {
+    TLS_LAST_ERROR.with(|s| *s.borrow_mut() = msg);
+}
+
+#[cfg(unix)]
+fn take_tls_error() -> String {
+    TLS_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
 }
 
 // Interpreter-side gzip error slot (Wave 1): same discipline as

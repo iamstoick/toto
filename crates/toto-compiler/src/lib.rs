@@ -24,6 +24,8 @@ pub mod parser;
 pub mod project;
 pub mod span;
 pub mod stdlib;
+#[cfg(unix)]
+pub mod tlslib;
 pub mod token;
 
 use std::collections::HashMap;

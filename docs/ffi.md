@@ -86,6 +86,7 @@ runtime helpers. Ownership, encoding, and thread-safety per binding:
 | `toto_rt_read_str` | `c_read_str` | counted bytes to a Toto string, UTF-8 validated (`E0210` on bad bytes, `E0308` on NULL); backs `c_read_file` chunk decoding |
 | `toto_rt_net_*` (13 names) | `gzv.std/net` wrappers | Wave 1 sockets (unix-only): fds are opaque `int` handles; bytes cross as `Array<int>` (0–255, `E0308` otherwise); every failure is a `Result` `Err` with the `strerror` text via the per-task call-duration slot; park on the M:N poller (DNS on the blocking pool), never on a worker |
 | `toto_rt_crypto_*` (13 names) | `gzv.std/crypto` wrappers | Wave 1 crypto (unix-only): one-shot OpenSSL/LibreSSL calls through `cryptolib` — no retained contexts or key handles (rooting covers the call); bytes cross as `Array<int>`; `verify`-style ops return 1/0 with a clean slot or -1 plus the slot on malformed input; fixed strings (never library queue wording) wherever goldens pin messages, so error text holds on OpenSSL and LibreSSL alike |
+| `toto_rt_tls_*` (6 names) | `gzv.std/tls` wrappers | Wave 2 Stage 1 TLS (unix-only): handshake upgrades (`connect`/`accept`) plus record I/O (`send`/`recv`) and teardown (`close`) over the system libssl through `tlslib`; sessions are retained under the fd (explicit handle rule — the `SSL*` never crosses into Toto, `tls_close` or any `net_close` frees it); bytes cross as `Array<int>`; scalar ops return the fd/count or -1, array ops the payload or empty, every failure in the per-task slot; blocking calls (interpreter) / blocking pool (executor), never the poller |
 | `toto_rt_gzip_*` (3 names) | `gzv.std/compress` wrappers | Wave 1 compression (unix-only gate; backend is portable pure Rust): one-shot gzip over `flate2`/`miniz_oxide`; same byte/error-slot discipline; failures are one fixed string |
 
 Two linked names have no wrapper: `close` cannot be named in an
@@ -128,6 +129,52 @@ libcrypto into the suite while macOS ships a different
 library family entirely. Licenses: Apache License 2.0 for
 OpenSSL 3.x; LibreSSL retains the original OpenSSL/SSLeay
 dual-license terms (plus ISC for newer parts).
+
+## Wave 2 Stage 1 allowlist extension (rationale)
+
+The allowlist grows by 6 more names in this wave (29 Wave-1
+names stand), within this wave's FFI rules (TLS handshake
+upgrades, record I/O, teardown, last-error), each recorded above
+with its per-binding contract.
+No deferred-FFI work is smuggled in: no structs-by-value cross
+(opaque OpenSSL `SSL_CTX*`/`SSL*`/`X509*`/`EVP_PKEY*` never
+leave Rust — Toto sees `int` handles and `Array<int>` bytes, the
+same `Array<int>` extern shape authorized 2026-11-19), no
+`dlopen` (every symbol is linked at binary build time), no
+binding generation (all `unsafe extern` blocks are hand-written).
+Retained sessions are the one deliberate difference from the
+one-shot crypto surface, and they ride the D6 handle rule: the
+`SSL*` is keyed by its fd in a process-global table, Toto names
+only the fd, `tls_close` (or any `net_close` of the same fd)
+frees the session, and a second close names the missing session
+instead of touching a recycled fd number.
+
+Link model (unchanged from Phase 5/Wave 1): "static linking"
+means statically-declared linkage — every foreign symbol known
+at build time, no runtime loading. The `toto-compiler` build
+script symlinks the versioned system libssl it finds
+(`OUT_DIR/libssl.so`) so `-lssl` resolves without a dev
+symlink; the recorded `DT_NEEDED` is still the SONAME
+(`libssl.so.3`). `TOTO_CRYPTO_LIB_DIR` overrides the search
+path for both libraries.
+
+TLS library identity (Wave 2 Stage 1): the system libssl — the
+TLS face of the same mature library as Wave 1 libcrypto
+(OpenSSL 3 on Linux, `libssl.so.3`; LibreSSL on macOS).
+Observed OpenSSL 3.5.5 on the implementing machine (link-time
+`DT_NEEDED libssl.so.3`, version never pinned in goldens).
+Only long-stable, opaque-pointer-only APIs are used
+(`TLS_client/server_method`, `SSL_CTX_new/free`,
+`SSL_new/free`, `SSL_set_fd`, `SSL_connect/accept/read/write/`
+`shutdown/get_error/get_verify_result`, `SSL_CTX_use_certificate`
+/`use_PrivateKey`/`check_private_key`/`get_cert_store`); every
+name was confirmed in the installed dynamic symbol table
+(`nm -D libssl.so.3` — no dev headers on the machine, so the
+C-header shapes rest on OpenSSL API knowledge plus the Wave 1
+precedent instead). `SSL_set_tlsext_host_name` is deliberately
+NOT used (upstream it is a C macro, not an exported symbol).
+Licenses: same as the crypto face (Apache-2.0 OpenSSL 3.x /
+OpenSSL+SSLeay+ISC LibreSSL).
 
 ## End-to-end proof dispositions (smoke-test unproven list)
 

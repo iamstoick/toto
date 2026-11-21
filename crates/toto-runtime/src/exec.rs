@@ -1528,6 +1528,16 @@ impl<'a> Executor<'a> {
         if Self::CRYPTO_FNS.contains(&name) {
             return self.exec_crypto(dst, name, args, span);
         }
+        // TLS foreign calls run on the blocking pool: handshakes and
+        // record I/O block on the network, so they must never run
+        // inline on a worker (unlike one-shot crypto) and never on
+        // the poller (an SSL step is not a readiness wait).
+        // Unix-only surface; checked code on other platforms cannot
+        // name these (E0301).
+        #[cfg(unix)]
+        if Self::TLS_FNS.contains(&name) {
+            return self.exec_tls(dst, name, args, span);
+        }
         // Gzip foreign calls run inline on the worker: one-shot
         // pure-Rust compression, never blocking, never parking.
         // Unix-gated like the other Wave 1 surfaces (uniformity;
@@ -2066,6 +2076,10 @@ impl<'a> Executor<'a> {
                 // instead of operating on a recycled fd number.
                 crate::sched::Scheduler::net_unregister_fd(self.shared, fd, "socket closed");
                 nn::forget_peer(fd);
+                // A TLS session names this fd: free it first so a plain
+                // `net_close` of a TLS connection never leaks the `SSL*`
+                // nor leaves a stale entry for a recycled fd number.
+                toto_compiler::tlslib::free_session(fd);
                 match nn::close(fd) {
                     Ok(()) => {
                         self.net_set_error(None);
@@ -2242,6 +2256,165 @@ impl<'a> Executor<'a> {
             .crypto_error
             .take()
             .unwrap_or_default()
+    }
+
+    /// TLS foreign functions (Wave 2, Stage 1, unix-only): blocking
+    /// libssl steps dispatched by name from `exec_foreign`.
+    ///
+    /// Shape: parse args with the shared `net_*` readers (fds, byte
+    /// arrays validated 0–255, `E0308` on bad values), park the task
+    /// on the dedicated blocking pool (`BlockingOp::Tls`), and map
+    /// the resume with `tls_scalar_resume` / `tls_array_resume`. The
+    /// drain sets the per-task `tls_error` slot on every completion
+    /// (read and cleared by `toto_rt_tls_last_error`). Scalar results
+    /// are the fd/count or -1; array results carry the payload (empty
+    /// on failure, or orderly shutdown when the slot stays clean).
+    #[cfg(unix)]
+    const TLS_FNS: &[&str] = &[
+        "toto_rt_tls_connect",
+        "toto_rt_tls_accept",
+        "toto_rt_tls_send",
+        "toto_rt_tls_recv",
+        "toto_rt_tls_close",
+        "toto_rt_tls_last_error",
+    ];
+
+    /// Take (read + clear) this task's TLS error slot.
+    #[cfg(unix)]
+    fn tls_take_error(&mut self) -> String {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        sched.slots[self.task.0]
+            .tls_error
+            .take()
+            .unwrap_or_default()
+    }
+
+    /// Resume mapping for scalar TLS ops: an Int resume is the
+    /// result; a Unit resume means the drain set `tls_error` (assign
+    /// -1 so the Toto wrapper reports the slot text).
+    #[cfg(unix)]
+    fn tls_scalar_resume(&mut self, dst: Option<usize>, v: RtVal) {
+        match v {
+            RtVal::Int(n) => self.net_assign(dst, RtVal::Int(n)),
+            _ => self.net_assign(dst, RtVal::Int(-1)),
+        }
+    }
+
+    /// Resume mapping for array-returning TLS ops: a Heap resume is
+    /// the payload (possibly empty); anything else means the drain
+    /// set `tls_error`. Empty + clean slot is orderly shutdown.
+    #[cfg(unix)]
+    fn tls_array_resume(&mut self, dst: Option<usize>, v: RtVal) {
+        match v {
+            RtVal::Heap(_) => self.net_assign(dst, v),
+            _ => self.net_assign(dst, self.net_alloc_bytes(Vec::new())),
+        }
+    }
+
+    /// Park the current task on one blocking TLS step. The resume
+    /// value IS the finished result: the pool ran the libssl call
+    /// and the drain converted it (setting the error slot).
+    /// Cancellations and unexpected responses propagate as errors.
+    #[cfg(unix)]
+    fn tls_wait(&mut self, op: crate::sched::TlsOp, span: Span) -> Result<RtVal, ExecErr> {
+        if self.scope_failed() {
+            return Err(self.cancelled("tls", span));
+        }
+        self.maybe_collect();
+        self.trace.push(TraceFrame {
+            name: "tls (pool)".to_string(),
+            span,
+        });
+        let out = match self.y.suspend(crate::sched::ToSched::Blocking {
+            op: crate::sched::BlockingOp::Tls { op },
+            span,
+        }) {
+            ToTask::Value(v) => Ok(v),
+            ToTask::Cancelled { op } => Err(self.cancelled(op, span)),
+            other => {
+                let _ = other;
+                Err(self.internal("tls response", span))
+            }
+        };
+        self.trace.pop();
+        out
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    fn exec_tls(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
+        use crate::sched::TlsOp;
+        // Every arm assigns `dst` and returns Ok, or returns an
+        // executor error (E0308 on bad values, Cancelled on scope
+        // failure, internal on impossible states). The error slot is
+        // set by the drain on every pool completion.
+        match name {
+            "toto_rt_tls_connect" => {
+                self.arity(name, args.len(), 2, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                let ca_pem = self.net_str(args, 1, name, span)?;
+                let v = self.tls_wait(TlsOp::Connect { fd, ca_pem }, span)?;
+                self.tls_scalar_resume(dst, v);
+                Ok(())
+            }
+            "toto_rt_tls_accept" => {
+                self.arity(name, args.len(), 3, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                let cert_pem = self.net_str(args, 1, name, span)?;
+                let key_pem = self.net_str(args, 2, name, span)?;
+                let v = self.tls_wait(
+                    TlsOp::Accept {
+                        fd,
+                        cert_pem,
+                        key_pem,
+                    },
+                    span,
+                )?;
+                self.tls_scalar_resume(dst, v);
+                Ok(())
+            }
+            "toto_rt_tls_send" => {
+                self.arity(name, args.len(), 2, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                let bytes = self.net_bytes(args, 1, span)?;
+                let v = self.tls_wait(TlsOp::Send { fd, bytes }, span)?;
+                self.tls_scalar_resume(dst, v);
+                Ok(())
+            }
+            "toto_rt_tls_recv" => {
+                self.arity(name, args.len(), 2, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                let max = self.net_count(args, 1, name, span)?;
+                let v = self.tls_wait(TlsOp::Recv { fd, max }, span)?;
+                self.tls_array_resume(dst, v);
+                Ok(())
+            }
+            "toto_rt_tls_close" => {
+                self.arity(name, args.len(), 1, span)?;
+                let fd = self.net_fd(args, 0, name, span)?;
+                // Unregister first so parked waiters fail loudly
+                // instead of operating on a recycled fd number.
+                crate::sched::Scheduler::net_unregister_fd(self.shared, fd, "socket closed");
+                toto_compiler::netsys::forget_peer(fd);
+                let v = self.tls_wait(TlsOp::Close { fd }, span)?;
+                self.tls_scalar_resume(dst, v);
+                Ok(())
+            }
+            "toto_rt_tls_last_error" => {
+                self.arity(name, args.len(), 0, span)?;
+                let e = self.tls_take_error();
+                let v = self.alloc_with(|h| h.alloc_str(&e));
+                self.net_assign(dst, RtVal::Heap(v));
+                Ok(())
+            }
+            _ => Err(self.internal("tls dispatch", span)),
+        }
     }
 
     #[cfg(unix)]

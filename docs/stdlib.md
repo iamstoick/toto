@@ -245,6 +245,44 @@ with `toto run`/`toto test`). Pinned by `proj13_crypto_kat`
 (published/pinned vectors per primitive) and
 `proj14_crypto_errors` (every malformed input is `Err`).
 
+## `tls`
+
+TLS upgrades for loopback TCP (Enterprise Wave 2, Stage 1;
+unix-only — see [ffi.md](ffi.md) for the per-binding
+contract). The state machine runs in the linked system libssl
+(OpenSSL 3 on Linux, LibreSSL on macOS) — bound, never
+implemented. Connections keep their `int` handles: TLS upgrades
+an already-connected TCP fd in place (client: `net_tcp_connect`
+then `tls_client_connect`; server: `net_tcp_listen`/`net_accept`
+then `tls_server_accept`), so the Wave 1 loopback rule carries
+over unchanged and no new socket layer exists. Bytes cross as
+`Array<int>` (0–255, `E0308` otherwise); every function returns
+`Result<_, string>`, closing twice or using a non-TLS socket is
+an `Err`. Trust model (Wave 1 reuse): the client verifies the
+server chain against the given CA PEM with the same
+`X509_STORE` semantics as `crypto_x509_verify`, enforced at
+handshake time — no hostname check (as in Wave 1), no client
+certificates, one-way loopback TLS only.
+
+| Function | Behavior |
+|---|---|
+| `tls_client_connect(conn, ca_pem)` | Upgrade a connected fd, verifying the chain; `Ok(fd)` |
+| `tls_server_accept(conn, cert_pem, key_pem)` | Upgrade an accepted fd; `Ok(fd)` |
+| `tls_send(conn, data)` | One record write; may short-write (`Ok(n)`) |
+| `tls_send_all(conn, data)` | Toto-level loop to full delivery; `Ok(len(data))` |
+| `tls_recv(conn, max)` | Up to `max` bytes; empty array is orderly shutdown, not an error |
+| `tls_close(sock)` | `close_notify` + free + close; `Ok(0)` |
+
+Handshake/record steps are blocking calls (interpreter) or
+blocking-pool waits (executor) — never the poller, which serves
+only `poll()`able readiness waits (spec §17.5 rule: an SSL step
+is not one). JIT/AOT refuse like the net surface (run with
+`toto run`/`toto test`). Pinned by `proj15_tls_echo` (Toto
+loopback echo through the real wrappers) and the
+`tls_interop`/`tls_openssl` suites (both directions against
+`openssl s_server`/`s_client`, plus the untrusted-chain
+negative).
+
 ## `compress`
 
 gzip compression (Enterprise Wave 1; unix-gated like the other
