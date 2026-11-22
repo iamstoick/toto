@@ -1,0 +1,3 @@
+Ok(2:plain:4.0:0:héllo|)
+Err(sqlite prepare: no such table: nope)
+Err(unknown database driver "nosuchdb" (want sqlite/postgres/mysql))

@@ -1,0 +1,20 @@
+import "gzv.std/db.gzv";
+
+fn run_db() -> Result<string, string> {
+    let dsn = "sqlite:path=dbfile_tmp.txt";
+    db_exec(dsn, "DROP TABLE IF EXISTS kv", [])?;
+    db_exec(dsn, "CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER)", [])?;
+    db_exec(dsn, "INSERT INTO kv (k, v) VALUES (?, ?)", [db_text("a"), db_int(1)])?;
+    db_exec(dsn, "INSERT INTO kv (k, v) VALUES (?, ?)", [db_text("b"), db_int(2)])?;
+    let rows = db_query(dsn, "SELECT k, v FROM kv ORDER BY k", [])?;
+    let mut out: string = "";
+    for row in rows {
+        out = out + row[0].s + "=" + to_string(row[1].i) + ";";
+    }
+    return Ok(out);
+}
+
+fn main() -> int {
+    println(run_db());
+    return 0;
+}

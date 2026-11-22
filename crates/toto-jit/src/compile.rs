@@ -2489,6 +2489,23 @@ impl<'a> FnCx<'a> {
                         ),
                     });
                 }
+                // Database calls lower through the executor's
+                // blocking pool (a checkout or a query blocks); the
+                // JIT task runtime has no pool integration, so
+                // refuse with the workaround like the other pool
+                // surfaces, never miscompile or stall in generated
+                // code. AOT shares this lowering, so the same
+                // refusal covers `toto build` (native DB in AOT is
+                // a recorded follow-up; the executor is the
+                // reference).
+                if name.starts_with("toto_rt_db_") {
+                    return Err(SubsetError {
+                        func: self.func.clone(),
+                        message: format!(
+                            "foreign function `{name}` is a blocking database wait, which needs the executor pool (run with `toto run`/`toto test`)"
+                        ),
+                    });
+                }
                 let idx = Self::extern_index(prog, name).ok_or_else(|| SubsetError {
                     func: self.func.clone(),
                     message: format!(

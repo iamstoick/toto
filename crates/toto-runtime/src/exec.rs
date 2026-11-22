@@ -1609,6 +1609,16 @@ impl<'a> Executor<'a> {
         if Self::LOG_FNS.contains(&name) {
             return self.exec_log(dst, name, args, span);
         }
+        // Wave 3 Stage 1 database calls run on the blocking pool: a
+        // checkout or a query blocks, so they must never run inline
+        // on a worker (unlike one-shot crypto/gzip) and never on
+        // the poller (a pool wait is not a readiness wait).
+        // Unix-only surface; checked code on other platforms cannot
+        // name these (E0301).
+        #[cfg(unix)]
+        if Self::DB_FNS.contains(&name) {
+            return self.exec_db(dst, name, args, span);
+        }
         // Generic pool tail lives in its own frame (see below): this
         // dispatcher stays thin so every inline foreign call on the
         // serve path (net/crypto/gzip/tls/ctx/clock/log) pays only the
@@ -3082,6 +3092,188 @@ impl<'a> Executor<'a> {
                 Ok(())
             }
             _ => Err(self.internal("unknown log function", span)),
+        }
+    }
+
+    /// Database foreign functions (Wave 3, Stage 1, unix-only):
+    /// pooled client-library steps dispatched by name from
+    /// `exec_foreign`. The pool (checkout, connect, query, fetch)
+    /// runs on the dedicated blocking pool; the worker never
+    /// blocks. Same error discipline as net/TLS (scalar ops
+    /// return the count or -1; the query op returns the framed
+    /// rows string or "" with the slot set; the message lands in
+    /// the call-duration slot read by `toto_rt_db_last_error`).
+    /// Params cross as the framing string and rows cross back as
+    /// the framed string on both engines (checked code cannot name
+    /// structs in foreign signatures, so no checker change and no
+    /// new types) — one Toto wrapper, one pure-Toto decoder.
+    #[cfg(unix)]
+    const DB_FNS: &[&str] = &[
+        "toto_rt_db_exec",
+        "toto_rt_db_query",
+        "toto_rt_db_pool_config",
+        "toto_rt_db_close_pool",
+        "toto_rt_db_last_error",
+    ];
+
+    /// Take (read + clear) this task's DB error slot.
+    #[cfg(unix)]
+    fn db_take_error(&mut self) -> String {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        sched.slots[self.task.0].db_error.take().unwrap_or_default()
+    }
+
+    /// Resume mapping for scalar DB ops: an Int resume is the
+    /// result; a Unit resume means the drain set `db_error` (assign
+    /// -1 so the Toto wrapper reports the slot text).
+    #[cfg(unix)]
+    fn db_scalar_resume(&mut self, dst: Option<usize>, v: RtVal) {
+        match v {
+            RtVal::Int(n) => self.net_assign(dst, RtVal::Int(n)),
+            _ => self.net_assign(dst, RtVal::Int(-1)),
+        }
+    }
+
+    /// Park the current task on one blocking DB step. The resume
+    /// value IS the finished result: the pool ran the
+    /// checkout/connect/query and the drain converted it (setting
+    /// the error slot). Cancellations and unexpected responses
+    /// propagate as errors.
+    #[cfg(unix)]
+    fn db_wait(&mut self, op: crate::sched::DbOp, span: Span) -> Result<RtVal, ExecErr> {
+        if self.scope_failed() {
+            return Err(self.cancelled("db", span));
+        }
+        self.check_deadline(span, "db")?;
+        self.maybe_collect();
+        self.trace.push(TraceFrame {
+            name: "db (pool)".to_string(),
+            span,
+        });
+        let out = match self.y.suspend(crate::sched::ToSched::Blocking {
+            op: crate::sched::BlockingOp::Db { op },
+            span,
+        }) {
+            ToTask::Value(v) => Ok(v),
+            ToTask::Cancelled { op } => Err(self.cancelled(op, span)),
+            other => {
+                let _ = other;
+                Err(self.internal("db response", span))
+            }
+        };
+        self.trace.pop();
+        out
+    }
+
+    /// Read the params framing string into plain cells (E0308 on
+    /// bad framing — pure Toto builds it, so this fires only on
+    /// hand-built strings).
+    #[cfg(unix)]
+    fn db_params(
+        &self,
+        args: &[usize],
+        i: usize,
+        span: Span,
+    ) -> Result<Vec<toto_compiler::dblib::DbCell>, ExecErr> {
+        let framing = self.net_str(args, i, "db params framing", span)?;
+        toto_compiler::dblib::decode_params(&framing).map_err(|e| {
+            self.err(
+                "E0308",
+                format!("bad db params framing ({e}; build it with db_encode_params)"),
+                span,
+            )
+        })
+    }
+
+    /// Read a framed rows string (the drain's `DbRows` conversion).
+    /// Empty (with a clean slot) is a rowless result; empty with a
+    /// set slot is a failure the wrapper reports.
+    #[cfg(unix)]
+    fn db_rows_resume(&mut self, dst: Option<usize>, v: RtVal) {
+        match v {
+            RtVal::Heap(_) => self.net_assign(dst, v),
+            _ => self.net_assign(dst, RtVal::Heap(self.alloc_with(|h| h.alloc_str("")))),
+        }
+    }
+
+    /// Read a non-negative int arg (pool max / timeout ms).
+    #[cfg(unix)]
+    fn db_nonneg(&self, args: &[usize], i: usize, name: &str, span: Span) -> Result<i64, ExecErr> {
+        let n = self.net_int(args, i, name, span)?;
+        if n < 0 {
+            return Err(self.err(
+                "E0308",
+                format!("db pool config needs non-negative numbers, got {n}"),
+                span,
+            ));
+        }
+        Ok(n)
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    fn exec_db(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
+        use crate::sched::DbOp;
+        // Every arm assigns `dst` and returns Ok, or returns an
+        // executor error (E0308 on bad values, Cancelled on scope
+        // failure, internal on impossible states). The error slot is
+        // set by the drain on every pool completion.
+        match name {
+            "toto_rt_db_exec" => {
+                self.arity(name, args.len(), 3, span)?;
+                let dsn = self.net_str(args, 0, name, span)?;
+                let sql = self.net_str(args, 1, name, span)?;
+                let params = self.db_params(args, 2, span)?;
+                let v = self.db_wait(DbOp::Exec { dsn, sql, params }, span)?;
+                self.db_scalar_resume(dst, v);
+                Ok(())
+            }
+            "toto_rt_db_query" => {
+                self.arity(name, args.len(), 3, span)?;
+                let dsn = self.net_str(args, 0, name, span)?;
+                let sql = self.net_str(args, 1, name, span)?;
+                let params = self.db_params(args, 2, span)?;
+                let v = self.db_wait(DbOp::Query { dsn, sql, params }, span)?;
+                self.db_rows_resume(dst, v);
+                Ok(())
+            }
+            "toto_rt_db_pool_config" => {
+                self.arity(name, args.len(), 3, span)?;
+                let dsn = self.net_str(args, 0, name, span)?;
+                let max = self.db_nonneg(args, 1, name, span)? as u32;
+                let timeout_ms = self.db_nonneg(args, 2, name, span)? as u64;
+                let v = self.db_wait(
+                    DbOp::PoolConfig {
+                        dsn,
+                        max,
+                        timeout_ms,
+                    },
+                    span,
+                )?;
+                self.db_scalar_resume(dst, v);
+                Ok(())
+            }
+            "toto_rt_db_close_pool" => {
+                self.arity(name, args.len(), 1, span)?;
+                let dsn = self.net_str(args, 0, name, span)?;
+                let v = self.db_wait(DbOp::ClosePool { dsn }, span)?;
+                self.db_scalar_resume(dst, v);
+                Ok(())
+            }
+            "toto_rt_db_last_error" => {
+                self.arity(name, args.len(), 0, span)?;
+                let e = self.db_take_error();
+                let v = self.alloc_with(|h| h.alloc_str(&e));
+                self.net_assign(dst, RtVal::Heap(v));
+                Ok(())
+            }
+            _ => Err(self.internal("unknown database function", span)),
         }
     }
 

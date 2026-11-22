@@ -501,11 +501,55 @@ escaping and cumulative math, every fixed error, alias isolation,
 handler over a synthetic request) and the corpus `proj19_metrics`
 golden (error paths + a live serve/scrape byte-match).
 
+## `db`
+
+Database drivers over pooled mature clients (Enterprise Wave 3,
+Stage 1). `DbVal` is `{kind:int, i:int, f:float, s:string}`
+(`kind`: 0 null, 1 int, 2 float, 3 text, 4 bool); constructors
+`db_null/int/float/text/bool` build it. DSN selects the driver:
+`sqlite:path=/x/y.db` (file), `sqlite::memory:` (process DB),
+`postgres:host=.. port=.. dbname=.. user=.. password=..
+[connect_timeout=..]`, `mysql:host=.. port=.. dbname=..
+user=.. password=.. [connect_timeout=..]`. `db_exec` runs a
+statement (affected rows; DDL counts are driver-defined);
+`db_query` returns `Array<Array<DbVal>>`; `db_pool_config`
+sets max connections + checkout timeout; `db_close_pool`
+retires a pool; every fallible fn returns `Result<_, string>`
+with the library message. `?` placeholders bind server-side
+(Postgres `?`→`$n`, SQLite native) or through the library
+escaper (MySQL) — never interpolated. Value decoding is
+native per driver (int/float/bool/text); Postgres numerics
+arrive as text (precision kept); MySQL decodes by shape
+(integer/float-shaped → int/float, else text — `CAST AS
+CHAR` when the distinction matters; no blob in v1).
+Non-finite floats on the interpreter path are a loud `Err`
+(Toto cannot construct NaN/±Infinity; the runtime engine
+handles them natively). Pool: one process-global pool per
+(driver, DSN), default max 8 / checkout timeout 5000 ms;
+exhaustion is `Err("pool exhausted ...")`, never a stall;
+`:memory:` pins its pool to one connection.
+
+| Function | Behavior |
+|---|---|
+| `db_null/int/float/text/bool(..)` | `DbVal` constructors |
+| `db_encode_params(args)` / `db_decode_rows(s)` | Framing codec (length-prefixed `P`/`R` grammar; multibyte-safe) |
+| `db_exec(dsn, sql, args)` | Statement; affected rows or `Err` |
+| `db_query(dsn, sql, args)` | Rows (`[]` when rowless) or `Err` |
+| `db_pool_config(dsn, max, timeout_ms)` | Pool bounds or `Err` |
+| `db_close_pool(dsn)` | Retire a pool (idempotent) |
+
+Pinned by `test_db.gzv` (constructors, framing round-trip incl.
+separators/multibyte text, CRUD, pool-config errors, unknown
+driver — sequential, so it covers the interpreter arms), the
+corpus `database/` goldens (`:memory:`, file, concurrent
+pool hammer), and the Rust suites (`db_sqlite`,
+`db_postgres`, `db_mysql`, `db_pool` pool semantics).
+
 ## Execution paths
 
 | Path | Status | Evidence |
 |---|---|---|
-| Interpreter (`toto run` / `toto test`) | Full suite green | `toto: 17 passed, 0 failed` in `stdlib/`; corpus `proj09`/`proj10` goldens |
+| Interpreter (`toto run` / `toto test`) | Full suite green | `toto: 18 passed, 0 failed` in `stdlib/`; corpus `proj09`/`proj10` goldens |
 | Runtime executor (concurrent) | Green | `test_concurrent.gzv` (pipeline over channels) |
 | Built executable (`toto build`) | Output-equivalent | `stdlib` smoke: binary stdout byte-identical to interpreter |
 | JIT via `toto dev` | Unsupported | `dev` is single-file scope (`parse_and_check` only); multi-file dev loop is the known carry-forward |

@@ -1,0 +1,27 @@
+import "gzv.std/db.gzv";
+
+fn show_users(dsn: string) -> Result<string, string> {
+    let rows = db_query(dsn, "SELECT id, name, score, active, note FROM users ORDER BY id", [])?;
+    let mut out: string = "";
+    for row in rows {
+        out = out + to_string(row[0].i) + ":" + row[1].s + ":" + to_string(row[2].f) + ":" + to_string(row[3].i) + ":" + row[4].s + "|";
+    }
+    return Ok(out);
+}
+
+fn run_db() -> Result<string, string> {
+    let dsn = "sqlite::memory:";
+    db_exec(dsn, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, score REAL, active INTEGER, note TEXT)", [])?;
+    db_exec(dsn, "INSERT INTO users (name, score, active, note) VALUES (?, ?, ?, ?)", [db_text("o'brien;x"), db_float(3.25), db_bool(true), db_null()])?;
+    db_exec(dsn, "INSERT INTO users (name, score, active, note) VALUES (?, ?, ?, ?)", [db_text("plain"), db_float(-0.5), db_bool(false), db_text("héllo")])?;
+    db_exec(dsn, "UPDATE users SET score = ? WHERE name = ?", [db_float(4.0), db_text("plain")])?;
+    db_exec(dsn, "DELETE FROM users WHERE name = ?", [db_text("o'brien;x")])?;
+    return show_users(dsn);
+}
+
+fn main() -> int {
+    println(run_db());
+    println(db_exec("sqlite::memory:", "INSERT INTO nope (a) VALUES (1)", []));
+    println(db_exec("nosuchdb:x=1", "SELECT 1", []));
+    return 0;
+}

@@ -203,6 +203,26 @@ first-panic-wins, parked tasks released, running tasks fail-fast
 at the next suspension point. Handles name scope indices, so a
 forged handle bounds-checks loudly instead of misrouting.
 
+## Wave 3 Stage 1 allowlist extension (rationale)
+
+The allowlist grows by 5 more names (`toto_rt_db_exec`,
+`toto_rt_db_query`, `toto_rt_db_pool_config`,
+`toto_rt_db_close_pool`, `toto_rt_db_last_error`), within this
+wave's FFI rules (D6: bind mature libraries — system
+libsqlite3 unix-wide, libpq + libmysqlclient on Linux only;
+no structs-by-value, no `dlopen`, no binding generation —
+all `unsafe extern` blocks are hand-written with opaque
+pointers + ints only). No new builtins: the 27-name catalog
+is untouched. Checked code cannot name structs in foreign
+signatures (unchanged `E0302`), so params cross as one
+length-prefixed framing string built by pure Toto and rows
+cross back as a framed string decoded by pure Toto (`gzv.std/db`);
+the runtime executor parses/builds the same framing and never
+touches user structs at the boundary. The only runtime
+capability is the scheduler's `BlockingOp::Db` pool step (same
+shape as the TLS `BlockingOp::Tls`), served on the dedicated
+blocking pool — never inline, never on the poller.
+
 ## End-to-end proof dispositions (smoke-test unproven list)
 
 1. **Real library — proven.** libc (`strlen`, `strcmp`, `strtod`,

@@ -10,6 +10,8 @@ pub mod compress;
 #[cfg(unix)]
 pub mod cryptolib;
 pub mod ctxlog;
+#[cfg(unix)]
+pub mod dblib;
 pub mod diag;
 pub mod ffi;
 pub mod fmt;

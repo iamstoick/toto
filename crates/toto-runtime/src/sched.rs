@@ -174,6 +174,45 @@ pub enum BlockingOp {
     Tls {
         op: TlsOp,
     },
+    /// Blocking database steps (Wave 3, Stage 1): checkout, connect,
+    /// query, and fetch run on the dedicated pool — never inline on
+    /// a worker (a checkout or a query blocks), never on the poller
+    /// (a pool wait is not a readiness wait; see the Wave 3
+    /// blocking-I/O policy). Unix only (same gate as the db
+    /// surface: sqlite unix-wide, postgres/mysql linux-only).
+    #[cfg(unix)]
+    Db {
+        op: DbOp,
+    },
+}
+
+/// One blocking database step, as the pool thread sees it. Owned
+/// plain data only: pool threads never touch the GC heap, channel
+/// tables, or scheduler state beyond pushing completions.
+/// Unix-only. Cells are `dblib::DbCell` (kind-tagged plain data).
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub enum DbOp {
+    /// Run a statement; the affected-row count comes back.
+    Exec {
+        dsn: String,
+        sql: String,
+        params: Vec<toto_compiler::dblib::DbCell>,
+    },
+    /// Run a query; all rows come back.
+    Query {
+        dsn: String,
+        sql: String,
+        params: Vec<toto_compiler::dblib::DbCell>,
+    },
+    /// Configure a pool (max connections, checkout timeout ms).
+    PoolConfig {
+        dsn: String,
+        max: u32,
+        timeout_ms: u64,
+    },
+    /// Retire a pool (test isolation, clean shutdown).
+    ClosePool { dsn: String },
 }
 
 /// One blocking TLS step, as the pool thread sees it. Owned plain
@@ -296,6 +335,23 @@ pub enum BlockingResult {
     /// `Unit`; the executor's `tls_last_error` reads the slot.
     #[cfg(unix)]
     TlsFail(String),
+    /// DB results (Wave 3, Stage 1, unix-only): same conversion
+    /// discipline as the TLS variants, but for database pool jobs
+    /// (see `BlockingOp::Db`) and accepted only by tasks parked on
+    /// `"blocking"` with a matching `blocking_seq`. The drain sets
+    /// the task's `db_error` slot from these (never `net_error` or
+    /// `tls_error`, so interleaved db/net calls never clobber each
+    /// other).
+    #[cfg(unix)]
+    DbInt(i64),
+    /// All rows (structs per row, converted to heap values in the
+    /// drain where the heap is available).
+    #[cfg(unix)]
+    DbRows(Vec<Vec<toto_compiler::dblib::DbCell>>),
+    /// Loud DB failure: the drain sets `db_error` and resumes with
+    /// `Unit`; the executor's `db_last_error` reads the slot.
+    #[cfg(unix)]
+    DbFail(String),
 }
 
 /// A finished pool job awaiting pickup. The scheduler turns it into
@@ -848,6 +904,13 @@ pub struct Slot {
     /// `toto_rt_tls_last_error`. Set on every TLS pool completion.
     #[cfg(unix)]
     pub(crate) tls_error: Option<String>,
+    /// Last DB error for this task (`None` = clean). Separate from
+    /// `net_error`/`tls_error` so interleaved db/net calls in one
+    /// task never clobber each other's `last_error`; read (and
+    /// cleared) by `toto_rt_db_last_error`. Set on every DB pool
+    /// completion.
+    #[cfg(unix)]
+    pub(crate) db_error: Option<String>,
     /// Current context slot (Wave 2, Stage 3): ordered pairs plus
     /// an optional absolute monotonic-ms deadline, inherited at
     /// spawn (ADR-009). Plain data — never a heap reference, so no
@@ -1228,6 +1291,8 @@ impl Scheduler {
             gzip_error: None,
             #[cfg(unix)]
             tls_error: None,
+            #[cfg(unix)]
+            db_error: None,
             ctx: CtxSlot::new(),
             #[cfg(unix)]
             ctx_error: None,
@@ -1731,7 +1796,10 @@ impl Scheduler {
                     | B::DnsFail(_)
                     | B::TlsInt(_)
                     | B::TlsBytes(_)
-                    | B::TlsFail(_) => Some(matches!(
+                    | B::TlsFail(_)
+                    | B::DbInt(_)
+                    | B::DbRows(_)
+                    | B::DbFail(_) => Some(matches!(
                         c.result,
                         B::NetInt(_) | B::NetBytes(_) | B::NetFail(_)
                     )),
@@ -1743,6 +1811,7 @@ impl Scheduler {
                     // a stale pool completion can never satisfy a
                     // poller wait or vice versa.
                     let is_tls = matches!(c.result, B::TlsInt(_) | B::TlsBytes(_) | B::TlsFail(_));
+                    let is_db = matches!(c.result, B::DbInt(_) | B::DbRows(_) | B::DbFail(_));
                     let Completion {
                         task,
                         result,
@@ -1752,6 +1821,24 @@ impl Scheduler {
                     let (resp, err): (ToTask, Option<String>) = match result {
                         B::NetInt(n) => (ToTask::Value(RtVal::Int(n)), None),
                         B::TlsInt(n) => (ToTask::Value(RtVal::Int(n)), None),
+                        B::DbInt(n) => (ToTask::Value(RtVal::Int(n)), None),
+                        B::DbRows(rows) => {
+                            // Rows cross back as the framed string
+                            // (same grammar pure Toto decodes on
+                            // the interpreter path — one wrapper,
+                            // one decoder, both engines). Payloads
+                            // are lossy-converted at read time, so
+                            // the framing is always valid UTF-8.
+                            let framed =
+                                String::from_utf8(toto_compiler::dblib::encode_rows(&rows))
+                                    .unwrap_or_default();
+                            let r = {
+                                let mut st = self.shared.state.lock().expect("shared state lock");
+                                st.heap.alloc_str(&framed)
+                            };
+                            (ToTask::Value(RtVal::Heap(r)), None)
+                        }
+                        B::DbFail(m) => (ToTask::Value(RtVal::Unit), Some(m)),
                         B::NetBytes(bytes) => {
                             let r = {
                                 let mut st = self.shared.state.lock().expect("shared state lock");
@@ -1806,6 +1893,8 @@ impl Scheduler {
                     if live {
                         if is_tls {
                             slot.tls_error = err;
+                        } else if is_db {
+                            slot.db_error = err;
                         } else {
                             slot.net_error = err;
                         }
@@ -1975,6 +2064,38 @@ impl Scheduler {
         }
     }
 
+    /// Run one database step on a pool thread (Wave 3, Stage 1):
+    /// the checkout (wait with timeout), connect, query, and fetch
+    /// all run to completion, and the result posts as a `Db*`
+    /// completion for the drain pre-pass. No heap, no scheduler
+    /// state — owned plain data only.
+    #[cfg(unix)]
+    fn run_db(op: &DbOp) -> BlockingResult {
+        use toto_compiler::dblib as db;
+        match op {
+            DbOp::Exec { dsn, sql, params } => match db::db_exec(dsn, sql, params) {
+                Ok(n) => BlockingResult::DbInt(n),
+                Err(e) => BlockingResult::DbFail(e),
+            },
+            DbOp::Query { dsn, sql, params } => match db::db_query(dsn, sql, params) {
+                Ok(rows) => BlockingResult::DbRows(rows),
+                Err(e) => BlockingResult::DbFail(e),
+            },
+            DbOp::PoolConfig {
+                dsn,
+                max,
+                timeout_ms,
+            } => match db::db_pool_config(dsn, *max, *timeout_ms) {
+                Ok(()) => BlockingResult::DbInt(0),
+                Err(e) => BlockingResult::DbFail(e),
+            },
+            DbOp::ClosePool { dsn } => {
+                db::db_close_pool(dsn);
+                BlockingResult::DbInt(0)
+            }
+        }
+    }
+
     /// Dedicated blocking-pool thread: run file-system jobs, post
     /// completions, never touch the heap or scheduler state directly.
     /// Exits once the last worker sets `shutdown`.
@@ -2036,6 +2157,8 @@ impl Scheduler {
                     }
                     Self::run_tls(&op)
                 }
+                #[cfg(unix)]
+                BlockingOp::Db { op } => Self::run_db(&op),
             };
             {
                 let mut pool = shared.pool.lock().expect("pool lock");

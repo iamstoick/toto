@@ -47,6 +47,7 @@ pub const MODULES: &[(&str, &str)] = &[
     std_module!("context"),
     std_module!("log"),
     std_module!("metrics"),
+    std_module!("db"),
 ];
 
 /// Embedded source for a canonical `gzv.std/...` path, if known.
