@@ -1,0 +1,456 @@
+// `gzv.std/saml` — SAML response parsing + structural validation
+// (Enterprise Wave 3, Stage 3).
+//
+// Scope is explicit and narrow: this module parses the
+// Response envelope (Issuer, Subject/NameID, Conditions time
+// bounds, Audience, Attributes) and validates time windows +
+// audience structurally. XML SIGNATURES ARE NOT VALIDATED —
+// that needs RSA bindings + XML canonicalization (a recorded
+// follow-up). A response carrying a `<Signature>` block is
+// REFUSED with a loud `Err` naming the gap (never silently
+// trusted); only unsigned responses validate. Fixtures carry
+// placeholder signatures or none at all, and NO keys are
+// committed anywhere (Stage 4 rule).
+//
+// Time bounds compare as UTC ISO-8601 strings (`now_iso` is
+// caller-supplied in the same shape — lexicographic order is
+// chronological order for fixed-shape UTC stamps, so no epoch
+// math is needed and tests stay deterministic). Skew is not
+// applied in v1 (documented).
+import "gzv.std/strings.gzv";
+
+pub struct SamlAttr {
+    name: string,
+    values: Array<string>,
+}
+
+pub struct SamlAssertion {
+    issuer: string,
+    subject: string,
+    name_format: string,
+    session_index: string,
+    not_before: string,
+    not_on_or_after: string,
+    audience: string,
+    signed: bool,
+    attrs: Array<SamlAttr>,
+}
+
+// `index_of` with a start offset (the stdlib only offers the
+// two-argument form).
+fn saml_index_from(xml: string, needle: string, from: int) -> int {
+    if from < 0 || from > len(xml) {
+        return -1;
+    } else {
+    }
+    let rel: int = index_of(substring(xml, from, len(xml)), needle);
+    if rel < 0 {
+        return -1;
+    } else {
+    }
+    return from + rel;
+}
+
+// Tag-name characters (prefix + local name + delimiters).
+fn saml_is_namechar(c: string) -> bool {
+    if c == ":" || c == "." || c == "-" || c == "_" {
+        return true;
+    } else {
+    }
+    if c >= "0" && c <= "9" {
+        return true;
+    } else {
+    }
+    if c >= "A" && c <= "Z" {
+        return true;
+    } else {
+    }
+    if c >= "a" && c <= "z" {
+        return true;
+    } else {
+    }
+    return false;
+}
+
+// Local name of the tag opening at `at` (the `<` index),
+// skipping any namespace prefix (`saml:Issuer` -> `Issuer`).
+// "" when `at` does not start a tag.
+fn saml_local_at(xml: string, at: int) -> string {
+    if at < 0 || at >= len(xml) || char_at(xml, at) != "<" {
+        return "";
+    }
+    let mut i: int = at + 1;
+    if i < len(xml) && char_at(xml, i) == "/" {
+        i = i + 1;
+    } else {
+    }
+    let mut name: string = "";
+    while i < len(xml) && saml_is_namechar(char_at(xml, i)) {
+        name = name + char_at(xml, i);
+        i = i + 1;
+    }
+    // Strip a single namespace prefix (`a:b` -> `b`).
+    let ci: int = index_of(name, ":");
+    if ci >= 0 {
+        return substring(name, ci + 1, len(name));
+    } else {
+    }
+    return name;
+}
+
+// Index of the next `<[prefix:]local` open tag at/after
+// `from` (namespace-aware: `<saml:Issuer` matches `Issuer`).
+// -1 when absent.
+fn saml_open_at(xml: string, local: string, from: int) -> int {
+    let mut p: int = from;
+    while p >= 0 && p < len(xml) {
+        let i: int = saml_index_from(xml, "<", p);
+        if i < 0 {
+            return -1;
+        }
+        if saml_local_at(xml, i) == local && char_at(xml, i + 1) != "/" {
+            return i;
+        } else {
+        }
+        p = i + 1;
+    }
+    return -1;
+}
+
+// Index of the next `</[prefix:]local>` close tag at/after
+// `from`. -1 when absent.
+fn saml_close_at(xml: string, local: string, from: int) -> int {
+    let mut p: int = from;
+    while p >= 0 && p < len(xml) {
+        let i: int = saml_index_from(xml, "</", p);
+        if i < 0 {
+            return -1;
+        }
+        if saml_local_at(xml, i) == local {
+            return i;
+        } else {
+        }
+        p = i + 2;
+    }
+    return -1;
+}
+
+// Find `<[prefix:]tag ...>content</[prefix:]tag>` (attributes
+// on the open tag are skipped, not parsed). Returns "" when
+// absent — callers decide whether absence is an error.
+fn saml_find(xml: string, tag: string) -> string {
+    let i: int = saml_open_at(xml, tag, 0);
+    if i < 0 {
+        return "";
+    }
+    let gt: int = saml_index_from(xml, ">", i);
+    if gt < 0 {
+        return "";
+    }
+    // Self-closing tags carry no content.
+    if char_at(xml, gt - 1) == "/" {
+        return "";
+    }
+    let j: int = saml_close_at(xml, tag, gt);
+    if j < 0 {
+        return "";
+    }
+    return substring(xml, gt + 1, j);
+}
+
+// Attribute value of `name="..."` inside an open tag starting
+// at `at` (the `<` index). Returns "" when absent.
+fn saml_attr(xml: string, at: int, name: string) -> string {
+    let gt: int = saml_index_from(xml, ">", at);
+    if gt < 0 {
+        return "";
+    }
+    let head: string = substring(xml, at, gt);
+    let key: string = name + "=\"";
+    let k: int = index_of(head, key);
+    if k < 0 {
+        return "";
+    }
+    let v0: int = k + len(key);
+    let rel: string = substring(head, v0, len(head));
+    let q: int = index_of(rel, "\"");
+    if q < 0 {
+        return "";
+    }
+    return substring(rel, 0, q);
+}
+
+// End offset (just past `>`) of the close tag found at `at`
+// (the `<` index of a `saml_close_at` hit). -1 when malformed.
+fn saml_close_end(xml: string, at: int) -> int {
+    if at < 0 {
+        return -1;
+    } else {
+    }
+    let gt: int = saml_index_from(xml, ">", at);
+    if gt < 0 {
+        return -1;
+    } else {
+    }
+    return gt + 1;
+}
+
+// All `<Attribute Name="...">` blocks with their values.
+fn saml_attributes(assert_xml: string) -> Result<Array<SamlAttr>, string> {
+    let mut out: Array<SamlAttr> = [];
+    let mut rest: string = assert_xml;
+    while true {
+        let i: int = saml_open_at(rest, "Attribute", 0);
+        if i < 0 {
+            break;
+        }
+        let gt: int = saml_index_from(rest, ">", i);
+        if gt < 0 {
+            return Err("bad saml (Attribute tag)");
+        }
+        let head: string = substring(rest, i, gt);
+        let nk: int = index_of(head, "Name=\"");
+        if nk < 0 {
+            return Err("bad saml (Attribute without Name)");
+        }
+        let nv0: int = nk + 6;
+        let nrel: string = substring(head, nv0, len(head));
+        let nq: int = index_of(nrel, "\"");
+        if nq < 0 {
+            return Err("bad saml (Attribute Name)");
+        }
+        let aname: string = substring(nrel, 0, nq);
+        let aclose: int = saml_close_at(rest, "Attribute", gt);
+        if aclose < 0 {
+            return Err("bad saml (unclosed Attribute)");
+        }
+        let body: string = substring(rest, gt + 1, aclose);
+        let mut vals: Array<string> = [];
+        let mut b: string = body;
+        while true {
+            let vi: int = saml_open_at(b, "AttributeValue", 0);
+            if vi < 0 {
+                break;
+            }
+            let vgt: int = saml_index_from(b, ">", vi);
+            if vgt < 0 {
+                return Err("bad saml (AttributeValue tag)");
+            }
+            let vc: int = saml_close_at(b, "AttributeValue", vgt);
+            if vc < 0 {
+                return Err("bad saml (unclosed AttributeValue)");
+            }
+            push(vals, substring(b, vgt + 1, vc));
+            let vend: int = saml_close_end(b, vc);
+            if vend < 0 {
+                return Err("bad saml (unclosed AttributeValue)");
+            }
+            b = substring(b, vend, len(b));
+        }
+        push(out, SamlAttr { name: aname, values: vals });
+        let aend: int = saml_close_end(rest, aclose);
+        if aend < 0 {
+            return Err("bad saml (unclosed Attribute)");
+        }
+        rest = substring(rest, aend, len(rest));
+    }
+    return Ok(out);
+}
+
+// Parse a base64 Response (the HTTP-Redirect/POST binding
+// payload). Structural parse only — see the module header.
+pub fn saml_parse_response(b64: string) -> Result<SamlAssertion, string> {
+    let raw = saml_b64_decode(b64)?;
+    let xml = jwt_ascii_hack(raw)?;
+    return saml_parse_xml(xml);
+}
+
+// Decode standard base64 (the SAML transport encoding — `+/`
+// alphabet with `=` padding, unlike JWT's unpadded base64url).
+// Transport-folded whitespace (space/LF/CR/TAB) is skipped,
+// not rejected; anything else outside the alphabet is a loud
+// Err. `=` terminates the payload (padding must be 1-2 chars
+// at the very end — anything after it is an Err).
+fn saml_b64_decode(s: string) -> Result<Array<int>, string> {
+    let alpha: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    // Padding is 1-2 `=` at the very end (whitespace around it
+    // is still skipped); anything else after the first `=` —
+    // including a third `=` — is an Err.
+    let mut vals: Array<int> = [];
+    let mut pads: int = 0;
+    for c in split(s, "") {
+        if pads > 0 {
+            if c == "=" && pads < 2 {
+                pads = pads + 1;
+            } else if c == " " || c == "\n" || c == "\r" || c == "\t" {
+            } else {
+                return Err("bad base64 (trailing data after padding)");
+            }
+        } else if c == " " || c == "\n" || c == "\r" || c == "\t" {
+        } else if c == "=" {
+            pads = 1;
+        } else {
+            let v: int = saml_b64_val(alpha, c);
+            if v < 0 {
+                return Err("bad base64 (bad char)");
+            } else {
+            }
+            push(vals, v);
+        }
+    }
+    // A length-1 tail can never align (mirrors the JWT rule).
+    if len(vals) % 4 == 1 {
+        return Err("bad base64 (bad length)");
+    }
+    let mut out: Array<int> = [];
+    let mut i: int = 0;
+    while i + 4 <= len(vals) {
+        let s0: int = vals[i];
+        let s1: int = vals[i + 1];
+        let s2: int = vals[i + 2];
+        let s3: int = vals[i + 3];
+        push(out, s0 * 4 + s1 / 16);
+        push(out, (s1 - (s1 / 16) * 16) * 16 + s2 / 4);
+        push(out, (s2 - (s2 / 4) * 4) * 64 + s3);
+        i = i + 4;
+    }
+    // Trailing quantum: `=` chars were already consumed as the
+    // terminator, so the remainder decodes by count (2 chars ->
+    // 1 byte, 3 chars -> 2 bytes).
+    let rem: int = len(vals) - i;
+    if rem == 2 {
+        push(out, vals[i] * 4 + vals[i + 1] / 16);
+    } else if rem == 3 {
+        let s0: int = vals[i];
+        let s1: int = vals[i + 1];
+        let s2: int = vals[i + 2];
+        push(out, s0 * 4 + s1 / 16);
+        push(out, (s1 - (s1 / 16) * 16) * 16 + s2 / 4);
+    } else {
+    }
+    return Ok(out);
+}
+
+// Base64 value with an explicit alphabet (the JWT codec bakes
+// its own in; SAML's differs in two characters).
+fn saml_b64_val(alpha: string, c: string) -> int {
+    let mut i: int = 0;
+    while i < len(alpha) {
+        if char_at(alpha, i) == c {
+            return i;
+        } else {
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ASCII bytes to string (shared shape with the JWT segment
+// decoder, minus the JWT-only error text).
+fn jwt_ascii_hack(data: Array<int>) -> Result<string, string> {
+    let alpha: string = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    let mut out: string = "";
+    for b in data {
+        if b == 9 {
+            out = out + "\t";
+        } else if b == 10 {
+            out = out + "\n";
+        } else if b == 13 {
+            out = out + "\r";
+        } else if b < 32 || b > 126 {
+            return Err("non-ASCII in saml response");
+        } else {
+            out = out + char_at(alpha, b - 32);
+        }
+    }
+    return Ok(out);
+}
+
+pub fn saml_parse_xml(xml: string) -> Result<SamlAssertion, string> {
+    if saml_open_at(xml, "Response", 0) < 0 {
+        return Err("bad saml (no Response)");
+    }
+    let ai: int = saml_open_at(xml, "Assertion", 0);
+    if ai < 0 {
+        return Err("bad saml (no Assertion)");
+    }
+    let aclose: int = saml_close_at(xml, "Assertion", ai);
+    if aclose < 0 {
+        return Err("bad saml (unclosed Assertion)");
+    }
+    let aend: int = saml_close_end(xml, aclose);
+    if aend < 0 {
+        return Err("bad saml (unclosed Assertion)");
+    }
+    let axml: string = substring(xml, ai, aend);
+    let signed: bool = saml_open_at(axml, "Signature", 0) >= 0;
+    let issuer: string = saml_find(axml, "Issuer");
+    if issuer == "" {
+        return Err("bad saml (no Issuer)");
+    }
+    let subj: string = saml_find(axml, "Subject");
+    let nameid: string = saml_find(subj, "NameID");
+    if nameid == "" {
+        return Err("bad saml (no NameID)");
+    }
+    let ni_at: int = saml_open_at(subj, "NameID", 0);
+    let name_format: string = saml_attr(subj, ni_at, "Format");
+    let cond: string = saml_find(axml, "Conditions");
+    if cond == "" {
+        return Err("bad saml (no Conditions)");
+    }
+    let ci: int = saml_open_at(axml, "Conditions", 0);
+    let not_before: string = saml_attr(axml, ci, "NotBefore");
+    let not_on_or_after: string = saml_attr(axml, ci, "NotOnOrAfter");
+    if not_before == "" || not_on_or_after == "" {
+        return Err("bad saml (no time bounds)");
+    }
+    let aud: string = saml_find(axml, "Audience");
+    if aud == "" {
+        return Err("bad saml (no Audience)");
+    }
+    let si: int = saml_open_at(axml, "AuthnStatement", 0);
+    let mut session_index: string = "";
+    if si >= 0 {
+        session_index = saml_attr(axml, si, "SessionIndex");
+    } else {
+    }
+    let attrs = saml_attributes(axml)?;
+    return Ok(SamlAssertion {
+        issuer: issuer,
+        subject: nameid,
+        name_format: name_format,
+        session_index: session_index,
+        not_before: not_before,
+        not_on_or_after: not_on_or_after,
+        audience: aud,
+        signed: signed,
+        attrs: attrs,
+    });
+}
+
+// Structural validation: time window + audience + unsigned.
+// `now_iso` is UTC ISO-8601 in the same shape as the bounds.
+pub fn saml_validate(a: SamlAssertion, now_iso: string, want_aud: string) -> Result<string, string> {
+    if a.signed {
+        return Err("saml signature validation not shipped (signed responses refused)");
+    } else {
+    }
+    if a.issuer == "" || a.subject == "" {
+        return Err("bad saml (empty issuer/subject)");
+    } else {
+    }
+    if !(a.not_before <= now_iso) {
+        return Err("bad saml (not yet valid)");
+    } else {
+    }
+    if !(now_iso < a.not_on_or_after) {
+        return Err("bad saml (expired)");
+    } else {
+    }
+    if want_aud != "" && a.audience != want_aud {
+        return Err("bad saml (audience mismatch)");
+    } else {
+    }
+    return Ok(a.subject);
+}

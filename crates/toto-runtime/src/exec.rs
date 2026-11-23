@@ -1619,6 +1619,24 @@ impl<'a> Executor<'a> {
         if Self::DB_FNS.contains(&name) {
             return self.exec_db(dst, name, args, span);
         }
+        // Wave 3 Stage 3 directory calls run on the blocking pool:
+        // a connect/bind/search blocks, so they must never run
+        // inline on a worker (unlike one-shot crypto/gzip) and
+        // never on the poller (a pool wait is not a readiness
+        // wait). Linux-only surface; checked code on other
+        // platforms cannot name these (E0301).
+        #[cfg(target_os = "linux")]
+        if Self::LDAP_FNS.contains(&name) {
+            return self.exec_ldap(dst, name, args, span);
+        }
+        // Wave 3 Stage 4 environment lookups run inline on the
+        // worker: `getenv` is a pure process-table read (never
+        // blocks, never parks) — same discipline as one-shot
+        // crypto/gzip. Unix-only surface.
+        #[cfg(unix)]
+        if Self::ENV_FNS.contains(&name) {
+            return self.exec_env(dst, name, args, span);
+        }
         // Generic pool tail lives in its own frame (see below): this
         // dispatcher stays thin so every inline foreign call on the
         // serve path (net/crypto/gzip/tls/ctx/clock/log) pays only the
@@ -2344,6 +2362,9 @@ impl<'a> Executor<'a> {
         "toto_rt_crypto_sign_sign",
         "toto_rt_crypto_sign_verify",
         "toto_rt_crypto_random",
+        "toto_rt_crypto_pbkdf2",
+        "toto_rt_crypto_pbkdf2_verify",
+        "toto_rt_crypto_rsa_verify",
         "toto_rt_crypto_x509_verify",
         "toto_rt_crypto_last_error",
         "toto_rt_crypto_version",
@@ -2648,6 +2669,30 @@ impl<'a> Executor<'a> {
                     return Ok(());
                 }
                 array_call!(cc::random_bytes(n as usize));
+                Ok(())
+            }
+            "toto_rt_crypto_pbkdf2" => {
+                self.arity(name, args.len(), 3, span)?;
+                let password = self.net_str(args, 0, name, span)?;
+                let salt = self.net_bytes(args, 1, span)?;
+                let iterations = self.net_int(args, 2, name, span)?;
+                array_call!(cc::pbkdf2_sha256(&password, &salt, iterations));
+                Ok(())
+            }
+            "toto_rt_crypto_pbkdf2_verify" => {
+                self.arity(name, args.len(), 2, span)?;
+                let expected = self.net_bytes(args, 0, span)?;
+                let got = self.net_bytes(args, 1, span)?;
+                verify_call!(cc::pbkdf2_verify(&expected, &got));
+                Ok(())
+            }
+            "toto_rt_crypto_rsa_verify" => {
+                self.arity(name, args.len(), 4, span)?;
+                let n = self.net_bytes(args, 0, span)?;
+                let e = self.net_bytes(args, 1, span)?;
+                let digest = self.net_bytes(args, 2, span)?;
+                let sig = self.net_bytes(args, 3, span)?;
+                verify_call!(cc::rsa_verify(&n, &e, &digest, &sig));
                 Ok(())
             }
             "toto_rt_crypto_x509_verify" => {
@@ -3274,6 +3319,203 @@ impl<'a> Executor<'a> {
                 Ok(())
             }
             _ => Err(self.internal("unknown database function", span)),
+        }
+    }
+
+    /// Environment lookups (Wave 3, Stage 4, unix-only): `getenv`
+    /// is a pure process-table read — inline on the worker, never
+    /// parked. Names cross as strings; `*_has` answers presence
+    /// (empty-but-set reads as "").
+    #[cfg(unix)]
+    const ENV_FNS: &[&str] = &["toto_rt_env_get", "toto_rt_env_has"];
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    fn exec_env(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
+        let read = |this: &Self, i: usize| -> Result<Option<String>, ExecErr> {
+            let s = this.net_str(args, i, name, span)?;
+            toto_compiler::netsys::env_get(&s).map_err(|e| this.internal(&e, span))
+        };
+        match name {
+            "toto_rt_env_get" => {
+                self.arity(name, args.len(), 1, span)?;
+                let v = read(self, 0)?.unwrap_or_default();
+                let r = self.alloc_with(|h| h.alloc_str(&v));
+                self.net_assign(dst, RtVal::Heap(r));
+                Ok(())
+            }
+            "toto_rt_env_has" => {
+                self.arity(name, args.len(), 1, span)?;
+                let present = read(self, 0)?.is_some();
+                self.net_assign(dst, RtVal::Int(if present { 1 } else { 0 }));
+                Ok(())
+            }
+            _ => Err(self.internal("unknown env function", span)),
+        }
+    }
+
+    /// LDAP foreign functions (Wave 3, Stage 3, Linux-only):
+    /// directory steps dispatched by name from `exec_foreign`.
+    /// Connect, bind, and operate run on the dedicated blocking
+    /// pool (an LDAP round-trip blocks) — never inline on a
+    /// worker, never on the poller. Same error discipline as db
+    /// (scalar ops return the count or -1; the search op returns
+    /// the JSON string or "" with the slot set; the message lands
+    /// in the call-duration slot read by
+    /// `toto_rt_ldap_last_error`). No handle cache in v1 — each
+    /// op is self-contained.
+    #[cfg(target_os = "linux")]
+    const LDAP_FNS: &[&str] = &[
+        "toto_rt_ldap_bind",
+        "toto_rt_ldap_search",
+        "toto_rt_ldap_last_error",
+    ];
+
+    /// Take (read + clear) this task's LDAP error slot.
+    #[cfg(target_os = "linux")]
+    fn ldap_take_error(&mut self) -> String {
+        let mut sched = self.shared.sched.lock().expect("sched lock");
+        sched.slots[self.task.0]
+            .ldap_error
+            .take()
+            .unwrap_or_default()
+    }
+
+    /// Resume mapping for scalar LDAP ops: an Int resume is the
+    /// result; a Unit resume means the drain set `ldap_error`
+    /// (assign -1 so the Toto wrapper reports the slot text).
+    #[cfg(target_os = "linux")]
+    fn ldap_scalar_resume(&mut self, dst: Option<usize>, v: RtVal) {
+        match v {
+            RtVal::Int(n) => self.net_assign(dst, RtVal::Int(n)),
+            _ => self.net_assign(dst, RtVal::Int(-1)),
+        }
+    }
+
+    /// Resume mapping for the search op: a Heap (string) resume is
+    /// the JSON result (possibly `"[]"`); anything else means the
+    /// drain set `ldap_error` (assign "" so the wrapper reports
+    /// the slot text).
+    #[cfg(target_os = "linux")]
+    fn ldap_str_resume(&mut self, dst: Option<usize>, v: RtVal) {
+        match v {
+            RtVal::Heap(_) => self.net_assign(dst, v),
+            _ => self.net_assign(dst, RtVal::Heap(self.alloc_with(|h| h.alloc_str("")))),
+        }
+    }
+
+    /// Park the current task on one blocking LDAP step. The resume
+    /// value IS the finished result: the pool ran the
+    /// connect/bind/operate and the drain converted it (setting
+    /// the error slot). Cancellations and unexpected responses
+    /// propagate as errors.
+    #[cfg(target_os = "linux")]
+    fn ldap_wait(&mut self, op: crate::sched::LdapOp, span: Span) -> Result<RtVal, ExecErr> {
+        if self.scope_failed() {
+            return Err(self.cancelled("ldap", span));
+        }
+        self.check_deadline(span, "ldap")?;
+        self.maybe_collect();
+        self.trace.push(TraceFrame {
+            name: "ldap (pool)".to_string(),
+            span,
+        });
+        let out = match self.y.suspend(crate::sched::ToSched::Blocking {
+            op: crate::sched::BlockingOp::Ldap { op },
+            span,
+        }) {
+            ToTask::Value(v) => Ok(v),
+            ToTask::Cancelled { op } => Err(self.cancelled(op, span)),
+            other => {
+                let _ = other;
+                Err(self.internal("ldap response", span))
+            }
+        };
+        self.trace.pop();
+        out
+    }
+
+    /// Read a port arg (1-65535, E0308 outside).
+    #[cfg(target_os = "linux")]
+    fn ldap_port(&self, args: &[usize], i: usize, name: &str, span: Span) -> Result<u16, ExecErr> {
+        let n = self.net_int(args, i, name, span)?;
+        if !(1..=65535).contains(&n) {
+            return Err(self.err("E0308", format!("ldap: bad port {n} (want 1-65535)"), span));
+        }
+        Ok(n as u16)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_lines)]
+    fn exec_ldap(
+        &mut self,
+        dst: Option<usize>,
+        name: &str,
+        args: &[usize],
+        span: Span,
+    ) -> Result<(), ExecErr> {
+        use crate::sched::LdapOp;
+        // Every arm assigns `dst` and returns Ok, or returns an
+        // executor error (E0308 on bad values, Cancelled on scope
+        // failure, internal on impossible states). The error slot is
+        // set by the drain on every pool completion.
+        match name {
+            "toto_rt_ldap_bind" => {
+                self.arity(name, args.len(), 4, span)?;
+                let host = self.net_str(args, 0, name, span)?;
+                let port = self.ldap_port(args, 1, name, span)?;
+                let bind_dn = self.net_str(args, 2, name, span)?;
+                let password = self.net_str(args, 3, name, span)?;
+                let v = self.ldap_wait(
+                    LdapOp::Bind {
+                        host,
+                        port,
+                        bind_dn,
+                        password,
+                    },
+                    span,
+                )?;
+                self.ldap_scalar_resume(dst, v);
+                Ok(())
+            }
+            "toto_rt_ldap_search" => {
+                self.arity(name, args.len(), 7, span)?;
+                let host = self.net_str(args, 0, name, span)?;
+                let port = self.ldap_port(args, 1, name, span)?;
+                let bind_dn = self.net_str(args, 2, name, span)?;
+                let password = self.net_str(args, 3, name, span)?;
+                let base = self.net_str(args, 4, name, span)?;
+                let filter = self.net_str(args, 5, name, span)?;
+                let attrs = self.net_str(args, 6, name, span)?;
+                let v = self.ldap_wait(
+                    LdapOp::Search {
+                        host,
+                        port,
+                        bind_dn,
+                        password,
+                        base,
+                        filter,
+                        attrs,
+                    },
+                    span,
+                )?;
+                self.ldap_str_resume(dst, v);
+                Ok(())
+            }
+            "toto_rt_ldap_last_error" => {
+                self.arity(name, args.len(), 0, span)?;
+                let e = self.ldap_take_error();
+                let v = self.alloc_with(|h| h.alloc_str(&e));
+                self.net_assign(dst, RtVal::Heap(v));
+                Ok(())
+            }
+            _ => Err(self.internal("unknown ldap function", span)),
         }
     }
 

@@ -184,6 +184,41 @@ pub enum BlockingOp {
     Db {
         op: DbOp,
     },
+    /// Blocking LDAP steps (Wave 3, Stage 3): connect, bind, and
+    /// search run on the dedicated blocking pool — never inline on
+    /// a worker (an LDAP round-trip blocks), never on the poller.
+    /// Linux-only (same gate as the ldap surface).
+    #[cfg(target_os = "linux")]
+    Ldap {
+        op: LdapOp,
+    },
+}
+
+/// One blocking LDAP step, as the pool thread sees it. Owned
+/// plain data only: pool threads never touch the GC heap,
+/// channel tables, or scheduler state beyond pushing
+/// completions. Linux-only. No handle cache in v1: each step
+/// connects, binds, operates, and unbinds (documented).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub enum LdapOp {
+    /// Bind-only check (authentication without search).
+    Bind {
+        host: String,
+        port: u16,
+        bind_dn: String,
+        password: String,
+    },
+    /// Subtree search returning a JSON array string.
+    Search {
+        host: String,
+        port: u16,
+        bind_dn: String,
+        password: String,
+        base: String,
+        filter: String,
+        attrs: String,
+    },
 }
 
 /// One blocking database step, as the pool thread sees it. Owned
@@ -352,6 +387,24 @@ pub enum BlockingResult {
     /// `Unit`; the executor's `db_last_error` reads the slot.
     #[cfg(unix)]
     DbFail(String),
+    /// LDAP results (Wave 3, Stage 3, Linux-only): same conversion
+    /// discipline as the DB variants, but for directory pool jobs
+    /// (see `BlockingOp::Ldap`) and accepted only by tasks parked
+    /// on `"blocking"` with a matching `blocking_seq`. The drain
+    /// sets the task's `ldap_error` slot from these (never
+    /// `net_error`/`db_error`, so interleaved calls never clobber
+    /// each other's `last_error`).
+    #[cfg(target_os = "linux")]
+    LdapInt(i64),
+    /// Search results as a JSON array string (parsed by
+    /// `gzv.std/json` — no new framing).
+    #[cfg(target_os = "linux")]
+    LdapStr(String),
+    /// Loud LDAP failure: the drain sets `ldap_error` and resumes
+    /// with `Unit`; the executor's `ldap_last_error` reads the
+    /// slot.
+    #[cfg(target_os = "linux")]
+    LdapFail(String),
 }
 
 /// A finished pool job awaiting pickup. The scheduler turns it into
@@ -911,6 +964,12 @@ pub struct Slot {
     /// completion.
     #[cfg(unix)]
     pub(crate) db_error: Option<String>,
+    /// Last LDAP error for this task (`None` = clean). Separate
+    /// slot, same discipline; read (and cleared) by
+    /// `toto_rt_ldap_last_error`. Set on every LDAP pool
+    /// completion.
+    #[cfg(target_os = "linux")]
+    pub(crate) ldap_error: Option<String>,
     /// Current context slot (Wave 2, Stage 3): ordered pairs plus
     /// an optional absolute monotonic-ms deadline, inherited at
     /// spawn (ADR-009). Plain data — never a heap reference, so no
@@ -1293,6 +1352,8 @@ impl Scheduler {
             tls_error: None,
             #[cfg(unix)]
             db_error: None,
+            #[cfg(target_os = "linux")]
+            ldap_error: None,
             ctx: CtxSlot::new(),
             #[cfg(unix)]
             ctx_error: None,
@@ -1803,6 +1864,11 @@ impl Scheduler {
                         c.result,
                         B::NetInt(_) | B::NetBytes(_) | B::NetFail(_)
                     )),
+                    // LDAP rides the same pool pre-pass (never
+                    // the poller — always `Some(false)`); the
+                    // arm vanishes where the variants do.
+                    #[cfg(target_os = "linux")]
+                    B::LdapInt(_) | B::LdapStr(_) | B::LdapFail(_) => Some(false),
                     _ => None,
                 };
                 if let Some(is_poller) = net_kind {
@@ -1812,6 +1878,11 @@ impl Scheduler {
                     // poller wait or vice versa.
                     let is_tls = matches!(c.result, B::TlsInt(_) | B::TlsBytes(_) | B::TlsFail(_));
                     let is_db = matches!(c.result, B::DbInt(_) | B::DbRows(_) | B::DbFail(_));
+                    #[cfg(target_os = "linux")]
+                    let is_ldap =
+                        matches!(c.result, B::LdapInt(_) | B::LdapStr(_) | B::LdapFail(_));
+                    #[cfg(not(target_os = "linux"))]
+                    let is_ldap = false;
                     let Completion {
                         task,
                         result,
@@ -1859,6 +1930,18 @@ impl Scheduler {
                         }
                         B::NetFail(m) => (ToTask::Value(RtVal::Unit), Some(m)),
                         B::TlsFail(m) => (ToTask::Value(RtVal::Unit), Some(m)),
+                        #[cfg(target_os = "linux")]
+                        B::LdapInt(n) => (ToTask::Value(RtVal::Int(n)), None),
+                        #[cfg(target_os = "linux")]
+                        B::LdapStr(s) => {
+                            let r = {
+                                let mut st = self.shared.state.lock().expect("shared state lock");
+                                st.heap.alloc_str(&s)
+                            };
+                            (ToTask::Value(RtVal::Heap(r)), None)
+                        }
+                        #[cfg(target_os = "linux")]
+                        B::LdapFail(m) => (ToTask::Value(RtVal::Unit), Some(m)),
                         B::DnsAddrs(addrs) => {
                             // Comma-joined contract (see `gzv.std/net`):
                             // IPv6 has colons, never commas, so the
@@ -1895,6 +1978,18 @@ impl Scheduler {
                             slot.tls_error = err;
                         } else if is_db {
                             slot.db_error = err;
+                        } else if is_ldap {
+                            // `is_ldap` is always false where the
+                            // variants do not exist; the dead branch
+                            // still compiles (it just drops).
+                            #[cfg(target_os = "linux")]
+                            {
+                                slot.ldap_error = err;
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                let _ = err;
+                            }
                         } else {
                             slot.net_error = err;
                         }
@@ -2096,6 +2191,39 @@ impl Scheduler {
         }
     }
 
+    /// Run one LDAP step on a pool thread (Wave 3, Stage 3):
+    /// connect, bind, and operate run to completion inside this
+    /// call (no handle cache — each step is self-contained), and
+    /// the result posts as an `Ldap*` completion. No heap, no
+    /// scheduler state — owned plain data only.
+    #[cfg(target_os = "linux")]
+    fn run_ldap(op: &LdapOp) -> BlockingResult {
+        use toto_compiler::ldaplib as ldap;
+        match op {
+            LdapOp::Bind {
+                host,
+                port,
+                bind_dn,
+                password,
+            } => match ldap::bind(host, *port, bind_dn, password) {
+                Ok(()) => BlockingResult::LdapInt(0),
+                Err(e) => BlockingResult::LdapFail(e),
+            },
+            LdapOp::Search {
+                host,
+                port,
+                bind_dn,
+                password,
+                base,
+                filter,
+                attrs,
+            } => match ldap::search(host, *port, bind_dn, password, base, filter, attrs) {
+                Ok(json) => BlockingResult::LdapStr(json),
+                Err(e) => BlockingResult::LdapFail(e),
+            },
+        }
+    }
+
     /// Dedicated blocking-pool thread: run file-system jobs, post
     /// completions, never touch the heap or scheduler state directly.
     /// Exits once the last worker sets `shutdown`.
@@ -2159,6 +2287,8 @@ impl Scheduler {
                 }
                 #[cfg(unix)]
                 BlockingOp::Db { op } => Self::run_db(&op),
+                #[cfg(target_os = "linux")]
+                BlockingOp::Ldap { op } => Self::run_ldap(&op),
             };
             {
                 let mut pool = shared.pool.lock().expect("pool lock");

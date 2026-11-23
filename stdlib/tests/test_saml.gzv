@@ -1,0 +1,166 @@
+// stdlib saml tests: run with `toto test` from stdlib/.
+//
+// Sequential (no `go`): structural parse + validation on
+// fixtures, signed-refusal, and every loud error. Fixtures
+// are unsigned (full validation) or carry placeholder
+// signatures (refused) — NO keys are committed anywhere.
+import "gzv.std/saml.gzv";
+
+fn check(cond: bool, msg: string) -> Result<bool, string> {
+    if cond {
+        return Ok(true);
+    } else {
+        return Err(msg);
+    }
+}
+
+// Full unsigned fixture (parse_response end to end).
+fn unsigned_b64() -> string {
+    return (
+        "PHNhbWxwOlJlc3BvbnNlIHhtbG5zOnNhbWxwPSJ1cm46b2FzaXM6bmFtZXM6dGM6U0FNTDoyLjA6cHJvdG9jb2wiIElEPSJyZXNw" +
+        "MSIgVmVyc2lvbj0iMi4wIiBJc3N1ZUluc3RhbnQ9IjIwMjYtMTEtMjJUMDg6MDA6MDBaIiBEZXN0aW5hdGlvbj0iaHR0cHM6Ly9z" +
+        "cC50b3RvLnRlc3QvYWNzIj4KICA8c2FtbDpJc3N1ZXIgeG1sbnM6c2FtbD0idXJuOm9hc2lzOm5hbWVzOnRjOlNBTUw6Mi4wOmFz" +
+        "c2VydGlvbiI+aHR0cHM6Ly9pZHAudG90by50ZXN0L21ldGFkYXRhPC9zYW1sOklzc3Vlcj4KICA8c2FtbDpBc3NlcnRpb24geG1s" +
+        "bnM6c2FtbD0idXJuOm9hc2lzOm5hbWVzOnRjOlNBTUw6Mi4wOmFzc2VydGlvbiIgSUQ9ImFzc2VydDEiIFZlcnNpb249IjIuMCIg" +
+        "SXNzdWVJbnN0YW50PSIyMDI2LTExLTIyVDA4OjAwOjAwWiI+CiAgICA8c2FtbDpJc3N1ZXI+aHR0cHM6Ly9pZHAudG90by50ZXN0" +
+        "L21ldGFkYXRhPC9zYW1sOklzc3Vlcj4KICAgIDxzYW1sOlN1YmplY3Q+CiAgICAgIDxzYW1sOk5hbWVJRCBGb3JtYXQ9InVybjpv" +
+        "YXNpczpuYW1lczp0YzpTQU1MOjEuMTpuYW1laWQtZm9ybWF0OmVtYWlsQWRkcmVzcyI+YWxpY2VAdG90by50ZXN0PC9zYW1sOk5h" +
+        "bWVJRD4KICAgICAgPHNhbWw6U3ViamVjdENvbmZpcm1hdGlvbiBNZXRob2Q9InVybjpvYXNpczpuYW1lczp0YzpTQU1MOjIuMDpj" +
+        "bTpiZWFyZXIiPgogICAgICAgIDxzYW1sOlN1YmplY3RDb25maXJtYXRpb25EYXRhIFJlY2lwaWVudD0iaHR0cHM6Ly9zcC50b3Rv" +
+        "LnRlc3QvYWNzIiBJblJlc3BvbnNlVG89InJlcTEiIE5vdE9uT3JBZnRlcj0iMjAyNi0xMS0yMlQwODowNTowMFoiLz4KICAgICAg" +
+        "PC9zYW1sOlN1YmplY3RDb25maXJtYXRpb24+CiAgICA8L3NhbWw6U3ViamVjdD4KICAgIDxzYW1sOkNvbmRpdGlvbnMgTm90QmVm" +
+        "b3JlPSIyMDI2LTExLTIyVDA3OjU1OjAwWiIgTm90T25PckFmdGVyPSIyMDI2LTExLTIyVDA4OjA1OjAwWiI+CiAgICAgIDxzYW1s" +
+        "OkF1ZGllbmNlUmVzdHJpY3Rpb24+CiAgICAgICAgPHNhbWw6QXVkaWVuY2U+aHR0cHM6Ly9zcC50b3RvLnRlc3QvbWV0YWRhdGE8" +
+        "L3NhbWw6QXVkaWVuY2U+CiAgICAgIDwvc2FtbDpBdWRpZW5jZVJlc3RyaWN0aW9uPgogICAgPC9zYW1sOkNvbmRpdGlvbnM+CiAg" +
+        "ICA8c2FtbDpBdXRoblN0YXRlbWVudCBBdXRobkluc3RhbnQ9IjIwMjYtMTEtMjJUMDg6MDA6MDBaIiBTZXNzaW9uSW5kZXg9InNl" +
+        "c3MtNDIiPgogICAgICA8c2FtbDpBdXRobkNvbnRleHQ+CiAgICAgICAgPHNhbWw6QXV0aG5Db250ZXh0Q2xhc3NSZWY+dXJuOm9h" +
+        "c2lzOm5hbWVzOnRjOlNBTUw6Mi4wOmFjOmNsYXNzZXM6UGFzc3dvcmRQcm90ZWN0ZWRUcmFuc3BvcnQ8L3NhbWw6QXV0aG5Db250" +
+        "ZXh0Q2xhc3NSZWY+CiAgICAgIDwvc2FtbDpBdXRobkNvbnRleHQ+CiAgICA8L3NhbWw6QXV0aG5TdGF0ZW1lbnQ+CiAgICA8c2Ft" +
+        "bDpBdHRyaWJ1dGVTdGF0ZW1lbnQ+CiAgICAgIDxzYW1sOkF0dHJpYnV0ZSBOYW1lPSJ1aWQiIE5hbWVGb3JtYXQ9InVybjpvYXNp" +
+        "czpuYW1lczp0YzpTQU1MOjIuMDphdHRybmFtZS1mb3JtYXQ6YmFzaWMiPgogICAgICAgIDxzYW1sOkF0dHJpYnV0ZVZhbHVlPmFs" +
+        "aWNlPC9zYW1sOkF0dHJpYnV0ZVZhbHVlPgogICAgICA8L3NhbWw6QXR0cmlidXRlPgogICAgICA8c2FtbDpBdHRyaWJ1dGUgTmFt" +
+        "ZT0iZ3JvdXBzIiBOYW1lRm9ybWF0PSJ1cm46b2FzaXM6bmFtZXM6dGM6U0FNTDoyLjA6YXR0cm5hbWUtZm9ybWF0OmJhc2ljIj4K" +
+        "ICAgICAgICA8c2FtbDpBdHRyaWJ1dGVWYWx1ZT5hZG1pbnM8L3NhbWw6QXR0cmlidXRlVmFsdWU+CiAgICAgICAgPHNhbWw6QXR0" +
+        "cmlidXRlVmFsdWU+ZGV2czwvc2FtbDpBdHRyaWJ1dGVWYWx1ZT4KICAgICAgPC9zYW1sOkF0dHJpYnV0ZT4KICAgIDwvc2FtbDpB" +
+        "dHRyaWJ1dGVTdGF0ZW1lbnQ+CiAgPC9zYW1sOkFzc2VydGlvbj4KPC9zYW1scDpSZXNwb25zZT4K"
+    );
+}
+
+// Same envelope with a placeholder Signature block.
+fn signed_b64() -> string {
+    return (
+        "PHNhbWxwOlJlc3BvbnNlIHhtbG5zOnNhbWxwPSJ1cm46b2FzaXM6bmFtZXM6dGM6U0FNTDoyLjA6cHJvdG9jb2wiIElEPSJyZXNw" +
+        "MSIgVmVyc2lvbj0iMi4wIiBJc3N1ZUluc3RhbnQ9IjIwMjYtMTEtMjJUMDg6MDA6MDBaIiBEZXN0aW5hdGlvbj0iaHR0cHM6Ly9z" +
+        "cC50b3RvLnRlc3QvYWNzIj4KICA8c2FtbDpJc3N1ZXIgeG1sbnM6c2FtbD0idXJuOm9hc2lzOm5hbWVzOnRjOlNBTUw6Mi4wOmFz" +
+        "c2VydGlvbiI+aHR0cHM6Ly9pZHAudG90by50ZXN0L21ldGFkYXRhPC9zYW1sOklzc3Vlcj4KICA8c2FtbDpBc3NlcnRpb24geG1s" +
+        "bnM6c2FtbD0idXJuOm9hc2lzOm5hbWVzOnRjOlNBTUw6Mi4wOmFzc2VydGlvbiIgSUQ9ImFzc2VydDEiIFZlcnNpb249IjIuMCIg" +
+        "SXNzdWVJbnN0YW50PSIyMDI2LTExLTIyVDA4OjAwOjAwWiI+CiAgICA8c2FtbDpJc3N1ZXI+aHR0cHM6Ly9pZHAudG90by50ZXN0" +
+        "L21ldGFkYXRhPC9zYW1sOklzc3Vlcj4KICAgIDxTaWduYXR1cmU+PFNpZ25lZEluZm8+UExBQ0VIT0xERVI8L1NpZ25lZEluZm8+" +
+        "PFNpZ25hdHVyZVZhbHVlPlBMQUNFSE9MREVSPC9TaWduYXR1cmVWYWx1ZT48L1NpZ25hdHVyZT48c2FtbDpTdWJqZWN0PgogICAg" +
+        "ICA8c2FtbDpOYW1lSUQgRm9ybWF0PSJ1cm46b2FzaXM6bmFtZXM6dGM6U0FNTDoxLjE6bmFtZWlkLWZvcm1hdDplbWFpbEFkZHJl" +
+        "c3MiPmFsaWNlQHRvdG8udGVzdDwvc2FtbDpOYW1lSUQ+CiAgICAgIDxzYW1sOlN1YmplY3RDb25maXJtYXRpb24gTWV0aG9kPSJ1" +
+        "cm46b2FzaXM6bmFtZXM6dGM6U0FNTDoyLjA6Y206YmVhcmVyIj4KICAgICAgICA8c2FtbDpTdWJqZWN0Q29uZmlybWF0aW9uRGF0" +
+        "YSBSZWNpcGllbnQ9Imh0dHBzOi8vc3AudG90by50ZXN0L2FjcyIgSW5SZXNwb25zZVRvPSJyZXExIiBOb3RPbk9yQWZ0ZXI9IjIw" +
+        "MjYtMTEtMjJUMDg6MDU6MDBaIi8+CiAgICAgIDwvc2FtbDpTdWJqZWN0Q29uZmlybWF0aW9uPgogICAgPC9zYW1sOlN1YmplY3Q+" +
+        "CiAgICA8c2FtbDpDb25kaXRpb25zIE5vdEJlZm9yZT0iMjAyNi0xMS0yMlQwNzo1NTowMFoiIE5vdE9uT3JBZnRlcj0iMjAyNi0x" +
+        "MS0yMlQwODowNTowMFoiPgogICAgICA8c2FtbDpBdWRpZW5jZVJlc3RyaWN0aW9uPgogICAgICAgIDxzYW1sOkF1ZGllbmNlPmh0" +
+        "dHBzOi8vc3AudG90by50ZXN0L21ldGFkYXRhPC9zYW1sOkF1ZGllbmNlPgogICAgICA8L3NhbWw6QXVkaWVuY2VSZXN0cmljdGlv" +
+        "bj4KICAgIDwvc2FtbDpDb25kaXRpb25zPgogICAgPHNhbWw6QXV0aG5TdGF0ZW1lbnQgQXV0aG5JbnN0YW50PSIyMDI2LTExLTIy" +
+        "VDA4OjAwOjAwWiIgU2Vzc2lvbkluZGV4PSJzZXNzLTQyIj4KICAgICAgPHNhbWw6QXV0aG5Db250ZXh0PgogICAgICAgIDxzYW1s" +
+        "OkF1dGhuQ29udGV4dENsYXNzUmVmPnVybjpvYXNpczpuYW1lczp0YzpTQU1MOjIuMDphYzpjbGFzc2VzOlBhc3N3b3JkUHJvdGVj" +
+        "dGVkVHJhbnNwb3J0PC9zYW1sOkF1dGhuQ29udGV4dENsYXNzUmVmPgogICAgICA8L3NhbWw6QXV0aG5Db250ZXh0PgogICAgPC9z" +
+        "YW1sOkF1dGhuU3RhdGVtZW50PgogICAgPHNhbWw6QXR0cmlidXRlU3RhdGVtZW50PgogICAgICA8c2FtbDpBdHRyaWJ1dGUgTmFt" +
+        "ZT0idWlkIiBOYW1lRm9ybWF0PSJ1cm46b2FzaXM6bmFtZXM6dGM6U0FNTDoyLjA6YXR0cm5hbWUtZm9ybWF0OmJhc2ljIj4KICAg" +
+        "ICAgICA8c2FtbDpBdHRyaWJ1dGVWYWx1ZT5hbGljZTwvc2FtbDpBdHRyaWJ1dGVWYWx1ZT4KICAgICAgPC9zYW1sOkF0dHJpYnV0" +
+        "ZT4KICAgICAgPHNhbWw6QXR0cmlidXRlIE5hbWU9Imdyb3VwcyIgTmFtZUZvcm1hdD0idXJuOm9hc2lzOm5hbWVzOnRjOlNBTUw6" +
+        "Mi4wOmF0dHJuYW1lLWZvcm1hdDpiYXNpYyI+CiAgICAgICAgPHNhbWw6QXR0cmlidXRlVmFsdWU+YWRtaW5zPC9zYW1sOkF0dHJp" +
+        "YnV0ZVZhbHVlPgogICAgICAgIDxzYW1sOkF0dHJpYnV0ZVZhbHVlPmRldnM8L3NhbWw6QXR0cmlidXRlVmFsdWU+CiAgICAgIDwv" +
+        "c2FtbDpBdHRyaWJ1dGU+CiAgICA8L3NhbWw6QXR0cmlidXRlU3RhdGVtZW50PgogIDwvc2FtbDpBc3NlcnRpb24+Cjwvc2FtbHA6" +
+        "UmVzcG9uc2U+Cg=="
+    );
+}
+
+fn t_unsigned_validates() -> Result<bool, string> {
+    let a = saml_parse_response(unsigned_b64())?;
+    check(a.issuer == "https://idp.toto.test/metadata", "issuer")?;
+    check(a.subject == "alice@toto.test", "subject")?;
+    check(a.name_format == "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress", "nameid format")?;
+    check(a.session_index == "sess-42", "session")?;
+    check(a.not_before == "2026-11-22T07:55:00Z", "notbefore")?;
+    check(a.not_on_or_after == "2026-11-22T08:05:00Z", "notonorafter")?;
+    check(a.audience == "https://sp.toto.test/metadata", "audience")?;
+    check(!a.signed, "unsigned flag")?;
+    check(len(a.attrs) == 2, "two attrs")?;
+    check(a.attrs[0].name == "uid" && a.attrs[0].values[0] == "alice", "uid attr")?;
+    check(a.attrs[1].name == "groups" && len(a.attrs[1].values) == 2, "groups attr")?;
+    let ok = saml_validate(a, "2026-11-22T08:00:00Z", "https://sp.toto.test/metadata")?;
+    check(ok == "alice@toto.test", "subject out")?;
+    return Ok(true);
+}
+
+fn t_window_and_audience() -> Result<bool, string> {
+    let a = saml_parse_response(unsigned_b64())?;
+    let early = saml_validate(a, "2026-11-22T07:00:00Z", "https://sp.toto.test/metadata");
+    let want_early: Result<string, string> = Err("bad saml (not yet valid)");
+    check(early == want_early, "notbefore enforced")?;
+    let late = saml_validate(a, "2026-11-22T09:00:00Z", "https://sp.toto.test/metadata");
+    let want_late: Result<string, string> = Err("bad saml (expired)");
+    check(late == want_late, "expiry enforced")?;
+    let aud = saml_validate(a, "2026-11-22T08:00:00Z", "https://evil.test/metadata");
+    let want_aud: Result<string, string> = Err("bad saml (audience mismatch)");
+    check(aud == want_aud, "audience enforced")?;
+    return Ok(true);
+}
+
+fn t_signed_refused() -> Result<bool, string> {
+    let a = saml_parse_response(signed_b64())?;
+    check(a.signed, "signed flag set")?;
+    let r = saml_validate(a, "2026-11-22T08:00:00Z", "https://sp.toto.test/metadata");
+    let want: Result<string, string> = Err("saml signature validation not shipped (signed responses refused)");
+    check(r == want, "signed refused loudly")?;
+    return Ok(true);
+}
+
+fn t_malformed() -> Result<bool, string> {
+    let r1 = saml_parse_xml("<Response></Response>");
+    let want1: Result<SamlAssertion, string> = Err("bad saml (no Assertion)");
+    check(r1 == want1, "no assertion loud")?;
+    let r2 = saml_parse_response("!!!not-base64!!!");
+    let want2: Result<SamlAssertion, string> = Err("bad base64 (bad char)");
+    check(r2 == want2, "bad b64 loud")?;
+    let r3 = saml_parse_xml("<Response><Assertion></Assertion></Response>");
+    let want3: Result<SamlAssertion, string> = Err("bad saml (no Issuer)");
+    check(r3 == want3, "no issuer loud")?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_unsigned_validates() != yes {
+        println("FAIL unsigned_validates");
+        failures = failures + 1;
+    } else {
+    }
+    if t_window_and_audience() != yes {
+        println("FAIL window_and_audience");
+        failures = failures + 1;
+    } else {
+    }
+    if t_signed_refused() != yes {
+        println("FAIL signed_refused");
+        failures = failures + 1;
+    } else {
+    }
+    if t_malformed() != yes {
+        println("FAIL malformed");
+        failures = failures + 1;
+    } else {
+    }
+    if failures > 0 {
+        println(to_string(failures) + " saml failures");
+        return 1;
+    } else {
+    }
+    return 0;
+}

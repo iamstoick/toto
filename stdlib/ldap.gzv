@@ -1,0 +1,49 @@
+// `gzv.std/ldap` — LDAP authentication + directory search
+// (Enterprise Wave 3, Stage 3).
+//
+// Thin wrappers over the runtime `toto_rt_ldap_*` foreign
+// functions (Linux-only, system libldap — same gate as the DB
+// drivers; the corpus never touches these, so macOS stays
+// green). Every operation connects, binds, operates, and
+// unbinds on the blocking pool — never inline on a worker,
+// never on the poller. No handle cache in v1 (documented):
+// each call is self-contained.
+//
+// `ldap_bind` checks credentials (0 ok); `ldap_search` returns
+// a JSON array string (parsed with `gzv.std/json` — no new
+// framing): `[{"dn":"...","attrs":{"cn":["a"],"mail":[...]}}]`.
+// Errors are `Err` with the library message via the
+// call-duration slot. Test-only credentials live in ephemeral
+// containers + CI env, never in fixtures or goldens —
+// fixtures use placeholders (see the Stage 4 rule).
+import "gzv.std/json.gzv";
+
+unsafe extern "C" {
+    fn toto_rt_ldap_bind(host: *c_char, port: c_int, bind_dn: *c_char, password: *c_char) -> c_int;
+    fn toto_rt_ldap_search(host: *c_char, port: c_int, bind_dn: *c_char, password: *c_char, base: *c_char, filter: *c_char, attrs: *c_char) -> string;
+    fn toto_rt_ldap_last_error() -> string;
+}
+
+fn ldap_last_error() -> string {
+    return toto_rt_ldap_last_error();
+}
+
+// Bind-only check: 0 = credentials accepted.
+pub fn ldap_bind(host: string, port: int, bind_dn: string, password: string) -> Result<int, string> {
+    let rc = toto_rt_ldap_bind(host, port, bind_dn, password);
+    if rc < 0 {
+        return Err(ldap_last_error());
+    }
+    return Ok(rc);
+}
+
+// Subtree search returning the JSON array string (parse with
+// `json_parse`). `attrs` is a comma-separated allowlist
+// ("" = all attributes).
+pub fn ldap_search(host: string, port: int, bind_dn: string, password: string, base: string, filter: string, attrs: string) -> Result<string, string> {
+    let out = toto_rt_ldap_search(host, port, bind_dn, password, base, filter, attrs);
+    if out == "" {
+        return Err(ldap_last_error());
+    }
+    return Ok(out);
+}

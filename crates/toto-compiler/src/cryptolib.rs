@@ -39,6 +39,7 @@ mod inner {
     enum EcGroup {}
     enum EcPoint {}
     enum BigNum {}
+    enum Rsa {}
     pub(crate) enum Bio {}
     pub(crate) enum X509 {}
     pub(crate) enum X509Store {}
@@ -47,6 +48,39 @@ mod inner {
 
     #[link(name = "crypto")]
     unsafe extern "C" {
+        // -- Password hashing (Wave 3, Stage 3): PBKDF2-HMAC-SHA256
+        // only (no new primitives — the mature KDF from the
+        // already-linked libcrypto, same Wave-2 pattern as the
+        // PEM helpers). Argon2/bcrypt/scrypt need libraries that
+        // are absent on supported runners — stated gap, not
+        // smuggled in.
+        fn PKCS5_PBKDF2_HMAC(
+            pass: *const c_char,
+            passlen: c_int,
+            salt: *const c_uchar,
+            saltlen: c_int,
+            iter: c_int,
+            digest: *const EvpMd,
+            keylen: c_int,
+            out: *mut c_uchar,
+        ) -> c_int;
+        // -- RSA verification (Wave 3, Stage 3: RS256 JWTs via
+        // JWKS — the enterprise default IdP shape). Only
+        // verification (public ops), never signing or keygen; the
+        // key arrives as raw (n, e) big-endian bytes and is loaded
+        // with `BN_bin2bn`/`RSA_set0_key` (no PEM/DER parsing in
+        // Toto, no new surface for key formats).
+        fn RSA_new() -> *mut Rsa;
+        fn RSA_set0_key(r: *mut Rsa, n: *mut BigNum, e: *mut BigNum, d: *mut BigNum) -> c_int;
+        fn RSA_verify(
+            type_: c_int,
+            m: *const c_uchar,
+            m_len: c_uint,
+            sig: *const c_uchar,
+            sig_len: c_uint,
+            rsa: *mut Rsa,
+        ) -> c_int;
+        fn RSA_free(rsa: *mut Rsa);
         // -- Digests --
         fn EVP_sha256() -> *const EvpMd;
         fn EVP_sha512() -> *const EvpMd;
@@ -642,6 +676,134 @@ mod inner {
             }
             Ok(out)
         }
+    }
+
+    /// PBKDF2-HMAC-SHA256 key derivation (Wave 3 password hashing):
+    /// 32-byte key from password + salt + iteration count. Bounds
+    /// are loud `Err`s (no silent truncation): passwords/salts are
+    /// byte-limited like every other boundary, iterations must be
+    /// positive (callers pass the OWASP count; tests pin small
+    /// counts for speed with exact vectors).
+    pub fn pbkdf2_sha256(password: &str, salt: &[u8], iterations: i64) -> Result<Vec<u8>, String> {
+        if salt.len() > c_int::MAX as usize {
+            return Err("pbkdf2: salt too long".to_string());
+        }
+        if iterations <= 0 || iterations > c_int::MAX as i64 {
+            return Err(format!(
+                "pbkdf2: need positive iterations, got {iterations}"
+            ));
+        }
+        // SAFETY: slices outlive the call; output owned and sized;
+        // null-checked digest constructor.
+        unsafe {
+            let md = EVP_sha256();
+            if md.is_null() {
+                return Err(ossl_err("pbkdf2 digest"));
+            }
+            let mut out = vec![0u8; 32];
+            let cstr = std::ffi::CString::new(password)
+                .map_err(|_| "pbkdf2: password has NUL byte".to_string())?;
+            let r = PKCS5_PBKDF2_HMAC(
+                cstr.as_ptr(),
+                password.len() as c_int,
+                if salt.is_empty() {
+                    std::ptr::null()
+                } else {
+                    salt.as_ptr()
+                },
+                salt.len() as c_int,
+                iterations as c_int,
+                md,
+                32,
+                out.as_mut_ptr(),
+            );
+            if r != 1 {
+                return Err(ossl_err("pbkdf2"));
+            }
+            Ok(out)
+        }
+    }
+
+    /// RSA PKCS#1 v1.5 verification with SHA-256 (Wave 3 RS256
+    /// JWTs via JWKS): `n`/`e` arrive as big-endian bytes (JWK
+    /// wire form — no PEM/DER parsing anywhere), the digest is
+    /// 32 bytes of SHA-256 over the signing input, and `sig` is
+    /// the raw signature. Only verification (public ops): no
+    /// signing, no keygen, no private material. `NID_sha256`
+    /// (672) is a stable number, like the Wave-1 `NID_P256`.
+    /// Bounds are loud `Err`s; a bad signature is `Ok(false)`
+    /// (never an exception — callers branch on the bool).
+    pub fn rsa_verify(n: &[u8], e: &[u8], digest: &[u8], sig: &[u8]) -> Result<bool, String> {
+        const NID_SHA256: c_int = 672;
+        if n.is_empty() || n.len() > 512 || e.is_empty() || e.len() > 8 {
+            return Err("rsa verify: need 1-512 byte n and 1-8 byte e".to_string());
+        }
+        if digest.len() != 32 {
+            return Err(format!(
+                "rsa verify: need a 32-byte SHA-256 digest, got {}",
+                digest.len()
+            ));
+        }
+        if sig.is_empty() || sig.len() > 512 {
+            return Err("rsa verify: bad signature length".to_string());
+        }
+        // SAFETY: slices outlive the call; every handle is owned
+        // for exactly its scope below (RSA takes the BIGNUMs on
+        // `RSA_set0_key` success, frees them via `RSA_free` —
+        // and on the early-`Err` paths nothing was transferred).
+        unsafe {
+            let rsa = RSA_new();
+            if rsa.is_null() {
+                return Err(ossl_err("rsa alloc"));
+            }
+            let bn_n = BN_bin2bn(n.as_ptr(), n.len() as c_int, std::ptr::null_mut());
+            let bn_e = BN_bin2bn(e.as_ptr(), e.len() as c_int, std::ptr::null_mut());
+            if bn_n.is_null() || bn_e.is_null() {
+                // Nothing transferred yet: free each live piece.
+                if !bn_n.is_null() {
+                    BN_free(bn_n);
+                }
+                if !bn_e.is_null() {
+                    BN_free(bn_e);
+                }
+                RSA_free(rsa);
+                return Err(ossl_err("rsa key"));
+            }
+            if RSA_set0_key(rsa, bn_n, bn_e, std::ptr::null_mut()) != 1 {
+                RSA_free(rsa);
+                return Err(ossl_err("rsa key"));
+            }
+            // From here the RSA object owns both BIGNUMs.
+            let r = RSA_verify(
+                NID_SHA256,
+                digest.as_ptr(),
+                digest.len() as c_uint,
+                sig.as_ptr(),
+                sig.len() as c_uint,
+                rsa,
+            );
+            RSA_free(rsa);
+            Ok(r == 1)
+        }
+    }
+
+    /// Constant-time 32-byte key comparison for password
+    /// verification (no early exit — the loop always reads both
+    /// inputs fully; length mismatch is a loud `Err`, never a
+    /// silent false).
+    pub fn pbkdf2_verify(expected: &[u8], got: &[u8]) -> Result<bool, String> {
+        if expected.len() != 32 || got.len() != 32 {
+            return Err(format!(
+                "pbkdf2 verify: need 32-byte keys, got {} and {}",
+                expected.len(),
+                got.len()
+            ));
+        }
+        let mut diff = 0u8;
+        for (a, b) in expected.iter().zip(got.iter()) {
+            diff |= a ^ b;
+        }
+        Ok(diff == 0)
     }
 
     // -- X.509 chain verification --

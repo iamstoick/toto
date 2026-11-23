@@ -2506,6 +2506,16 @@ impl<'a> FnCx<'a> {
                         ),
                     });
                 }
+                // LDAP calls lower the same way (a connect/bind
+                // round-trip blocks); same refusal, same reason.
+                if name.starts_with("toto_rt_ldap_") {
+                    return Err(SubsetError {
+                        func: self.func.clone(),
+                        message: format!(
+                            "foreign function `{name}` is a blocking LDAP wait, which needs the executor pool (run with `toto run`/`toto test`)"
+                        ),
+                    });
+                }
                 let idx = Self::extern_index(prog, name).ok_or_else(|| SubsetError {
                     func: self.func.clone(),
                     message: format!(

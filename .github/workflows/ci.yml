@@ -41,6 +41,32 @@ jobs:
           --health-interval=2s
           --health-timeout=2s
           --health-retries=60
+      # Wave 3 Stage 3: OpenLDAP for the directory interop
+      # suite (`ldap_auth` — bind + subtree search with code
+      # assertions). Test-only directory, seeded by the
+      # provision step below; the host port matches the
+      # hardcoded `TOTO_TEST_LDAP_PORT` default (53389) so
+      # rootless local docker and CI services agree.
+      openldap:
+        image: osixia/openldap:1.5.0
+        env:
+          LDAP_ORGANISATION: "Toto Test"
+          LDAP_DOMAIN: "toto.test"
+          LDAP_ADMIN_PASSWORD: toto-admin-pw
+        ports:
+          - 53389:389
+      # Wave 3 Stage 3: Keycloak for the OIDC interop suite
+      # (`oidc_keycloak` — discovery, password grant, JWKS
+      # RS256 verify, userinfo). Test-only realm, provisioned
+      # by the step below (realm + RS256 client + user from
+      # env; no secrets committed anywhere).
+      keycloak:
+        image: quay.io/keycloak/keycloak:26.0
+        env:
+          KC_BOOTSTRAP_ADMIN_USERNAME: admin
+          KC_BOOTSTRAP_ADMIN_PASSWORD: toto-admin-pw
+        ports:
+          - 8080:8080
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -49,13 +75,50 @@ jobs:
       # Wave 3 Stage 1: client dev libraries for the FFI link
       # (system libs, same as the libssl/libcrypto model; the local
       # equivalent is `TOTO_DB_LIB_DIR` over extracted .debs).
-      - name: install database client libraries
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libpq-dev libsqlite3-dev default-libmysqlclient-dev
+      - name: install identity client libraries
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libpq-dev libsqlite3-dev default-libmysqlclient-dev ldap-utils libldap2-dev
+      - name: provision identity fixtures (LDAP seed + Keycloak realm + Vault dev server)
+        run: ./scripts/ci-provision-identity.sh
+        env:
+          LDAP_HOST: 127.0.0.1
+          LDAP_PORT: "53389"
+          LDAP_ADMIN_DN: cn=admin,dc=toto,dc=test
+          LDAP_ADMIN_PW: toto-admin-pw
+          LDAP_TEST_USER_PW: alice-pw
+          LDAP_TEST_USER_PW2: bob-pw
+          KC_BASE: http://127.0.0.1:8080
+          KC_ADMIN_USER: admin
+          KC_ADMIN_PW: toto-admin-pw
+          KC_REALM: toto
+          KC_CLIENT: refsvc-rs256
+          KC_REDIRECT: http://127.0.0.1:18080/cb
+          KC_USER: alice
+          KC_USER_PW: alice-pw
+          KC_USER_FIRST: Alice
+          KC_USER_LAST: Liddell
+          KC_USER_EMAIL: alice@toto.test
+          KC_CLIENT_SECRET: toto-test-client-secret-0123456789ab
+          VAULT_PORT: "8200"
+          VAULT_TOKEN: toto-test-vault-root-token
       - name: fmt + clippy + test gate
         run: ./scripts/check.sh
         env:
           TOTO_TEST_PG_DSN: "postgres:host=127.0.0.1 port=5432 dbname=totodb user=toto password=toto-test-pw"
           TOTO_TEST_MYSQL_DSN: "mysql:host=127.0.0.1 port=3306 dbname=totodb user=toto password=toto-test-pw"
+          TOTO_TEST_LDAP_HOST: 127.0.0.1
+          TOTO_TEST_LDAP_PORT: "53389"
+          TOTO_TEST_LDAP_ADMIN_DN: cn=admin,dc=toto,dc=test
+          TOTO_TEST_LDAP_ADMIN_PW: toto-admin-pw
+          TOTO_TEST_LDAP_USER_PW: alice-pw
+          TOTO_TEST_LDAP_BASE: ou=users,dc=toto,dc=test
+          TOTO_TEST_OIDC_BASE: http://127.0.0.1:8080
+          TOTO_TEST_OIDC_REALM: toto
+          TOTO_TEST_OIDC_CLIENT_ID: refsvc-rs256
+          TOTO_TEST_OIDC_CLIENT_SECRET: toto-test-client-secret-0123456789ab
+          TOTO_TEST_OIDC_USER: alice
+          TOTO_TEST_OIDC_PASSWORD: alice-pw
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: toto-test-vault-root-token
   release-gates:
     runs-on: ubuntu-latest
     steps:

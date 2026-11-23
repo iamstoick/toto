@@ -1,7 +1,7 @@
 // `toto-compiler` build script: link the system libcrypto (Wave 1),
-// libssl (Wave 2, Stage 1: TLS), and the Wave 3 database client
+// libssl (Wave 2, Stage 1: TLS), the Wave 3 database client
 // libraries (sqlite3 everywhere unix; libpq + libmysqlclient on
-// Linux only — macOS ships neither as a system library).
+// Linux only), and the Wave 3 LDAP client (libldap, Linux-only).
 //
 // Crypto/TLS/DB bind the mature system libraries (OpenSSL 3 on Linux,
 // LibreSSL on macOS) with the same load-time link model Phase 5
@@ -87,6 +87,10 @@ fn main() {
             db_names.push(("libpq.so.5", "pq"));
             db_names.push(("libmysqlclient.so.24", "mysqlclient"));
             db_names.push(("libmysqlclient.so.21", "mysqlclient"));
+            // Wave 3 Stage 3 LDAP client (OpenLDAP; `ber_free`
+            // lives in liblber, linked alongside).
+            db_names.push(("libldap.so.2", "ldap"));
+            db_names.push(("liblber.so.2", "lber"));
         }
     }
     let mut linked = false;
@@ -144,5 +148,7 @@ fn main() {
     if is_linux {
         println!("cargo:rustc-link-lib=pq");
         println!("cargo:rustc-link-lib=mysqlclient");
+        println!("cargo:rustc-link-lib=ldap");
+        println!("cargo:rustc-link-lib=lber");
     }
 }
