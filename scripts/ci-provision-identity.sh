@@ -5,15 +5,6 @@
 # re-run against a fresh ephemeral service.
 set -eu
 
-echo "--- wait for services (LDAP :$LDAP_PORT, Keycloak $KC_BASE)"
-for i in $(seq 1 60); do
-    if (echo > /dev/tcp/127.0.0.1/"$LDAP_PORT") 2>/dev/null && curl -sf -o /dev/null "$KC_BASE/realms/master/.well-known/openid-configuration"; then
-        echo "services ready after ${i}x5s"
-        break
-    fi
-    if [ "$i" = 60 ]; then echo "services never became ready" >&2; exit 1; fi
-    sleep 5
-done
 : "${LDAP_HOST:=127.0.0.1}"
 : "${LDAP_PORT:=389}"
 : "${LDAP_ADMIN_DN:=cn=admin,dc=toto,dc=test}"
@@ -34,6 +25,27 @@ done
 : "${KC_USER_EMAIL:=alice@toto.test}"
 : "${VAULT_PORT:=8200}"
 : "${VAULT_TOKEN:?set VAULT_TOKEN (dev root token, test-only)}"
+
+echo "--- Keycloak: start container (start-dev, like the local proof)"
+echo "--- (service containers cannot pass the start command; without it the image exits)"
+docker run -d --name w3keycloak -p 8080:8080 \
+  -e KC_BOOTSTRAP_ADMIN_USERNAME="$KC_ADMIN_USER" \
+  -e KC_BOOTSTRAP_ADMIN_PASSWORD="$KC_ADMIN_PW" \
+  quay.io/keycloak/keycloak:26.0 start-dev > /dev/null
+
+echo "--- wait for services (LDAP :$LDAP_PORT, Keycloak $KC_BASE)"
+for i in $(seq 1 60); do
+    if (echo > /dev/tcp/127.0.0.1/"$LDAP_PORT") 2>/dev/null && curl -sf -o /dev/null "$KC_BASE/realms/master/.well-known/openid-configuration"; then
+        echo "services ready after ${i}x5s"
+        break
+    fi
+    if [ "$i" = 60 ]; then
+        (echo > /dev/tcp/127.0.0.1/"$LDAP_PORT") 2>/dev/null && echo "ldap up :$LDAP_PORT" || echo "ldap DOWN :$LDAP_PORT"
+        curl -sf -o /dev/null "$KC_BASE/realms/master/.well-known/openid-configuration" && echo "keycloak up $KC_BASE" || echo "keycloak DOWN $KC_BASE"
+        echo "services never became ready" >&2; exit 1
+    fi
+    sleep 5
+done
 
 echo "--- LDAP: seed directory"
 export LDAP_TEST_USER_PW LDAP_TEST_USER_PW2

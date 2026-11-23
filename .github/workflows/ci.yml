@@ -55,18 +55,12 @@ jobs:
           LDAP_ADMIN_PASSWORD: toto-admin-pw
         ports:
           - 53389:389
-      # Wave 3 Stage 3: Keycloak for the OIDC interop suite
-      # (`oidc_keycloak` — discovery, password grant, JWKS
-      # RS256 verify, userinfo). Test-only realm, provisioned
-      # by the step below (realm + RS256 client + user from
-      # env; no secrets committed anywhere).
-      keycloak:
-        image: quay.io/keycloak/keycloak:26.0
-        env:
-          KC_BOOTSTRAP_ADMIN_USERNAME: admin
-          KC_BOOTSTRAP_ADMIN_PASSWORD: toto-admin-pw
-        ports:
-          - 8080:8080
+      # Wave 3 Stage 3: Keycloak is booted by the provision step
+      # below (`docker run ... start-dev`), NOT as a service
+      # container — the image exits without a start command
+      # (diagnosed from run 45106604384: LDAP healthy, :8080
+      # never answered). Port contract 8080:8080 matches
+      # TOTO_TEST_OIDC_BASE.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
