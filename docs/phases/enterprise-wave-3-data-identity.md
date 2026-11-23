@@ -906,6 +906,18 @@ peer vs shutdown, server handshake, client handshake; each
 returns in ~5 s post-fix and hangs forever pre-fix, verified
 both ways).
 
+Second fix in this turn (gate-blocking, pre-existing Wave-3
+pool bug, unrelated to F1's mechanism): `proj23_db_concurrent`
+flaked (`sqlite prepare: no such table: hammer`) once locally,
+once on ARM CI, once on macOS CI. Root cause: `:memory:`
+SQLite databases live inside one connection, so the pool pins
+them to max 1 — but a later `db_pool_config(dsn, 2, ...)` silently
+raised the max, and the moment two checkouts overlapped the
+second got a fresh empty handle. Fix: `db_pool_config` clamps
+the max to 1 for `sqlite::memory:` (the pin holds against
+reconfiguration; 20/20 `HAMMER-OK` post-fix). No test, API, or
+threshold changed; `db_pool` 3/3 still green.
+
 Re-proof: the 2-client minimal repro completes (15/15 runs,
 `F1-CASE-TLS-BLOCKING-OK`); concurrent Phase C (60 requests,
 conc=2 — the proven deterministic envelope, see below) is

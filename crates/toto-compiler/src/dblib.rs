@@ -403,6 +403,16 @@ mod inner {
         if max == 0 {
             return Err("db pool max must be >= 1".to_string());
         }
+        // `:memory:` SQLite databases live inside one connection:
+        // honoring a larger max here would hand out fresh empty
+        // handles (missing tables) the moment two checkouts
+        // overlap, so the single-handle pin from `get_pool` holds
+        // against reconfiguration (a flaky `no such table` otherwise).
+        let max = if parsed.driver == Driver::Sqlite && dsn == "sqlite::memory:" {
+            max.min(1)
+        } else {
+            max
+        };
         let pool = get_pool(parsed.driver, dsn);
         let mut st = pool.state.lock().expect("db pool lock");
         st.max = max;
