@@ -1,0 +1,484 @@
+// `gzv.std/config` — configuration: files, environment,
+// defaults (Enterprise Wave 3, Stage 4).
+//
+// One value model: a `JsonVal` object mapping dotted paths to
+// STRINGS. TOML/YAML trees flatten on load (arrays as `a.0`
+// segments, null as the literal `"null"`); typed getters parse
+// with loud `Err`s. Merging is per dotted key (later wins),
+// so `config_merge` needs no schema knowledge — flatness
+// makes layered config trivially correct. Precedence:
+// env > file > defaults — always explicit: file loading
+// names its files, env overlay names every `ENV=config.path`
+// mapping, defaults are built by the caller. No network, no
+// includes, no interpolation in v1 (documented limits).
+// Empty-vs-unset env distinguishes via `config_env_has`
+// (`getenv` returns "" for both; `has` asks presence).
+import "gzv.std/json.gzv";
+import "gzv.std/strings.gzv";
+import "gzv.std/toml.gzv";
+import "gzv.std/yaml.gzv";
+
+unsafe extern "C" {
+    fn toto_rt_env_get(name: *c_char) -> string;
+    fn toto_rt_env_has(name: *c_char) -> c_int;
+}
+
+// An empty config object (defaults start here).
+pub fn config_empty() -> Result<JsonVal, string> {
+    return json_parse("{}");
+}
+
+// Raw environment access (the overlay below is the usual
+// entry point; these two are public for tests/REPL use).
+pub fn config_env_get(name: string) -> string {
+    return toto_rt_env_get(name);
+}
+
+pub fn config_env_has(name: string) -> bool {
+    if toto_rt_env_has(name) == 1 {
+        return true;
+    } else {
+    }
+    return false;
+}
+
+// Required lookup: missing keys Err as `missing key: <path>`
+// (the json layer's error — named here so callers can rely
+// on the exact text).
+pub fn config_require(cfg: JsonVal, path: string) -> Result<string, string> {
+    let v = json_object_get(cfg, path)?;
+    return Ok(json_as_string(v)?);
+}
+
+// Lookup with a default (missing key only — a present key is
+// never replaced, not even when empty). Loud Err only when a
+// present value is somehow not a string (breaks the config
+// invariant — cannot happen through the loaders above).
+pub fn config_get(cfg: JsonVal, path: string, dflt: string) -> Result<string, string> {
+    if !config_has_key(cfg, path) {
+        return Ok(dflt);
+    } else {
+    }
+    return Ok(json_as_string(json_object_get(cfg, path)?)?);
+}
+
+// Typed getters (loud Err on malformed values — a bad port
+// number aborts loudly instead of binding somewhere weird).
+pub fn config_get_int(cfg: JsonVal, path: string, dflt: int) -> Result<int, string> {
+    let raw = config_get_raw(cfg, path)?;
+    if raw == "" {
+        return Ok(dflt);
+    }
+    return Ok(config_parse_int(raw)?);
+}
+
+pub fn config_get_float(cfg: JsonVal, path: string, dflt: float) -> Result<float, string> {
+    let raw = config_get_raw(cfg, path)?;
+    if raw == "" {
+        return Ok(dflt);
+    }
+    return Ok(config_parse_float(raw)?);
+}
+
+pub fn config_get_bool(cfg: JsonVal, path: string, dflt: bool) -> Result<bool, string> {
+    let raw = config_get_raw(cfg, path)?;
+    if raw == "" {
+        return Ok(dflt);
+    }
+    if raw == "true" {
+        return Ok(true);
+    } else if raw == "false" {
+        return Ok(false);
+    } else {
+        return Err("bad bool for config key");
+    }
+}
+
+fn config_get_raw(cfg: JsonVal, path: string) -> Result<string, string> {
+    if config_has_key(cfg, path) {
+        return Ok(json_as_string(json_object_get(cfg, path)?)?);
+    }
+    return Ok("");
+}
+
+fn config_has_key(cfg: JsonVal, path: string) -> bool {
+    for k in cfg.keys {
+        if k == path {
+            return true;
+        } else {
+        }
+    }
+    return false;
+}
+
+// All dotted keys (enumeration for merges/dumps/tests).
+pub fn config_keys(cfg: JsonVal) -> Array<string> {
+    return cfg.keys;
+}
+
+// Overlay `over` onto `base`: every key in `over` wins.
+pub fn config_merge(base: JsonVal, over: JsonVal) -> Result<JsonVal, string> {
+    let mut keys: Array<string> = [];
+    let mut vals: Array<JsonVal> = [];
+    for k in base.keys {
+        let v: JsonVal = json_object_get(base, k)?;
+        push(keys, k);
+        push(vals, v);
+    }
+    for k in over.keys {
+        if config_has_key_list(keys, k) {
+            let i: int = config_index_of(keys, k);
+            vals[i] = json_object_get(over, k)?;
+        } else {
+            push(keys, k);
+            push(vals, json_object_get(over, k)?);
+        }
+    }
+    return json_object(keys, vals);
+}
+
+fn config_has_key_list(keys: Array<string>, want: string) -> bool {
+    for k in keys {
+        if k == want {
+            return true;
+        } else {
+        }
+    }
+    return false;
+}
+
+fn config_index_of(keys: Array<string>, want: string) -> int {
+    let mut i: int = 0;
+    while i < len(keys) {
+        if keys[i] == want {
+            return i;
+        } else {
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Env overlay: each mapping is `"ENV_VAR=config.path"` — set
+// variables win over `cfg`, unset ones are skipped (never
+// overwrite with ""). Returns the merged config.
+pub fn config_apply_env(cfg: JsonVal, mappings: Array<string>) -> Result<JsonVal, string> {
+    let mut keys: Array<string> = [];
+    let mut vals: Array<string> = [];
+    for m in mappings {
+        let eq: int = index_of(m, "=");
+        if eq < 0 {
+            return Err("bad env mapping (want ENV=config.path)");
+        } else {
+        }
+        let env_name: string = substring(m, 0, eq);
+        let path: string = substring(m, eq + 1, len(m));
+        if config_env_has(env_name) {
+            push(keys, path);
+            push(vals, config_env_get(env_name));
+        } else {
+        }
+    }
+    if len(keys) == 0 {
+        return Ok(cfg);
+    }
+    let over = json_object(keys, json_strings(vals))?;
+    return config_merge(cfg, over);
+}
+
+fn json_strings(ss: Array<string>) -> Array<JsonVal> {
+    let mut out: Array<JsonVal> = [];
+    for s in ss {
+        push(out, json_string(s));
+    }
+    return out;
+}
+
+// TOML/YAML file loading (flattened to the dotted string
+// map; arrays indexed, null as `"null"`).
+pub fn config_from_toml_file(path: string) -> Result<JsonVal, string> {
+    return config_flatten_toml(toml_parse(read_file(path))?, "", config_empty()?);
+}
+
+pub fn config_from_yaml_file(path: string) -> Result<JsonVal, string> {
+    // YAML caveat (inherited, not fixed here): an unquoted
+    // scalar ending in `:` re-parses as a mapping head in the
+    // Wave-1 yaml layer (pinned by its suite). Quote such
+    // values (`dsn: "sqlite::memory:"`) — the supported path.
+    return config_flatten_yaml(yaml_parse(read_file(path))?, "", config_empty()?);
+}
+
+pub fn config_from_toml_text(text: string) -> Result<JsonVal, string> {
+    return config_flatten_toml(toml_parse(text)?, "", config_empty()?);
+}
+
+pub fn config_from_yaml_text(text: string) -> Result<JsonVal, string> {
+    return config_flatten_yaml(yaml_parse(text)?, "", config_empty()?);
+}
+
+fn config_join(prefix: string, seg: string) -> string {
+    if prefix == "" {
+        return seg;
+    } else {
+    }
+    return prefix + "." + seg;
+}
+
+fn config_toml_child(v: TomlVal, key: string) -> Result<TomlVal, string> {
+    for i in 0..len(v.keys) {
+        if v.keys[i] == key {
+            let frag: string = v.vals[i];
+            // Subtable fragments always contain a newline (see
+            // toml_build); scalar literals never do.
+            if index_of(frag, "\n") >= 0 {
+                return toml_table_get(v, key);
+            }
+            let lit: string = config_trim(frag);
+            let lc: Array<string> = split(lit, "");
+            if len(lc) > 0 && lc[0] == "[" {
+                return toml_table_get_array(v, key);
+            } else {
+                return toml_table_get(v, key);
+            }
+        } else {
+        }
+    }
+    return Err("missing key: " + key);
+}
+
+fn config_trim(s: string) -> string {
+    // The toml module's trimmer is private; dotted keys never
+    // carry whitespace here, so trim ASCII space/tabs only.
+    let cs: Array<string> = split(s, "");
+    let mut a: int = 0;
+    let mut b: int = len(cs);
+    while a < b && (cs[a] == " " || cs[a] == "\t" || cs[a] == "\n" || cs[a] == "\r") {
+        a = a + 1;
+    }
+    while b > a && (cs[b - 1] == " " || cs[b - 1] == "\t" || cs[b - 1] == "\n" || cs[b - 1] == "\r") {
+        b = b - 1;
+    }
+    let mut out: string = "";
+    for i in a..b {
+        out = out + cs[i];
+    }
+    return out;
+}
+
+fn config_put(acc: JsonVal, path: string, val: string) -> Result<JsonVal, string> {
+    return config_merge(acc, json_object([path], [json_string(val)])?);
+}
+
+fn config_flatten_toml(v: TomlVal, prefix: string, acc: JsonVal) -> Result<JsonVal, string> {
+    let kind: string = toml_kind(v);
+    if kind == "table" {
+        let keys: Array<string> = v.keys;
+        let mut out: JsonVal = acc;
+        for k in keys {
+            // Arrays surface through a separate accessor
+            // (scalar `[...]` literals): dispatch on the raw
+            // literal's first character.
+            let child: TomlVal = config_toml_child(v, k)?;
+            let mut p: string = k;
+            if prefix != "" {
+                p = prefix + "." + k;
+            }
+            out = config_flatten_toml(child, p, out)?;
+        }
+        return Ok(out);
+    } else if kind == "arr" {
+        let mut out: JsonVal = acc;
+        let mut i: int = 0;
+        while i < toml_array_len(v)? {
+            let child = toml_array_get(v, i)?;
+            out = config_flatten_toml(child, config_join(prefix, to_string(i)), out)?;
+            i = i + 1;
+        }
+        return Ok(out);
+    } else {
+        return Ok(config_put(acc, prefix, toml_scalar_text(v)?)?);
+    }
+}
+
+fn toml_scalar_text(v: TomlVal) -> Result<string, string> {
+    let kind: string = toml_kind(v);
+    if kind == "str" {
+        return Ok(toml_as_string(v)?);
+    } else if kind == "int" {
+        return Ok(to_string(toml_as_int(v)?));
+    } else if kind == "float" {
+        return Ok(to_string(toml_as_float(v)?));
+    } else if kind == "bool" {
+        if toml_as_bool(v)? {
+            return Ok("true");
+        } else {
+        }
+        return Ok("false");
+    }
+    return Err("bad toml scalar");
+}
+
+fn config_flatten_yaml(v: YamlVal, prefix: string, acc: JsonVal) -> Result<JsonVal, string> {
+    let kind: string = yaml_kind(v);
+    if kind == "obj" {
+        let keys: Array<string> = v.keys;
+        let mut out: JsonVal = acc;
+        for k in keys {
+            let child = yaml_object_get(v, k)?;
+            let mut p: string = k;
+            if prefix != "" {
+                p = prefix + "." + k;
+            }
+            out = config_flatten_yaml(child, p, out)?;
+        }
+        return Ok(out);
+    } else if kind == "arr" {
+        let mut out: JsonVal = acc;
+        let mut i: int = 0;
+        while i < yaml_array_len(v)? {
+            let child = yaml_array_get(v, i)?;
+            out = config_flatten_yaml(child, config_join(prefix, to_string(i)), out)?;
+            i = i + 1;
+        }
+        return Ok(out);
+    } else {
+        return Ok(config_put(acc, prefix, yaml_scalar_text(v)?)?);
+    }
+}
+
+fn yaml_scalar_text(v: YamlVal) -> Result<string, string> {
+    let kind: string = yaml_kind(v);
+    if kind == "str" {
+        return Ok(yaml_as_string(v)?);
+    } else if kind == "int" {
+        return Ok(to_string(yaml_as_int(v)?));
+    } else if kind == "float" {
+        return Ok(to_string(yaml_as_float(v)?));
+    } else if kind == "bool" {
+        if yaml_as_bool(v)? {
+            return Ok("true");
+        } else {
+        }
+        return Ok("false");
+    } else if kind == "null" {
+        return Ok("null");
+    }
+    return Err("bad yaml scalar");
+}
+
+// Strict int/float parsing with loud errors (parse_int aborts
+// the program on bad input — validate first, return Err).
+pub fn config_parse_int(s: string) -> Result<int, string> {
+    let mut t: string = s;
+    if len(t) > 0 && char_at(t, 0) == "-" {
+        t = substring(t, 1, len(t));
+    } else {
+    }
+    if t == "" || !config_all_digits(t) {
+        return Err("bad int: " + s);
+    }
+    return Ok(parse_int(s));
+}
+
+pub fn config_parse_float(s: string) -> Result<float, string> {
+    // Reuse the db framing float shape (finite decimals only;
+    // non-finite is a loud Err, same rule as db params).
+    return Ok(config_parse_finite(s)?);
+}
+
+fn config_parse_finite(s: string) -> Result<float, string> {
+    let mut neg: bool = false;
+    let mut rest: string = s;
+    if len(rest) > 0 && char_at(rest, 0) == "-" {
+        neg = true;
+        rest = substring(rest, 1, len(rest));
+    } else {
+    }
+    if rest == "NaN" || rest == "Infinity" || rest == "+Infinity" {
+        return Err("bad float (non-finite): " + s);
+    }
+    let dot: int = index_of(rest, ".");
+    let epos: int = config_find_e(rest);
+    let mut mant: string = rest;
+    let mut exp: int = 0;
+    if epos >= 0 {
+        mant = substring(rest, 0, epos);
+        let es: string = substring(rest, epos + 1, len(rest));
+        let mut ed: string = es;
+        let mut esign: int = 1;
+        if len(es) > 0 && char_at(es, 0) == "-" {
+            esign = -1;
+            ed = substring(es, 1, len(es));
+        } else if len(es) > 0 && char_at(es, 0) == "+" {
+            ed = substring(es, 1, len(es));
+        } else {
+        }
+        if !config_all_digits(ed) || ed == "" {
+            return Err("bad float: " + s);
+        }
+        exp = esign * parse_int(ed);
+    }
+    let mut ip: string = mant;
+    let mut fp: string = "0";
+    if dot >= 0 {
+        ip = substring(mant, 0, dot);
+        fp = substring(mant, dot + 1, len(mant));
+    }
+    if ip == "" {
+        ip = "0";
+    }
+    if fp == "" {
+        fp = "0";
+    }
+    if !config_all_digits(ip) || !config_all_digits(fp) {
+        return Err("bad float: " + s);
+    }
+    let mut v: float = to_float(parse_int(ip));
+    let mut scale: float = 1.0;
+    for c in split(fp, "") {
+        scale = scale * 10.0;
+        v = v + to_float(parse_int(c)) / scale;
+    }
+    let mut k: int = 0;
+    while k < exp {
+        v = v * 10.0;
+        k = k + 1;
+    }
+    while k > exp {
+        v = v / 10.0;
+        k = k - 1;
+    }
+    if neg {
+        v = 0.0 - v;
+    }
+    return Ok(v);
+}
+
+fn config_find_e(s: string) -> int {
+    let e1: int = index_of(s, "e");
+    let e2: int = index_of(s, "E");
+    if e1 < 0 {
+        return e2;
+    }
+    if e2 < 0 {
+        return e1;
+    }
+    if e1 < e2 {
+        return e1;
+    } else {
+    }
+    return e2;
+}
+
+fn config_all_digits(s: string) -> bool {
+    if len(s) == 0 {
+        return false;
+    }
+    for c in split(s, "") {
+        if c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
