@@ -134,7 +134,15 @@ fn t_typed_errors() -> Result<bool, string> {
 }
 
 fn t_toml_file() -> Result<bool, string> {
-    let path = "target/config_test_fixture.toml";
+    // Same scratch rule as test_secrets: $TMPDIR else /tmp (no
+    // mkdir builtin; `target/` is not guaranteed to exist).
+    let dir = config_env_get("TMPDIR");
+    let mut base = "/tmp";
+    if dir != "" {
+        base = dir;
+    } else {
+    }
+    let path = base + "/config_test_fixture.toml";
     write_file(path, toml_doc());
     let cfg = config_from_toml_file(path)?;
     check(config_require(cfg, "server.port")? == "8080", "file port")?;
