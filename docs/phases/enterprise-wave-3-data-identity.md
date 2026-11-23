@@ -935,8 +935,9 @@ next); nothing else changes mark; (f) totals re-derived below
 (the fix adds the `tls_peer_wait_bounds` suite).
 
 Fresh full-gate totals (local detached run 2026-11-23,
-`CHECK_EXIT:0`; harness `/tmp/checkf1c.sh`, same env/services as
-the Wave-3 gate): `cargo fmt` clean; `cargo clippy
+`CHECK_EXIT:0`; harness `/tmp/checkf1d.sh`, same env/services as
+the Wave-3 gate; re-run quiet after the forgery fix with
+identical totals): `cargo fmt` clean; `cargo clippy
 --workspace --all-targets -- -D warnings` clean;
 `cargo test --workspace` green: 74 result lines, 269 passed,
 0 failed — bridge from Wave 3 (73 / 266 / 0, derived 2026-11-23):
@@ -946,14 +947,22 @@ client-handshake bound, 3/3). Per-binary changes vs Wave 3 are
 that suite alone; every other binary holds its Wave-3 count.
 Corpus: stdlib `toto test` 24/24; wordfreq 1/1 + interp==built
 identity; census 186 (160 top-level + 26 project mains —
-unchanged: no corpus file added or removed, `load.gzv` edited
-in place, `main.gzv` untouched). One gate attempt failed
-mid-way at the corpus golden (`forged=BAD` vs `forged=aborted`,
-single line, `main.gzv`): not reproduced in 3/3 quiet reruns,
-all CI runs, or any other local run — it fired while four
-instrumented load hammers ran alongside on the same host
-(self-imposed contention, documented here, not hidden); the
-clean re-run above is the record.
+unchanged: no corpus case added or removed, `main.gzv` edited
+in place for the forgery fix below, goldens byte-identical).
+Corpus-flake postscript (pre-existing test bug, found and fixed
+this turn — it blocked one local gate attempt and one ARM CI
+probe with `forged=BAD` vs `forged=aborted`, single line):
+the test forged tokens by flipping the LAST signature character
+(`A`<->`B`), but base64url's last char of a 32-byte signature
+carries only 4 significant bits — flips within the same high
+nibble (e.g. `A`<->`B` differ only in pad bits) decode to
+IDENTICAL signature bytes, so the "forgery" verified ~1/16 of
+the time (rate matches: 1/20 mine, 1/20 pristine-tip,
+1 ARM CI run; decoded bytes proven identical on a caught flip).
+The fix flips the FIRST signature character instead (fully
+significant; `A`<->`Q` differ in bit 4) — 20/20 `aborted`
+post-fix. Crypto, framework, and gate are exonerated: no
+product-code change was needed, only the test's tamper method.
 
 §4 Gates + CI re-proof: local gate green as above. CI run id +
 per-platform status: [PENDING — fill after green; report-only

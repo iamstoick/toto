@@ -146,13 +146,21 @@ fn run() -> Result<string, string> {
     // Forged signature: the handler `Err` aborts the connection
     // fail-closed (accepted v1 deviation) — the client must see
     // a transport failure, never a 200 and never a 500.
-    let mut last: string = substring(tok, len(tok) - 1, len(tok));
-    if last == "A" {
-        last = "B";
+    // Forge by flipping the FIRST signature character (all six
+    // bits significant — the old last-char flip was a silent no-op
+    // whenever old and new shared the high nibble (e.g. A<->B
+    // differ only in pad bits), letting the "forgery" verify ~1/16
+    // of the time and flaking the golden).
+    let tparts: Array<string> = split(tok, ".");
+    let sig: string = tparts[2];
+    let first: string = substring(sig, 0, 1);
+    let rest: string = substring(sig, 1, len(sig));
+    let mut new_first: string = "Q";
+    if first == "Q" {
+        new_first = "A";
     } else {
-        last = "A";
     }
-    let forged = substring(tok, 0, len(tok) - 1) + last;
+    let forged = tparts[0] + "." + tparts[1] + "." + new_first + rest;
     let bf: Array<HttpHeader> = [HttpHeader { name: "Authorization", value: "Bearer " + forged }];
     let n = neg_probe(fn() -> Result<HttpClientResp, string> {
         return http_do(HttpClientReq { method: "GET", url: base + "/users/alice", headers: bf, body: [], ca_pem: ca }, copts);
