@@ -6,6 +6,9 @@
 # bench/conc.gzv (channel fan-out/fan-in), bench/stdlib.gzv
 # (gzv.std math + collections), apps/wordfreq with a scaled input
 # (real app: stdlib strings/json/ffi/io + channels + FFI).
+# tests/corpus/project/proj25_refsvc_data/load.gzv (reference
+# service load: pooled DB + authed TLS service, sequential
+# client; pool contention proven concurrently in-process).
 # Corpus programs are all millisecond-scale, so the first three are
 # calibrated bench workloads (~2-3 s interpreter each); wordfreq is
 # the repo-real anchor (stock input runs in ~10 ms, hence the scaled
@@ -154,6 +157,24 @@ timed interp-stdlib "$TOTO" run "$ROOT/bench/stdlib.gzv"
 echo "== cpu: gc workloads (runtime executor; STW collector under test) =="
 timed exec-gc-alloc "$TOTO" run "$ROOT/bench/gc_alloc.gzv"
 timed exec-gc-chan "$TOTO" run "$ROOT/bench/gc_chan.gzv"
+
+echo "== refsvc load (runtime executor; pooled DB + authed TLS service) =="
+# The service reads fixtures + service.toml relative to its project
+# dir, so everything runs there; the DB file lives in $SAMPLE.
+# Correctness first: the program gates itself (nonzero exit on any
+# gate failure) and prints its verdict + LOAD line; fail loudly.
+(
+cd "$ROOT/tests/corpus/project/proj25_refsvc_data"
+export TOTO_REFSVC_PORT=48527
+export TOTO_REFSVC_DSN="sqlite:path=$SAMPLE/toto-refsvc-bench.db"
+export TOTO_REFSVC_REQS=60
+"$TOTO" run load.gzv > "$SAMPLE/bench_refsvc.out" 2>&1
+grep -q "LOAD-OK" "$SAMPLE/bench_refsvc.out" || { echo "FAIL refsvc-load: no LOAD-OK"; exit 1; }
+grep -q "^phase-c ok=" "$SAMPLE/bench_refsvc.out" || { echo "FAIL refsvc-load: no phase-c line"; exit 1; }
+grep -hE "^(LOAD|recover|phase-a)" "$SAMPLE/bench_refsvc.out" | tail -n 4
+timed exec-refsvc-load "$TOTO" run load.gzv
+)
+rm -f "$SAMPLE"/toto-refsvc-bench.db*
 
 echo "== cpu: jit (compile+run) =="
 timed jit-compute "$PROBE" "$ROOT/bench/compute.gzv"

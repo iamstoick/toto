@@ -1,0 +1,278 @@
+// Wave 3 Stage 5 reference service (golden): the DB-backed,
+// authed HTTPS service over loopback, driven by an in-process
+// client as the integration proof. Deterministic by
+// construction (proj20 precedent): no ports, fds, or timing
+// in the output; per-request latency observations are the
+// fixed 1ms stand-in; `ts` is normalized; random passwords,
+// salts, and the JWT key never print.
+//
+// Exercises: config file + typed getters (port/dsn/ttl),
+// migrations at startup, seeded PBKDF2 users, login → JWT,
+// Bearer-gated reads/writes, every 401 shape, forged-token
+// abort (fail-closed v1 deviation), expired-token 401,
+// unknown-user 404, byte-exact metrics scrape, wrong-CA
+// rejection + survival, buffered-log drain.
+import "common.gzv";
+import "gzv.std/context.gzv";
+import "gzv.std/crypto.gzv";
+import "gzv.std/db.gzv";
+import "gzv.std/http.gzv";
+import "gzv.std/json.gzv";
+import "gzv.std/jwt.gzv";
+import "gzv.std/log.gzv";
+import "gzv.std/metrics.gzv";
+import "gzv.std/strings.gzv";
+import "gzv.std/time.gzv";
+
+// Normalize the nondeterministic `ts` to 0 using the exact wire
+// format (`{"ts":NNN,"level":...}`) — same shape as proj17.
+fn strip_ts(line: string) -> Result<string, string> {
+    let parts = split(line, "{\"ts\":");
+    if len(parts) != 2 {
+        return Err("no ts prefix");
+    } else {
+    }
+    let tail = split(parts[1], ",\"level\":\"");
+    if len(tail) < 2 {
+        return Err("no level separator");
+    } else {
+    }
+    let mut rest = tail[1];
+    let mut i = 2;
+    while i < len(tail) {
+        rest = rest + ",\"level\":\"" + tail[i];
+        i = i + 1;
+    }
+    return Ok("{\"ts\":0,\"level\":\"" + rest);
+}
+
+// NOTE: `http_post` hardcodes `ca_pem: ""` (plain-HTTP only) and
+// hangs against an `https://` URL instead of failing — repro'd
+// this turn, carried as a Wave-2 follow-up. TLS posts go through
+// `http_do` with the pinned CA (proj20 precedent).
+fn post_login(base: string, ca: string, user: string, pw: string, copts: HttpClientOpts) -> Result<HttpClientResp, string> {
+    let body = http_text_to_bytes("{\"user\":\"" + user + "\",\"password\":\"" + pw + "\"}")?;
+    return http_do(HttpClientReq { method: "POST", url: base + "/login", headers: [], body: body, ca_pem: ca }, copts);
+}
+
+fn get_authed(base: string, ca: string, target: string, tok: string, copts: HttpClientOpts) -> Result<HttpClientResp, string> {
+    let hs: Array<HttpHeader> = [HttpHeader { name: "Authorization", value: "Bearer " + tok }];
+    return http_do(HttpClientReq { method: "GET", url: base + target, headers: hs, body: [], ca_pem: ca }, copts);
+}
+
+// Any-Err-is-good probe (proj16 shape): the exchange must FAIL;
+// an unexpected success becomes the fixed marker the caller CAN
+// compare against.
+fn neg_probe(make_bad: fn() -> Result<HttpClientResp, string>) -> Result<string, string> {
+    make_bad()?;
+    return Err("http: unexpected success");
+}
+
+fn bearer_of(resp: HttpClientResp) -> Result<string, string> {
+    let doc = json_parse(http_bytes_to_text(resp.body)?)?;
+    return Ok(json_as_string(json_object_get(doc, "token")?)?);
+}
+
+fn run() -> Result<string, string> {
+    log_set_sink("buffer")?;
+    log_set_level("info")?;
+    ctx_set_current(ctx_with_value(ctx_background(), "trace_id", "refsvc-data-1"))?;
+    log_info("refsvc-data starting")?;
+    let cfg = refsvc_config()?;
+    let port = refsvc_port(cfg)?;
+    let dsn = refsvc_dsn(cfg)?;
+    let ttl = refsvc_ttl(cfg)?;
+    db_pool_config(dsn, 8, 5000)?;
+    let pws = refsvc_setup(dsn, true)?;
+    let key = crypto_random(32)?;
+    let reg = metrics_registry();
+    refsvc_register(reg)?;
+    let router = http_router();
+    let svc = RefsDat { dsn: dsn, key: key, ttl_ms: ttl, meter: true };
+    refsvc_routes(router, svc, reg)?;
+    let listener = refsvc_serve(port, router)?;
+    let copts = refsvc_client_opts();
+    let ca = refsvc_ca();
+    let base = "https://localhost:" + to_string(port);
+    // Login ok (alice) + token capture.
+    let r1 = post_login(base, ca, "alice", pws[0], copts)?;
+    if r1.status != 200 {
+        net_close(listener)?;
+        return Err("login status");
+    } else {
+    }
+    let tok = bearer_of(r1)?;
+    println("login=200");
+    // Wrong password and unknown user are the same 401.
+    let r2 = post_login(base, ca, "alice", "pw-wrong", copts)?;
+    if r2.status != 401 {
+        net_close(listener)?;
+        return Err("badlogin status");
+    } else {
+    }
+    println("badlogin=401");
+    let r3 = post_login(base, ca, "nosuch", "pw-wrong", copts)?;
+    if r3.status != 401 {
+        net_close(listener)?;
+        return Err("nouser status");
+    } else {
+    }
+    println("nouser-login=401");
+    // No token, bad scheme, bad shape: 401 responses.
+    let b0: Array<HttpHeader> = [];
+    let u1 = http_do(HttpClientReq { method: "GET", url: base + "/users/alice", headers: b0, body: [], ca_pem: ca }, copts)?;
+    if u1.status != 401 {
+        net_close(listener)?;
+        return Err("noauth status");
+    } else {
+    }
+    println("noauth=401");
+    let b1: Array<HttpHeader> = [HttpHeader { name: "Authorization", value: "Token " + tok }];
+    let u2 = http_do(HttpClientReq { method: "GET", url: base + "/users/alice", headers: b1, body: [], ca_pem: ca }, copts)?;
+    if u2.status != 401 {
+        net_close(listener)?;
+        return Err("badscheme status");
+    } else {
+    }
+    println("badscheme=401");
+    let b2: Array<HttpHeader> = [HttpHeader { name: "Authorization", value: "Bearer a.b" }];
+    let u3 = http_do(HttpClientReq { method: "GET", url: base + "/users/alice", headers: b2, body: [], ca_pem: ca }, copts)?;
+    if u3.status != 401 {
+        net_close(listener)?;
+        return Err("badshape status");
+    } else {
+    }
+    println("badshape=401");
+    // Forged signature: the handler `Err` aborts the connection
+    // fail-closed (accepted v1 deviation) — the client must see
+    // a transport failure, never a 200 and never a 500.
+    let mut last: string = substring(tok, len(tok) - 1, len(tok));
+    if last == "A" {
+        last = "B";
+    } else {
+        last = "A";
+    }
+    let forged = substring(tok, 0, len(tok) - 1) + last;
+    let bf: Array<HttpHeader> = [HttpHeader { name: "Authorization", value: "Bearer " + forged }];
+    let n = neg_probe(fn() -> Result<HttpClientResp, string> {
+        return http_do(HttpClientReq { method: "GET", url: base + "/users/alice", headers: bf, body: [], ca_pem: ca }, copts);
+    });
+    let w_bad: Result<string, string> = Err("http: unexpected success");
+    let mut fg = "aborted";
+    if n == w_bad {
+        fg = "BAD";
+    } else {
+    }
+    println("forged=" + fg);
+    // Expired token (valid signature, issued ttl+1ms ago by the
+    // monotonic clock): 401, not abort. Deterministic: the clock
+    // never runs backward, so now-iat only grows past ttl.
+    let old_iat = clock_monotonic_ms() - ttl - 1;
+    let old_tok = jwt_sign_hs256("{\"sub\":\"alice\",\"iat_ms\":" + to_string(old_iat) + ",\"ttl_ms\":" + to_string(ttl) + ",\"iss\":\"toto-refsvc\"}", key)?;
+    let u4 = get_authed(base, ca, "/users/alice", old_tok, copts)?;
+    if u4.status != 401 {
+        net_close(listener)?;
+        return Err("expired status");
+    } else {
+    }
+    println("expired=401");
+    // Authed read ok + unknown user 404.
+    let u5 = get_authed(base, ca, "/users/alice", tok, copts)?;
+    if u5.status != 200 {
+        net_close(listener)?;
+        return Err("user status");
+    } else {
+    }
+    let uname = json_as_string(json_object_get(json_parse(http_bytes_to_text(u5.body)?)?, "name")?)?;
+    println("user=200:" + uname);
+    let u6 = get_authed(base, ca, "/users/nosuch", tok, copts)?;
+    if u6.status != 404 {
+        net_close(listener)?;
+        return Err("404 status");
+    } else {
+    }
+    println("nouser=404");
+    // Authed writes + read-back.
+    let nb = http_text_to_bytes("{\"body\":\"hello-1\"}")?;
+    let hs: Array<HttpHeader> = [HttpHeader { name: "Authorization", value: "Bearer " + tok }];
+    let w1 = http_do(HttpClientReq { method: "POST", url: base + "/notes", headers: hs, body: nb, ca_pem: ca }, copts)?;
+    if w1.status != 200 {
+        net_close(listener)?;
+        return Err("notes post 1");
+    } else {
+    }
+    let nb2 = http_text_to_bytes("{\"body\":\"hello-2\"}")?;
+    let w2 = http_do(HttpClientReq { method: "POST", url: base + "/notes", headers: hs, body: nb2, ca_pem: ca }, copts)?;
+    if w2.status != 200 {
+        net_close(listener)?;
+        return Err("notes post 2");
+    } else {
+    }
+    let g = get_authed(base, ca, "/notes", tok, copts)?;
+    if g.status != 200 {
+        net_close(listener)?;
+        return Err("notes get");
+    } else {
+    }
+    let notes = json_parse(http_bytes_to_text(g.body)?)?;
+    println("notes=200:" + to_string(json_array_len(notes)?));
+    // Metrics: unauthed 401, authed scrape byte-matches local render.
+    let m0 = http_do(HttpClientReq { method: "GET", url: base + "/metrics", headers: b0, body: [], ca_pem: ca }, copts)?;
+    if m0.status != 401 {
+        net_close(listener)?;
+        return Err("metrics auth status");
+    } else {
+    }
+    println("metrics-auth=401");
+    let sc = get_authed(base, ca, "/metrics", tok, copts)?;
+    if sc.status != 200 {
+        net_close(listener)?;
+        return Err("scrape status");
+    } else {
+    }
+    let ct = http_header_get(sc.headers, "content-type")?;
+    if ct != metrics_content_type() {
+        net_close(listener)?;
+        return Err("scrape content-type");
+    } else {
+    }
+    let body = http_bytes_to_text(sc.body)?;
+    let want = metrics_render(reg)?;
+    if body != want {
+        net_close(listener)?;
+        return Err("scrape mismatch");
+    } else {
+    }
+    println("metrics=200:match");
+    print(body);
+    // Wrong CA: handshake fails; survival proven by the request after.
+    let other_ca = refsvc_other_ca();
+    let n2 = neg_probe(fn() -> Result<HttpClientResp, string> {
+        return http_do(HttpClientReq { method: "GET", url: base + "/users/alice", headers: hs, body: [], ca_pem: other_ca }, copts);
+    });
+    let mut ng = "yes";
+    if n2 == w_bad {
+        ng = "BAD";
+    } else {
+    }
+    println("neg=" + ng);
+    let after = get_authed(base, ca, "/users/bob", tok, copts)?;
+    if after.status != 200 {
+        net_close(listener)?;
+        return Err("after status");
+    } else {
+    }
+    println("after=200");
+    net_close(listener)?;
+    let lines = log_drain_lines();
+    for line in lines {
+        println(strip_ts(line)?);
+    }
+    println("log-lines=" + to_string(len(lines)));
+    return Ok("REFSVC-DATA-OK");
+}
+
+fn main() -> int {
+    println(run());
+    return 0;
+}

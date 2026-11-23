@@ -64,14 +64,21 @@ follow-ups.
 ## §7 acceptance-criteria checklist (honest, updated per stage)
 
 1. Starting state verified; follow-ups dispositioned — DONE
-   (Stage 0 above).
-2. Database drivers + pooling — NOT YET (Stage 1).
-3. Migrations — NOT YET (Stage 2).
-4. Auth — NOT YET (Stage 3).
-5. Config + secrets — NOT YET (Stage 4).
-6. Reference service + load proof + SSO demo + gates — NOT YET
-   (Stage 5).
-7. Report complete — NOT YET (appended per stage).
+   (Stage 0 above; F1 added 2026-11-23, everything carried by name).
+2. Database drivers + pooling — DONE (Stage 1 record; interop green
+   in the fresh full gate: db_sqlite 7, db_postgres 4, db_mysql 4,
+   db_pool 3).
+3. Migrations — DONE (Stage 2 record; proj24 green in the gate).
+4. Auth — DONE, flagged for acceptance review (Stage 3 record;
+   ldap_auth 2 + oidc_keycloak 2 green locally; CI leg pending push).
+5. Config + secrets — DONE (Stage 4 record; test_config +
+   test_secrets green incl. live Vault; no credential committed).
+6. Reference service + load proof + SSO demo + gates — DONE
+   LOCALLY (Stage 5 record + verdict above; local CHECK_EXIT:0;
+   CI leg pending push — the only open leg).
+7. Report complete — DONE on the branch (records + totals +
+   packaging note + follow-ups + verdict above); CI run-id fill
+   commit follows green.
 
 ### Stage 1 implementation record
 
@@ -134,6 +141,197 @@ fixtures or goldens).
 
 §7 checklist: criterion 2 — IN PROGRESS (drivers + pool
 shipped and proven locally; CI interop pending push).
+
+### Stage 2 implementation record
+
+Library `gzv.std/migrate` (pure Toto over `gzv.std/db` —
+no new FFI, no CLI in v1). Insertion-sort by version +
+duplicate rejection; ledger `toto_schema_migrations`
+(`IF NOT EXISTS`); apply-in-order with stop-at-first-failure
+(resumable); rollback strictly above target in descending
+order with the ledger trimmed per success; empty `down`
+means irreversible (loud named `Err`); rolling back the
+unapplied is a no-op `Ok`. Proven by `stdlib/tests/
+test_migrate.gzv` (apply/rollback/failure-resume/
+duplicates/irreversible, ledger verified at every step)
+and corpus `proj24_db_migrations` (out-of-order input,
+schema+data+ledger goldens before/after, irreversible
+refusal pinned). Per-statement atomicity only (Stage 1
+limitation carries explicitly — proven by the pg
+`transactions_are_per_statement` test).
+
+§7 checklist: criterion 3 — IN PROGRESS (shipped and
+proven locally; CI proof pending push).
+
+## Stage 4 — config + secrets design (recorded before implementation)
+
+Config (`gzv.std/config`): files (TOML/YAML via the Wave-1
+serialization formats), environment, and inline defaults —
+precedence env > file > defaults (stated, tested). One
+value model: a `JsonVal` object mapping dotted paths to
+STRINGS (TOML/YAML trees flatten on load, arrays as
+`a.0`-style segments; typed getters parse with loud
+`Err`s). Env comes from two tiny libc FFI fns
+(`toto_rt_env_get`/`toto_rt_env_has` — FFI plumbing like
+everything this wave, not new builtins) via an explicit
+`"ENV_NAME=config.path"` mapping list (predictable, no
+magic prefix rules). All config tests use fixtures +
+explicit env in the harness (never ambient CI env).
+
+Secrets (`gzv.std/secrets`): store-agnostic
+`secrets_fetch(store, key)` / `secrets_rotate(store, key,
+value)` where `store` names the backend (`vault` |
+`file`). `vault` is the REAL HashiCorp Vault over HTTP
+(KV-v2 read/write via the Wave-2 http client; rotation =
+new version write; old versions retained per Vault;
+failures surface HTTP status + body). `file` is a
+file-backed double with identical fetch/rotate semantics
+(including rotation-failure behavior) that proves the
+rotation LOGIC. Cloud secret stores (AWS/GCP): NO live
+access from here or CI — stated gap, never asserted; the
+`file` double + the store-agnostic seam are the extension
+point, and the report says so explicitly. Provenance:
+Vault dev server in docker locally + as a CI step (real
+server, test-only root token via env); fixtures carry
+placeholders only. Credential rule, precisely: NO
+production, long-lived, or cloud credential anywhere in
+the repo, ever. Test-only passwords for ephemeral
+localhost/CI services (test DBs/LDAP, test Keycloak
+admin/user, Vault dev root) MAY appear as committed
+test defaults and CI workflow env (industry standard —
+GitHub's own docs do this; they unlock nothing outside
+their throwaway instances, which are created fresh per
+run with exactly those values). The OIDC client secret
+and user password are env-required with no committed
+default (higher sensitivity); Vault's dev root token is
+env-only.
+
+## Stage 3 — auth API design (recorded before implementation;
+user reviews the surface at acceptance — flagged here so it
+is not approved by inattention)
+
+Modules (all pure Toto except the two noted FFI additions;
+no new builtins, no D5/type-system change, no checker
+change):
+- `gzv.std/password`: `pw_hash(password) ->
+  Result<string>` (PBKDF2-HMAC-SHA256, 600k iterations
+  default per OWASP 2023, 16-byte random salt) and
+  `pw_verify(password, stored) -> Result<bool>`. Format
+  `$toto$pbkdf2-sha256$i=<n>$l=<b64url salt>$<b64url hash>`.
+  Backed by ONE new libcrypto binding
+  (`PKCS5_PBKDF2_HMAC` — the mature library already
+  linked; same Wave-2 pattern as `pem_to_pkey`) plus a
+  constant-time compare in native code; the KDF math
+  itself is never Toto code (600k HMAC rounds in Toto
+  would be minutes per hash). Inline crypto discipline
+  (one-shot call); the ~0.3 s cost at default iterations
+  is documented, async-offload is a recorded follow-up.
+- `gzv.std/jwt`: base64url codec in pure Toto (an
+  encoding, not crypto) + `jwt_sign_hs256` /
+  `jwt_verify_hs256` (HMAC via Wave-1 bindings) +
+  `jwt_sign_es256` / `jwt_verify_es256` (ECDSA P-256 via
+  Wave-1 `sign_*`; keys are the 32-byte scalar /
+  64-byte x||y shapes `sign_keygen` already produces).
+  Verification enforces `alg` (rejects `none` and
+  mismatches — the classic confusion), signature, and
+  `exp`/`nbf`/`iat` with a caller-supplied skew.
+  Pinned RFC 7515 A.1 HS256 vector. `jwt_verify_rs256`
+  ships too (RSA PKCS#1 v1.5 via a new libcrypto binding —
+  verify-only, keyed by JWK `(n, e)` bytes; the mature
+  library, FFI-first, same Wave-2 precedent as the PEM
+  helpers — NOT home-grown RSA). HS256 against Keycloak
+  client secrets was abandoned with evidence (the IdP
+  signs with an opaque derived key, not the raw secret —
+  verified empirically twice); RS256+JWKS is the standard
+  path and the one proven.
+- `gzv.std/oidc`: discovery (`GET .well-known`), auth-URL
+  builder (state/nonce/PKCE-S256 via Wave-1 SHA-256),
+  code exchange (POST form), ID-token validation (JWT
+  verify + `iss`/`aud`/expiry/nonce checks), userinfo
+  fetch. Provider: Keycloak with HS256-signed ID tokens
+  (client setting — the realm default RSA stays
+  untouched). No browser is automated in CI: interop
+  proves discovery + password-grant tokens + validation
+  end to end; the §6 demonstration drives the full
+  auth-code leg with form login over HTTP (same client).
+- `gzv.std/saml`: `saml_parse_response` (Issuer/Subject/
+  NameID/Audience/Conditions times/attributes) +
+  `saml_validate_conditions` (time windows, audience).
+  XML-DSig/RSA signature verification is an explicit
+  STATED GAP (needs RSA bindings + XML canonicalization
+  — a follow-up; fixtures carry placeholder signatures
+  and NO keys are committed, per the Stage 4 rule).
+- `gzv.std/ldap` + 3 FFI names (`toto_rt_ldap_bind`,
+  `toto_rt_ldap_search`, `toto_rt_ldap_last_error`) over
+  system libldap (Linux-only like pq/mysql — no system
+  libldap the probe can link; E0301 elsewhere).
+  Each op connects+binds+operates+unbinds on the
+  blocking pool (same policy as DB — never a worker);
+  no handle cache in v1 (documented). Search returns a
+  JSON array string parsed by `gzv.std/json` (no new
+  framing — JSON is the Wave-1 carrier). Interop against
+  OpenLDAP in docker (bind + subtree search + filter).
+
+What ships as what: OIDC is the demonstrated SSO (§6,
+Keycloak, external IdP); LDAP ships live-tested
+(OpenLDAP); SAML ships as surface + structural tests
+with its signature gap stated — never claimed as
+validated auth. No home-grown crypto primitive, mode, or
+validation logic anywhere: every signature/hash goes
+through the linked mature libraries.
+
+## Stage 2 — migrations (design recorded before implementation)
+
+Tooling: a library, `gzv.std/migrate`, over the Stage 1
+`gzv.std/db` surface (no new FFI, no CLI in v1 — the
+corpus + stdlib prove the library; a `toto migrate` CLI
+is a follow-up, not smuggled in here).
+
+Shapes: `Migration` is `{version:int, name:string,
+up:string, down:string}`. Versions order application
+(ascending); duplicates are an `Err`; gaps are allowed
+(versions need not be contiguous — recorded, not
+assumed). An empty `down` string means IRREVERSIBLE by
+convention; attempting to roll it back is a loud `Err`
+naming the version (a migration that cannot be rolled
+back says so explicitly, at the attempt, never silently).
+
+Ledger: `toto_schema_migrations (version INTEGER PRIMARY
+KEY, name TEXT)`, created with `IF NOT EXISTS` on first
+use. The ledger is the only state (no files, no checksums
+in v1 — content drift after apply is out of scope and
+stated as such).
+
+Apply (`migrate_up(dsn, migrations)`): read applied
+versions from the ledger; run each pending `up` in
+version order via `db_exec`; record `(version, name)` on
+success; STOP at the first failure and return its `Err`
+(library message preserved). Schema state on failure:
+all migrations before the failed one applied, the failed
+one not recorded — deliberate, resumable (re-running
+applies the remainder). No implicit transaction wraps
+the batch (Stage 1 per-statement limitation carries over
+explicitly — a single statement is still atomic in its
+engine).
+
+Rollback (`migrate_down(dsn, migrations, target)`):
+applied versions above `target` roll back in DESCENDING
+order via their `down` SQL, each removed from the ledger
+after its `down` succeeds; a missing `down` (empty
+string) or a failing `down` stops with a loud `Err` and
+leaves the ledger exactly where the failure happened
+(partial rollback is visible state, not silent drift).
+Rolling back what was never applied is a no-op `Ok`.
+
+Failure behavior summary: apply and rollback are
+stop-at-first-failure with the library error surfaced;
+the ledger always reflects exactly the applied prefix
+(the applied set is always a prefix of the sorted
+known-version list — no holes, because apply proceeds
+in order and rollback in reverse). DDL-heavy migrations
+inherit the
+driver-defined affected counts (assert success, not
+counts — Stage 1 rule).
 
 ## Stage 1 — database drivers + connection pooling
 
@@ -256,3 +454,355 @@ dbname=.. user=.. password=.. [connect_timeout=..]`,
 `mysql:host=.. port=.. dbname=.. user=.. password=..
 [connect_timeout=..]`. Secrets never live in goldens
 (placeholders in fixtures; Stage 4 owns rotation).
+
+### Stage 4 implementation record
+
+Shipped on this branch: `stdlib/config.gzv` +
+`stdlib/tests/test_config.gzv`, `stdlib/secrets.gzv` +
+`stdlib/tests/test_secrets.gzv`, `crates/toto-compiler/src/
+stdlib.rs` (+2 modules; the `stdlib_table_is_complete` pin
+moves 27 → 29 with this stage: 21 at the Stage-1 tip + 6
+from Stages 2–3 + 2 here),
+`crates/toto-compiler/src/netsys.rs` (`env_get` over libc
+`getenv`, inline/never-blocks),
+`tests/corpus/diagnostics/diag13_ffi_unlinked.stderr`
+(golden gains `toto_rt_env_get/has` — registered in Stage 3
+but the golden lagged one step), `docs/stdlib.md`
+(`config` + `secrets` sections),
+`.github/workflows/ci.yml` (Vault dev-server step +
+`VAULT_ADDR`/`VAULT_TOKEN` for the `check` job),
+`scripts/ci-provision-identity.sh` (Vault section:
+`docker run` dev server on `:8200`, health-gated,
+KV-v2 `secret/` seeded with placeholder keys).
+
+Decisions made while implementing (all within the recorded
+design): (1) the merge needs no schema knowledge — the
+flat dotted-string model makes `config_merge` a per-key
+overlay (later wins), so layered config is trivially
+correct. (2) Env overlay maps are explicit
+`"ENV=config.path"` strings (no prefix magic); unset
+variables are SKIPPED (never blanked in); a mapping
+without `=` is a loud `Err`. (3) Empty-vs-unset env
+distinguishes through `config_env_has` (`getenv` returns
+`""` for both) — an empty password is a misconfig `Err`,
+never a credential. (4) The Vault name grammar is
+`mount/path[#field]` (default field `value`); the write
+path returns the KV-v2 version NUMBER rendered to string
+(Vault versions are JSON numbers — `json_as_int` then
+`to_string`, found live: `json_as_string` on the version
+`Err`d). (5) `secrets_fetch_first` is fail-CLOSED: sources
+are skipped only when provably absent (bool presence
+probe — unset env, missing file, unconfigured vault),
+never on read failure; a present source that fails
+propagates loudly instead of falling through (no silent
+fallback to a weaker source). (6) Cloud names
+(`aws`/`gcp`/`azure`) are explicit unavailable providers
+behind the same two functions — the seam ships, the
+drivers stay a stated gap. (7) `toto fmt --check` is NOT
+run on `stdlib/*.gzv` (committed Wave-1 files fail it
+too — pre-existing drift, not a gate); new modules match
+the surrounding hand style instead.
+
+Bugs found while proving (fixed, with evidence): two
+infinite loops in the first flatten pass (the `while`
+index never advanced — hung `toto run` until killed);
+TOML scalar arrays need `toml_table_get_array`
+(`table_get` `Err`s on `[...]` literals — dispatch on
+the raw literal); root-level arrays flattened to `.0`
+keys (`config_join` skips the dot on an empty prefix);
+`config_get`'s default was unreachable (`json_object_get`
+`Err`s on missing — pre-check with `config_has_key`);
+`?` needs a `Result` return (probes use plain `main`
+plus inner fns); `netsys.rs` needed `use std::ffi::CStr`
+plus `#[link_name = "getenv"]` (first placed under the
+`getaddrinfo` attribute — caught at link, fixed before
+any commit).
+
+Proven this turn (local, Linux x86_64): `test_config`
+green (loaders incl. a real file under `target/`, merge
+precedence with inputs unchanged, env overlay with
+`PATH` + unset-skip + bad-mapping rejection, typed
+getters incl. bad-int/bad-float/non-finite/bad-bool);
+`test_secrets` green WITHOUT a server (closed-door
+assertions) AND against a local Vault 1.15 dev server
+(real KV-v2 fetch + rotate with version advance +
+restore, vault-wins cascade, bad-field/bad-shape loud).
+Vault 1.15 serves `data.data` exactly as parsed; writes
+return the version under `data.version`. No credential
+committed: every value is `placeholder-*` or ambient
+(`PATH`); the dev root token is env-only. CI provides
+the same via the provisioned dev server (`check` job
+only — probes need no secrets).
+
+Design deltas (explicit, no silent drift): (i) the
+recorded design named stores `vault | file`; shipped
+providers are `env | file | vault` plus named-gap
+`aws/gcp/azure` — `env` is required for the overlay
+story and the local-dev fallback, and naming the cloud
+gap beats silence. (ii) The design said "never ambient
+CI env" for config tests; one ambient read remains
+(`PATH` — env cannot be set from inside the language,
+so no hermetic positive overlay proof exists; the
+value is never asserted, only self-consistency).
+(iii) New carried Wave-1 follow-up (same class as the
+TOML empty-table item): an unquoted YAML scalar ending
+in `:` re-parses as a mapping head (pinned by
+`test_yaml.gzv:75` — out of this wave's scope to fix);
+quote such values (shown in code + docs + tests).
+
+§7 checklist: criterion 5 — IN PROGRESS (shipped and
+proven locally incl. live Vault; CI proof pending push).
+
+### Stage 3 implementation record (appended 2026-11-23, Stage-5 turn)
+
+Shipped on this branch: `stdlib/jwt.gzv` + `stdlib/tests/test_jwt.gzv`,
+`stdlib/password.gzv` + `stdlib/tests/test_password.gzv`,
+`stdlib/ldap.gzv`, `stdlib/saml.gzv` + `stdlib/tests/test_saml.gzv`,
+`stdlib/oidc.gzv`, `crates/toto-compiler/src/ldaplib.rs` (native LDAP
+surface over system libldap), `cryptolib.rs` PBKDF2-HMAC-SHA256
+(`PKCS5_PBKDF2_HMAC`) + RSA verify-only bindings, `ffi.rs`
+registrations (`toto_rt_crypto_*`, `toto_rt_ldap_*`), `lib.rs`,
+`crates/toto-jit/src/compile.rs`, runtime `exec.rs`/`sched.rs`
+(blocking-pool paths), `crates/toto-runtime/tests/ldap_auth.rs`,
+`crates/toto-runtime/tests/oidc_keycloak.rs` (password-grant +
+auth-code-form-login SSO demo), `tests/fixtures/ldap/seed.ldif.tmpl`,
+`scripts/ci-provision-identity.sh`, `stdlib/crypto.gzv` (+41 lines),
+`docs/ffi.md`, `build.rs` link updates. [Pre-push amendment
+2026-11-23: `docs/ffi.md`, `ci.yml`, and the provision script also
+carry Stage-4 additions in the committed bytes — see the packaging
+note below; nothing is claimed here that the files do not contain.]
+
+Proven: Keycloak RS256/JWKS — password grant AND full auth-code leg
+with automated form login, against real Keycloak 26 (local docker;
+CI-services leg pending push). HS256-against-client-secret abandoned
+with evidence (the IdP signs with an opaque derived key, not the raw
+secret — verified twice); RS256+JWKS is the standard path. OpenLDAP
+bind + subtree search + filter (docker, seeded by the provision
+script; ephemeral test-only credentials). SAML structural parsing +
+conditions validation (XML-DSig/RSA verification an explicit STATED
+GAP — fixtures carry placeholder signatures, no keys committed).
+PBKDF2-HMAC-SHA256 at 600k iterations default per OWASP 2023
+(~0.3 s per hash — documented; async offload a recorded follow-up);
+no home-grown crypto anywhere. RFC 7515 A.1 HS256 vector pinned.
+
+Design deltas vs the recorded Stage-3 design: (i) RS256+JWKS shipped
+as the proven path where the design recorded an HS256 client-secret
+option — abandoned with evidence, never silently. (ii) The SSO demo
+automates the form POST over plain HTTP (no browser involved — the
+design constraint honored, fuller leg than password-grant-only).
+(iii) `oidc_exchange_code` gained a `code_verifier` parameter
+(required when the auth URL used a PKCE challenge; empty string
+omits it for plain flows) — additive, same function, documented
+here.
+
+Auth API acceptance: the surface is exactly the five modules plus
+the OIDC discovery/auth-url/exchange/verify/userinfo shapes in the
+design section above — flagged here for the user's acceptance
+review, not approved by inattention. No new builtins, no D5/type-
+system change, no checker change.
+
+### Stage 5 implementation record (reference service + load + benchmarks; appended 2026-11-23)
+
+Location: `tests/corpus/project/proj25_refsvc_data/` — `common.gzv`
+(service core shared by both entry points), `main.gzv`
+(deterministic golden), `load.gzv` (load hammer), `fixtures/`
+(loopback TLS PKI valid to 2056, `service.toml` topology config —
+no secrets anywhere). Rust gate:
+`crates/toto-runtime/tests/refsvc_load.rs` (SQLite/PG/MySQL variants
+via DSN env + cancel program).
+
+Service: TLS loopback via the Wave-2 HTTP framework over the Wave-1
+substrate; SQLite file DB in the case dir (hermetic on every
+platform, serverless) and file/server DSNs in the load runs;
+migrations at startup (Stage-2 library); two seeded users with
+PBKDF2 hashes (Stage-3 password, fresh random passwords per run);
+HS256 Bearer JWT (Stage-3 jwt, per-process random key — no committed
+secret, no env); structured logging + Prometheus exposition (Wave-2
+substrate, proj20 patterns). Auth: POST /login mints the token;
+every other route verifies signature + iss, then enforces the
+monotonic-ms TTL (v1 has no wall clock). Structural failures are
+401s; forgeries abort fail-closed (accepted v1 deviation — the
+service never returns Err). Deliberately out of scope: no
+registration, no refresh, no per-query timeout, no browser UI.
+
+Golden (`main.gzv`, corpus): login ok / bad-password + unknown-user
+401s / no-token, bad-scheme, bad-shape 401s / forged-abort /
+expired-401 / authed read 200 / unknown-user 404 / two authed
+writes + read-back / gated metrics 401 + byte-exact scrape match /
+wrong-CA rejection + survival / normalized log drain + count. Fixed
+1ms latency stand-in, `ts` normalized, random secrets never printed.
+
+Pool behavior under load, verified (methodology + numbers):
+Phase A — forced exhaustion, 8 concurrent direct-DB tasks on a slow
+query, pool max 1 / checkout timeout 300 ms. Max sits BELOW the
+blocking-pool thread count (2): running jobs can never exceed the
+thread count, so a max >= threads can never exhaust (checkout always
+finds capacity); max 1 forces the documented timeout path. Gate:
+every attempt is Ok or the documented `pool exhausted...` Err, at
+least one exhausts (the slow query outlasts the timeout by an order
+of magnitude — same margin class as `db_pool`'s SRC_EXHAUST).
+Measured (local, debug interpreter): ok=1, exhausted=7, other=0
+(SQLite + Postgres); ok=2, exhausted=6, other=0 (MySQL — same gate,
+counts vary by holder timing). MySQL needs its own slow query
+(SELECT SLEEP(2)): the recursive CTE aborts fast at 1000 iterations
+(errno 3636). Phase C — sequential service load: one login, then 60
+authed reads back to back on a single connection (sequential by
+explicit design — concurrent TLS requests whose handlers park on
+the blocking pool deadlock the shared pool; see follow-up F1
+below). Each request is timed on the monotonic clock; every
+response must byte-match the exact expected shape; any deviation
+fails loudly with its request index. Measured (same setup, 3 full
+runs): 60 reqs, elapsed ~61-71 s, ~0.84-1.0 rps, p50 ~1010-1080 ms,
+p99 ~1010-1070 ms typical with one ~2 s outlier observed (n=60 per
+run). Per request ~1 s interpreted (routing + header parse + JWT +
+DB framing in Toto). CI bench row measures wall time of the whole
+run; RPS/latency are deployment data, never pinned. PG/MySQL
+variants run the same gate (10-req hammer in the Rust suite for
+time; behavior classes identical). Recovery: db_close_pool then
+fresh query ok. Cancellation: separate program (max-1 pool) —
+waiter on slow query under sibling burst, scope cancelled, E0214
+through the standard sweep, then same-process pool serves a burst
+all-ok (asserted at the Rust level; no hang under contention).
+Timeouts: checkout timeout proven by phase A (message names the
+configured pool); connect timeout is driver-level (exercised by
+every CI run against real PG/MySQL); per-query timeout is NOT
+provided in v1 (recorded limit). Load benchmarks, published:
+RPS ~0.95 (single-connection sequential service load, debug
+interpreter, loopback TLS, x86_64); latency p50 ~1015 ms,
+p99 ~1040 ms. GC pauses (release `gc_perf`): 1k live med 43us
+p99 53us; 10k med 294us p99 313us; 100k med 5.5ms p99 6.5ms — all
+under the 10 ms Wave-0 budget. Bench: `scripts/bench.sh` gains
+`exec-refsvc-load` (correctness gate plus timed median vs 5x
+baseline rule). Baseline `exec-refsvc-load 66496` (wall-ms of one
+60-req sequential run on the reference x86_64 host).
+Wave-2 follow-up F1 (load-bearing, NEW, carried as OPEN): concurrent
+TLS requests whose handlers park on the blocking pool deadlock the
+shared 2-thread pool (order-dependent; minimal repro: two concurrent
+`http_do` GETs against a `http_serve_tls` with a DB or file-blocking
+handler — hangs indefinitely). Plain-HTTP same shape completes;
+sequential TLS completes; concurrent TLS without blocking waits
+completes. Suspected mechanism: client-side and server-side TLS
+handshake/record jobs pile on the same side of the pool (mutual wait
+on network reads for flights only the queued counterpart can
+produce), no timeout, invisible to the E0216 deadlock guard. Not
+proven with pool introspection (none exists). Impact: concurrent
+service load deferred; contention proven directly; service numbers
+are single-connection. No Wave-3 code works around it (that would
+paper over a gate-relevant defect).
+SSO demonstration: `oidc_auth_code_form_login` in
+`crates/toto-runtime/tests/oidc_keycloak.rs` — discovery, auth URL
+(PKCE S256), login form, credential POST with manual cookie jar,
+code extraction, code exchange (with verifier; `oidc_exchange_code`
+gained an additive `code_verifier` param), RS256 JWKS verify,
+userinfo with sub match. Fixed step lines only (no tokens, codes,
+or secrets). Green against real Keycloak 26 locally; CI leg
+pending push. [Pre-push amendment 2026-11-23: the draft line
+"locally and in CI" is struck until the push proves it.]
+Isolation finding: the golden first used `sqlite::memory:` but
+`fmt_equiv` runs all corpus projects in one process (shared
+process-global pools), so its `users` table and ledger versions
+collided with other cases' tables; the fixture now names a
+case-local file DB (`refsvc_data_tmp.txt`, cleaned by the harness
+like proj22's), which is byte-identical in output and hermetic
+everywhere. MySQL DDL finding: the users-table PRIMARY KEY on TEXT
+fails on MySQL/utf8mb4 (errno 1170); the migration uses
+VARCHAR(191) (affine TEXT on SQLite, varchar on Postgres) —
+portable everywhere, recorded here. Minor wart (follow-up, not
+fixed here): `db_exec` of a result-returning statement on MySQL
+returns an empty error string (error slot unset on that path)
+instead of naming the misuse.
+
+### Fresh full-gate totals (this turn: local detached run 2026-11-23, CHECK_EXIT:0)
+
+Harness: `/tmp/checkall.sh` (detached, `TOTO_DB_LIB_DIR` +
+`LD_LIBRARY_PATH=$HOME/.local/lib/toto-deps`; services local —
+PG :5432, MySQL :3306, OpenLDAP :53389 seeded by
+`scripts/ci-provision-identity.sh`, Keycloak :54080 provisioned
+realm `toto`, Vault dev :8200). `cargo fmt --all -- --check`
+clean; `cargo clippy --workspace --all-targets -- -D warnings`
+clean; `cargo test --workspace` green: 73 result lines, 266 passed,
+0 failed (Wave 2 was 66 / 240 / 0; delta +7 lines / +26 tests =
+exactly the new suites: `db_sqlite` 7, `db_postgres` 4, `db_mysql`
+4, `db_pool` 3, `refsvc_load` 4, `oidc_keycloak` 2, `ldap_auth` 2).
+Per-binary passed (all failed 0; same-named binaries across crates
+merged): unittests src/lib.rs 34, cli 17, unittests src/main.rs 16,
+project 15, gc 11, dev 11, reload 10, packages 10, jit 8, interp 8,
+gate 8, spike1 7, lexer 7, ffi 7, db_sqlite 7, stack1b 6, mn_jit 6,
+parser 5, mn 5, refsvc_load 4, http_interop 4, db_postgres 4,
+db_mysql 4, blocking 4, tls_openssl 3, tls_interop 3, opt 3,
+lsp 3, gc_perf 3, db_pool 3, concurrent 3, stack_jit 2, race 2,
+oidc_keycloak 2, ldap_auth 2, fmt 2, differential 2, ctx_stage3 2,
+1 each: corpus, differential_concurrent, differential_task,
+fmt_equiv, mir, mir_conform, net_hammer_mw, panics, sequential,
+stack, timings, yield_jit, zz_ffidiag (sums to 266 — verified).
+Corpus: stdlib `toto test` 24 passed 0 failed (was 17; +7 new
+suites: config, db, jwt, migrate, password, saml, secrets);
+wordfreq `toto test` 1 passed + interp==built identity. Corpus
+census: 186 cases (160 top-level `.gzv` — concurrent 22,
+diagnostics 16, interp 30, lexing 5, parsing 9, results 13,
+typing 65 — plus 26 project `main.gzv`s, proj01–proj25 incl. both
+proj11 variants; was 181 = 160 + 21). No overrides needed on this
+host (no TMPDIR/RUST_MIN_STACK workarounds; macOS-only guards
+untouched — CI proves the other platforms).
+
+### Commit-packaging note (dated 2026-11-23; history hygiene, no content change)
+
+Stages 2–5 are committed as four sequential commits (Stage-2 /
+Stage-3 / Stage-4 / Stage-5) on top of `4026697` (Stage 1),
+because the intermediate worktree was one uncommitted union and
+the report file is shared append-only prose: carving it per commit
+would rewrite committed text. Each commit message lists exactly
+what it carries. Three deliberate packaging calls, recorded here
+so the history reads honestly: (1) `ffi.rs` + `exec.rs` ship whole
+in the Stage-3 commit although they contain the Stage-4 env-inline
+lines — the executor's extern dispatch and the allowlist were
+extended once for both stages' externs, and `netsys.rs` (`env_get`)
+rides in the Stage-3 commit as the dependency that keeps it
+compiling; Stage-4 code that USES those lines (config overlays)
+lands in the Stage-4 commit. The Stage-4 record's parenthetical
+"(registered in Stage 3 but the golden lagged one step)" is
+accurate under this packaging. (2) `ci.yml` + the provision script
+ship whole in the Stage-3 commit although the Vault dev-server
+section and the two `VAULT_*` env lines serve Stage 4 — they ride
+along inertly (no Stage-3 test reads `VAULT_*`); where the
+Stage-4 record says "shipped", read "first used", with the bytes
+arriving one commit earlier as documented here. (3) Progressive
+pins: `stdlib.rs` carries 22 modules in the Stage-2 commit
+(+migrate), 27 in Stage-3 (+jwt/password/ldap/saml/oidc),
+29 in Stage-4 (+config/secrets, = the worktree bytes);
+`stdlib_table_is_complete` moves 21 → 22 → 27 → 29 in the same
+steps; `diag13_ffi_unlinked.stderr` gains the Stage-3 symbols in
+the Stage-3 commit and the env symbols in Stage-4. The union of
+the four commits is byte-identical to the pre-commit worktree
+(plus this report section, which touches no code).
+
+### Follow-ups (dated 2026-11-23; nothing disappears silently)
+
+F1 (NEW, load-bearing, OPEN — from the Stage-5 record above):
+concurrent TLS + blocking-pool parking deadlocks the shared pool;
+concurrent service load stays deferred until it is diagnosed with
+pool introspection. Carried from Stage 0 unchanged: (a) E0216
+race root-cause, (b) intermittent CI stall, (c) SIGBUS per-program
+log-text confirmation, (d) TOML empty-table reporting — plus the
+new Wave-1-class item (e2) unquoted YAML scalar ending in `:`
+re-parses as a mapping head (pinned by `test_yaml.gzv:75`);
+(e) native AOT net/crypto/gzip by design; (f) Windows
+crypto/compression (POSIX-compat decision); (g) all-interfaces
+bind + Group C; (h) 8.6 KiB wording (cosmetic, closed in
+merge-hygiene). Plus the Wave 2 named follow-ups carried in
+Stage 0. `toto dev` single-file-only stays a known open
+limitation. MySQL `db_exec` empty-misuse-error wart carried above.
+
+### Wave verdict (branch state 2026-11-23; CI proof pending push)
+
+Criteria 1–5 and 7 MET on the local full gate (CHECK_EXIT:0, totals
+above); criterion 6 MET locally (reference service end to end,
+pool exhaustion/timeouts/cancellation as documented, SSO demo
+green locally, benchmarks published, local gate green on Linux
+x86_64) with the CI leg pending push. No new builtins, no
+D5/type-system change, no checker change, no D1–D8 change, no
+Waves 4–5 work, no Windows Tier-1 work, no real credentials
+anywhere (fixtures use placeholders; the dev root token is
+env-only). Push + CI green remain; the final chat report carries
+the CI run id. A report-only fill commit will record the CI run
+id in this file after green (Wave-2-merge precedent).
