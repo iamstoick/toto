@@ -37,14 +37,17 @@
 // Wave 1 `x509_verify` (chain only) — a recorded follow-up, not a
 // silent addition.
 //
-// Blocking discipline: every handshake/read/write call blocks (the
-// fd is forced blocking on entry — see `ensure_blocking`, harmless
-// when the interpreter already uses blocking sockets). The
-// interpreter calls these inline; the runtime executor runs them on
-// the dedicated blocking pool (never inline, never on the poller —
+// Blocking discipline: handshakes and teardown drive on a
+// nonblocking fd with an overall deadline (Wave 3 F1: peer waits
+// are bounded, never indefinite); record I/O blocks (the fd is
+// forced blocking on entry — see `ensure_blocking`, harmless when
+// the interpreter already uses blocking sockets). The interpreter
+// calls these inline; the runtime executor runs them on the
+// dedicated blocking pool (never inline, never on the poller —
 // an SSL step is not a `poll()` readiness wait, so §17.5 parks it
 // on the pool like DNS). `WANT_READ`/`WANT_WRITE` cannot fire on a
-// blocking fd; the retry loop through `poll_wait` is defense only.
+// blocking fd; the record-I/O retry loop through `poll_wait` is
+// defense only.
 //
 // Sessions are retained (an `SSL*` lives from handshake to close),
 // which D6 allows with an explicit handle rule — here it is: the
@@ -77,6 +80,16 @@ mod inner {
     // `SSL_ERROR_WANT_READ` / `SSL_ERROR_WANT_WRITE` (stable values).
     const WANT_READ: c_int = 2;
     const WANT_WRITE: c_int = 3;
+    // Bound on handshake peer-flight waits (Wave 3 F1 fix, same
+    // class as the shutdown bound): a handshake stalled past this
+    // fails loudly instead of pinning a pool thread forever. Same
+    // 5 s scale as every other peer wait in the system.
+    const HANDSHAKE_TIMEOUT_MS: u64 = 5000;
+    // Bound on the `close_notify` courtesy wait in `shutdown_close`
+    // (Wave 3 F1 fix): a peer that never answers must not pin a pool
+    // thread forever. Same scale as the blocking-I/O default
+    // checkout timeout (5 s).
+    const SHUTDOWN_COURTESY_MS: u64 = 5000;
     // `X509_V_OK` (stable value).
     const VERIFY_OK: c_long = 0;
 
@@ -144,7 +157,12 @@ mod inner {
     /// sound. Concurrent use of one connection from two tasks is a
     /// user race (OpenSSL `SSL*` objects are not thread-safe for
     /// concurrent use), reported loudly, never silently.
-    struct Session(*mut Ssl);
+    struct Session {
+        ssl: *mut Ssl,
+        /// Role for pool routing (Wave 3 F1 fix): server-role TLS
+        /// waits must never queue behind client-role work.
+        is_client: bool,
+    }
     // SAFETY: as documented above — single-owner use, removal
     // before free, table lock for every insert/remove/lookup.
     unsafe impl Send for Session {}
@@ -328,6 +346,20 @@ mod inner {
             } else {
                 "tls handshake (server)"
             };
+            // Bounded peer wait (Wave 3 F1 fix, same class as the
+            // shutdown bound): the exchange drives on a nonblocking
+            // fd with an overall deadline. A handshake whose peer
+            // flight is produced only by a queued pool job
+            // (loopback self-talk) — or never comes at all — must
+            // fail loudly here instead of pinning a pool thread
+            // forever. Loopback handshakes complete in
+            // milliseconds, so the bound only fires on genuine
+            // stalls; the fd returns to blocking for the session
+            // lifetime below.
+            crate::netsys::set_nonblocking(fd)
+                .map_err(|e| format!("{ctx}: cannot set nonblocking ({e})"))?;
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(HANDSHAKE_TIMEOUT_MS);
             loop {
                 let r = if is_client {
                     SSL_connect(ssl)
@@ -343,8 +375,29 @@ mod inner {
                     // otherwise so goldens hold on both families.
                     return Err(ossl_err(ctx));
                 }
-                want_retry(ssl, fd, r, ctx)?;
+                let err = SSL_get_error(ssl as *const Ssl, r);
+                if err != WANT_READ && err != WANT_WRITE {
+                    return Err(ossl_err(ctx));
+                }
+                let wait_ms = deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis()
+                    .min(HANDSHAKE_TIMEOUT_MS as u128) as c_int;
+                if wait_ms <= 0 {
+                    return Err(format!(
+                        "{ctx}: timed out after {HANDSHAKE_TIMEOUT_MS} ms waiting for peer flight"
+                    ));
+                }
+                let want_read = err == WANT_READ;
+                if crate::netsys::poll_wait(&[(fd, want_read, !want_read)], wait_ms).is_err() {
+                    // Fixed text (never queue-drained library text):
+                    // the poll itself failed, so the queue may hold
+                    // stale entries from earlier calls.
+                    return Err(format!("{ctx}: peer wait failed"));
+                }
             }
+            crate::netsys::set_blocking(fd)
+                .map_err(|e| format!("{ctx}: cannot restore blocking ({e})"))?;
             if is_client && SSL_get_verify_result(ssl) != VERIFY_OK {
                 let code = SSL_get_verify_result(ssl);
                 return Err(format!("{ctx}: certificate rejected (verify code {code})"));
@@ -352,7 +405,7 @@ mod inner {
             SESSIONS
                 .lock()
                 .expect("tls session lock")
-                .insert(fd, Session(ssl));
+                .insert(fd, Session { ssl, is_client });
             Ok(())
         }
     }
@@ -364,7 +417,7 @@ mod inner {
             .lock()
             .expect("tls session lock")
             .get(&fd)
-            .map(|s| s.0)
+            .map(|s| s.ssl)
             .ok_or_else(|| "tls: not a TLS connection".to_string())
     }
 
@@ -429,6 +482,20 @@ mod inner {
     /// A missing session is a loud `Err` (never a double-free, never
     /// silent); the fd is left untouched on that path so the caller
     /// can still `net_close` it.
+    ///
+    /// The `close_notify` exchange is best-effort AND bounded (Wave 3
+    /// F1 fix): `SSL_shutdown` on a blocking fd waits inside the call
+    /// for the peer's `close_notify`. When the peer's own close is a
+    /// job queued behind this one (loopback self-talk on the shared
+    /// blocking pool) — or never comes at all (silent remote) — that
+    /// wait pins the pool thread forever: the queued peer close can
+    /// never run, and every other job behind it starves (the F1
+    /// deadlock; E0216 cannot see it because a busy pool reads as
+    /// future work). So the exchange runs on a nonblocking fd with an
+    /// overall courtesy deadline (`SHUTDOWN_COURTESY_MS`, same scale
+    /// as the blocking-I/O default timeout); a cooperating peer still
+    /// gets the orderly shutdown, and the fd closes either way (the
+    /// peer sees FIN).
     pub fn shutdown_close(fd: c_int) -> Result<(), String> {
         let ssl = session(fd)?;
         // SAFETY: `ssl` is live and removed from the table below
@@ -436,12 +503,49 @@ mod inner {
         unsafe {
             // Best-effort `close_notify` so the peer sees orderly
             // shutdown (its `recv` returns empty, not an error).
-            // `0` means "call again"; `<0` is ignored — the fd is
-            // closing either way.
-            for _ in 0..4 {
-                let r = SSL_shutdown(ssl);
-                if r != 0 {
-                    break;
+            // `1` (orderly) and `<0` (error — the fd is closing
+            // either way) both end the exchange; `0` means the peer
+            // leg is still outstanding and retries while the
+            // deadline holds.
+            if crate::netsys::set_nonblocking(fd).is_ok() {
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(SHUTDOWN_COURTESY_MS);
+                loop {
+                    let r = SSL_shutdown(ssl);
+                    if r != 0 {
+                        break;
+                    }
+                    // `0` is in-band ("peer leg outstanding"), not an
+                    // error return: `SSL_get_error` has no WANT to
+                    // report for it (observed: `SYSCALL`), so do not
+                    // consult it for direction. Poll read-only: the
+                    // only leg that takes time is the peer's reply
+                    // (our 7-byte alert sends unless the peer's
+                    // window is full AND unread, which the deadline
+                    // covers). Polling write too would hot-spin —
+                    // a connected socket is always write-ready.
+                    let wait_ms = deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis()
+                        .min(SHUTDOWN_COURTESY_MS as u128)
+                        as c_int;
+                    if wait_ms <= 0 {
+                        break;
+                    }
+                    if crate::netsys::poll_wait(&[(fd, true, false)], wait_ms).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                // `set_nonblocking` failed (practically unreachable —
+                // the fd came from a live session): keep the previous
+                // blocking behavior rather than inventing a new
+                // failure mode.
+                for _ in 0..4 {
+                    let r = SSL_shutdown(ssl);
+                    if r != 0 {
+                        break;
+                    }
                 }
             }
             SESSIONS.lock().expect("tls session lock").remove(&fd);
@@ -455,12 +559,25 @@ mod inner {
     /// are fine here, since every close funnels through this.
     pub fn free_session(fd: c_int) {
         let ssl = SESSIONS.lock().expect("tls session lock").remove(&fd);
-        if let Some(Session(s)) = ssl {
+        if let Some(Session { ssl: s, .. }) = ssl {
             // SAFETY: removed from the table under the lock, so this
             // thread owns the last reference; freeing is sound.
             unsafe {
                 SSL_free(s);
             }
         }
+    }
+
+    /// Role of a live session for pool routing (Wave 3 F1 fix):
+    /// server-role TLS waits must never queue behind client-role
+    /// work on the shared lane. `None` when no session exists
+    /// (the job then routes to the shared lane and fails loudly
+    /// there, as before).
+    pub fn session_is_client(fd: c_int) -> Option<bool> {
+        SESSIONS
+            .lock()
+            .expect("tls session lock")
+            .get(&fd)
+            .map(|s| s.is_client)
     }
 }

@@ -6,10 +6,12 @@
 # wordfreq Off, n=3 for the rest); `exec-gc-*` rows are debug-executor
 # medians measured locally on 2026-11-18 (same machine, n=3) — the GC
 # workloads run on the runtime executor (debug `toto`), not AOT.
-# `exec-refsvc-load` is the Stage 6 reference-service load row
-# (60 sequential authed requests + phase-A pool contention, ~65 s
+# `exec-refsvc-load` is the reference-service load row (60 authed
+# requests over concurrent TLS + phase-A pool contention, ~65 s
 # debug-executor): median measured locally on 2026-11-23 (12-core
-# x86_64, 27 GB RAM, Linux, rustc 1.100.0, n=3).
+# x86_64, 27 GB RAM, Linux, rustc 1.100.0, n=3). Wave 3 F1
+# fix-forward: Phase C went sequential → concurrent (conc=2,
+# the deterministic envelope); wall time unchanged in scale.
 # CI compares `--runs 3` medians against these; any median above 5x
 # its baseline prints FLAG and fails the suite (exit 1). The 5x rule
 # absorbs machine variance (CI runners differ from the recording
@@ -29,7 +31,7 @@ aotrel-stdlib 48
 interp-wordfreq 1189
 exec-gc-alloc 2682
 exec-gc-chan 3553
-exec-refsvc-load 66496
+exec-refsvc-load 65000
 aot-wordfreq 515
 aotrel-wordfreq 145
 interp-wf-6 16

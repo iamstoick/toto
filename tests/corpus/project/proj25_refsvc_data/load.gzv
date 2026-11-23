@@ -30,7 +30,9 @@
 // the Rust gate passes a unique temp file, PG/MySQL DSNs in
 // CI), TOTO_REFSVC_PORT (default 48524 — off the golden's
 // 48523 so the corpus binary and this never collide),
-// TOTO_REFSVC_REQS (default 60 sequential reads),
+// TOTO_REFSVC_REQS (default 60 concurrent reads),
+// TOTO_REFSVC_CONC (default 2 concurrent workers: the proven
+// deterministic envelope — see run()),
 // TOTO_REFSVC_POOLMAX (default 8), TOTO_REFSVC_TIMEOUT
 // (default 5000). Auth is per-request Bearer verification
 // after one password login per run.
@@ -178,25 +180,32 @@ fn want_user_get(name: string) -> Result<HttpClientResp, string> {
     return Ok(HttpClientResp { status: 200, reason: "OK", headers: hs, body: body });
 }
 
-// Phase C is SEQUENTIAL by explicit design (single-connection
-// service load): concurrent TLS requests whose handlers park
-// on the blocking pool deadlock the shared 2-thread pool
-// (order-dependent; minimal repro in the Stage 6 report as a
-// Wave-2 follow-up — client and server handshake jobs pile on
-// the same side). Sequential requests prove the full
-// TLS + auth + DB path per request with honest single-flight
-// RPS/latency; pool contention is proven concurrently in
-// phase A (no HTTP involved). Any deviation from the exact
-// expected response fails loudly with its request index.
-fn phase_c_request(base: string, ca: string, copts: HttpClientOpts, hs: Array<HttpHeader>, user: string, want: HttpClientResp) -> Result<int, string> {
-    let t0 = clock_monotonic_ms();
-    let r = http_do(HttpClientReq { method: "GET", url: base + "/users/" + user, headers: hs, body: [], ca_pem: ca }, copts);
-    let dt = clock_monotonic_ms() - t0;
-    let want_ok: Result<HttpClientResp, string> = Ok(want);
-    if r != want_ok {
-        return Err("phase-c unexpected response");
+// Phase C is CONCURRENT service load (Wave 3 F1 fix-forward):
+// the F1 deadlock (concurrent TLS requests whose handlers park
+// on the blocking pool wedged the shared 2-thread pool via an
+// unbounded `close_notify` wait) is fixed by bounding the
+// shutdown courtesy wait, so the 60-request shape now runs with
+// concurrency and the numbers are real concurrent-service data.
+// Each worker hammers its share sequentially and reports every
+// per-request latency; any deviation from the exact expected
+// response fails loudly (`-1` sentinel with a diagnostic line).
+fn phase_c_worker(base: string, ca: string, copts: HttpClientOpts, hs: Array<HttpHeader>, user: string, want: HttpClientResp, n: int, out: chan<int>) -> int {
+    let mut i: int = 0;
+    while i < n {
+        let t0 = clock_monotonic_ms();
+        let r = http_do(HttpClientReq { method: "GET", url: base + "/users/" + user, headers: hs, body: [], ca_pem: ca }, copts);
+        let dt = clock_monotonic_ms() - t0;
+        let want_ok: Result<HttpClientResp, string> = Ok(want);
+        if r != want_ok {
+            println("phase-c worker request failed");
+            out <- -1;
+            return 1;
+        } else {
+        }
+        out <- dt;
+        i = i + 1;
     }
-    return Ok(dt);
+    return 0;
 }
 
 fn sort_ints(xs: Array<int>) -> Array<int> {
@@ -228,17 +237,52 @@ fn sort_ints(xs: Array<int>) -> Array<int> {
     return out;
 }
 
-fn phase_c(base: string, ca: string, copts: HttpClientOpts, tok: string, user: string, reqs: int, poolmax: int, timeout: int, dsn: string) -> Result<string, string> {
+// Worker w of `workers` gets an even share plus one of the
+// remainder while it lasts (pure: no `mut`, so `go` blocks
+// may capture the result).
+fn phase_c_share(reqs: int, workers: int, w: int) -> int {
+    let share = reqs / workers;
+    let extra = reqs - share * workers;
+    if w < extra {
+        return share + 1;
+    } else {
+    }
+    return share;
+}
+
+fn phase_c(base: string, ca: string, copts: HttpClientOpts, tok: string, user: string, reqs: int, conc: int, poolmax: int, timeout: int, dsn: string) -> Result<string, string> {
     db_pool_config(dsn, poolmax, timeout)?;
     let hs = [HttpHeader { name: "Authorization", value: "Bearer " + tok }];
     let wa = want_user_get("alice")?;
-    let mut lats: Array<int> = [];
+    let mut workers = conc;
+    if workers < 1 {
+        workers = 1;
+    } else {
+    }
+    if workers > reqs {
+        workers = reqs;
+    } else {
+    }
+    let out = chan<int>(reqs);
     let t0 = clock_monotonic_ms();
-    let mut i: int = 0;
-    while i < reqs {
-        let dt = phase_c_request(base, ca, copts, hs, user, wa)?;
+    let mut w: int = 0;
+    while w < workers {
+        let n = phase_c_share(reqs, workers, w);
+        go {
+            phase_c_worker(base, ca, copts, hs, user, wa, n, out);
+        }
+        w = w + 1;
+    }
+    let mut lats: Array<int> = [];
+    let mut k: int = 0;
+    while k < reqs {
+        let dt = <-out;
+        if dt < 0 {
+            return Err("phase-c worker failed (see diagnostic above)");
+        } else {
+        }
         push(lats, dt);
-        i = i + 1;
+        k = k + 1;
     }
     let elapsed = clock_monotonic_ms() - t0;
     let total = reqs;
@@ -251,7 +295,7 @@ fn phase_c(base: string, ca: string, copts: HttpClientOpts, tok: string, user: s
     }
     let rps_x1000 = (total * 1000000) / ms;
     println("phase-c ok=" + to_string(total) + "/" + to_string(total) + " other=0");
-    println("LOAD mode=sequential reqs=" + to_string(total) + " elapsed_ms=" + to_string(elapsed) + " rps_x1000=" + to_string(rps_x1000) + " p50_ms=" + to_string(p50) + " p99_ms=" + to_string(p99) + " latn=" + to_string(len(sorted)));
+    println("LOAD mode=concurrent conc=" + to_string(workers) + " reqs=" + to_string(total) + " elapsed_ms=" + to_string(elapsed) + " rps_x1000=" + to_string(rps_x1000) + " p50_ms=" + to_string(p50) + " p99_ms=" + to_string(p99) + " latn=" + to_string(len(sorted)));
     // Recovery: retire the pool mid-flight, then prove a fresh
     // pool serves (no leaked checkout wedges it).
     db_close_pool(dsn)?;
@@ -271,6 +315,15 @@ fn run() -> Result<string, string> {
     let dsn = env_or("TOTO_REFSVC_DSN", "sqlite:path=/tmp/toto-refsvc-load.db");
     let ttl = refsvc_ttl(cfg)?;
     let reqs = env_int("TOTO_REFSVC_REQS", 60)?;
+    // Default 2 (Wave 3 F1 fix-forward): concurrency is proven
+    // deterministic exactly while concurrent client handshakes fit
+    // the shared lane (2 threads) — every server handshake then
+    // finds its peer running, so pairs always overlap and complete.
+    // Above that the burst submit order can strand pairs (loud
+    // 5 s handshake timeouts, never a silent hang — see the
+    // report); raising CONC past the lane size is explicit
+    // opt-in to that envelope, not the gated shape.
+    let conc = env_int("TOTO_REFSVC_CONC", 2)?;
     let poolmax = env_int("TOTO_REFSVC_POOLMAX", 8)?;
     let timeout = env_int("TOTO_REFSVC_TIMEOUT", 5000)?;
     // Pool sizing: max 1 / timeout 300 from here on. Phase A
@@ -291,10 +344,22 @@ fn run() -> Result<string, string> {
     let ca = refsvc_ca();
     let base = "https://localhost:" + to_string(port);
     println("serving port=" + to_string(port) + " dsn-class=" + dsn_class(dsn));
-    let tok = refsvc_login_token(base, ca, copts, "alice", pws[0])?;
-    phase_a(dsn)?;
-    phase_c(base, ca, copts, tok, "alice", reqs, poolmax, timeout, dsn)?;
+    // The listener closes on EVERY path (Wave 3 F1 fix-forward):
+    // an early `?` return used to skip the close, stranding the
+    // accept loop parked on the live listener — the run then hung
+    // silently (a live poller registration blinds E0216, and a
+    // main-task error value is a clean completion, not a
+    // fail-fast). Close failures are loud too, never silent.
+    let r = run_phases(base, ca, copts, pws[0], dsn, reqs, conc, poolmax, timeout);
     net_close(listener)?;
+    return r;
+}
+
+// Post-serve work, separated so the listener close above always runs.
+fn run_phases(base: string, ca: string, copts: HttpClientOpts, pw: string, dsn: string, reqs: int, conc: int, poolmax: int, timeout: int) -> Result<string, string> {
+    let tok = refsvc_login_token(base, ca, copts, "alice", pw)?;
+    phase_a(dsn)?;
+    phase_c(base, ca, copts, tok, "alice", reqs, conc, poolmax, timeout, dsn)?;
     return Ok("LOAD-OK");
 }
 

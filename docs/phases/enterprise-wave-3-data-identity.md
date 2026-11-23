@@ -1,8 +1,10 @@
 # Enterprise Wave 3 report — data and identity
 
-Status: STAGE 0 COMPLETE (starting-state verification + carry-forward
-disposition, this turn). Earlier section text is preserved verbatim;
-the report is appended stage by stage.
+Status: WAVE COMPLETE ON THE BRANCH — verdict recorded below,
+F1 fix-forward in progress (this turn); CI re-proof pending push.
+Earlier section text is preserved verbatim; the report is appended
+stage by stage (the STAGE 0 header above is superseded by the
+verdict + F1 sections, kept for the audit trail).
 
 Branch: `enterprise/wave-3-data-identity`, from `main` at `34d2394`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -75,10 +77,11 @@ follow-ups.
 5. Config + secrets — DONE (Stage 4 record; test_config +
    test_secrets green incl. live Vault; no credential committed).
 6. Reference service + load proof + SSO demo + gates — DONE
-   (local CHECK_EXIT:0 + CI run 45116580699 Success 2026-11-23:
-   check + release-gates + bench + macOS/ARM64 Tier-1 probes
-   green; Windows probe fails as expected-informational under
-   continue-on-error — the ONLY failing job).
+   LOCALLY on the concurrent numbers (F1 addendum: 60-req conc=2
+   `LOAD-OK`, local gate re-run pending totals below; CI leg
+   pending the re-proof run id). Sequential-only numbers do NOT
+   close this criterion — the concurrent Phase C does, once the
+   re-proof gate + CI are green.
 7. Report complete — DONE (records + totals + packaging note +
    follow-ups + verdict + CI-proof note below).
 
@@ -814,13 +817,144 @@ secrets, and the stdlib corpus); release-gates green; bench green
 probes green (build + conformance + corpus + concurrent program);
 Windows probe fails as expected-informational under
 `continue-on-error` (POSIX-compat deferred — the ONLY failing
-job, the run stays Success). Four fix-forward commits stand on
+job, the run stays Success). Five fix-forward commits stand on
 top of the five stage commits (Keycloak `start-dev` boot, `UID`
-→ `KC_UID`, openssl-server retry on output, scratch fixtures);
-each diagnosed from its run's log with local reproduction or
-direct API probing, none a guess. The Stage-5 record's SSO
+→ `KC_UID`, openssl-server retry on output, OIDC client secret
+in the create body, scratch fixtures) — the CI-proof note as
+first written said "four" and omitted 9cadb58 (OIDC client
+secret); corrected here, nothing else reworded. Each diagnosed
+from its run's log with local reproduction or direct API
+probing, none a guess. Tip run 45119119477 (head 6676490,
+Status Success 2026-11-23/24: check + release-gates + bench +
+macOS/Linux ARM64 probes green; Windows probe the only
+failure, informational) is recorded here — the report previously
+recorded only 45116580699 (head 3ae9522). The Stage-5 record's SSO
 "[locally] and in CI" bracket is lifted here (proven in this
 run's check job) — the bracketed text stands unreworded above.
 Wave verdict: ACCEPTED pending the user's review of the flagged
 auth API surface (criterion 4) and the open follow-ups (F1
 load-bearing).
+
+### F1 fix-forward dated addendum (appended 2026-11-23/24; branch tip — report fill follows CI green)
+
+F1 (concurrent TLS + blocking-pool deadlock) reproduced, root-caused,
+fixed, and re-proven below. No frozen decision changed (D1–D8, 27
+builtins, module model, ADR-009, spec §17/§18 untouched); no new
+builtin; no framework API redesign; the two accepted v1 deviations
+stay as written.
+
+§1 Step 1 — repro (branch tip 6676490, local Linux x86_64, debug
+interpreter; scratch programs in /tmp, never committed): two
+concurrent `http_do` GETs against `http_serve_tls` with a
+file-blocking handler HANG — serving marker present, zero client
+completions in 240 s (normal completions take ~1 s). Three
+exclusions all complete: sequential TLS + blocking handler;
+concurrent TLS + non-blocking handler; concurrent plain-HTTP +
+blocking handler. Shape confirmed exactly as reported.
+
+§1 Step 2 — mechanism (proved, hypothesis corrected). Temporary
+pool introspection (submit/pickup/completion logging plus a
+one-shot stuck-state dump, all removed before reporting) showed
+the stuck pair directly: server-side `TlsClose` blocked in
+`SSL_shutdown` waiting for the client's `close_notify` while the
+client's own close sat queued behind it (circular wait), with a
+client `TlsRecv` stuck on the queued server response beside it.
+A 4-concurrent variant then proved a second member of the same
+class: client handshakes stuck waiting for server flights whose
+server-handshake jobs queued behind them (burst clients always
+submit first — connect precedes accept — so the first picks can
+all be unblockable). Root cause, revised from the report's
+suspicion: ANY pool job that blocks on a peer action can wedge
+when the job producing that action is queued behind it on the
+fixed 2-thread FIFO pool; the report's "client/server TLS jobs
+pile on the same side" was one instance (the close leg). E0216
+blind spot confirmed by code reading: the detector requires a
+drained pool (`jobs` empty AND `in_flight == 0`) before it may
+claim deadlock, so busy-forever pool threads read as future
+work; a live listener registration (the accept loop) blinds it
+further. A 1-thread-pool experiment additionally showed
+handshake waits wedge the same way (kept as a documented limit:
+the pool size is not user-configurable; no supported config is
+affected). Pool introspection was diagnostic-only and is fully
+removed.
+
+§2 Fix (three parts, smallest change that addresses the diagnosed
+cause; all in `crates/toto-compiler/src/tlslib.rs`,
+`crates/toto-runtime/src/sched.rs`, plus harness hygiene):
+(1) Bounded peer waits: `shutdown_close` and the handshake drive
+(`ssl_handshake`) now run on a nonblocking fd with a 5 s overall
+deadline — a cooperating peer still gets the orderly exchange,
+an absent/queued peer yields a loud failure instead of an
+indefinite wedge (same 5 s scale as the blocking-I/O default
+checkout timeout). `recv`/`send` are deliberately unbounded:
+sends complete via the kernel, and bounding recvs would fail
+legitimately slow reads (never observed stuck; documented risk,
+see follow-ups). (2) Role-split lanes: server-role TLS jobs
+(`TlsAccept` by construction; `Send`/`Recv`/`Close` by live
+session role via a new `session_is_client` lookup) run on a
+dedicated one-thread lane; everything else shares the existing
+2-thread pool. The invariant: no lane ever waits on its own
+lane's queued work for the gated shapes (client handshakes all
+fit the shared lane at the gated concurrency — see below).
+(3) Close-on-every-path in the load harness (`load.gzv`
+`run_phases` split): an early `?` return used to skip
+`net_close(listener)`, stranding the accept loop parked on the
+live listener — a silent hang with E0216 blinded (main's error
+value is a clean completion, not a fail-fast).
+Regression tests: `tls_peer_wait_bounds.rs` (3 tests — silent
+peer vs shutdown, server handshake, client handshake; each
+returns in ~5 s post-fix and hangs forever pre-fix, verified
+both ways).
+
+Re-proof: the 2-client minimal repro completes (15/15 runs,
+`F1-CASE-TLS-BLOCKING-OK`); concurrent Phase C (60 requests,
+conc=2 — the proven deterministic envelope, see below) is
+green: `phase-c ok=60/60`, `LOAD mode=concurrent conc=2
+reqs=60 elapsed_ms=59835 rps_x1000=1002 p50_ms=1989
+p99_ms=2089 latn=60`, wall 65 s (methodology: single-connection
+sequential baseline was p50 ~1015 ms; 2-way concurrency shares
+the interpreted runtime + single server lane — deployment data,
+never pinned; bench baseline updated 66496 → 65000).
+Deterministic envelope (proven by construction + 5/5 load runs
++ 12/12 repro runs): concurrency is deterministic exactly while
+concurrent client handshakes fit the shared lane (2 threads) —
+every server handshake then finds its peer running. Above that
+the burst submit order can still strand pairs: loud 5 s
+handshake timeouts, never a silent hang. Concurrency beyond the
+envelope (and the 1-thread-pool handshake wedge) are carried as
+named follow-ups with paths (async TLS state machine on the
+poller, or elastic pool — both explicitly out of scope here).
+
+§3 report corrections in this addendum: (a) commit count fixed
+to five fix-forwards (names above); (b) tip run 45119119477
+recorded above; (c) header updated to wave state; (d) this
+record; (e) checklist: criterion 4 stays flagged for acceptance
+review (untouched); criterion 6 MET on the concurrent numbers
+below + local gate (CI leg pending the re-proof run id, filled
+next); nothing else changes mark; (f) totals re-derived below
+(the fix adds the `tls_peer_wait_bounds` suite).
+
+Fresh full-gate totals (local detached run 2026-11-23,
+`CHECK_EXIT:0`; harness `/tmp/checkf1c.sh`, same env/services as
+the Wave-3 gate): `cargo fmt` clean; `cargo clippy
+--workspace --all-targets -- -D warnings` clean;
+`cargo test --workspace` green: 74 result lines, 269 passed,
+0 failed — bridge from Wave 3 (73 / 266 / 0, derived 2026-11-23):
+delta +1 line / +3 tests, exactly the new
+`tls_peer_wait_bounds` suite (shutdown + server-handshake +
+client-handshake bound, 3/3). Per-binary changes vs Wave 3 are
+that suite alone; every other binary holds its Wave-3 count.
+Corpus: stdlib `toto test` 24/24; wordfreq 1/1 + interp==built
+identity; census 186 (160 top-level + 26 project mains —
+unchanged: no corpus file added or removed, `load.gzv` edited
+in place, `main.gzv` untouched). One gate attempt failed
+mid-way at the corpus golden (`forged=BAD` vs `forged=aborted`,
+single line, `main.gzv`): not reproduced in 3/3 quiet reruns,
+all CI runs, or any other local run — it fired while four
+instrumented load hammers ran alongside on the same host
+(self-imposed contention, documented here, not hidden); the
+clean re-run above is the record.
+
+§4 Gates + CI re-proof: local gate green as above. CI run id +
+per-platform status: [PENDING — fill after green; report-only
+fill follows.] STOP after the report — no merge.
