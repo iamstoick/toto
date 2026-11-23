@@ -70,15 +70,17 @@ follow-ups.
    db_pool 3).
 3. Migrations — DONE (Stage 2 record; proj24 green in the gate).
 4. Auth — DONE, flagged for acceptance review (Stage 3 record;
-   ldap_auth 2 + oidc_keycloak 2 green locally; CI leg pending push).
+   ldap_auth 2 + oidc_keycloak 2 green locally and in CI run
+   45116580699).
 5. Config + secrets — DONE (Stage 4 record; test_config +
    test_secrets green incl. live Vault; no credential committed).
 6. Reference service + load proof + SSO demo + gates — DONE
-   LOCALLY (Stage 5 record + verdict above; local CHECK_EXIT:0;
-   CI leg pending push — the only open leg).
-7. Report complete — DONE on the branch (records + totals +
-   packaging note + follow-ups + verdict above); CI run-id fill
-   commit follows green.
+   (local CHECK_EXIT:0 + CI run 45116580699 Success 2026-11-23:
+   check + release-gates + bench + macOS/ARM64 Tier-1 probes
+   green; Windows probe fails as expected-informational under
+   continue-on-error — the ONLY failing job).
+7. Report complete — DONE (records + totals + packaging note +
+   follow-ups + verdict + CI-proof note below).
 
 ### Stage 1 implementation record
 
@@ -793,16 +795,32 @@ merge-hygiene). Plus the Wave 2 named follow-ups carried in
 Stage 0. `toto dev` single-file-only stays a known open
 limitation. MySQL `db_exec` empty-misuse-error wart carried above.
 
-### Wave verdict (branch state 2026-11-23; CI proof pending push)
+### Wave verdict (branch state 2026-11-23; CI green on run 45116580699)
 
-Criteria 1–5 and 7 MET on the local full gate (CHECK_EXIT:0, totals
-above); criterion 6 MET locally (reference service end to end,
-pool exhaustion/timeouts/cancellation as documented, SSO demo
-green locally, benchmarks published, local gate green on Linux
-x86_64) with the CI leg pending push. No new builtins, no
+Criteria 1–7 MET: local full gate (CHECK_EXIT:0, totals above)
+plus CI run 45116580699 (Status Success — see CI-proof note
+below) covering criterion 6's CI leg. No new builtins, no
 D5/type-system change, no checker change, no D1–D8 change, no
 Waves 4–5 work, no Windows Tier-1 work, no real credentials
 anywhere (fixtures use placeholders; the dev root token is
-env-only). Push + CI green remain; the final chat report carries
-the CI run id. A report-only fill commit will record the CI run
-id in this file after green (Wave-2-merge precedent).
+env-only).
+
+### CI-proof note (dated 2026-11-23; run 45116580699, Status Success)
+
+check green (fmt + clippy + full gate incl. the OIDC SSO suites
+against the provisioned Keycloak, LDAP interop, Vault-backed
+secrets, and the stdlib corpus); release-gates green; bench green
+(incl. the new `exec-refsvc-load` row); Tier-1 macOS + Linux ARM64
+probes green (build + conformance + corpus + concurrent program);
+Windows probe fails as expected-informational under
+`continue-on-error` (POSIX-compat deferred — the ONLY failing
+job, the run stays Success). Four fix-forward commits stand on
+top of the five stage commits (Keycloak `start-dev` boot, `UID`
+→ `KC_UID`, openssl-server retry on output, scratch fixtures);
+each diagnosed from its run's log with local reproduction or
+direct API probing, none a guess. The Stage-5 record's SSO
+"[locally] and in CI" bracket is lifted here (proven in this
+run's check job) — the bracketed text stands unreworded above.
+Wave verdict: ACCEPTED pending the user's review of the flagged
+auth API surface (criterion 4) and the open follow-ups (F1
+load-bearing).
