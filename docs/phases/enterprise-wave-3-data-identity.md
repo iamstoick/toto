@@ -77,11 +77,13 @@ follow-ups.
 5. Config + secrets — DONE (Stage 4 record; test_config +
    test_secrets green incl. live Vault; no credential committed).
 6. Reference service + load proof + SSO demo + gates — DONE
-   LOCALLY on the concurrent numbers (F1 addendum: 60-req conc=2
-   `LOAD-OK`, local gate re-run pending totals below; CI leg
-   pending the re-proof run id). Sequential-only numbers do NOT
-   close this criterion — the concurrent Phase C does, once the
-   re-proof gate + CI are green.
+   (concurrent Phase C: 60-req conc=2 `LOAD-OK` locally with
+   published numbers + methodology; local gate CHECK_EXIT:0 at
+   74/269/0; CI run 45156987879 Success with check +
+   release-gates + bench + macOS/ARM64 probes green, Windows
+   probe the only failure, informational). Sequential-only
+   numbers did NOT close this criterion — the concurrent
+   re-proof above does.
 7. Report complete — DONE (records + totals + packaging note +
    follow-ups + verdict + CI-proof note below).
 
@@ -831,9 +833,13 @@ failure, informational) is recorded here — the report previously
 recorded only 45116580699 (head 3ae9522). The Stage-5 record's SSO
 "[locally] and in CI" bracket is lifted here (proven in this
 run's check job) — the bracketed text stands unreworded above.
-Wave verdict: ACCEPTED pending the user's review of the flagged
-auth API surface (criterion 4) and the open follow-ups (F1
-load-bearing).
+Wave verdict (updated by the F1 re-proof below, which closes
+the F1 load-bearing flag): ACCEPTED pending the user's review
+of the flagged auth API surface (criterion 4) and the remaining
+follow-ups (burst-ordering limit, recv blind spot, 1-thread
+pool, YAML `:` item, MySQL empty-misuse wart — carried by name
+in the F1 addendum; E0216, CI stall, SIGBUS log-text, TOML,
+native AOT, Windows, Group C as before).
 
 ### F1 fix-forward dated addendum (appended 2026-11-23/24; branch tip — report fill follows CI green)
 
@@ -976,6 +982,14 @@ significant; `A`<->`Q` differ in bit 4) — 20/20 `aborted`
 post-fix. Crypto, framework, and gate are exonerated: no
 product-code change was needed, only the test's tamper method.
 
-§4 Gates + CI re-proof: local gate green as above. CI run id +
-per-platform status: [PENDING — fill after green; report-only
-fill follows.] STOP after the report — no merge.
+§4 Gates + CI re-proof: local gate green as above (74/269/0,
+stdlib 24/24, census 186). CI run 45156987879 (head 3d1d6ed,
+Status Success 2026-11-23/24): check + release-gates + bench
+(incl. the concurrent `exec-refsvc-load` row vs the 65000
+baseline) + macOS/Linux ARM64 Tier-1 probes green; Windows
+probe fails as expected-informational under `continue-on-error`
+(POSIX-compat deferred — the ONLY failing job). Two earlier
+re-proof runs failed dissectively first (ARM `proj23` flake →
+memory-pin fix above; macOS `proj23` flake → same fix; forged
+flakes → forgery fix above), then green. STOP after the report —
+no merge.
