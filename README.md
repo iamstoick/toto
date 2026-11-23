@@ -1,5 +1,19 @@
 # Toto (.gzv) — language implementation in Rust
 
+> Enterprise Wave 3 (data and identity) complete —
+> ACCEPTED-WITH-FLAGS: database drivers (Postgres/MySQL/SQLite)
+> + pooling + migrations + auth (OAuth2/OIDC, JWT, passwords,
+> SAML, LDAP) + config/secrets (Vault) shipped, with a reference
+> service, load proof, and enterprise SSO demo; F1 concurrent-TLS
+> deadlock diagnosed and fixed (5 s TLS bounds + role-split pool
+> lanes). Gate green (74 result lines, 269 tests, 0 failed).
+> Auth API surface and flags accepted 2026-11-23: the five auth
+> stdlib modules + OIDC shapes as written; conc=2 deterministic
+> envelope for concurrent TLS load; SAML without XML-DSig
+> verification; cloud secret stores seam-only (Vault is live).
+> See [Wave 3 report](docs/phases/enterprise-wave-3-data-identity.md).
+> Roadmap: [Implementation Roadmap v2.5](docs/) (D1–D8 + ratified decisions; Enterprise Track gated waves).
+
 > Enterprise Wave 2 (services, HTTP, logging, metrics) complete —
 > ACCEPTED-WITH-FLAGS: TLS + HTTP/1.1 framework + structured logging
 > (ADR-009) + Prometheus metrics shipped, with benchmarks and

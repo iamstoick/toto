@@ -1,10 +1,8 @@
+Wave 3 verdict: ACCEPTED-WITH-FLAGS — merged to main as 3eb0c75. Database drivers + pooling + migrations + auth + config/secrets shipped; F1 concurrent-TLS deadlock diagnosed (any pool job blocking on a peer action wedges when the producing job is queued behind it) and fixed with 5 s TLS bounds + role-split lanes. Verdict, the auth API surface, and the flags approved by the user 2026-11-23. Gate green (74 result lines, 269 tests, 0 failed); CI green on run PENDING-STEP-3 (check + release-gates + bench + macOS/Linux ARM64 probes; Windows probe informational under continue-on-error). Details in the sections below; earlier section text is preserved verbatim.
+
 # Enterprise Wave 3 report — data and identity
 
-Status: WAVE COMPLETE ON THE BRANCH — verdict recorded below,
-F1 fix-forward in progress (this turn); CI re-proof pending push.
-Earlier section text is preserved verbatim; the report is appended
-stage by stage (the STAGE 0 header above is superseded by the
-verdict + F1 sections, kept for the audit trail).
+Status: MERGED TO MAIN as 3eb0c75 — Wave 3 ACCEPTED-WITH-FLAGS (verdict + F1 re-proof + CI green all recorded below). Earlier section text is preserved verbatim; the report is appended stage by stage (the STAGE 0 header above is superseded by the verdict + F1 sections, kept for the audit trail).
 
 Branch: `enterprise/wave-3-data-identity`, from `main` at `34d2394`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -785,10 +783,11 @@ the four commits is byte-identical to the pre-commit worktree
 
 ### Follow-ups (dated 2026-11-23; nothing disappears silently)
 
-F1 (NEW, load-bearing, OPEN — from the Stage-5 record above):
-concurrent TLS + blocking-pool parking deadlocks the shared pool;
-concurrent service load stays deferred until it is diagnosed with
-pool introspection. Carried from Stage 0 unchanged: (a) E0216
+F1 (CLOSED by the fix-forward below — was NEW/load-bearing/OPEN
+in Stage 5; diagnosed with pool introspection, fixed with 5 s TLS
+bounds + role-split lanes, re-proved with concurrent load green
+locally and in CI): concurrent TLS + blocking-pool parking no
+longer deadlocks. Carried from Stage 0 unchanged: (a) E0216
 race root-cause, (b) intermittent CI stall, (c) SIGBUS per-program
 log-text confirmation, (d) TOML empty-table reporting — plus the
 new Wave-1-class item (e2) unquoted YAML scalar ending in `:`
@@ -800,7 +799,7 @@ merge-hygiene). Plus the Wave 2 named follow-ups carried in
 Stage 0. `toto dev` single-file-only stays a known open
 limitation. MySQL `db_exec` empty-misuse-error wart carried above.
 
-### Wave verdict (branch state 2026-11-23; CI green on run 45116580699)
+### Wave verdict (merged to main; CI green on the re-proof run 45156987879 — supersedes the 45116580699 citation below, kept verbatim)
 
 Criteria 1–7 MET: local full gate (CHECK_EXIT:0, totals above)
 plus CI run 45116580699 (Status Success — see CI-proof note
@@ -993,3 +992,82 @@ re-proof runs failed dissectively first (ARM `proj23` flake →
 memory-pin fix above; macOS `proj23` flake → same fix; forged
 flakes → forgery fix above), then green. STOP after the report —
 no merge.
+
+### Merge-hygiene dated notes (2026-11-23, on main; append-only)
+
+(a) The re-proof run is recorded: run 45156987879 (Status
+Success on head 3d1d6ed; check, release-gates, bench, macOS
+probe, Linux ARM64 probe all green; Windows probe fails exit
+101 as informational, the ONLY failing job). Criterion 6 is MET
+on the concurrent numbers (Phase C ok=60/60 at conc=2, p50 1989
+ms / p99 2089 ms) + this run. Tip run 45161189944 (head
+d01bb10, report-only fill): Status Success, verified
+2026-11-23 — recorded here.
+
+(b) Stale-text corrections (append-only; the older text stands
+verbatim above). The report header (top lines) read "Status:
+WAVE COMPLETE ON THE BRANCH ... F1 fix-forward in progress
+(this turn); CI re-proof pending push" — updated to the merged
+state at the top of this file. The Follow-ups section listed F1
+as "(NEW, load-bearing, OPEN ... concurrent service load stays
+deferred until it is diagnosed with pool introspection)" —
+F1 is CLOSED by the fix-forward (diagnosed, fixed with 5 s TLS
+bounds + role-split lanes, re-proved with concurrent load green
+locally and in CI); the entry now says so, and the old OPEN text
+no longer stands as the current state. The verdict heading cited
+run 45116580699 — corrected to the re-proof run 45156987879.
+Recorded here: §3(c)'s "header updated" claim was false as
+written (the header still carried the branch-state wording, and
+the follow-ups entry still read OPEN); the correction lands in
+this hygiene commit, not earlier.
+
+(c) ARM/macOS attribution reconciliation. §4 says "ARM `proj23`
+flake → memory-pin fix", but the corpus-flake postscript and the
+6b5e663 commit message attribute the single ARM corpus-gate
+failure in run 101 (45141642332) to the forgery bug, and the
+sequence supports forgery=ARM (ARM green in run 102,
+45152491170, after the forgery fix) and proj23=macOS (macOS green
+in run 103, 45156987879, after the :memory: fix). Reconciled and
+recorded here: the ARM failure in run 101 is attributed to the
+forged-token flake (`forged=BAD`, log-observed); the macOS
+failure in run 102 is attributed to `proj23` (`sqlite prepare:
+no such table: hammer`, log-observed); §4's "ARM proj23" line
+is corrected as a misattribution. The CI logs fetched via the
+API show exactly these two signatures, and they are the
+authority here.
+
+(d) Addendum date correction: "2026-11-23/24" is wrong — runs
+45156987879 and 45119119477 are both 2026-11-23 in UTC, Manila,
+and PST. The F1 addendum's date reads 2026-11-23.
+
+(e) Branch total: 15 commits (5 stage: 4026697, 3539c58, a7c494d,
+53f0670, 1d9db1b; 5 fix-forwards: 57bbe91, afa8a7d, 59bd348,
+9cadb58, 3ae9522; 1 Wave-3 fill: 6676490; 4 F1 fix-forward
+commits: 0e79693, 6b5e663, 3d1d6ed, d01bb10). §3(a) corrected
+four→five fix-forwards and named 9cadb58, which stands.
+
+(f) User-accepted flags, recorded as written 2026-11-23: the
+auth API surface (criterion 4) — exactly the five stdlib modules
+(gzv.std/password, gzv.std/jwt, gzv.std/oidc, gzv.std/saml,
+gzv.std/ldap) plus the OIDC discovery/auth-url/exchange/verify/
+userinfo shapes in the Stage 3 design section; the conc=2
+deterministic envelope for concurrent TLS service load (beyond
+conc=2, burst submit order can strand pairs with loud 5 s
+handshake timeouts, never a silent hang — the async TLS state
+machine on the poller, or an elastic pool, is the named
+follow-up and is NOT this merge); SAML without XML-DSig/RSA
+signature verification (surface + structural parsing +
+conditions validation only, never claimed as validated auth);
+cloud secret stores (AWS/GCP/Azure) seam-only (Vault is the only
+live secret store). Remaining carried follow-ups by name: recv/
+send unbounded peer waits (documented risk), 1-thread pool
+wedge (documented config limit), E0216 root-cause (Phase 4
+follow-up — the guard still cannot see a busy-forever pool),
+intermittent CI stall, SIGBUS per-program log-text confirmation,
+TOML empty-table reporting, YAML `:` item, MySQL empty-misuse
+wart, native AOT net/crypto/gzip, Windows DEFERRED WITH
+EVIDENCE, Group C items.
+
+(g) Test totals confirmed: 74 result lines / 269 passed /
+0 failed (73+1 / 266+3, exactly the `tls_peer_wait_bounds`
+suite); stdlib 24/24; corpus census 186.
