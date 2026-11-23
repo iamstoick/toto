@@ -1,0 +1,56 @@
+import "gzv.std/db.gzv";
+
+fn worker(dsn: string, base: int, out: chan<Result<int, string>>) -> int {
+    let mut i: int = 0;
+    while i < 25 {
+        let r = db_exec(dsn, "INSERT INTO hammer (v) VALUES (?)", [db_int(base + i)]);
+        let want_one: Result<int, string> = Ok(1);
+        if r != want_one {
+            out <- r;
+            return 0;
+        } else {
+        }
+        i = i + 1;
+    }
+    out <- Ok(25);
+    return 0;
+}
+
+fn run_db() -> Result<string, string> {
+    let dsn = "sqlite::memory:";
+    db_exec(dsn, "CREATE TABLE hammer (v INTEGER)", [])?;
+    db_pool_config(dsn, 2, 5000)?;
+    let done = chan<Result<int, string>>(4);
+    go {
+        worker(dsn, 0, done);
+    }
+    go {
+        worker(dsn, 1000, done);
+    }
+    go {
+        worker(dsn, 2000, done);
+    }
+    go {
+        worker(dsn, 3000, done);
+    }
+    let mut ok: int = 0;
+    let mut k: int = 0;
+    while k < 4 {
+        let got = <-done;
+        ok = ok + got?;
+        k = k + 1;
+    }
+    let rows = db_query(dsn, "SELECT COUNT(*), SUM(v) FROM hammer", [])?;
+    let total: int = rows[0][0].i;
+    let sum: int = rows[0][1].i;
+    db_close_pool(dsn)?;
+    if ok == 100 && total == 100 && sum == 151200 {
+        return Ok("HAMMER-OK inserts=100 sum=151200");
+    }
+    return Err("hammer mismatch");
+}
+
+fn main() -> int {
+    println(run_db());
+    return 0;
+}

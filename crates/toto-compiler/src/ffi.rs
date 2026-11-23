@@ -332,6 +332,9 @@ pub const LINKED: &[&str] = &[
     "toto_rt_crypto_sign_sign",
     "toto_rt_crypto_sign_verify",
     "toto_rt_crypto_random",
+    "toto_rt_crypto_pbkdf2",
+    "toto_rt_crypto_pbkdf2_verify",
+    "toto_rt_crypto_rsa_verify",
     "toto_rt_crypto_x509_verify",
     "toto_rt_crypto_last_error",
     "toto_rt_crypto_version",
@@ -375,10 +378,33 @@ pub const LINKED: &[&str] = &[
     "toto_rt_log_set_sink",
     "toto_rt_log_drain",
     "toto_rt_log_last_error",
+    // Wave 3 Stage 1 database drivers (unix-only — same gate as
+    // sockets/crypto/TLS: the executor owns the per-task slot,
+    // the interpreter a thread-local; the pool lives in `dblib`).
+    // Statements cross as framed text (params in, rows out —
+    // checked code cannot name structs in foreign signatures, so
+    // no checker change and no new types); the runtime executor
+    // converts values directly and never touches the framing.
+    "toto_rt_db_exec",
+    "toto_rt_db_query",
+    "toto_rt_db_pool_config",
+    "toto_rt_db_close_pool",
+    "toto_rt_db_last_error",
+    // Wave 3 Stage 3 LDAP (Linux-only, same gate as the DB
+    // drivers: the executor owns the per-task slot, the
+    // interpreter a thread-local; each op connects, binds,
+    // operates, and unbinds on the blocking pool).
+    "toto_rt_ldap_bind",
+    "toto_rt_ldap_search",
+    "toto_rt_ldap_last_error",
+    // Wave 3 Stage 4 config overlays (unix-only — libc getenv;
+    // checked code on other platforms cannot name these).
+    "toto_rt_env_get",
+    "toto_rt_env_has",
 ];
 
 /// POSIX-only FFI names: threads, file descriptors, `errno`, sleep,
-/// sockets, crypto, TLS. No MSVC equivalents; naming one on Windows
+/// sockets, crypto, TLS, databases, LDAP. No MSVC equivalents; naming one on Windows
 /// is a clean E0301 at check time (the dispatch arms are `cfg(unix)`
 /// to match, so the `unreachable!("linkage checked above")` tail
 /// stays sound).
@@ -415,6 +441,9 @@ const POSIX_ONLY: &[&str] = &[
     "toto_rt_crypto_sign_sign",
     "toto_rt_crypto_sign_verify",
     "toto_rt_crypto_random",
+    "toto_rt_crypto_pbkdf2",
+    "toto_rt_crypto_pbkdf2_verify",
+    "toto_rt_crypto_rsa_verify",
     "toto_rt_crypto_x509_verify",
     "toto_rt_crypto_last_error",
     "toto_rt_crypto_version",
@@ -444,6 +473,22 @@ const POSIX_ONLY: &[&str] = &[
     "toto_rt_log_set_sink",
     "toto_rt_log_drain",
     "toto_rt_log_last_error",
+    "toto_rt_db_exec",
+    "toto_rt_db_query",
+    "toto_rt_db_pool_config",
+    "toto_rt_db_close_pool",
+    "toto_rt_db_last_error",
+    // Wave 3 Stage 3 LDAP (Linux-only, same gate as the DB
+    // drivers: the executor owns the per-task slot, the
+    // interpreter a thread-local; each op connects, binds,
+    // operates, and unbinds on the blocking pool).
+    "toto_rt_ldap_bind",
+    "toto_rt_ldap_search",
+    "toto_rt_ldap_last_error",
+    // Wave 3 Stage 4 config overlays (unix-only — libc getenv;
+    // checked code on other platforms cannot name these).
+    "toto_rt_env_get",
+    "toto_rt_env_has",
 ];
 
 pub fn is_linked(name: &str) -> bool {
@@ -1182,6 +1227,71 @@ fn call_inner(
             }
         }
         #[cfg(unix)]
+        "toto_rt_crypto_pbkdf2" => {
+            let password = match &args[0] {
+                Value::Str(s) => s.to_string(),
+                other => {
+                    return Err(fail(
+                        "E0308",
+                        format!("cannot hash {} (need a password string)", other.type_name()),
+                        span,
+                    ));
+                }
+            };
+            let salt = bytes_arg(&args[1], span)?;
+            let iterations = int_arg(&args[2], &sig.params[2].1, span)?;
+            match crate::cryptolib::pbkdf2_sha256(&password, &salt, iterations) {
+                Ok(out) => {
+                    set_crypto_error(None);
+                    Ok(bytes_value(out))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(bytes_value(Vec::new()))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_crypto_pbkdf2_verify" => {
+            let expected = bytes_arg(&args[0], span)?;
+            let got = bytes_arg(&args[1], span)?;
+            match crate::cryptolib::pbkdf2_verify(&expected, &got) {
+                Ok(true) => {
+                    set_crypto_error(None);
+                    Ok(Value::Int(1))
+                }
+                Ok(false) => {
+                    set_crypto_error(None);
+                    Ok(Value::Int(0))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_crypto_rsa_verify" => {
+            let n = bytes_arg(&args[0], span)?;
+            let e = bytes_arg(&args[1], span)?;
+            let digest = bytes_arg(&args[2], span)?;
+            let sig = bytes_arg(&args[3], span)?;
+            match crate::cryptolib::rsa_verify(&n, &e, &digest, &sig) {
+                Ok(true) => {
+                    set_crypto_error(None);
+                    Ok(Value::Int(1))
+                }
+                Ok(false) => {
+                    set_crypto_error(None);
+                    Ok(Value::Int(0))
+                }
+                Err(e) => {
+                    set_crypto_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
         "toto_rt_crypto_x509_verify" => {
             let leaf = match &args[0] {
                 Value::Str(s) => s.to_string(),
@@ -1516,6 +1626,175 @@ fn call_inner(
         "toto_rt_log_last_error" => Ok(Value::Str(std::rc::Rc::new(
             crate::ctxlog::take_log_error(),
         ))),
+        // Wave 3 Stage 1 database drivers (interpreter path:
+        // blocking client-library calls — the tree-walker has no
+        // scheduler to integrate with, so blocking calls are the
+        // reference semantics; the runtime executor parks these on
+        // the blocking pool instead. Same error discipline as
+        // net/crypto/TLS (scalar ops return the count or -1; array
+        // ops return the framed rows or an empty array; the message
+        // lands in the call-duration slot read by
+        // `toto_rt_db_last_error`). Params cross as one framing
+        // string built by pure Toto (`gzv.std/db`); rows cross back
+        // as framed bytes decoded by the same Toto code — checked
+        // code cannot name structs in foreign signatures, so no
+        // checker change and no new types).
+        #[cfg(unix)]
+        "toto_rt_db_exec" => {
+            let dsn = db_str_arg(&args[0], "a DSN string", span)?;
+            let sql = db_str_arg(&args[1], "a SQL string", span)?;
+            let framing = db_str_arg(&args[2], "a params framing string", span)?;
+            let params = db_params_arg(&framing, span)?;
+            match crate::dblib::db_exec(&dsn, &sql, &params) {
+                Ok(n) => {
+                    set_db_error(None);
+                    Ok(Value::Int(n))
+                }
+                Err(e) => {
+                    set_db_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_db_query" => {
+            let dsn = db_str_arg(&args[0], "a DSN string", span)?;
+            let sql = db_str_arg(&args[1], "a SQL string", span)?;
+            let framing = db_str_arg(&args[2], "a params framing string", span)?;
+            let params = db_params_arg(&framing, span)?;
+            match crate::dblib::db_query(&dsn, &sql, &params) {
+                Ok(rows) => {
+                    set_db_error(None);
+                    Ok(Value::Str(std::rc::Rc::new(
+                        String::from_utf8(crate::dblib::encode_rows(&rows)).unwrap_or_default(),
+                    )))
+                }
+                Err(e) => {
+                    set_db_error(Some(e));
+                    Ok(Value::Str(std::rc::Rc::new(String::new())))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_db_pool_config" => {
+            let dsn = db_str_arg(&args[0], "a DSN string", span)?;
+            let max = int_arg(&args[1], &sig.params[1].1, span)?;
+            let timeout = int_arg(&args[2], &sig.params[2].1, span)?;
+            if max < 0 || timeout < 0 {
+                return Err(fail(
+                    "E0308",
+                    "db pool config needs non-negative max and timeout".to_string(),
+                    span,
+                ));
+            }
+            match crate::dblib::db_pool_config(&dsn, max as u32, timeout as u64) {
+                Ok(()) => {
+                    set_db_error(None);
+                    Ok(Value::Int(0))
+                }
+                Err(e) => {
+                    set_db_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_db_close_pool" => {
+            let dsn = db_str_arg(&args[0], "a DSN string", span)?;
+            crate::dblib::db_close_pool(&dsn);
+            set_db_error(None);
+            Ok(Value::Int(0))
+        }
+        #[cfg(unix)]
+        "toto_rt_db_last_error" => Ok(Value::Str(std::rc::Rc::new(take_db_error()))),
+        // Wave 3 Stage 3 LDAP (interpreter path: blocking
+        // libldap calls — the tree-walker has no scheduler to
+        // integrate with, so blocking calls are the reference
+        // semantics; the runtime executor parks these on the
+        // blocking pool instead. Same error discipline as db:
+        // 0/-1 results with the message in the call-duration
+        // slot read by `toto_rt_ldap_last_error`).
+        #[cfg(target_os = "linux")]
+        "toto_rt_ldap_bind" => {
+            let host = db_str_arg(&args[0], "an LDAP host", span)?;
+            let port = int_arg(&args[1], &sig.params[1].1, span)?;
+            let bind_dn = db_str_arg(&args[2], "a bind DN", span)?;
+            let password = db_str_arg(&args[3], "a password", span)?;
+            if !(1..=65535).contains(&port) {
+                return Err(fail(
+                    "E0308",
+                    format!("ldap: bad port {port} (want 1-65535)"),
+                    span,
+                ));
+            }
+            match crate::ldaplib::bind(&host, port as u16, &bind_dn, &password) {
+                Ok(()) => {
+                    set_ldap_error(None);
+                    Ok(Value::Int(0))
+                }
+                Err(e) => {
+                    set_ldap_error(Some(e));
+                    Ok(Value::Int(-1))
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        "toto_rt_ldap_search" => {
+            let host = db_str_arg(&args[0], "an LDAP host", span)?;
+            let port = int_arg(&args[1], &sig.params[1].1, span)?;
+            let bind_dn = db_str_arg(&args[2], "a bind DN", span)?;
+            let password = db_str_arg(&args[3], "a password", span)?;
+            let base = db_str_arg(&args[4], "a base DN", span)?;
+            let filter = db_str_arg(&args[5], "a filter", span)?;
+            let attrs = db_str_arg(&args[6], "an attr list", span)?;
+            if !(1..=65535).contains(&port) {
+                return Err(fail(
+                    "E0308",
+                    format!("ldap: bad port {port} (want 1-65535)"),
+                    span,
+                ));
+            }
+            match crate::ldaplib::search(
+                &host,
+                port as u16,
+                &bind_dn,
+                &password,
+                &base,
+                &filter,
+                &attrs,
+            ) {
+                Ok(json) => {
+                    set_ldap_error(None);
+                    Ok(Value::Str(std::rc::Rc::new(json)))
+                }
+                Err(e) => {
+                    set_ldap_error(Some(e));
+                    Ok(Value::Str(std::rc::Rc::new(String::new())))
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        "toto_rt_ldap_last_error" => Ok(Value::Str(std::rc::Rc::new(take_ldap_error()))),
+        // Wave 3 Stage 4 config overlays (interpreter path:
+        // libc `getenv` inline — a pure lookup, no blocking,
+        // no scheduler involved).
+        #[cfg(unix)]
+        "toto_rt_env_get" => {
+            let name = db_str_arg(&args[0], "an env var name", span)?;
+            match crate::netsys::env_get(&name) {
+                Ok(Some(v)) => Ok(Value::Str(std::rc::Rc::new(v))),
+                Ok(None) => Ok(Value::Str(std::rc::Rc::new(String::new()))),
+                Err(e) => Err(fail("E0308", e, span)),
+            }
+        }
+        #[cfg(unix)]
+        "toto_rt_env_has" => {
+            let name = db_str_arg(&args[0], "an env var name", span)?;
+            match crate::netsys::env_get(&name) {
+                Ok(v) => Ok(Value::Int(if v.is_some() { 1 } else { 0 })),
+                Err(e) => Err(fail("E0308", e, span)),
+            }
+        }
         "toto_rt_read_i32" => {
             let p = ptr_arg(&args[0], span)? as *const c_void;
             Ok(Value::Int(toto_rt_read_i32(p) as i64))
@@ -1701,6 +1980,44 @@ fn take_tls_error() -> String {
     TLS_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
 }
 
+// Interpreter-side DB error slot (Wave 3, Stage 1): same
+// discipline as the net/crypto/TLS slots, kept separate so
+// interleaved db/net calls in one task never clobber each
+// other's `last_error`.
+#[cfg(unix)]
+thread_local! {
+    static DB_LAST_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(unix)]
+fn set_db_error(msg: Option<String>) {
+    DB_LAST_ERROR.with(|s| *s.borrow_mut() = msg);
+}
+
+#[cfg(unix)]
+fn take_db_error() -> String {
+    DB_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
+// Interpreter-side LDAP error slot (Wave 3, Stage 3): same
+// discipline as the db slot (Linux-only, like the modules).
+#[cfg(target_os = "linux")]
+thread_local! {
+    static LDAP_LAST_ERROR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_os = "linux")]
+fn set_ldap_error(msg: Option<String>) {
+    LDAP_LAST_ERROR.with(|s| *s.borrow_mut() = msg);
+}
+
+#[cfg(target_os = "linux")]
+fn take_ldap_error() -> String {
+    LDAP_LAST_ERROR.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
 // Interpreter-side gzip error slot (Wave 1): same discipline as
 // the net/crypto slots. (The backend is pure Rust and could run
 // anywhere; it rides the unix gate for uniformity with the other
@@ -1856,6 +2173,45 @@ fn bytes_value(bytes: Vec<u8>) -> Value {
     Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
         bytes.into_iter().map(|b| Value::Int(b as i64)).collect(),
     )))
+}
+
+/// A Toto string where a `*c_char` db parameter is declared. The
+/// strings never cross into C here (dblib parses DSN/SQL/framing
+/// from Rust `&str` and reports NUL bytes itself), so no NUL-copy
+/// is needed — but the E0308 type error matches the other
+/// boundaries.
+#[cfg(unix)]
+fn db_str_arg(
+    v: &Value,
+    what: &str,
+    span: Span,
+) -> Result<String, (Diag, Vec<crate::interp::TraceFrame>)> {
+    match v {
+        Value::Str(s) => Ok(s.to_string()),
+        other => Err(fail(
+            "E0308",
+            format!("cannot pass {} where {what} is expected", other.type_name()),
+            span,
+        )),
+    }
+}
+
+/// Parse a Toto-built params framing string into `DbCell`s. A
+/// malformed framing is an E0308 (wrong shape from the caller —
+/// pure Toto builds it, so this fires only on hand-built
+/// strings).
+#[cfg(unix)]
+fn db_params_arg(
+    framing: &str,
+    span: Span,
+) -> Result<Vec<crate::dblib::DbCell>, (Diag, Vec<crate::interp::TraceFrame>)> {
+    crate::dblib::decode_params(framing).map_err(|e| {
+        fail(
+            "E0308",
+            format!("bad db params framing ({e}; build it with db_encode_params)"),
+            span,
+        )
+    })
 }
 
 /// A Toto function value to a C function pointer: claim a trampoline

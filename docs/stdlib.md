@@ -501,11 +501,175 @@ escaping and cumulative math, every fixed error, alias isolation,
 handler over a synthetic request) and the corpus `proj19_metrics`
 golden (error paths + a live serve/scrape byte-match).
 
+## `jwt`
+
+JSON Web Tokens (HS256 + ES256 sign/verify, RS256 verify).
+`jwt_b64_encode/decode` are the unpadded base64url codec in
+pure Toto (an encoding, not crypto — padding is rejected).
+Signing covers the ASCII `header_b64.payload_b64` bytes;
+verification pins `alg` exactly (`none` and mismatches are
+loud `Err`), checks the signature, then enforces
+`exp`/`nbf`/`iat` against caller time + skew and optional
+`iss`/`aud`. Non-ASCII payloads are a loud `Err` (no `ord`
+builtin); non-finite floats cannot appear. Pinned by
+`test_jwt.gzv` (codec vectors incl. rejections, RFC 7515
+A.1 HS256 byte-for-byte, ES256 round-trip, tamper/wrong-key/
+expired/`none` rejections).
+
+## `password`
+
+PBKDF2-HMAC-SHA256 passwords: `pw_hash` (600k-iteration
+OWASP default) / `pw_hash_with_iterations` (tests pin
+small counts with exact vectors) produce
+`$toto$pbkdf2-sha256$i=N$l=<hex salt>$<hex hash>`;
+`pw_verify` re-derives and compares in constant-time
+native code. Hex (not base64) keeps the codec
+dependency-free; multibyte passwords hash as UTF-8 bytes.
+Malformed stored forms are `Err`, wrong passwords are
+`Ok(false)` — never a silent false. Pinned by
+`test_password.gzv`.
+
+## `ldap`
+
+LDAP bind + subtree search over system libldap
+(Linux-only). `ldap_bind` checks credentials (0 ok);
+`ldap_search` returns a JSON array string parsed with
+`gzv.std/json` (no new framing). Reads the call-duration
+error slot like `db` (`Err` carries the library message
+with the LDAP code). No connection reuse in v1 (each op
+connects/binds/operates/unbinds on the blocking pool).
+Test-only credentials never committed (env-driven
+interop; fixtures carry placeholders). Pinned by the
+Rust `ldap_auth` suite (real OpenLDAP: bind, wrong-password
+code 49, search with allowlist, bad-base code 32).
+
+## `saml`
+
+SAML response parsing + structural validation (unsigned
+responses only). `saml_parse_response` decodes the
+base64 transport encoding (whitespace folded, padding
+enforced) and parses Issuer/Subject/NameID/Conditions
+Audience/attributes with namespace-aware tag matching;
+`saml_validate` enforces time windows + audience and
+REFUSES signed responses with a loud `Err` naming the
+gap (XML-DSig/RSA validation is a recorded follow-up —
+fixtures carry placeholder signatures at most, NO keys
+are committed). Skew is not applied in v1. Pinned by
+`test_saml.gzv` (full unsigned fixture, window/audience
+enforcement, signed refusal, malformed inputs).
+
+## `oidc`
+
+OAuth2 / OpenID Connect client: discovery, auth-URL
+builder (state/nonce/PKCE-S256), code exchange, password
+grants, JWKS fetch, RS256 ID-token validation with
+`kid` selection + iss/aud/expiry enforcement, userinfo.
+HS256/ES256 tokens verify through `gzv.std/jwt` with
+caller-held keys (their keys are never published).
+Pinned by the Rust `oidc_keycloak` suite against a real
+Keycloak (discovery, grant, JWKS verify, userinfo) with
+env-injected test credentials (never committed).
+
+## `config`
+
+Configuration: files (TOML/YAML via the Wave-1 formats),
+environment, and inline defaults — precedence
+env > file > defaults (stated, tested). One value model: a
+`JsonVal` object mapping dotted paths to STRINGS (TOML/YAML
+trees flatten on load; arrays index as `a.0` segments; null
+is the literal `"null"`). Env arrives through two tiny libc
+FFI fns (`toto_rt_env_get`/`toto_rt_env_has` — FFI plumbing,
+not new builtins) applied through an explicit
+`"ENV_NAME=config.path"` mapping list (predictable, no
+magic prefix rules); unset variables are skipped, never
+blanked in. Typed getters (`config_get_int/float/bool`)
+parse with loud `Err`s (a bad port aborts instead of
+binding somewhere weird); `config_require` names the
+missing path; `config_merge` overlays per dotted key.
+Known inherited limit: an unquoted YAML scalar ending in
+`:` (e.g. `sqlite::memory:`) re-parses as a mapping head in
+the Wave-1 yaml layer (pinned by its suite) — quote such
+values (TOML is unaffected). Pinned by `test_config.gzv`
+(loaders, merge precedence, env overlay incl. unset-skip
+and bad-mapping rejection, typed getters incl. errors,
+file load). The only ambient environment read is `PATH`
+(env cannot be set from inside the language, so one
+universal variable proves the positive overlay path; its
+value is never asserted, only self-consistency).
+
+## `secrets`
+
+Secrets fetch + rotation behind one store-agnostic seam:
+`secrets_fetch(provider, name)` / `secrets_rotate(provider,
+name, value)` / `secrets_fetch_first(refs)` (fail-closed
+fallback: a source is skipped only when provably absent —
+unset env, missing file, unconfigured vault — never on a
+read failure). Providers: `env` (unset-or-empty is a loud
+`Err`, rotation refused — process env is not a store),
+`file` (Docker-secret style; rotation rewrites the file),
+`vault` (real HashiCorp Vault KV-v2 over the Wave-2 HTTP
+client, loopback-only by construction; address + token
+from `VAULT_ADDR`/`VAULT_TOKEN`, never arguments; name is
+`mount/path[#field]`, rotation is a KV-v2 PUT returning the
+new version number). `aws`/`gcp`/`azure` parse as names
+but report unavailable — the seam is the deliverable, not
+the cloud drivers (stated gap). No credential is committed
+anywhere: fixtures carry placeholders only; the Vault dev
+root token is env-only (CI provides it for its throwaway
+dev server). Pinned by `test_secrets.gzv` (env/file
+providers, file rotation, fail-closed cascade, cloud gaps;
+the Vault roundtrip runs live only when a dev server is
+configured, otherwise the closed door is asserted).
+
+## `db`
+
+Database drivers over pooled mature clients (Enterprise Wave 3,
+Stage 1). `DbVal` is `{kind:int, i:int, f:float, s:string}`
+(`kind`: 0 null, 1 int, 2 float, 3 text, 4 bool); constructors
+`db_null/int/float/text/bool` build it. DSN selects the driver:
+`sqlite:path=/x/y.db` (file), `sqlite::memory:` (process DB),
+`postgres:host=.. port=.. dbname=.. user=.. password=..
+[connect_timeout=..]`, `mysql:host=.. port=.. dbname=..
+user=.. password=.. [connect_timeout=..]`. `db_exec` runs a
+statement (affected rows; DDL counts are driver-defined);
+`db_query` returns `Array<Array<DbVal>>`; `db_pool_config`
+sets max connections + checkout timeout; `db_close_pool`
+retires a pool; every fallible fn returns `Result<_, string>`
+with the library message. `?` placeholders bind server-side
+(Postgres `?`→`$n`, SQLite native) or through the library
+escaper (MySQL) — never interpolated. Value decoding is
+native per driver (int/float/bool/text); Postgres numerics
+arrive as text (precision kept); MySQL decodes by shape
+(integer/float-shaped → int/float, else text — `CAST AS
+CHAR` when the distinction matters; no blob in v1).
+Non-finite floats on the interpreter path are a loud `Err`
+(Toto cannot construct NaN/±Infinity; the runtime engine
+handles them natively). Pool: one process-global pool per
+(driver, DSN), default max 8 / checkout timeout 5000 ms;
+exhaustion is `Err("pool exhausted ...")`, never a stall;
+`:memory:` pins its pool to one connection.
+
+| Function | Behavior |
+|---|---|
+| `db_null/int/float/text/bool(..)` | `DbVal` constructors |
+| `db_encode_params(args)` / `db_decode_rows(s)` | Framing codec (length-prefixed `P`/`R` grammar; multibyte-safe) |
+| `db_exec(dsn, sql, args)` | Statement; affected rows or `Err` |
+| `db_query(dsn, sql, args)` | Rows (`[]` when rowless) or `Err` |
+| `db_pool_config(dsn, max, timeout_ms)` | Pool bounds or `Err` |
+| `db_close_pool(dsn)` | Retire a pool (idempotent) |
+
+Pinned by `test_db.gzv` (constructors, framing round-trip incl.
+separators/multibyte text, CRUD, pool-config errors, unknown
+driver — sequential, so it covers the interpreter arms), the
+corpus `database/` goldens (`:memory:`, file, concurrent
+pool hammer), and the Rust suites (`db_sqlite`,
+`db_postgres`, `db_mysql`, `db_pool` pool semantics).
+
 ## Execution paths
 
 | Path | Status | Evidence |
 |---|---|---|
-| Interpreter (`toto run` / `toto test`) | Full suite green | `toto: 17 passed, 0 failed` in `stdlib/`; corpus `proj09`/`proj10` goldens |
+| Interpreter (`toto run` / `toto test`) | Full suite green | `toto: 24 passed, 0 failed` in `stdlib/` (incl. `db`, `migrate`, `jwt`, `password`, `saml`, `config`, `secrets`); corpus `proj09`/`proj10` goldens |
 | Runtime executor (concurrent) | Green | `test_concurrent.gzv` (pipeline over channels) |
 | Built executable (`toto build`) | Output-equivalent | `stdlib` smoke: binary stdout byte-identical to interpreter |
 | JIT via `toto dev` | Unsupported | `dev` is single-file scope (`parse_and_check` only); multi-file dev loop is the known carry-forward |

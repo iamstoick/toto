@@ -1,0 +1,137 @@
+// `gzv.std/migrate` — versioned schema migrations over
+// `gzv.std/db` (Enterprise Wave 3, Stage 2).
+//
+// A library, not a CLI: migrations are Toto values applied
+// and rolled back deliberately, proven in corpus + stdlib.
+// `Migration` is `{version:int, name:string, up:string,
+// down:string}`. An empty `down` means IRREVERSIBLE —
+// attempting to roll it back is a loud `Err` naming the
+// version (never silent). Versions order application
+// (ascending); duplicates are an `Err`; gaps are allowed.
+//
+// State lives in `toto_schema_migrations (version INTEGER
+// PRIMARY KEY, name TEXT)`, created with `IF NOT EXISTS`.
+// Apply stops at the first failure (earlier migrations stay
+// applied — resumable); rollback proceeds in descending
+// order and stops at the first missing/failing `down` with
+// the ledger exactly where it happened. No implicit
+// transaction wraps a batch (per-statement atomicity only —
+// Stage 1 limitation, carried explicitly).
+import "gzv.std/db.gzv";
+
+pub struct Migration {
+    version: int,
+    name: string,
+    up: string,
+    down: string,
+}
+
+pub fn migration(version: int, name: string, up: string, down: string) -> Migration {
+    return Migration { version: version, name: name, up: up, down: down };
+}
+
+// Sort a copy by version ascending (insertion order is input
+// order; callers may pass any order).
+fn sort_migrations(ms: Array<Migration>) -> Array<Migration> {
+    let mut out: Array<Migration> = [];
+    for m in ms {
+        push(out, m);
+    }
+    let mut i: int = 1;
+    while i < len(out) {
+        let key: Migration = out[i];
+        let mut j: int = i - 1;
+        while j >= 0 {
+            if out[j].version > key.version {
+                out[j + 1] = out[j];
+            } else {
+                break;
+            }
+            j = j - 1;
+        }
+        out[j + 1] = key;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn check_versions(ms: Array<Migration>) -> Result<int, string> {
+    let mut i: int = 1;
+    while i < len(ms) {
+        if ms[i].version == ms[i - 1].version {
+            return Err("migrate: duplicate version " + to_string(ms[i].version));
+        } else {
+        }
+        i = i + 1;
+    }
+    return Ok(len(ms));
+}
+
+// Applied versions, ascending (ledger order).
+fn applied_versions(dsn: string) -> Result<Array<int>, string> {
+    db_exec(dsn, "CREATE TABLE IF NOT EXISTS toto_schema_migrations (version INTEGER PRIMARY KEY, name TEXT)", [])?;
+    let rows = db_query(dsn, "SELECT version FROM toto_schema_migrations ORDER BY version", [])?;
+    let mut out: Array<int> = [];
+    for row in rows {
+        push(out, row[0].i);
+    }
+    return Ok(out);
+}
+
+fn is_applied(applied: Array<int>, v: int) -> bool {
+    for a in applied {
+        if a == v {
+            return true;
+        } else {
+        }
+    }
+    return false;
+}
+
+// Apply all pending migrations in version order. Stops at the
+// first failure with its Err (earlier ones stay applied).
+pub fn migrate_up(dsn: string, migrations: Array<Migration>) -> Result<int, string> {
+    let ms: Array<Migration> = sort_migrations(migrations);
+    check_versions(ms)?;
+    let applied = applied_versions(dsn)?;
+    let mut n: int = 0;
+    for m in ms {
+        if is_applied(applied, m.version) {
+        } else {
+            db_exec(dsn, m.up, [])?;
+            db_exec(dsn, "INSERT INTO toto_schema_migrations (version, name) VALUES (?, ?)", [db_int(m.version), db_text(m.name)])?;
+            n = n + 1;
+        }
+    }
+    return Ok(n);
+}
+
+// Roll back applied migrations strictly above `target`, newest
+// first. A missing `down` or a failing `down` stops with a loud
+// Err; the ledger keeps exactly the applied prefix.
+pub fn migrate_down(dsn: string, migrations: Array<Migration>, target: int) -> Result<int, string> {
+    let ms: Array<Migration> = sort_migrations(migrations);
+    check_versions(ms)?;
+    let applied = applied_versions(dsn)?;
+    let mut n: int = 0;
+    let mut i: int = len(ms) - 1;
+    while i >= 0 {
+        let m: Migration = ms[i];
+        if m.version > target && is_applied(applied, m.version) {
+            if m.down == "" {
+                return Err("migrate: version " + to_string(m.version) + " (" + m.name + ") is not reversible (no down SQL)");
+            }
+            db_exec(dsn, m.down, [])?;
+            db_exec(dsn, "DELETE FROM toto_schema_migrations WHERE version = ?", [db_int(m.version)])?;
+            n = n + 1;
+        } else {
+        }
+        i = i - 1;
+    }
+    return Ok(n);
+}
+
+// Ledger contents for verification (ascending versions).
+pub fn migrate_applied(dsn: string) -> Result<Array<int>, string> {
+    return applied_versions(dsn);
+}

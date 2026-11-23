@@ -1,0 +1,121 @@
+// stdlib jwt tests: run with `toto test` from stdlib/.
+//
+// Sequential (no `go`): covers the interpreter arms and the
+// pure-Toto codec. The HS256 case pins RFC 7515 Appendix A.1
+// byte-for-byte (independent reference vector); ES256 covers
+// sign/verify round-trips plus the four loud rejections
+// (tampered, wrong key, expired, `none`).
+import "gzv.std/jwt.gzv";
+import "gzv.std/crypto.gzv";
+
+fn check(cond: bool, msg: string) -> Result<bool, string> {
+    if cond {
+        return Ok(true);
+    } else {
+        return Err(msg);
+    }
+}
+
+fn t_b64_codec() -> Result<bool, string> {
+    check(jwt_b64_encode([102, 111, 111]) == "Zm9v", "foo")?;
+    check(jwt_b64_encode([102, 111]) == "Zm8", "fo")?;
+    check(jwt_b64_encode([102]) == "Zg", "f")?;
+    check(jwt_b64_encode([]) == "", "empty")?;
+    let back = jwt_b64_decode("Zm9vYmFy")?;
+    check(len(back) == 6 && back[0] == 102 && back[5] == 114, "foobar")?;
+    // Padding is rejected (un-padded JWT style only).
+    let padded = jwt_b64_decode("Zm9v=");
+    let want_pad: Result<Array<int>, string> = Err("bad base64url (padding rejected)");
+    check(padded == want_pad, "padding loud")?;
+    let badlen = jwt_b64_decode("A");
+    let want_len: Result<Array<int>, string> = Err("bad base64url (bad length)");
+    check(badlen == want_len, "bad length loud")?;
+    return Ok(true);
+}
+
+fn t_rfc7515_a1() -> Result<bool, string> {
+    // RFC 7515 Appendix A.1, byte-for-byte.
+    let h = "eyJ0eXAiOiJKV1QiLA0KICJhbGciOiJIUzI1NiJ9";
+    let p = "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ";
+    let key = jwt_b64_decode("AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow")?;
+    check(len(key) == 64, "a1 key length")?;
+    let good = h + "." + p + ".dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    // `now` == `exp`: valid at the exact expiry second, expired after.
+    let v = jwt_verify(good, key, [], 1300819380, 0, "", "")?;
+    check(v != "", "a1 verifies")?;
+    let late = jwt_verify(good, key, [], 1300819381, 0, "", "");
+    let want_late: Result<string, string> = Err("bad jwt (expired)");
+    check(late == want_late, "a1 expiry enforced")?;
+    // Tampered payload must fail (signature mismatch, not parse).
+    let bad = jwt_verify(h + "." + p + "A" + ".dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk", key, [], 1300819380, 0, "", "");
+    let want_bad: Result<string, string> = Err("bad jwt signature");
+    check(bad == want_bad, "a1 tamper loud")?;
+    // Issuer/audience binding enforced when asked for.
+    let iss = jwt_verify(good, key, [], 1300819380, 0, "joe", "")?;
+    check(iss != "", "iss ok")?;
+    let iss_bad = jwt_verify(good, key, [], 1300819380, 0, "mallory", "");
+    let want_iss: Result<string, string> = Err("bad jwt (issuer mismatch)");
+    check(iss_bad == want_iss, "iss enforced")?;
+    return Ok(true);
+}
+
+fn t_es256_roundtrip() -> Result<bool, string> {
+    let kp = crypto_sign_keygen()?;
+    let mut secret: Array<int> = [];
+    let mut pubk: Array<int> = [];
+    let mut i: int = 0;
+    while i < 32 {
+        push(secret, kp.secret[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 64 {
+        push(pubk, kp.public[i]);
+        i = i + 1;
+    }
+    let t = jwt_sign_es256("{\"sub\":\"u1\",\"exp\":2000000000}", secret)?;
+    let w = jwt_verify(t, [], pubk, 1000000000, 60, "", "")?;
+    check(w != "", "es256 verifies")?;
+    // Wrong key must fail loudly.
+    let kp2 = crypto_sign_keygen()?;
+    let mut pub2: Array<int> = [];
+    let mut j: int = 0;
+    while j < 64 {
+        push(pub2, kp2.public[j]);
+        j = j + 1;
+    }
+    let r2 = jwt_verify(t, [], pub2, 1000000000, 60, "", "");
+    let want_bad: Result<string, string> = Err("bad jwt signature");
+    check(r2 == want_bad, "wrong key loud")?;
+    // `none` algorithm is never accepted, even unsigned-correct.
+    let r4 = jwt_verify("eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1MSJ9.", [], pubk, 1000000000, 60, "", "");
+    let want_none: Result<string, string> = Err("bad jwt alg (want HS256 or ES256)");
+    check(r4 == want_none, "none rejected")?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_b64_codec() != yes {
+        println("FAIL b64_codec");
+        failures = failures + 1;
+    } else {
+    }
+    if t_rfc7515_a1() != yes {
+        println("FAIL rfc7515_a1");
+        failures = failures + 1;
+    } else {
+    }
+    if t_es256_roundtrip() != yes {
+        println("FAIL es256_roundtrip");
+        failures = failures + 1;
+    } else {
+    }
+    if failures > 0 {
+        println(to_string(failures) + " jwt failures");
+        return 1;
+    } else {
+    }
+    return 0;
+}

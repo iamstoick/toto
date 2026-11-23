@@ -465,18 +465,22 @@ fn main() -> int {{
     );
     write_main(&dir, &src);
     // Retry while the listener comes up (refused consumes no state).
+    // NOTE (Wave 3 fix-forward): the client program prints Err(...) but
+    // still exits 0, so the retry must key on the output — keying on
+    // the exit code first made the retry dead and the test racy under
+    // a loaded runner (openssl s_server slow to bind).
     let (code, out) = {
         let start = Instant::now();
         loop {
             let (code, stdout) = run_toto_to_end(&dir, "main.gzv", "toto https client");
-            if code == 0 {
-                break (code, stdout);
-            }
             if stdout.contains("refused") && start.elapsed() < Duration::from_secs(15) {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
-            panic!("https client failed: exit={code} out={stdout:?}");
+            if code != 0 {
+                panic!("https client failed: exit={code} out={stdout:?}");
+            }
+            break (code, stdout);
         }
     };
     assert_eq!(code, 0, "https client exit");

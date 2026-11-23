@@ -174,6 +174,80 @@ pub enum BlockingOp {
     Tls {
         op: TlsOp,
     },
+    /// Blocking database steps (Wave 3, Stage 1): checkout, connect,
+    /// query, and fetch run on the dedicated pool — never inline on
+    /// a worker (a checkout or a query blocks), never on the poller
+    /// (a pool wait is not a readiness wait; see the Wave 3
+    /// blocking-I/O policy). Unix only (same gate as the db
+    /// surface: sqlite unix-wide, postgres/mysql linux-only).
+    #[cfg(unix)]
+    Db {
+        op: DbOp,
+    },
+    /// Blocking LDAP steps (Wave 3, Stage 3): connect, bind, and
+    /// search run on the dedicated blocking pool — never inline on
+    /// a worker (an LDAP round-trip blocks), never on the poller.
+    /// Linux-only (same gate as the ldap surface).
+    #[cfg(target_os = "linux")]
+    Ldap {
+        op: LdapOp,
+    },
+}
+
+/// One blocking LDAP step, as the pool thread sees it. Owned
+/// plain data only: pool threads never touch the GC heap,
+/// channel tables, or scheduler state beyond pushing
+/// completions. Linux-only. No handle cache in v1: each step
+/// connects, binds, operates, and unbinds (documented).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub enum LdapOp {
+    /// Bind-only check (authentication without search).
+    Bind {
+        host: String,
+        port: u16,
+        bind_dn: String,
+        password: String,
+    },
+    /// Subtree search returning a JSON array string.
+    Search {
+        host: String,
+        port: u16,
+        bind_dn: String,
+        password: String,
+        base: String,
+        filter: String,
+        attrs: String,
+    },
+}
+
+/// One blocking database step, as the pool thread sees it. Owned
+/// plain data only: pool threads never touch the GC heap, channel
+/// tables, or scheduler state beyond pushing completions.
+/// Unix-only. Cells are `dblib::DbCell` (kind-tagged plain data).
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub enum DbOp {
+    /// Run a statement; the affected-row count comes back.
+    Exec {
+        dsn: String,
+        sql: String,
+        params: Vec<toto_compiler::dblib::DbCell>,
+    },
+    /// Run a query; all rows come back.
+    Query {
+        dsn: String,
+        sql: String,
+        params: Vec<toto_compiler::dblib::DbCell>,
+    },
+    /// Configure a pool (max connections, checkout timeout ms).
+    PoolConfig {
+        dsn: String,
+        max: u32,
+        timeout_ms: u64,
+    },
+    /// Retire a pool (test isolation, clean shutdown).
+    ClosePool { dsn: String },
 }
 
 /// One blocking TLS step, as the pool thread sees it. Owned plain
@@ -296,6 +370,41 @@ pub enum BlockingResult {
     /// `Unit`; the executor's `tls_last_error` reads the slot.
     #[cfg(unix)]
     TlsFail(String),
+    /// DB results (Wave 3, Stage 1, unix-only): same conversion
+    /// discipline as the TLS variants, but for database pool jobs
+    /// (see `BlockingOp::Db`) and accepted only by tasks parked on
+    /// `"blocking"` with a matching `blocking_seq`. The drain sets
+    /// the task's `db_error` slot from these (never `net_error` or
+    /// `tls_error`, so interleaved db/net calls never clobber each
+    /// other).
+    #[cfg(unix)]
+    DbInt(i64),
+    /// All rows (structs per row, converted to heap values in the
+    /// drain where the heap is available).
+    #[cfg(unix)]
+    DbRows(Vec<Vec<toto_compiler::dblib::DbCell>>),
+    /// Loud DB failure: the drain sets `db_error` and resumes with
+    /// `Unit`; the executor's `db_last_error` reads the slot.
+    #[cfg(unix)]
+    DbFail(String),
+    /// LDAP results (Wave 3, Stage 3, Linux-only): same conversion
+    /// discipline as the DB variants, but for directory pool jobs
+    /// (see `BlockingOp::Ldap`) and accepted only by tasks parked
+    /// on `"blocking"` with a matching `blocking_seq`. The drain
+    /// sets the task's `ldap_error` slot from these (never
+    /// `net_error`/`db_error`, so interleaved calls never clobber
+    /// each other's `last_error`).
+    #[cfg(target_os = "linux")]
+    LdapInt(i64),
+    /// Search results as a JSON array string (parsed by
+    /// `gzv.std/json` — no new framing).
+    #[cfg(target_os = "linux")]
+    LdapStr(String),
+    /// Loud LDAP failure: the drain sets `ldap_error` and resumes
+    /// with `Unit`; the executor's `ldap_last_error` reads the
+    /// slot.
+    #[cfg(target_os = "linux")]
+    LdapFail(String),
 }
 
 /// A finished pool job awaiting pickup. The scheduler turns it into
@@ -565,6 +674,15 @@ pub struct Shared {
     /// touch neither the heap nor scheduler state directly.
     pub pool: Mutex<PoolState>,
     pub pool_cv: Condvar,
+    /// Server-role TLS lane (Wave 3 F1 fix): exactly the jobs that
+    /// wait on a client peer's next flight (server handshake, and
+    /// server-side send/recv/close by session role). One thread,
+    /// never shared with client-role work, so a burst of client
+    /// jobs — which always queue first (connect precedes accept)
+    /// — cannot starve the server jobs that unblock them. See
+    /// `Lane` for the cycle-freedom invariant.
+    pub pool_srv: Mutex<PoolState>,
+    pub pool_srv_cv: Condvar,
     pub done: Mutex<VecDeque<Completion>>,
     /// M:N network poller (Wave 1, unix-only): registrations in,
     /// readiness completions out. The poller thread touches neither
@@ -627,6 +745,32 @@ pub struct GcState {
     pub workers: usize,
     pub generation: u64,
 }
+
+/// Which blocking-pool lane a job runs on (Wave 3 F1 fix).
+/// Cycle-freedom invariant: no job ever waits (transitively) on a
+/// job in its own lane. Client-lane jobs wait only on server-lane
+/// progress (server flights) or lane-independent completions
+/// (kernel I/O, engine queries bounded by their own timeouts);
+/// server-lane jobs wait only on client-lane progress or the
+/// kernel. Peer waits therefore always resolve cross-lane, and
+/// the 5 s shutdown/handshake courtesy bounds backstop even that
+/// (e.g. a wedged foreign op stalling a lane fails loudly
+/// instead of wedging the other lane forever).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lane {
+    /// Shared lane: client-role TLS plus every non-TLS op (Db,
+    /// Ldap, FS, DNS, Foreign — none of which wait on pool
+    /// actions, so sharing the lane cannot form a cycle).
+    Cli,
+    /// Server-role TLS only. Exactly one thread (`POOL_SRV_THREADS`).
+    Srv,
+}
+
+/// Server-lane thread count (Wave 3 F1 fix): one. Server-role TLS
+/// jobs serialize here safely — every wait they perform is
+/// cross-lane (client flights) or kernel-backed — while staying
+/// out of the client burst's way.
+const POOL_SRV_THREADS: usize = 1;
 
 /// Blocking-pool state. `shutdown` is set once the run finishes so
 /// pool threads exit; workers never wait on `pool_cv`.
@@ -848,6 +992,19 @@ pub struct Slot {
     /// `toto_rt_tls_last_error`. Set on every TLS pool completion.
     #[cfg(unix)]
     pub(crate) tls_error: Option<String>,
+    /// Last DB error for this task (`None` = clean). Separate from
+    /// `net_error`/`tls_error` so interleaved db/net calls in one
+    /// task never clobber each other's `last_error`; read (and
+    /// cleared) by `toto_rt_db_last_error`. Set on every DB pool
+    /// completion.
+    #[cfg(unix)]
+    pub(crate) db_error: Option<String>,
+    /// Last LDAP error for this task (`None` = clean). Separate
+    /// slot, same discipline; read (and cleared) by
+    /// `toto_rt_ldap_last_error`. Set on every LDAP pool
+    /// completion.
+    #[cfg(target_os = "linux")]
+    pub(crate) ldap_error: Option<String>,
     /// Current context slot (Wave 2, Stage 3): ordered pairs plus
     /// an optional absolute monotonic-ms deadline, inherited at
     /// spawn (ADR-009). Plain data — never a heap reference, so no
@@ -1116,6 +1273,12 @@ impl Scheduler {
                 shutdown: false,
             }),
             pool_cv: Condvar::new(),
+            pool_srv: Mutex::new(PoolState {
+                jobs: VecDeque::new(),
+                in_flight: 0,
+                shutdown: false,
+            }),
+            pool_srv_cv: Condvar::new(),
             done: Mutex::new(VecDeque::new()),
             #[cfg(unix)]
             net: Mutex::new(NetState::default()),
@@ -1228,6 +1391,10 @@ impl Scheduler {
             gzip_error: None,
             #[cfg(unix)]
             tls_error: None,
+            #[cfg(unix)]
+            db_error: None,
+            #[cfg(target_os = "linux")]
+            ldap_error: None,
             ctx: CtxSlot::new(),
             #[cfg(unix)]
             ctx_error: None,
@@ -1367,7 +1534,10 @@ impl Scheduler {
     pub fn run(&self) -> SchedOutcome {
         std::thread::scope(|scope| {
             for _ in 0..self.shared.pool_threads {
-                scope.spawn(|| Self::pool_loop(&self.shared));
+                scope.spawn(|| Self::pool_loop(&self.shared, Lane::Cli));
+            }
+            for _ in 0..POOL_SRV_THREADS {
+                scope.spawn(|| Self::pool_loop(&self.shared, Lane::Srv));
             }
             #[cfg(unix)]
             scope.spawn(|| Self::poller_loop(&self.shared));
@@ -1540,6 +1710,13 @@ impl Scheduler {
                                         let pool = self.shared.pool.lock().expect("pool lock");
                                         !pool.jobs.is_empty() || pool.in_flight > 0
                                     } || {
+                                        // Server lane counts too (Wave 3
+                                        // F1 fix): a busy server thread is
+                                        // future work the same way.
+                                        let pool_srv =
+                                            self.shared.pool_srv.lock().expect("pool srv lock");
+                                        !pool_srv.jobs.is_empty() || pool_srv.in_flight > 0
+                                    } || {
                                         #[cfg(unix)]
                                         {
                                             !self
@@ -1657,6 +1834,11 @@ impl Scheduler {
                         pool.shutdown = true;
                         drop(pool);
                         self.shared.pool_cv.notify_all();
+                        // Same for the server lane (Wave 3 F1 fix).
+                        let mut pool_srv = self.shared.pool_srv.lock().expect("pool srv lock");
+                        pool_srv.shutdown = true;
+                        drop(pool_srv);
+                        self.shared.pool_srv_cv.notify_all();
                         // Same for the poller (unix-only): set the
                         // flag and poke the pipe so its `poll`
                         // wakes, sees shutdown, and returns.
@@ -1731,10 +1913,18 @@ impl Scheduler {
                     | B::DnsFail(_)
                     | B::TlsInt(_)
                     | B::TlsBytes(_)
-                    | B::TlsFail(_) => Some(matches!(
+                    | B::TlsFail(_)
+                    | B::DbInt(_)
+                    | B::DbRows(_)
+                    | B::DbFail(_) => Some(matches!(
                         c.result,
                         B::NetInt(_) | B::NetBytes(_) | B::NetFail(_)
                     )),
+                    // LDAP rides the same pool pre-pass (never
+                    // the poller — always `Some(false)`); the
+                    // arm vanishes where the variants do.
+                    #[cfg(target_os = "linux")]
+                    B::LdapInt(_) | B::LdapStr(_) | B::LdapFail(_) => Some(false),
                     _ => None,
                 };
                 if let Some(is_poller) = net_kind {
@@ -1743,6 +1933,12 @@ impl Scheduler {
                     // a stale pool completion can never satisfy a
                     // poller wait or vice versa.
                     let is_tls = matches!(c.result, B::TlsInt(_) | B::TlsBytes(_) | B::TlsFail(_));
+                    let is_db = matches!(c.result, B::DbInt(_) | B::DbRows(_) | B::DbFail(_));
+                    #[cfg(target_os = "linux")]
+                    let is_ldap =
+                        matches!(c.result, B::LdapInt(_) | B::LdapStr(_) | B::LdapFail(_));
+                    #[cfg(not(target_os = "linux"))]
+                    let is_ldap = false;
                     let Completion {
                         task,
                         result,
@@ -1752,6 +1948,24 @@ impl Scheduler {
                     let (resp, err): (ToTask, Option<String>) = match result {
                         B::NetInt(n) => (ToTask::Value(RtVal::Int(n)), None),
                         B::TlsInt(n) => (ToTask::Value(RtVal::Int(n)), None),
+                        B::DbInt(n) => (ToTask::Value(RtVal::Int(n)), None),
+                        B::DbRows(rows) => {
+                            // Rows cross back as the framed string
+                            // (same grammar pure Toto decodes on
+                            // the interpreter path — one wrapper,
+                            // one decoder, both engines). Payloads
+                            // are lossy-converted at read time, so
+                            // the framing is always valid UTF-8.
+                            let framed =
+                                String::from_utf8(toto_compiler::dblib::encode_rows(&rows))
+                                    .unwrap_or_default();
+                            let r = {
+                                let mut st = self.shared.state.lock().expect("shared state lock");
+                                st.heap.alloc_str(&framed)
+                            };
+                            (ToTask::Value(RtVal::Heap(r)), None)
+                        }
+                        B::DbFail(m) => (ToTask::Value(RtVal::Unit), Some(m)),
                         B::NetBytes(bytes) => {
                             let r = {
                                 let mut st = self.shared.state.lock().expect("shared state lock");
@@ -1772,6 +1986,18 @@ impl Scheduler {
                         }
                         B::NetFail(m) => (ToTask::Value(RtVal::Unit), Some(m)),
                         B::TlsFail(m) => (ToTask::Value(RtVal::Unit), Some(m)),
+                        #[cfg(target_os = "linux")]
+                        B::LdapInt(n) => (ToTask::Value(RtVal::Int(n)), None),
+                        #[cfg(target_os = "linux")]
+                        B::LdapStr(s) => {
+                            let r = {
+                                let mut st = self.shared.state.lock().expect("shared state lock");
+                                st.heap.alloc_str(&s)
+                            };
+                            (ToTask::Value(RtVal::Heap(r)), None)
+                        }
+                        #[cfg(target_os = "linux")]
+                        B::LdapFail(m) => (ToTask::Value(RtVal::Unit), Some(m)),
                         B::DnsAddrs(addrs) => {
                             // Comma-joined contract (see `gzv.std/net`):
                             // IPv6 has colons, never commas, so the
@@ -1806,6 +2032,20 @@ impl Scheduler {
                     if live {
                         if is_tls {
                             slot.tls_error = err;
+                        } else if is_db {
+                            slot.db_error = err;
+                        } else if is_ldap {
+                            // `is_ldap` is always false where the
+                            // variants do not exist; the dead branch
+                            // still compiles (it just drops).
+                            #[cfg(target_os = "linux")]
+                            {
+                                slot.ldap_error = err;
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                let _ = err;
+                            }
                         } else {
                             slot.net_error = err;
                         }
@@ -1975,15 +2215,88 @@ impl Scheduler {
         }
     }
 
+    /// Run one database step on a pool thread (Wave 3, Stage 1):
+    /// the checkout (wait with timeout), connect, query, and fetch
+    /// all run to completion, and the result posts as a `Db*`
+    /// completion for the drain pre-pass. No heap, no scheduler
+    /// state — owned plain data only.
+    #[cfg(unix)]
+    fn run_db(op: &DbOp) -> BlockingResult {
+        use toto_compiler::dblib as db;
+        match op {
+            DbOp::Exec { dsn, sql, params } => match db::db_exec(dsn, sql, params) {
+                Ok(n) => BlockingResult::DbInt(n),
+                Err(e) => BlockingResult::DbFail(e),
+            },
+            DbOp::Query { dsn, sql, params } => match db::db_query(dsn, sql, params) {
+                Ok(rows) => BlockingResult::DbRows(rows),
+                Err(e) => BlockingResult::DbFail(e),
+            },
+            DbOp::PoolConfig {
+                dsn,
+                max,
+                timeout_ms,
+            } => match db::db_pool_config(dsn, *max, *timeout_ms) {
+                Ok(()) => BlockingResult::DbInt(0),
+                Err(e) => BlockingResult::DbFail(e),
+            },
+            DbOp::ClosePool { dsn } => {
+                db::db_close_pool(dsn);
+                BlockingResult::DbInt(0)
+            }
+        }
+    }
+
+    /// Run one LDAP step on a pool thread (Wave 3, Stage 3):
+    /// connect, bind, and operate run to completion inside this
+    /// call (no handle cache — each step is self-contained), and
+    /// the result posts as an `Ldap*` completion. No heap, no
+    /// scheduler state — owned plain data only.
+    #[cfg(target_os = "linux")]
+    fn run_ldap(op: &LdapOp) -> BlockingResult {
+        use toto_compiler::ldaplib as ldap;
+        match op {
+            LdapOp::Bind {
+                host,
+                port,
+                bind_dn,
+                password,
+            } => match ldap::bind(host, *port, bind_dn, password) {
+                Ok(()) => BlockingResult::LdapInt(0),
+                Err(e) => BlockingResult::LdapFail(e),
+            },
+            LdapOp::Search {
+                host,
+                port,
+                bind_dn,
+                password,
+                base,
+                filter,
+                attrs,
+            } => match ldap::search(host, *port, bind_dn, password, base, filter, attrs) {
+                Ok(json) => BlockingResult::LdapStr(json),
+                Err(e) => BlockingResult::LdapFail(e),
+            },
+        }
+    }
+
     /// Dedicated blocking-pool thread: run file-system jobs, post
     /// completions, never touch the heap or scheduler state directly.
-    /// Exits once the last worker sets `shutdown`.
-    fn pool_loop(shared: &Arc<Shared>) {
+    /// Exits once the last worker sets `shutdown`. One lane runs
+    /// here (Wave 3 F1 fix): server-role TLS on its own lane can
+    /// never be head-of-line-blocked by a client-role burst.
+    fn pool_loop(shared: &Arc<Shared>, lane: Lane) {
         loop {
             let job = {
-                let mut pool = shared.pool.lock().expect("pool lock");
+                let (mut pool, cv) = match lane {
+                    Lane::Cli => (shared.pool.lock().expect("pool lock"), &shared.pool_cv),
+                    Lane::Srv => (
+                        shared.pool_srv.lock().expect("pool srv lock"),
+                        &shared.pool_srv_cv,
+                    ),
+                };
                 while pool.jobs.is_empty() && !pool.shutdown {
-                    pool = shared.pool_cv.wait(pool).expect("pool cv wait");
+                    pool = cv.wait(pool).expect("pool cv wait");
                 }
                 if pool.jobs.is_empty() {
                     debug_assert!(pool.shutdown, "pool wakeup with no job and no shutdown");
@@ -2036,9 +2349,19 @@ impl Scheduler {
                     }
                     Self::run_tls(&op)
                 }
+                #[cfg(unix)]
+                BlockingOp::Db { op } => Self::run_db(&op),
+                #[cfg(target_os = "linux")]
+                BlockingOp::Ldap { op } => Self::run_ldap(&op),
             };
             {
-                let mut pool = shared.pool.lock().expect("pool lock");
+                // Decrement the lane this thread serves (Wave 3 F1
+                // fix): a server-lane completion must not release a
+                // shared-lane in-flight slot.
+                let mut pool = match lane {
+                    Lane::Cli => shared.pool.lock().expect("pool lock"),
+                    Lane::Srv => shared.pool_srv.lock().expect("pool srv lock"),
+                };
                 let mut done = shared.done.lock().expect("done lock");
                 done.push_back(Completion {
                     task: job.task,
@@ -3465,6 +3788,34 @@ impl Scheduler {
         toto_compiler::netsys::poke_pipe(self.shared.net_wake[1]);
     }
 
+    /// Lane routing for a blocking job (Wave 3 F1 fix): server-role
+    /// TLS runs on the server lane; everything else shares the
+    /// client lane. Decided here, before any lock is taken, so no
+    /// new lock nesting is introduced (the session table is a leaf
+    /// lock — it never nests with scheduler state).
+    #[cfg(unix)]
+    fn tls_lane(op: &BlockingOp) -> Lane {
+        match op {
+            BlockingOp::Tls { op } => match op {
+                // Accept is server-role by construction.
+                TlsOp::Accept { .. } => Lane::Srv,
+                // Connect is client-role by construction.
+                TlsOp::Connect { .. } => Lane::Cli,
+                // Send/Recv/Close route by live session role; a
+                // missing session (already closed or never
+                // handshaked) rides the shared lane and fails
+                // loudly there, exactly as before.
+                TlsOp::Send { fd, .. } | TlsOp::Recv { fd, .. } | TlsOp::Close { fd } => {
+                    match toto_compiler::tlslib::session_is_client(*fd) {
+                        Some(false) => Lane::Srv,
+                        _ => Lane::Cli,
+                    }
+                }
+            },
+            _ => Lane::Cli,
+        }
+    }
+
     fn op_blocking(&self, worker: usize, id: TaskId, op: BlockingOp, span: Span) {
         // No fail-fast check here: like `park`, the executor checks the
         // scope BEFORE yielding, so a task that reaches this request is
@@ -3472,10 +3823,27 @@ impl Scheduler {
         // the task with `Cancelled`; the stale completion is dropped by
         // its `seq` — see `drain_completions`.)
         let _ = worker;
+        // Decide the lane once, up front (a session could close
+        // between two lookups and split the job from its bell:
+        // a missed wakeup strands the job).
+        #[cfg(unix)]
+        let lane = Self::tls_lane(&op);
+        // Wake the lane's bell after release (outside the `sched`
+        // section, as before — a woken thread only needs its lane
+        // lock, never `sched`).
+        #[cfg(unix)]
+        let cv = match lane {
+            Lane::Cli => &self.shared.pool_cv,
+            Lane::Srv => &self.shared.pool_srv_cv,
+        };
+        #[cfg(not(unix))]
+        let cv = &self.shared.pool_cv;
         // Park and submit atomically (one `sched` section, pool nested
         // inside per the lock order): a task observed as `Blocked` on
         // `blocking` always has its job submitted, so the deadlock
         // check can never see a parked task with an idle-looking pool.
+        // The lane is decided by role before any lock is taken (see
+        // `tls_lane`), so no new lock nesting is introduced.
         {
             let mut sched = self.shared.sched.lock().expect("sched lock");
             let slot = &mut sched.slots[id.0];
@@ -3485,6 +3853,12 @@ impl Scheduler {
                 span,
                 op: "blocking",
             };
+            #[cfg(unix)]
+            let mut pool = match lane {
+                Lane::Cli => self.shared.pool.lock().expect("pool lock"),
+                Lane::Srv => self.shared.pool_srv.lock().expect("pool srv lock"),
+            };
+            #[cfg(not(unix))]
             let mut pool = self.shared.pool.lock().expect("pool lock");
             pool.jobs.push_back(PoolJob {
                 task: id,
@@ -3493,7 +3867,7 @@ impl Scheduler {
                 seq,
             });
         }
-        self.shared.pool_cv.notify_one();
+        cv.notify_one();
     }
 }
 

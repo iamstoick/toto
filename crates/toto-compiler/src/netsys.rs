@@ -13,6 +13,7 @@
 //! Toto values cross this boundary (callers marshal); no heap
 //! access, so poller and pool threads may call freely.
 
+use std::ffi::CStr;
 #[cfg(target_os = "macos")]
 use std::os::raw::c_ulong;
 use std::os::raw::{c_char, c_int, c_void};
@@ -828,6 +829,26 @@ pub fn close(fd: c_int) -> Result<(), String> {
     if r < 0 { Err(last_error()) } else { Ok(()) }
 }
 
+/// Read a process environment variable (Wave 3 config overlays).
+/// Pure libc lookup — inline anywhere (never blocks, never parks).
+/// `None` is unset; empty-but-set reads as `Some("")`.
+/// NUL bytes in the name are a loud `Err` (rejected, like every
+/// other FFI boundary).
+pub fn env_get(name: &str) -> Result<Option<String>, String> {
+    use std::ffi::CString;
+    let n = CString::new(name).map_err(|_| "env var name has NUL byte".to_string())?;
+    // SAFETY: `n` outlives the call; a null return means unset.
+    let v = unsafe {
+        let p = libc_getenv(n.as_ptr());
+        if p.is_null() {
+            None
+        } else {
+            Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+        }
+    };
+    Ok(v)
+}
+
 /// Resolve a hostname to IP strings via blocking `getaddrinfo`
 /// (pool thread or interpreter — never a worker).
 pub fn resolve_blocking(host: &str) -> Result<Vec<String>, String> {
@@ -916,6 +937,8 @@ fn gai_error(code: c_int) -> String {
 }
 
 unsafe extern "C" {
+    #[link_name = "getenv"]
+    fn libc_getenv(name: *const c_char) -> *const c_char;
     #[link_name = "getaddrinfo"]
     fn libc_getaddrinfo(
         host: *const c_char,

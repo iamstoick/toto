@@ -1,0 +1,18 @@
+# Wave 3 Stage 5 reference service topology (fixture — committed).
+# No secrets anywhere: the DB is serverless SQLite, users are
+# seeded per run with random passwords, the JWT key is random
+# per process. Knobs the load hammer overrides by environment:
+# TOTO_REFSVC_DSN, TOTO_REFSVC_PORT, TOTO_REFSVC_REQS,
+# TOTO_REFSVC_POOLMAX, TOTO_REFSVC_TIMEOUT (the file values
+# below are the golden-path defaults).
+[server]
+port = 48523
+tls = true
+
+[db]
+dsn = "sqlite:path=refsvc_data_tmp.txt"
+pool_max = 8
+checkout_timeout_ms = 5000
+
+[auth]
+ttl_ms = 600000

@@ -367,7 +367,7 @@ fn relative_imports_never_match_dep_names() {
 
 #[test]
 fn stdlib_table_is_complete() {
-    assert_eq!(toto_compiler::stdlib::MODULES.len(), 20);
+    assert_eq!(toto_compiler::stdlib::MODULES.len(), 29);
     for (path, src) in toto_compiler::stdlib::MODULES {
         assert!(
             path.starts_with("gzv.std/") && path.ends_with(".gzv"),

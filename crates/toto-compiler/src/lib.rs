@@ -10,11 +10,15 @@ pub mod compress;
 #[cfg(unix)]
 pub mod cryptolib;
 pub mod ctxlog;
+#[cfg(unix)]
+pub mod dblib;
 pub mod diag;
 pub mod ffi;
 pub mod fmt;
 pub mod hir;
 pub mod interp;
+#[cfg(target_os = "linux")]
+pub mod ldaplib;
 pub mod lexer;
 pub mod mir;
 pub mod mir_interp;

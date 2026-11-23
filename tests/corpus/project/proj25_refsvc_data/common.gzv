@@ -1,0 +1,336 @@
+// Wave 3 Stage 5 reference service core: the DB-backed, authed
+// HTTPS service shared by the golden (`main.gzv`) and the load
+// hammer (`load.gzv`). Support code only — never run standalone
+// (the corpus harness runs `main.gzv`; nothing else here is an
+// entry point).
+//
+// What the service is: TLS loopback, SQLite file or server DB
+// (real mature engines; the corpus golden uses a file DB in
+// the case dir so every platform proves it with no server),
+// migrations applied
+// at startup (the Stage-2 library serving Stage-5), seeded users
+// with PBKDF2 hashes (Stage-3 password), JWT HS256 Bearer tokens
+// (Stage-3 jwt, per-process random key — no committed secret,
+// no env needed), structured logging + Prometheus metrics
+// (Wave-2 substrate, proj20 patterns).
+//
+// Auth model: POST /login checks the password hash and mints a
+// token `{"sub","iat_ms","ttl_ms","iss"}`; every other route
+// verifies signature + iss, then enforces the TTL against the
+// MONOTONIC clock (v1 has no wall clock — `time.gzv` is
+// explicit; lifetimes are monotonic-ms TTLs, tamper-proof via
+// the signature). Structural failures are 401 responses;
+// a forged signature aborts the connection fail-closed (the
+// accepted v1 handler-`Err` deviation — this service never
+// returns `Err` itself, it only ever serves responses).
+//
+// Concurrency rule: handlers take `meter`; the sequential
+// golden meters (logging + metrics proven), the load hammer
+// does not (client-side measurement only — no shared-struct
+// mutation across hammer tasks). Logging stays on in both:
+// the level gate drops info before the sink in load mode.
+//
+// What it deliberately does not do: no registration endpoint
+// (users are seeded), no token refresh (short TTL + re-login),
+// no per-query timeout (v1 pool limit, recorded), no browser
+// UI (the SSO browser leg is the separate §6 demonstration).
+import "gzv.std/db.gzv";
+import "gzv.std/migrate.gzv";
+import "gzv.std/password.gzv";
+import "gzv.std/jwt.gzv";
+import "gzv.std/crypto.gzv";
+import "gzv.std/http.gzv";
+import "gzv.std/metrics.gzv";
+import "gzv.std/log.gzv";
+import "gzv.std/json.gzv";
+import "gzv.std/time.gzv";
+import "gzv.std/strings.gzv";
+import "gzv.std/config.gzv";
+
+// NOTE (checker rule): imported struct types (`MetricsRegistry`)
+// are visible in fn signatures but NOT as user-struct fields, so
+// the registry crosses by parameter everywhere (same discipline
+// as routers-by-parameter in proj20).
+pub struct RefsDat {
+    dsn: string,
+    key: Array<int>,
+    ttl_ms: int,
+    meter: bool
+}
+
+// Operational config: a committed fixture (`service.toml`,
+// topology only — no secrets anywhere) with env overlay for
+// the load knobs. Precedence env > file > builtin default,
+// per the `gzv.std/config` story.
+pub fn refsvc_config() -> Result<JsonVal, string> {
+    let cfg = config_from_toml_file(refsvc_fix("service.toml"))?;
+    let over = config_apply_env(cfg, ["TOTO_REFSVC_DSN=db.dsn", "TOTO_REFSVC_PORT=server.port"])?;
+    return Ok(over);
+}
+
+pub fn refsvc_port(cfg: JsonVal) -> Result<int, string> {
+    return config_get_int(cfg, "server.port", 48523);
+}
+
+pub fn refsvc_dsn(cfg: JsonVal) -> Result<string, string> {
+    return config_get(cfg, "db.dsn", "sqlite:path=refsvc_data_tmp.txt");
+}
+
+pub fn refsvc_ttl(cfg: JsonVal) -> Result<int, string> {
+    return config_get_int(cfg, "auth.ttl_ms", 600000);
+}
+
+pub fn refsvc_register(reg: MetricsRegistry) -> Result<unit, string> {
+    metrics_register_counter(reg, "refsvc_requests_total", "Reference service requests.", ["method", "route", "code"])?;
+    metrics_register_gauge(reg, "refsvc_inflight", "Reference service inflight.", [])?;
+    metrics_register_histogram(reg, "refsvc_latency_ms", "Reference service latency milliseconds.", ["route"], [5, 25, 100, 500])?;
+    return Ok(());
+}
+
+fn refsvc_meter(svc: RefsDat, reg: MetricsRegistry, method: string, route: string, code: string) -> Result<unit, string> {
+    if svc.meter {
+        metrics_inc(reg, "refsvc_requests_total", [method, route, code], 1)?;
+        // Fixed 1ms stand-in (proj19 precedent): the golden stays
+        // byte-exact — the wiring (observe in the live handler
+        // path, scrape the shared registry) is what is proven
+        // here; real latencies are deployment data, measured by
+        // the load hammer, not pinned.
+        metrics_observe(reg, "refsvc_latency_ms", [route], 1)?;
+    } else {
+    }
+    return Ok(());
+}
+
+// Fixture dir: `fixtures` beside the entry (corpus + bench
+// run with the case dir as cwd); the Rust load test runs with
+// the crate dir as cwd and points here at the case fixtures.
+pub fn refsvc_fix(name: string) -> string {
+    if config_env_has("TOTO_REFSVC_FIXDIR") {
+        return config_env_get("TOTO_REFSVC_FIXDIR") + "/" + name;
+    } else {
+    }
+    return "fixtures/" + name;
+}
+
+// Migrations served by the Stage-2 library: v1 the users
+// table (PBKDF2 hashes, never plaintext), v2 the notes table
+// the write route exercises (dropped on rollback — the
+// service never rolls back, the down path is proven by
+// `test_migrate` + proj24 instead).
+pub fn refsvc_migrations() -> Array<Migration> {
+    return [
+        migration(1, "users", "CREATE TABLE users (name VARCHAR(191) PRIMARY KEY, hash TEXT)", ""),
+        migration(2, "notes", "CREATE TABLE notes (id INTEGER PRIMARY KEY, author TEXT, body TEXT)", "DROP TABLE notes"),
+    ];
+}
+
+// Seed users with FRESH random passwords per run (closed
+// loop: hashes stored, plaintext returned to the caller for
+// the in-process client — no committed or env credential
+// anywhere). `DELETE` first so every run starts identical;
+// migrations stay idempotent via the ledger.
+pub fn refsvc_seed(dsn: string) -> Result<Array<string>, string> {
+    let p1 = "pw-" + pw_hex_encode(crypto_random(16)?);
+    let p2 = "pw-" + pw_hex_encode(crypto_random(16)?);
+    let h1 = pw_hash(p1)?;
+    let h2 = pw_hash(p2)?;
+    db_exec(dsn, "DELETE FROM users WHERE name = 'alice' OR name = 'bob'", [])?;
+    db_exec(dsn, "INSERT INTO users (name, hash) VALUES (?, ?)", [db_text("alice"), db_text(h1)])?;
+    db_exec(dsn, "INSERT INTO users (name, hash) VALUES (?, ?)", [db_text("bob"), db_text(h2)])?;
+    db_exec(dsn, "DELETE FROM notes", [])?;
+    return Ok([p1, p2]);
+}
+
+pub fn refsvc_setup(dsn: string, applied_log: bool) -> Result<Array<string>, string> {
+    let n = migrate_up(dsn, refsvc_migrations())?;
+    if applied_log {
+        log_info("migrated=" + to_string(n))?;
+    } else {
+    }
+    return refsvc_seed(dsn);
+}
+
+// Mint a token for `user` with a monotonic-ms issue stamp.
+pub fn refsvc_mint(key: Array<int>, user: string, ttl_ms: int) -> Result<string, string> {
+    let now = clock_monotonic_ms();
+    let payload = "{\"sub\":\"" + user + "\",\"iat_ms\":" + to_string(now) + ",\"ttl_ms\":" + to_string(ttl_ms) + ",\"iss\":\"toto-refsvc\"}";
+    return jwt_sign_hs256(payload, key);
+}
+
+// Returns Ok(sub) or Ok("401 ...") — never Err (see the
+// module header). Order: structural checks first (pure,
+// exact); the signature check last (a forgery propagates
+// as the framework `Err` and the connection aborts
+// fail-closed — the accepted v1 deviation, never a 500
+// masquerade). Post-verify field reads are signature-safe
+// (only key-holders mint passing tokens).
+pub fn refsvc_auth(key: Array<int>, ttl_ms: int, req: HttpRequest) -> Result<string, string> {
+    let hv = http_header_get(req.headers, "authorization");
+    let want_missing: Result<string, string> = Err("http: missing header authorization");
+    if hv == want_missing {
+        return Ok("401 missing bearer");
+    }
+    let auth = hv?;
+    if !starts_with(auth, "Bearer ") {
+        return Ok("401 bad scheme");
+    }
+    let tok = substring(auth, 7, len(auth));
+    if len(split(tok, ".")) != 3 {
+        return Ok("401 bad shape");
+    }
+    let payload = jwt_verify(tok, key, [], 0, 0, "toto-refsvc", "")?;
+    let doc = json_parse(payload)?;
+    let iat = json_as_int(json_object_get(doc, "iat_ms")?)?;
+    let ttl = json_as_int(json_object_get(doc, "ttl_ms")?)?;
+    if ttl != ttl_ms {
+        return Ok("401 ttl mismatch");
+    }
+    if clock_monotonic_ms() - iat > ttl {
+        return Ok("401 expired");
+    }
+    return Ok(json_as_string(json_object_get(doc, "sub")?)?);
+}
+
+fn send_401(msg: string) -> Result<HttpResponse, string> {
+    return http_text(401, "Unauthorized", msg);
+}
+
+fn authed(sub: string) -> bool {
+    return !starts_with(sub, "401 ");
+}
+
+// Login body: `{"user":"...","password":"..."}`. Unknown user
+// and wrong password are the same 401 (no oracle).
+fn h_login_factory(svc: RefsDat, reg: MetricsRegistry) -> fn(HttpRequest) -> Result<HttpResponse, string> {
+    return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        let doc = json_parse(http_bytes_to_text(req.body)?)?;
+        let user = json_as_string(json_object_get(doc, "user")?)?;
+        let pw = json_as_string(json_object_get(doc, "password")?)?;
+        let rows = db_query(svc.dsn, "SELECT hash FROM users WHERE name = ?", [db_text(user)])?;
+        if len(rows) != 1 {
+            refsvc_meter(svc, reg, "POST", "/login", "401")?;
+            return send_401("bad credentials");
+        }
+        if pw_verify(pw, rows[0][0].s)? != true {
+            refsvc_meter(svc, reg, "POST", "/login", "401")?;
+            return send_401("bad credentials");
+        }
+        let tok = refsvc_mint(svc.key, user, svc.ttl_ms)?;
+        refsvc_meter(svc, reg, "POST", "/login", "200")?;
+        return http_text(200, "OK", "{\"token\":\"" + tok + "\"}");
+    };
+}
+
+fn h_user_factory(svc: RefsDat, reg: MetricsRegistry) -> fn(HttpRequest) -> Result<HttpResponse, string> {
+    return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        let sub = refsvc_auth(svc.key, svc.ttl_ms, req)?;
+        if !authed(sub) {
+            refsvc_meter(svc, reg, "GET", "/users/{id}", "401")?;
+            return send_401(sub);
+        } else {
+        }
+        let raw = http_param(req.params, "id")?;
+        let did = http_decode_pct(raw)?;
+        let rows = db_query(svc.dsn, "SELECT name FROM users WHERE name = ?", [db_text(did)])?;
+        if len(rows) != 1 {
+            refsvc_meter(svc, reg, "GET", "/users/{id}", "404")?;
+            return http_text(404, "Not Found", "no such user");
+        }
+        refsvc_meter(svc, reg, "GET", "/users/{id}", "200")?;
+        return http_text(200, "OK", "{\"name\":\"" + rows[0][0].s + "\"}");
+    };
+}
+
+fn h_notes_factory(svc: RefsDat, reg: MetricsRegistry) -> fn(HttpRequest) -> Result<HttpResponse, string> {
+    return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        let sub = refsvc_auth(svc.key, svc.ttl_ms, req)?;
+        if !authed(sub) {
+            refsvc_meter(svc, reg, "POST", "/notes", "401")?;
+            return send_401(sub);
+        } else {
+        }
+        if req.method == "POST" {
+            let doc = json_parse(http_bytes_to_text(req.body)?)?;
+            let body = json_as_string(json_object_get(doc, "body")?)?;
+            db_exec(svc.dsn, "INSERT INTO notes (author, body) VALUES (?, ?)", [db_text(sub), db_text(body)])?;
+            refsvc_meter(svc, reg, "POST", "/notes", "200")?;
+            return http_text(200, "OK", "stored");
+        } else {
+        }
+        let rows = db_query(svc.dsn, "SELECT author, body FROM notes ORDER BY id", [])?;
+        let mut out: string = "[";
+        let mut first: bool = true;
+        for r in rows {
+            if first {
+                first = false;
+            } else {
+                out = out + ",";
+            }
+            out = out + "{\"author\":\"" + r[0].s + "\",\"body\":\"" + r[1].s + "\"}";
+        }
+        refsvc_meter(svc, reg, "GET", "/notes", "200")?;
+        return http_text(200, "OK", out + "]");
+    };
+}
+
+fn h_metrics_factory(svc: RefsDat, reg: MetricsRegistry) -> fn(HttpRequest) -> Result<HttpResponse, string> {
+    return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        let sub = refsvc_auth(svc.key, svc.ttl_ms, req)?;
+        if !authed(sub) {
+            refsvc_meter(svc, reg, "GET", "/metrics", "401")?;
+            return send_401(sub);
+        } else {
+        }
+        // Meter BEFORE serving: the scrape body then already
+        // contains its own observation, so a post-scrape local
+        // render byte-matches (deterministic golden).
+        refsvc_meter(svc, reg, "GET", "/metrics", "200")?;
+        let h = metrics_handler(reg);
+        let r = h(req)?;
+        return Ok(r);
+    };
+}
+
+fn mw_log(req: HttpRequest, next: fn(HttpRequest) -> Result<HttpResponse, string>) -> Result<HttpResponse, string> {
+    log_info("mw " + req.method + " " + req.target)?;
+    let r = next(req)?;
+    return Ok(r);
+}
+
+// NOTE (runtime edge, proj20 shape): the router crosses by
+// parameter and only `Result<unit>` returns — a `Result`
+// holding function values cannot be `?`-unwrapped in v1.
+pub fn refsvc_routes(router: HttpRouter, svc: RefsDat, reg: MetricsRegistry) -> Result<unit, string> {
+    let login = h_login_factory(svc, reg);
+    route_add(router, "POST", "/login", login)?;
+    let user = h_user_factory(svc, reg);
+    route_add(router, "GET", "/users/{id}", user)?;
+    let notes = h_notes_factory(svc, reg);
+    route_add(router, "POST", "/notes", notes)?;
+    route_add(router, "GET", "/notes", notes)?;
+    let metrics = h_metrics_factory(svc, reg);
+    route_add(router, "GET", "/metrics", metrics)?;
+    use_mw(router, mw_log);
+    return Ok(());
+}
+
+// Serve TLS in the background (returns the listener fd, like
+// proj20 — the caller drives the client, then closes).
+pub fn refsvc_serve(port: int, router: HttpRouter) -> Result<int, string> {
+    let cert = read_file(refsvc_fix("server-cert.pem"));
+    let key = read_file(refsvc_fix("server-key.pem"));
+    let opts = HttpServeOpts { expose_errors: false, max_body: 65536, keepalive_ms: 0, server_name: "toto-refsvc-data" };
+    return http_serve_tls(port, router, opts, cert, key);
+}
+
+pub fn refsvc_client_opts() -> HttpClientOpts {
+    return HttpClientOpts { max_body: 65536, redirects: 0, host_allow: [] };
+}
+
+pub fn refsvc_ca() -> string {
+    return read_file(refsvc_fix("ca.pem"));
+}
+
+pub fn refsvc_other_ca() -> string {
+    return read_file(refsvc_fix("other-ca.pem"));
+}

@@ -1,0 +1,118 @@
+import "gzv.std/db.gzv";
+
+fn check(cond: bool, msg: string) -> Result<bool, string> {
+    if cond {
+        return Ok(true);
+    } else {
+        return Err(msg);
+    }
+}
+
+fn t_constructors() -> Result<bool, string> {
+    let n = db_null();
+    check(n.kind == 0, "null kind")?;
+    let i = db_int(-42);
+    check(i.kind == 1 && i.i == -42, "int")?;
+    let f = db_float(1.5);
+    check(f.kind == 2 && f.f == 1.5, "float")?;
+    let s = db_text("héllo;?");
+    check(s.kind == 3 && s.s == "héllo;?", "text")?;
+    let t = db_bool(true);
+    check(t.kind == 4 && t.i == 1, "bool true")?;
+    let b = db_bool(false);
+    check(b.kind == 4 && b.i == 0, "bool false")?;
+    return Ok(true);
+}
+
+fn t_framing_roundtrip() -> Result<bool, string> {
+    let args: Array<DbVal> = [db_null(), db_int(-7), db_float(2.5), db_text("a;b:?"), db_bool(true)];
+    let enc = db_encode_params(args);
+    check(enc == "P5:0,0:;1,2:-7;2,3:2.5;3,5:a;b:?;4,1:1;", "framing exact")?;
+    let back = db_decode_rows("R2:C2:1,2:-7;3,5:a;b:?;C1:4,1:1;")?;
+    check(len(back) == 2, "rows count")?;
+    check(len(back[0]) == 2, "row 0 width")?;
+    check(back[0][0].kind == 1 && back[0][0].i == -7, "row 0 int")?;
+    check(back[0][1].kind == 3 && back[0][1].s == "a;b:?", "row 0 text with seps")?;
+    check(len(back[1]) == 1, "row 1 width")?;
+    check(back[1][0].kind == 4 && back[1][0].i == 1, "row 1 bool")?;
+    let bad = db_decode_rows("R1:C1:2,3:NaN;");
+    let want_nan: Result<Array<Array<DbVal>>, string> = Err("non-finite float in interpreter db path (use the runtime engine)");
+    check(bad == want_nan, "nan loud")?;
+    let bad2 = db_decode_rows("R1:C1:1,2:-7");
+    let want_trunc: Result<Array<Array<DbVal>>, string> = Err("bad db framing (want ';')");
+    check(bad2 == want_trunc, "truncated loud")?;
+    return Ok(true);
+}
+
+fn t_sqlite_crud() -> Result<bool, string> {
+    let dsn = "sqlite::memory:";
+    check(db_exec(dsn, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL, active INTEGER, note TEXT)", [])? == 0, "ddl rc")?;
+    check(db_exec(dsn, "INSERT INTO t (name, score, active, note) VALUES (?, ?, ?, ?)", [db_text("o'brien;x"), db_float(3.25), db_bool(true), db_null()])? == 1, "insert 1")?;
+    check(db_exec(dsn, "INSERT INTO t (name, score, active, note) VALUES (?, ?, ?, ?)", [db_text("plain"), db_float(-0.5), db_bool(false), db_text("n")])? == 1, "insert 2")?;
+    let rows = db_query(dsn, "SELECT id, name, score, active, note FROM t ORDER BY id", [])?;
+    check(len(rows) == 2, "row count")?;
+    check(rows[0][1].s == "o'brien;x", "quoted text")?;
+    check(rows[0][2].f == 3.25, "float")?;
+    check(rows[0][3].kind == 1 && rows[0][3].i == 1, "sqlite bool-as-int")?;
+    check(rows[0][4].kind == 0, "null")?;
+    check(rows[1][3].i == 0, "false int")?;
+    let one = db_query(dsn, "SELECT name FROM t WHERE name = ?", [db_text("o'brien;x")])?;
+    check(len(one) == 1 && one[0][0].s == "o'brien;x", "bound select")?;
+    let bad = db_exec(dsn, "INSERT INTO nope (a) VALUES (1)", []);
+    let want_bad: Result<int, string> = Err("sqlite prepare: no such table: nope");
+    check(bad == want_bad, "bad sql loud")?;
+    return Ok(true);
+}
+
+fn t_pool_config_errors() -> Result<bool, string> {
+    let dsn = "sqlite::memory:";
+    check(db_pool_config(dsn, 2, 1000)? == 0, "config ok")?;
+    let zero = db_pool_config(dsn, 0, 1000);
+    let want_zero: Result<int, string> = Err("db pool max must be >= 1");
+    check(zero == want_zero, "max 0 rejected")?;
+    check(db_close_pool(dsn)? == 0, "close ok")?;
+    return Ok(true);
+}
+
+fn t_unknown_driver() -> Result<bool, string> {
+    let r = db_exec("nosuchdb:x=1", "SELECT 1", []);
+    let want: Result<int, string> = Err("unknown database driver \"nosuchdb\" (want sqlite/postgres/mysql)");
+    check(r == want, "unknown driver loud")?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_constructors() != yes {
+        println("FAIL constructors");
+        failures = failures + 1;
+    } else {
+    }
+    if t_framing_roundtrip() != yes {
+        println("FAIL framing_roundtrip");
+        failures = failures + 1;
+    } else {
+    }
+    if t_sqlite_crud() != yes {
+        println("FAIL sqlite_crud");
+        failures = failures + 1;
+    } else {
+    }
+    if t_pool_config_errors() != yes {
+        println("FAIL pool_config_errors");
+        failures = failures + 1;
+    } else {
+    }
+    if t_unknown_driver() != yes {
+        println("FAIL unknown_driver");
+        failures = failures + 1;
+    } else {
+    }
+    if failures > 0 {
+        println(to_string(failures) + " db failures");
+        return 1;
+    } else {
+    }
+    return 0;
+}

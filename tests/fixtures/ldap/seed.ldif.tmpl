@@ -1,0 +1,27 @@
+dn: ou=users,dc=toto,dc=test
+objectClass: organizationalUnit
+ou: users
+
+dn: uid=alice,ou=users,dc=toto,dc=test
+objectClass: inetOrgPerson
+objectClass: posixAccount
+uid: alice
+cn: Alice Liddell
+sn: Liddell
+mail: alice@toto.test
+userPassword: ${LDAP_TEST_USER_PW}
+uidNumber: 10001
+gidNumber: 10001
+homeDirectory: /home/alice
+
+dn: uid=bob,ou=users,dc=toto,dc=test
+objectClass: inetOrgPerson
+objectClass: posixAccount
+uid: bob
+cn: Bob Builder
+sn: Builder
+mail: bob@toto.test
+userPassword: ${LDAP_TEST_USER_PW2}
+uidNumber: 10002
+gidNumber: 10002
+homeDirectory: /home/bob

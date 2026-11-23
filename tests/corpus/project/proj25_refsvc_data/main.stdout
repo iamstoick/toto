@@ -1,0 +1,78 @@
+login=200
+badlogin=401
+nouser-login=401
+noauth=401
+badscheme=401
+badshape=401
+forged=aborted
+expired=401
+user=200:alice
+nouser=404
+notes=200:2
+metrics-auth=401
+metrics=200:match
+# HELP refsvc_requests_total Reference service requests.
+# TYPE refsvc_requests_total counter
+refsvc_requests_total{method="POST",route="/login",code="200"} 1
+refsvc_requests_total{method="POST",route="/login",code="401"} 2
+refsvc_requests_total{method="GET",route="/users/{id}",code="401"} 4
+refsvc_requests_total{method="GET",route="/users/{id}",code="200"} 1
+refsvc_requests_total{method="GET",route="/users/{id}",code="404"} 1
+refsvc_requests_total{method="POST",route="/notes",code="200"} 2
+refsvc_requests_total{method="GET",route="/notes",code="200"} 1
+refsvc_requests_total{method="GET",route="/metrics",code="401"} 1
+refsvc_requests_total{method="GET",route="/metrics",code="200"} 1
+# HELP refsvc_inflight Reference service inflight.
+# TYPE refsvc_inflight gauge
+# HELP refsvc_latency_ms Reference service latency milliseconds.
+# TYPE refsvc_latency_ms histogram
+refsvc_latency_ms_bucket{le="5",route="/login"} 3
+refsvc_latency_ms_bucket{le="25",route="/login"} 3
+refsvc_latency_ms_bucket{le="100",route="/login"} 3
+refsvc_latency_ms_bucket{le="500",route="/login"} 3
+refsvc_latency_ms_bucket{le="+Inf",route="/login"} 3
+refsvc_latency_ms_sum{route="/login"} 3
+refsvc_latency_ms_count{route="/login"} 3
+refsvc_latency_ms_bucket{le="5",route="/users/{id}"} 6
+refsvc_latency_ms_bucket{le="25",route="/users/{id}"} 6
+refsvc_latency_ms_bucket{le="100",route="/users/{id}"} 6
+refsvc_latency_ms_bucket{le="500",route="/users/{id}"} 6
+refsvc_latency_ms_bucket{le="+Inf",route="/users/{id}"} 6
+refsvc_latency_ms_sum{route="/users/{id}"} 6
+refsvc_latency_ms_count{route="/users/{id}"} 6
+refsvc_latency_ms_bucket{le="5",route="/notes"} 3
+refsvc_latency_ms_bucket{le="25",route="/notes"} 3
+refsvc_latency_ms_bucket{le="100",route="/notes"} 3
+refsvc_latency_ms_bucket{le="500",route="/notes"} 3
+refsvc_latency_ms_bucket{le="+Inf",route="/notes"} 3
+refsvc_latency_ms_sum{route="/notes"} 3
+refsvc_latency_ms_count{route="/notes"} 3
+refsvc_latency_ms_bucket{le="5",route="/metrics"} 2
+refsvc_latency_ms_bucket{le="25",route="/metrics"} 2
+refsvc_latency_ms_bucket{le="100",route="/metrics"} 2
+refsvc_latency_ms_bucket{le="500",route="/metrics"} 2
+refsvc_latency_ms_bucket{le="+Inf",route="/metrics"} 2
+refsvc_latency_ms_sum{route="/metrics"} 2
+refsvc_latency_ms_count{route="/metrics"} 2
+neg=yes
+after=200
+{"ts":0,"level":"info","msg":"refsvc-data starting","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"migrated=2","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw POST /login","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw POST /login","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw POST /login","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw GET /users/alice","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw GET /users/alice","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw GET /users/alice","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw GET /users/alice","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw GET /users/alice","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw GET /users/alice","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw GET /users/nosuch","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw POST /notes","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw POST /notes","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw GET /notes","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw GET /metrics","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw GET /metrics","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw GET /users/bob","ctx":{"trace_id":"refsvc-data-1"}}
+log-lines=18
+Ok(REFSVC-DATA-OK)

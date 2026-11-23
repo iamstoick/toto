@@ -203,6 +203,57 @@ first-panic-wins, parked tasks released, running tasks fail-fast
 at the next suspension point. Handles name scope indices, so a
 forged handle bounds-checks loudly instead of misrouting.
 
+## Wave 3 Stage 3 allowlist extension (rationale)
+
+The allowlist grows by 6 names: `toto_rt_crypto_pbkdf2` +
+`toto_rt_crypto_pbkdf2_verify` (password hashing: the mature
+libcrypto KDF, never Toto math; constant-time compare in
+native code), `toto_rt_crypto_rsa_verify` (RS256 JWTs: public
+operations only — verify, never sign/keygen — keyed by JWK
+`(n, e)` bytes via `BN_bin2bn`/`RSA_set0_key`, no PEM/DER
+surface), and `toto_rt_ldap_bind` / `toto_rt_ldap_search` /
+`toto_rt_ldap_last_error` (system libldap, Linux-only).
+Same Wave-2 discipline: every new extern is hand-declared
+with C scalars, `*c_char`, and `Array<int>` only (checked
+code still cannot name structs in foreign signatures — no
+checker change, no new types); password KDF and directory
+steps run blocking-inline (interpreter) or on the runtime's
+dedicated blocking pool (executor, new `BlockingOp::Ldap`
+mirroring `BlockingOp::Db`) — never on a worker, never on
+the poller. Argon2/bcrypt/scrypt need libraries absent on
+supported runners — stated gaps, not smuggled in.
+
+## Wave 3 Stage 4 allowlist extension (rationale)
+
+The allowlist grows by 2 names: `toto_rt_env_get` /
+`toto_rt_env_has` (libc `getenv`, unix-only — checked code on
+other platforms cannot name them). Process environment only;
+no new surface for setting, enumerating, or modifying it.
+Same Wave-2 discipline: plain C strings in and out, `None`
+for unset (empty-but-set stays `Some("")`); NUL bytes in
+the name are a loud `Err`. Blocking policy: pure libc lookup,
+inline anywhere — never blocks, never parks.
+
+## Wave 3 Stage 1 allowlist extension (rationale)
+
+The allowlist grows by 5 more names (`toto_rt_db_exec`,
+`toto_rt_db_query`, `toto_rt_db_pool_config`,
+`toto_rt_db_close_pool`, `toto_rt_db_last_error`), within this
+wave's FFI rules (D6: bind mature libraries — system
+libsqlite3 unix-wide, libpq + libmysqlclient on Linux only;
+no structs-by-value, no `dlopen`, no binding generation —
+all `unsafe extern` blocks are hand-written with opaque
+pointers + ints only). No new builtins: the 27-name catalog
+is untouched. Checked code cannot name structs in foreign
+signatures (unchanged `E0302`), so params cross as one
+length-prefixed framing string built by pure Toto and rows
+cross back as a framed string decoded by pure Toto (`gzv.std/db`);
+the runtime executor parses/builds the same framing and never
+touches user structs at the boundary. The only runtime
+capability is the scheduler's `BlockingOp::Db` pool step (same
+shape as the TLS `BlockingOp::Tls`), served on the dedicated
+blocking pool — never inline, never on the poller.
+
 ## End-to-end proof dispositions (smoke-test unproven list)
 
 1. **Real library — proven.** libc (`strlen`, `strcmp`, `strtod`,

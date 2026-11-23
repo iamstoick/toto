@@ -38,6 +38,9 @@ unsafe extern "C" {
     fn toto_rt_crypto_sign_sign(secret: Array<int>, msg: Array<int>) -> Array<int>;
     fn toto_rt_crypto_sign_verify(public: Array<int>, msg: Array<int>, sig: Array<int>) -> c_int;
     fn toto_rt_crypto_random(n: c_int) -> Array<int>;
+    fn toto_rt_crypto_pbkdf2(password: *c_char, salt: Array<int>, iterations: c_int) -> Array<int>;
+    fn toto_rt_crypto_pbkdf2_verify(expected: Array<int>, got: Array<int>) -> c_int;
+    fn toto_rt_crypto_rsa_verify(n: Array<int>, e: Array<int>, digest: Array<int>, sig: Array<int>) -> c_int;
     fn toto_rt_crypto_x509_verify(leaf: *c_char, ca: *c_char) -> c_int;
     fn toto_rt_crypto_last_error() -> string;
     fn toto_rt_crypto_version() -> string;
@@ -125,6 +128,44 @@ pub fn crypto_random(n: int) -> Result<Array<int>, string> {
         return Err("random: need 1-65536 bytes, got " + to_string(n));
     }
     return ok_or_empty(toto_rt_crypto_random(n));
+}
+
+// PBKDF2-HMAC-SHA256, 32-byte key (Wave 3 password hashing).
+// Iterations must be positive (callers pass the OWASP count);
+// the KDF itself runs in the linked libcrypto, never in Toto.
+pub fn crypto_pbkdf2(password: string, salt: Array<int>, iterations: int) -> Result<Array<int>, string> {
+    if iterations < 1 {
+        return Err("pbkdf2: need positive iterations, got " + to_string(iterations));
+    }
+    return ok_or_empty(toto_rt_crypto_pbkdf2(password, salt, iterations));
+}
+
+// Constant-time 32-byte comparison: 1 equal, 0 different, Err
+// on bad lengths (never a silent false).
+pub fn crypto_pbkdf2_verify(expected: Array<int>, got: Array<int>) -> Result<int, string> {
+    if len(expected) != 32 || len(got) != 32 {
+        return Err("pbkdf2 verify: need 32-byte keys");
+    }
+    let v = toto_rt_crypto_pbkdf2_verify(expected, got);
+    if v < 0 {
+        return Err(crypto_last_error());
+    }
+    return Ok(v);
+}
+
+// RSA PKCS#1 v1.5 verification with SHA-256 (Wave 3 RS256
+// JWTs): 1 valid, 0 invalid, Err on bad inputs (never silent).
+// `n`/`e` are big-endian JWK bytes, `digest` is 32 bytes of
+// SHA-256, `sig` the raw signature.
+pub fn crypto_rsa_verify(n: Array<int>, e: Array<int>, digest: Array<int>, sig: Array<int>) -> Result<int, string> {
+    if len(digest) != 32 {
+        return Err("rsa verify: need a 32-byte digest");
+    }
+    let v = toto_rt_crypto_rsa_verify(n, e, digest, sig);
+    if v < 0 {
+        return Err(crypto_last_error());
+    }
+    return Ok(v);
 }
 
 pub fn crypto_x509_verify(leaf_pem: string, ca_pem: string) -> Result<int, string> {

@@ -1,0 +1,197 @@
+// stdlib config tests: run with `toto test` from stdlib/.
+//
+// Covers the loaders (TOML/YAML text + file), the merge and env
+// overlay, the typed getters, and key enumeration. No network,
+// no ambient secrets: the only environment read is `PATH`
+// (present on every supported platform) plus one provably
+// absent `TOTO_WAVE3_*` name.
+import "gzv.std/config.gzv";
+import "gzv.std/json.gzv";
+
+fn check(cond: bool, msg: string) -> Result<bool, string> {
+    if cond {
+        return Ok(true);
+    } else {
+    }
+    return Err(msg);
+}
+
+fn toml_doc() -> string {
+    return "title = \"refsvc\"\n[server]\nhost = \"127.0.0.1\"\nport = 8080\ntls = true\nratio = 1.5\n[db]\ndsn = \"sqlite::memory:\"\npool = 4\ntags = [\"a\", \"b\"]\n";
+}
+
+fn yaml_doc() -> string {
+    // The DSN is double-quoted on purpose: an unquoted scalar
+    // ending in `:` re-parses as a mapping head in the Wave-1
+    // yaml layer (pinned by its own test suite — carried as a
+    // Wave-1 follow-up, not fixed here). Quoted scalars are the
+    // supported path and round-trip exactly.
+    return "title: refsvc\nserver:\n  host: 127.0.0.1\n  port: 8080\n  tls: true\ndb:\n  dsn: \"sqlite::memory:\"\n  pool: 4\n";
+}
+
+fn t_empty_require_get() -> Result<bool, string> {
+    let cfg = config_empty()?;
+    let want_missing: Result<string, string> = Err("missing key: db.host");
+    check(config_require(cfg, "db.host") == want_missing, "require missing")?;
+    check(config_get(cfg, "db.host", "fallback")? == "fallback", "default")?;
+    // A present-but-empty key is NOT replaced by the default.
+    let one = config_merge(cfg, json_object(["k"], [json_string("")])?)?;
+    check(config_get(one, "k", "dflt")? == "", "empty wins")?;
+    check(config_get_int(cfg, "db.pool", 7)? == 7, "int default")?;
+    check(config_get_bool(cfg, "srv.tls", true)? == true, "bool default")?;
+    return Ok(true);
+}
+
+fn t_toml_text() -> Result<bool, string> {
+    let cfg = config_from_toml_text(toml_doc())?;
+    check(config_require(cfg, "title")? == "refsvc", "title")?;
+    check(config_require(cfg, "server.host")? == "127.0.0.1", "host")?;
+    check(config_require(cfg, "server.port")? == "8080", "port")?;
+    check(config_require(cfg, "server.tls")? == "true", "tls")?;
+    check(config_require(cfg, "server.ratio")? == "1.5", "ratio")?;
+    check(config_require(cfg, "db.dsn")? == "sqlite::memory:", "dsn")?;
+    check(config_require(cfg, "db.pool")? == "4", "pool")?;
+    check(config_require(cfg, "db.tags.0")? == "a", "tags.0")?;
+    check(config_require(cfg, "db.tags.1")? == "b", "tags.1")?;
+    check(config_get_int(cfg, "server.port", 0)? == 8080, "typed port")?;
+    check(config_get_int(cfg, "db.pool", 0)? == 4, "typed pool")?;
+    check(config_get_bool(cfg, "server.tls", false)? == true, "typed tls")?;
+    check(config_get_float(cfg, "server.ratio", 0.0)? == 1.5, "typed ratio")?;
+    return Ok(true);
+}
+
+fn t_yaml_text() -> Result<bool, string> {
+    let cfg = config_from_yaml_text(yaml_doc())?;
+    check(config_require(cfg, "title")? == "refsvc", "title")?;
+    check(config_require(cfg, "server.host")? == "127.0.0.1", "host")?;
+    check(config_require(cfg, "server.port")? == "8080", "port")?;
+    check(config_require(cfg, "server.tls")? == "true", "tls")?;
+    check(config_require(cfg, "db.dsn")? == "sqlite::memory:", "dsn")?;
+    check(config_require(cfg, "db.pool")? == "4", "pool")?;
+    return Ok(true);
+}
+
+fn t_merge_precedence() -> Result<bool, string> {
+    let base = config_from_toml_text(toml_doc())?;
+    let over = config_from_yaml_text("server:\n  port: 9090\n  extra: yes\n")?;
+    let merged = config_merge(base, over)?;
+    // Overlay wins on conflicts, adds new keys, keeps the rest.
+    check(config_require(merged, "server.port")? == "9090", "over wins")?;
+    check(config_require(merged, "server.extra")? == "yes", "new key")?;
+    check(config_require(merged, "server.host")? == "127.0.0.1", "base kept")?;
+    // The inputs are unchanged (merge builds a new object).
+    check(config_require(base, "server.port")? == "8080", "base intact")?;
+    check(config_require(over, "server.extra")? == "yes", "over intact")?;
+    // Key enumeration covers both sides.
+    let keys = config_keys(merged);
+    check(t_has(keys, "server.port"), "keys port")?;
+    check(t_has(keys, "db.pool"), "keys pool")?;
+    return Ok(true);
+}
+
+fn t_has(keys: Array<string>, want: string) -> bool {
+    for k in keys {
+        if k == want {
+            return true;
+        } else {
+        }
+    }
+    return false;
+}
+
+fn t_env_overlay() -> Result<bool, string> {
+    let base = config_from_toml_text(toml_doc())?;
+    // PATH exists on every supported platform: mapped in, wins.
+    let with_path = config_apply_env(base, ["PATH=env.path"])?;
+    check(config_require(with_path, "env.path")? == config_env_get("PATH"), "path overlaid")?;
+    check(config_require(with_path, "server.port")? == "8080", "base kept")?;
+    // A provably absent variable is skipped, never blanked in.
+    let skipped = config_apply_env(base, ["TOTO_WAVE3_DEFINITELY_UNSET_XYZ=env.missing"])?;
+    let want_missing: Result<string, string> = Err("missing key: env.missing");
+    check(config_require(skipped, "env.missing") == want_missing, "unset skipped")?;
+    // A mapping without `=` is a loud Err, not a silent skip.
+    let bad = config_apply_env(base, ["NOEQUALS"]);
+    let want_bad: Result<JsonVal, string> = Err("bad env mapping (want ENV=config.path)");
+    check(bad == want_bad, "bad mapping")?;
+    return Ok(true);
+}
+
+fn t_typed_errors() -> Result<bool, string> {
+    let cfg = config_from_toml_text("port = \"12x\"\nflag = \"maybe\"\nneg = \"-3\"\nbig = \"1.25\"\n")?;
+    let w1: Result<int, string> = Err("bad int: 12x");
+    check(config_get_int(cfg, "port", 0) == w1, "bad int")?;
+    check(config_get_int(cfg, "neg", 0)? == -3, "negative int")?;
+    let w2: Result<bool, string> = Err("bad bool for config key");
+    check(config_get_bool(cfg, "flag", true) == w2, "bad bool")?;
+    check(config_get_float(cfg, "big", 0.0)? == 1.25, "float")?;
+    let w3: Result<float, string> = Err("bad float: 1.2.3");
+    let cfg2 = config_from_toml_text("v = \"1.2.3\"\n")?;
+    check(config_get_float(cfg2, "v", 0.0) == w3, "bad float")?;
+    let w4: Result<float, string> = Err("bad float (non-finite): NaN");
+    let cfg3 = config_from_toml_text("v = \"NaN\"\n")?;
+    check(config_get_float(cfg3, "v", 0.0) == w4, "non-finite")?;
+    return Ok(true);
+}
+
+fn t_toml_file() -> Result<bool, string> {
+    // Same scratch rule as test_secrets: $TMPDIR else /tmp (no
+    // mkdir builtin; `target/` is not guaranteed to exist).
+    let dir = config_env_get("TMPDIR");
+    let mut base = "/tmp";
+    if dir != "" {
+        base = dir;
+    } else {
+    }
+    let path = base + "/config_test_fixture.toml";
+    write_file(path, toml_doc());
+    let cfg = config_from_toml_file(path)?;
+    check(config_require(cfg, "server.port")? == "8080", "file port")?;
+    check(config_require(cfg, "db.tags.1")? == "b", "file tags")?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_empty_require_get() != yes {
+        println("FAIL empty_require_get");
+        failures = failures + 1;
+    } else {
+    }
+    if t_toml_text() != yes {
+        println("FAIL toml_text");
+        failures = failures + 1;
+    } else {
+    }
+    if t_yaml_text() != yes {
+        println("FAIL yaml_text");
+        failures = failures + 1;
+    } else {
+    }
+    if t_merge_precedence() != yes {
+        println("FAIL merge_precedence");
+        failures = failures + 1;
+    } else {
+    }
+    if t_env_overlay() != yes {
+        println("FAIL env_overlay");
+        failures = failures + 1;
+    } else {
+    }
+    if t_typed_errors() != yes {
+        println("FAIL typed_errors");
+        failures = failures + 1;
+    } else {
+    }
+    if t_toml_file() != yes {
+        println("FAIL toml_file");
+        failures = failures + 1;
+    } else {
+    }
+    if failures > 0 {
+        println(to_string(failures) + " config failures");
+        return 1;
+    } else {
+    }
+    return 0;
+}
