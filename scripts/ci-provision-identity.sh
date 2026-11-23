@@ -76,8 +76,8 @@ echo "--- Keycloak: user $KC_USER"
 curl -s -o /dev/null -w "user=%{http_code}\n" -X POST "$KC_BASE/admin/realms/$KC_REALM/users" \
   -H "Authorization: Bearer $KC_TOKEN" -H "Content-Type: application/json" \
   -d "{\"username\":\"$KC_USER\",\"enabled\":true,\"email\":\"$KC_USER_EMAIL\",\"emailVerified\":true,\"firstName\":\"$KC_USER_FIRST\",\"lastName\":\"$KC_USER_LAST\",\"credentials\":[{\"type\":\"password\",\"value\":\"$KC_USER_PW\",\"temporary\":false}]}"
-UID=$(curl -s "$KC_BASE/admin/realms/$KC_REALM/users?username=$KC_USER" -H "Authorization: Bearer $KC_TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
-echo "uid=$UID"
+KC_UID=$(curl -s "$KC_BASE/admin/realms/$KC_REALM/users?username=$KC_USER" -H "Authorization: Bearer $KC_TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
+echo "uid=$KC_UID"
 CID2=$(curl -s "$KC_BASE/admin/realms/$KC_REALM/clients?clientId=$KC_CLIENT" -H "Authorization: Bearer $KC_TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
 # Deterministic test-only secret (same class as the test-only DB
 # passwords in CI env — no production value, never rotated).
