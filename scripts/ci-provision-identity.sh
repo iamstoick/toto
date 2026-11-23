@@ -70,7 +70,7 @@ curl -s -o /dev/null -w "realm=%{http_code}\n" -X POST "$KC_BASE/admin/realms" \
 echo "--- Keycloak: client $KC_CLIENT (default RS256)"
 curl -s -o /dev/null -w "client=%{http_code}\n" -X POST "$KC_BASE/admin/realms/$KC_REALM/clients" \
   -H "Authorization: Bearer $KC_TOKEN" -H "Content-Type: application/json" \
-  -d "{\"clientId\":\"$KC_CLIENT\",\"enabled\":true,\"publicClient\":false,\"directAccessGrantsEnabled\":true,\"standardFlowEnabled\":true,\"redirectUris\":[\"$KC_REDIRECT\"]}"
+  -d "{\"clientId\":\"$KC_CLIENT\",\"enabled\":true,\"publicClient\":false,\"directAccessGrantsEnabled\":true,\"standardFlowEnabled\":true,\"redirectUris\":[\"$KC_REDIRECT\"],\"secret\":\"$KC_CLIENT_SECRET\"}"
 
 echo "--- Keycloak: user $KC_USER"
 curl -s -o /dev/null -w "user=%{http_code}\n" -X POST "$KC_BASE/admin/realms/$KC_REALM/users" \
@@ -78,11 +78,10 @@ curl -s -o /dev/null -w "user=%{http_code}\n" -X POST "$KC_BASE/admin/realms/$KC
   -d "{\"username\":\"$KC_USER\",\"enabled\":true,\"email\":\"$KC_USER_EMAIL\",\"emailVerified\":true,\"firstName\":\"$KC_USER_FIRST\",\"lastName\":\"$KC_USER_LAST\",\"credentials\":[{\"type\":\"password\",\"value\":\"$KC_USER_PW\",\"temporary\":false}]}"
 KC_UID=$(curl -s "$KC_BASE/admin/realms/$KC_REALM/users?username=$KC_USER" -H "Authorization: Bearer $KC_TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
 echo "uid=$KC_UID"
-CID2=$(curl -s "$KC_BASE/admin/realms/$KC_REALM/clients?clientId=$KC_CLIENT" -H "Authorization: Bearer $KC_TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
-# Deterministic test-only secret (same class as the test-only DB
-# passwords in CI env — no production value, never rotated).
-curl -s -o /dev/null -w "secret=%{http_code}
-" -X PUT "$KC_BASE/admin/realms/$KC_REALM/clients/$CID2/client-secret" -H "Authorization: Bearer $KC_TOKEN" -H "Content-Type: application/json" -d "{\"value\":\"$KC_CLIENT_SECRET\"}"
+# NOTE (Wave 3 fix-forward): the client secret rides in the create
+# body above. Keycloak 26 has no PUT .../client-secret (404 —
+# diagnosed from run 45111621615, secret=404); POST regenerates a
+# random value, which the fixed test env cannot use.
 echo "--- Vault: dev server on :$VAULT_PORT"
 docker run -d --name w3vault -p "$VAULT_PORT:8200" hashicorp/vault:1.15 server -dev -dev-listen-address=0.0.0.0:8200 -dev-root-token-id="$VAULT_TOKEN" > /dev/null
 for i in $(seq 1 30); do
