@@ -1,0 +1,118 @@
+// stdlib migrate tests: run with `toto test` from stdlib/.
+//
+// Sequential (no `go`): covers the interpreter path over
+// `:memory:` — apply/rollback/failure/irreversible, with the
+// ledger verified at every step (no timing, no server).
+import "gzv.std/db.gzv";
+import "gzv.std/migrate.gzv";
+
+fn check(cond: bool, msg: string) -> Result<bool, string> {
+    if cond {
+        return Ok(true);
+    } else {
+        return Err(msg);
+    }
+}
+
+fn migs() -> Array<Migration> {
+    return [
+        migration(1, "users", "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", "DROP TABLE users"),
+        migration(2, "score", "ALTER TABLE users ADD COLUMN score REAL", "ALTER TABLE users DROP COLUMN score"),
+        migration(3, "seed", "INSERT INTO users (name, score) VALUES ('a', 1.5)", "DELETE FROM users WHERE name = 'a'"),
+    ];
+}
+
+fn t_apply_rollback() -> Result<bool, string> {
+    let dsn = "sqlite::memory:";
+    check(migrate_up(dsn, migs())? == 3, "apply 3")?;
+    check(migrate_applied(dsn)? == [1, 2, 3], "ledger full")?;
+    // Re-running applies nothing (idempotent).
+    check(migrate_up(dsn, migs())? == 0, "reapply 0")?;
+    // Data works through the migrated schema.
+    let rows = db_query(dsn, "SELECT name, score FROM users", [])?;
+    check(len(rows) == 1 && rows[0][0].s == "a" && rows[0][1].f == 1.5, "seed row")?;
+    // Roll back one (seed down), then to zero.
+    check(migrate_down(dsn, migs(), 2)? == 1, "down 1")?;
+    check(migrate_applied(dsn)? == [1, 2], "ledger pair")?;
+    check(migrate_down(dsn, migs(), 0)? == 2, "down to 0")?;
+    let want_empty: Array<int> = [];
+    check(migrate_applied(dsn)? == want_empty, "ledger empty")?;
+    // Rolling back nothing is a no-op Ok.
+    check(migrate_down(dsn, migs(), 0)? == 0, "down noop")?;
+    check(db_close_pool(dsn)? == 0, "close")?;
+    return Ok(true);
+}
+
+fn t_failure_stops() -> Result<bool, string> {
+    let dsn = "sqlite::memory:";
+    let bad: Array<Migration> = [
+        migration(1, "ok", "CREATE TABLE t (a INTEGER)", "DROP TABLE t"),
+        migration(2, "broken", "INSERT INTO nope (a) VALUES (1)", "SELECT 1"),
+        migration(3, "never", "CREATE TABLE never (a INTEGER)", "DROP TABLE never"),
+    ];
+    let r = migrate_up(dsn, bad);
+    let want: Result<int, string> = Err("sqlite prepare: no such table: nope");
+    check(r == want, "failure stops with library error")?;
+    // Ledger holds exactly the applied prefix: [1], never 2 or 3.
+    check(migrate_applied(dsn)? == [1], "ledger prefix")?;
+    // Resuming after fixing applies the remainder (2 fixed here).
+    let fixed: Array<Migration> = [
+        migration(1, "ok", "CREATE TABLE t (a INTEGER)", "DROP TABLE t"),
+        migration(2, "fixed", "INSERT INTO t (a) VALUES (7)", "DELETE FROM t WHERE a = 7"),
+        migration(3, "never", "CREATE TABLE never (a INTEGER)", "DROP TABLE never"),
+    ];
+    check(migrate_up(dsn, fixed)? == 2, "resume applies rest")?;
+    check(migrate_applied(dsn)? == [1, 2, 3], "ledger full")?;
+    // Duplicate versions are an Err (validated before touching).
+    let dup: Array<Migration> = [
+        migration(1, "a", "SELECT 1", "SELECT 1"),
+        migration(1, "b", "SELECT 2", "SELECT 2"),
+    ];
+    let d = migrate_up(dsn, dup);
+    let want_dup: Result<int, string> = Err("migrate: duplicate version 1");
+    check(d == want_dup, "duplicate loud")?;
+    check(db_close_pool(dsn)? == 0, "close")?;
+    return Ok(true);
+}
+
+fn t_irreversible() -> Result<bool, string> {
+    let dsn = "sqlite::memory:";
+    let ms: Array<Migration> = [
+        migration(1, "rev", "CREATE TABLE r (a INTEGER)", "DROP TABLE r"),
+        migration(2, "once", "CREATE TABLE o (a INTEGER)", ""),
+    ];
+    check(migrate_up(dsn, ms)? == 2, "apply 2")?;
+    let r = migrate_down(dsn, ms, 0);
+    let want: Result<int, string> = Err("migrate: version 2 (once) is not reversible (no down SQL)");
+    check(r == want, "irreversible loud")?;
+    // Ledger untouched by the refused rollback (still [1, 2]).
+    check(migrate_applied(dsn)? == [1, 2], "ledger intact")?;
+    check(db_close_pool(dsn)? == 0, "close")?;
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_apply_rollback() != yes {
+        println("FAIL apply_rollback");
+        failures = failures + 1;
+    } else {
+    }
+    if t_failure_stops() != yes {
+        println("FAIL failure_stops");
+        failures = failures + 1;
+    } else {
+    }
+    if t_irreversible() != yes {
+        println("FAIL irreversible");
+        failures = failures + 1;
+    } else {
+    }
+    if failures > 0 {
+        println(to_string(failures) + " migrate failures");
+        return 1;
+    } else {
+    }
+    return 0;
+}

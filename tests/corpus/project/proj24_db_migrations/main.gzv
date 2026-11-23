@@ -1,0 +1,57 @@
+import "gzv.std/db.gzv";
+
+import "gzv.std/migrate.gzv";
+
+fn migs() -> Array<Migration> {
+    return [migration(3, "seed", "INSERT INTO users (name, score) VALUES ('b', 2.5)", "DELETE FROM users WHERE name = 'b'"), migration(1, "users", "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", "DROP TABLE users"), migration(2, "score", "ALTER TABLE users ADD COLUMN score REAL", "ALTER TABLE users DROP COLUMN score")];
+}
+
+fn show(dsn: string) -> Result<string, string> {
+    let ledger = migrate_applied(dsn)?;
+    let rows = db_query(dsn, "SELECT id, name, score FROM users ORDER BY id", [])?;
+    let mut out: string = "ledger=" + to_string(len(ledger)) + ":";
+    for v in ledger {
+        out = out + to_string(v) + ",";
+    }
+    out = out + " rows=" + to_string(len(rows)) + ":";
+    for row in rows {
+        out = out + row[1].s + "=" + to_string(row[2].f) + ";";
+    }
+    return Ok(out);
+}
+
+fn show_rolled_back(dsn: string) -> Result<string, string> {
+    let ledger = migrate_applied(dsn)?;
+    let rows = db_query(dsn, "SELECT id, name FROM users ORDER BY id", [])?;
+    let mut out: string = "ledger=" + to_string(len(ledger)) + ":";
+    for v in ledger {
+        out = out + to_string(v) + ",";
+    }
+    out = out + " rows=" + to_string(len(rows)) + ":";
+    for row in rows {
+        out = out + row[1].s + ";";
+    }
+    return Ok(out);
+}
+
+fn run() -> Result<string, string> {
+    let dsn = "sqlite::memory:";
+    let n = migrate_up(dsn, migs())?;
+    let s0 = show(dsn)?;
+    let d = migrate_down(dsn, migs(), 1)?;
+    let s1 = show_rolled_back(dsn)?;
+    let once: Array<Migration> = [migration(4, "once", "CREATE TABLE o (a INTEGER)", "")];
+    migrate_up(dsn, once)?;
+    let bad = migrate_down(dsn, once, 0);
+    let want_bad: Result<int, string> = Err("migrate: version 4 (once) is not reversible (no down SQL)");
+    if bad == want_bad {
+        return Ok(to_string(n) + " " + s0 + " | down=" + to_string(d) + " " + s1 + " | irreversible-ok");
+    } else {
+        return Err("unexpected rollback result");
+    }
+}
+
+fn main() -> int {
+    println(run());
+    return 0;
+}
