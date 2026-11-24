@@ -56,6 +56,7 @@ pub const MODULES: &[(&str, &str)] = &[
     std_module!("oidc"),
     std_module!("config"),
     std_module!("secrets"),
+    std_module!("trace"),
 ];
 
 /// Embedded source for a canonical `gzv.std/...` path, if known.

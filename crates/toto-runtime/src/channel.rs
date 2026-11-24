@@ -90,6 +90,17 @@ impl ChannelTable {
         self.channels.get(id.0)
     }
 
+    /// Channel count, for diagnostics that walk every channel by
+    /// index (green-thread dumps).
+    pub fn len(&self) -> usize {
+        self.channels.len()
+    }
+
+    /// True when no channel exists yet.
+    pub fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+    }
+
     pub fn get_mut(&mut self, id: ChannelId) -> Option<&mut Channel> {
         self.channels.get_mut(id.0)
     }

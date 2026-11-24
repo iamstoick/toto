@@ -1,0 +1,23 @@
+# Toto Enterprise Wave 4 Stage 5 — wordfreq batch image.
+#
+# Context: the output of `toto dist` in apps/wordfreq
+#   (target/dist/wordfreq/ with bin/wordfreq + lib/*.so.*).
+# Base digest pinned at build time (2026-11-24); changing the
+# base is a conscious re-pin, recorded in the wave report.
+# Layout: /app/bin/<app>, /app/lib/ (bundled FFI closure),
+# /app/work/ (writable cwd: input + report.json). The binary's
+# baked $ORIGIN rpath resolves lib/ — no LD_LIBRARY_PATH.
+# Non-root user; batch entrypoint (exit code is the verdict).
+# Base must satisfy the bundled libs' glibc floor (check: max
+# GLIBC_2.x across bin + lib/*.so via `objdump -T`; this host's
+# closure needs 2.38, bookworm-slim ships 2.36, so Ubuntu 26.04
+# (2.43) is the base here — a newer build host re-pins this).
+FROM ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db
+COPY bin/ /app/bin/
+COPY lib/ /app/lib/
+COPY input.stock needle.txt /app/work/
+RUN mv /app/work/input.stock /app/work/input.txt
+WORKDIR /app/work
+RUN useradd -m -u 10001 app && chown -R app:app /app/work
+USER app
+ENTRYPOINT ["/app/bin/wordfreq"]

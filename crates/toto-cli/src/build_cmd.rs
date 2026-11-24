@@ -255,6 +255,18 @@ pub fn build(release: bool, offline: bool) -> ExitCode {
         rustflags.push(' ');
     }
     rustflags.push_str(&format!("-C link-arg={}", obj_abs.display()));
+    // Relocatable dist support (Wave 4 Stage 5): bake both dist
+    // layouts as rpaths (`target/<name>` beside `target/lib`, and
+    // `dist/<name>/bin` beside `dist/<name>/lib`). Missing dirs are
+    // ignored by the loader, so plain `toto build` output behaves
+    // exactly as before (system search); `toto dist` fills the
+    // closure in and the binary runs with an empty environment.
+    rustflags.push_str(" -C link-arg=-Wl,-rpath,$ORIGIN/lib:$ORIGIN/../lib");
+    // Classic RPATH, not RUNPATH: the closure's transitive deps
+    // (libpq → libgssapi, ...) resolve through the main binary's
+    // entry, which RUNPATH does not provide (RUNPATH never
+    // propagates to transitive loads).
+    rustflags.push_str(" -C link-arg=-Wl,--disable-new-dtags");
     cmd.env("RUSTFLAGS", rustflags);
     eprintln!(
         "toto: linking {} ({}) ...",
@@ -304,6 +316,120 @@ pub fn build(release: bool, offline: bool) -> ExitCode {
     ExitCode::from(0)
 }
 
+/// `toto dist [--release] [--offline]`: build, then lay out a
+/// self-contained distribution beside it (`target/dist/<name>/`
+/// with `bin/<name>` + `lib/*.so.*`). The binary's baked rpath
+/// (`$ORIGIN/lib:$ORIGIN/../lib`, see `build`) resolves the
+/// bundled closure, so the dist runs with an empty environment
+/// on any same-arch glibc host. Only the platform C runtime
+/// stays system (libc, libm, libpthread, libdl, librt, libresolv,
+/// NSS, ld-linux — glibc `-static` is rejected: it breaks DNS).
+/// Fully-static musl is a separate toolchain proposal.
+pub fn dist(release: bool, offline: bool) -> ExitCode {
+    let code = build(release, offline);
+    if code != ExitCode::from(0) {
+        return code;
+    }
+    let (root, manifest) = match project_root() {
+        Ok(ok) => ok,
+        Err(code) => return code,
+    };
+    let bin = root.join("target").join(&manifest.name);
+    if !bin.is_file() {
+        eprintln!("toto: dist: missing binary {}", bin.display());
+        return ExitCode::from(3);
+    }
+    let dist = root.join("target").join("dist").join(&manifest.name);
+    let bindir = dist.join("bin");
+    let libdir = dist.join("lib");
+    for d in [&bindir, &libdir] {
+        if let Err(e) = std::fs::create_dir_all(d) {
+            eprintln!("toto: dist: couldn't create {}: {e}", d.display());
+            return ExitCode::from(3);
+        }
+    }
+    // Shared-lib closure via `ldd` (C locale: stable `=>` shape).
+    // Bundle-by-default except the platform C runtime allowlist.
+    let ldd = std::process::Command::new("ldd")
+        .arg(&bin)
+        .env("LC_ALL", "C")
+        .output();
+    let ldd = match ldd {
+        Ok(o) if o.status.success() => o,
+        _ => {
+            eprintln!("toto: dist: `ldd` failed on {}", bin.display());
+            return ExitCode::from(3);
+        }
+    };
+    let text = String::from_utf8_lossy(&ldd.stdout);
+    let mut bundled: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let path = if let Some(i) = line.find("=>") {
+            line[i + 2..].split_whitespace().next().unwrap_or("")
+        } else {
+            line.split_whitespace().next().unwrap_or("")
+        };
+        if path.is_empty() || path == "not" || !path.starts_with('/') {
+            continue; // vdso, `not found` (loud below), or noise
+        }
+        let base = path.rsplit('/').next().unwrap_or(path);
+        if is_system_lib(base) {
+            continue;
+        }
+        let dst = libdir.join(base);
+        if dst.is_file() {
+            continue; // same SONAME twice (dedup)
+        }
+        if let Err(e) = std::fs::copy(path, &dst) {
+            eprintln!("toto: dist: couldn't bundle {path}: {e}");
+            return ExitCode::from(3);
+        }
+        bundled.push(base.to_string());
+    }
+    if text.contains("not found") {
+        eprintln!("toto: dist: `ldd` reports missing libraries");
+        return ExitCode::from(3);
+    }
+    let out_bin = bindir.join(&manifest.name);
+    if let Err(e) = std::fs::copy(&bin, &out_bin) {
+        eprintln!("toto: dist: couldn't install binary: {e}");
+        return ExitCode::from(3);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&out_bin, std::fs::Permissions::from_mode(0o755));
+    }
+    bundled.sort();
+    println!(
+        "toto: dist {} (bin + {} bundled libs)",
+        dist.display(),
+        bundled.len()
+    );
+    for b in &bundled {
+        println!("toto: dist lib: {b}");
+    }
+    ExitCode::from(0)
+}
+
+/// Platform C runtime: stays system in a dist (glibc coherence —
+/// NSS, DNS, ld-linux — never bundled, never static).
+fn is_system_lib(base: &str) -> bool {
+    const SYSTEM: &[&str] = &[
+        "libc.so.6",
+        "libm.so.6",
+        "libpthread.so.0",
+        "libdl.so.2",
+        "librt.so.1",
+        "libutil.so.1",
+        "libresolv.so.2",
+    ];
+    if SYSTEM.contains(&base) {
+        return true;
+    }
+    base.starts_with("ld-linux") || base.starts_with("libnss_") || base == "linux-vdso.so.1"
+}
+
 /// Fingerprint key: every input byte codegen and linking consume.
 /// Sources (entry + imports + dependency files, in loader order),
 /// manifest text, lockfile text when present, opt level, and the
@@ -334,6 +460,11 @@ fn build_fingerprint(
     }
     mix(if release { b"speed" } else { b"none" });
     mix(env!("CARGO_PKG_VERSION").as_bytes());
+    // Link-recipe version (Wave 4 Stage 5): the fingerprint must
+    // change whenever the link args do, or stale pre-recipe
+    // binaries skip the rebuild and ship without the rpath.
+    // Bump this when the RUSTFLAGS link-arg recipe changes.
+    mix(b"link-recipe-rpath-v1");
     format!("{h:016x}")
 }
 

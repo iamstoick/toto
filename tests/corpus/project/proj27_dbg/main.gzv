@@ -1,0 +1,14 @@
+fn main() -> int {
+    let a = chan<int>(0);
+    let b = chan<int>(0);
+    go {
+        let x = <-a;
+        b <- x;
+    }
+    go {
+        let y = <-b;
+        a <- y;
+    }
+    println("wedged");
+    return 0;
+}

@@ -54,6 +54,120 @@ refsvc_latency_ms_bucket{le="500",route="/metrics"} 2
 refsvc_latency_ms_bucket{le="+Inf",route="/metrics"} 2
 refsvc_latency_ms_sum{route="/metrics"} 2
 refsvc_latency_ms_count{route="/metrics"} 2
+front=200
+span name=GET /front/users/{id} parent=test-front-call kind=server service=refsvc-front attrs=http.method=GET,http.target=/front/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/nosuch status=ok
+span name=GET /users/{id} parent=front-to-data kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/nosuch status=ok
+span name=GET /users/{id} parent=front-to-data kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/nosuch status=ok
+span name=GET /users/{id} parent=front-to-data kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/nosuch status=ok
+span name=GET /users/{id} parent=front-to-data kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/nosuch status=ok
+span name=GET /users/{id} parent=front-to-data kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/nosuch status=ok
+span name=GET /users/{id} parent=front-to-data kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=GET /users/{id} parent=- kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/nosuch status=ok
+span name=GET /users/{id} parent=front-to-data kind=server service=refsvc-data attrs=http.method=GET,http.target=/users/alice status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=auth parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=db parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=db parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=db parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=db parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=db parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=db parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=db parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=db parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=db parent=GET /users/{id} kind=internal service=refsvc-data attrs= status=ok
+span name=front-to-data parent=GET /front/users/{id} kind=client service=refsvc-front attrs=http.url=https://localhost:48523/users/alice status=ok
+span name=test-front-call parent=- kind=client service=refsvc-front attrs= status=ok
+trace_ids_equal=no
+span_count=20
+
 neg=yes
 after=200
 {"ts":0,"level":"info","msg":"refsvc-data starting","ctx":{"trace_id":"refsvc-data-1"}}
@@ -73,6 +187,7 @@ after=200
 {"ts":0,"level":"info","msg":"mw GET /notes","ctx":{"trace_id":"refsvc-data-1"}}
 {"ts":0,"level":"info","msg":"mw GET /metrics","ctx":{"trace_id":"refsvc-data-1"}}
 {"ts":0,"level":"info","msg":"mw GET /metrics","ctx":{"trace_id":"refsvc-data-1"}}
+{"ts":0,"level":"info","msg":"mw GET /users/alice","ctx":{"trace_id":"refsvc-data-1"}}
 {"ts":0,"level":"info","msg":"mw GET /users/bob","ctx":{"trace_id":"refsvc-data-1"}}
-log-lines=18
+log-lines=19
 Ok(REFSVC-DATA-OK)

@@ -1,0 +1,6 @@
+panic[E0216]: deadlock: no runnable tasks remain (2 blocked with no one left to wake them); task1 `go-1` blocked in `recv` (bytes 96..99); task2 `go-2` blocked in `recv` (bytes 148..151)
+ --> main.gzv:5:17
+  |
+5 |         let x = <-a;
+  |                 ^^^
+stack trace:

@@ -13,6 +13,7 @@
 // unknown-user 404, byte-exact metrics scrape, wrong-CA
 // rejection + survival, buffered-log drain.
 import "common.gzv";
+import "gzv.std/config.gzv";
 import "gzv.std/context.gzv";
 import "gzv.std/crypto.gzv";
 import "gzv.std/db.gzv";
@@ -23,6 +24,27 @@ import "gzv.std/log.gzv";
 import "gzv.std/metrics.gzv";
 import "gzv.std/strings.gzv";
 import "gzv.std/time.gzv";
+import "gzv.std/trace.gzv";
+
+// Env overlay for the interop leg (mirrors load.gzv): the corpus
+// golden runs on file defaults; the Rust interop test points at
+// fresh fixtures + the real collector.
+fn env_or(name: string, dflt: string) -> string {
+    if config_env_has(name) {
+        return config_env_get(name);
+    } else {
+    }
+    return dflt;
+}
+
+fn env_int(name: string, dflt: int) -> Result<int, string> {
+    let raw = env_or(name, "");
+    if raw == "" {
+        return Ok(dflt);
+    } else {
+    }
+    return config_parse_int(raw);
+}
 
 // Normalize the nondeterministic `ts` to 0 using the exact wire
 // format (`{"ts":NNN,"level":...}`) — same shape as proj17.
@@ -73,27 +95,136 @@ fn bearer_of(resp: HttpClientResp) -> Result<string, string> {
     return Ok(json_as_string(json_object_get(doc, "token")?)?);
 }
 
+fn trace_has_name(names: Array<string>, want: string) -> bool {
+    for n in names {
+        if n == want {
+            return true;
+        } else {
+        }
+    }
+    return false;
+}
+
+// Check one Jaeger /api/traces/{id} document: the trace exists,
+// carries exactly the six demo spans by operation name, and links
+// at least one child to its parent. Returns "found" or "wait"
+// (keep polling); hard failures propagate.
+fn trace_check_doc(doc: JsonVal, tid: string) -> Result<string, string> {
+    let data = json_object_get(doc, "data")?;
+    if json_array_len(data)? == 0 {
+        return Ok("wait");
+    } else {
+    }
+    let t0 = json_array_get(data, 0)?;
+    if json_as_string(json_object_get(t0, "traceID")?)? != tid {
+        return Ok("wait");
+    } else {
+    }
+    let spans = json_object_get(t0, "spans")?;
+    let names: Array<string> = [];
+    let mut child_of: bool = false;
+    let mut i: int = 0;
+    let n: int = json_array_len(spans)?;
+    while i < n {
+        let s = json_array_get(spans, i)?;
+        let nm = json_as_string(json_object_get(s, "operationName")?)?;
+        push(names, nm);
+        let refs = json_object_get(s, "references")?;
+        let m: int = json_array_len(refs)?;
+        let mut k: int = 0;
+        while k < m {
+            let r = json_array_get(refs, k)?;
+            let rt = json_as_string(json_object_get(r, "refType")?)?;
+            let ri = json_as_string(json_object_get(r, "traceID")?)?;
+            if rt == "CHILD_OF" && ri == tid {
+                child_of = true;
+            } else {
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    if n != 6 {
+        return Ok("wait");
+    } else {
+    }
+    if !trace_has_name(names, "test-front-call") {
+        return Ok("wait");
+    } else {
+    }
+    if !trace_has_name(names, "GET /front/users/{id}") {
+        return Ok("wait");
+    } else {
+    }
+    if !trace_has_name(names, "front-to-data") {
+        return Ok("wait");
+    } else {
+    }
+    if !trace_has_name(names, "GET /users/{id}") {
+        return Ok("wait");
+    } else {
+    }
+    if !trace_has_name(names, "auth") {
+        return Ok("wait");
+    } else {
+    }
+    if !trace_has_name(names, "db") {
+        return Ok("wait");
+    } else {
+    }
+    if !child_of {
+        return Ok("wait");
+    } else {
+    }
+    return Ok("found");
+}
+
+fn trace_verify_jaeger(tid: string, copts: HttpClientOpts) -> Result<string, string> {
+    let qb = env_or("TOTO_TEST_JAEGER_BASE", "http://127.0.0.1:16686");
+    let mut i: int = 0;
+    while i < 50 {
+        let r = http_do(HttpClientReq { method: "GET", url: qb + "/api/traces/" + tid, headers: [], body: [], ca_pem: "" }, copts)?;
+        if r.status == 200 {
+            let doc = json_parse(http_bytes_to_text(r.body)?)?;
+            if trace_check_doc(doc, tid)? == "found" {
+                return Ok("trace-verified=yes");
+            } else {
+            }
+        } else {
+        }
+        i = i + 1;
+    }
+    return Err("trace missing from collector");
+}
+
 fn run() -> Result<string, string> {
     log_set_sink("buffer")?;
     log_set_level("info")?;
     ctx_set_current(ctx_with_value(ctx_background(), "trace_id", "refsvc-data-1"))?;
     log_info("refsvc-data starting")?;
     let cfg = refsvc_config()?;
-    let port = refsvc_port(cfg)?;
-    let dsn = refsvc_dsn(cfg)?;
+    let port = env_int("TOTO_REFSVC_PORT", refsvc_port(cfg)?)?;
+    let dsn = env_or("TOTO_REFSVC_DSN", refsvc_dsn(cfg)?);
+    let front_port = env_int("TOTO_REFSVC_FRONT_PORT", 48520)?;
     let ttl = refsvc_ttl(cfg)?;
     db_pool_config(dsn, 8, 5000)?;
     let pws = refsvc_setup(dsn, true)?;
     let key = crypto_random(32)?;
     let reg = metrics_registry();
     refsvc_register(reg)?;
+    let tracer = trace_tracer();
     let router = http_router();
     let svc = RefsDat { dsn: dsn, key: key, ttl_ms: ttl, meter: true };
-    refsvc_routes(router, svc, reg)?;
+    refsvc_routes(router, svc, reg, tracer, refsvc_drain_dir(cfg)?)?;
     let listener = refsvc_serve(port, router)?;
+    let frouter = http_router();
+    let data_base = "https://localhost:" + to_string(port);
     let copts = refsvc_client_opts();
     let ca = refsvc_ca();
+    refsvc_front_routes(frouter, svc, tracer, data_base, ca, copts)?;
+    let flistener = refsvc_serve_front(front_port, frouter)?;
     let base = "https://localhost:" + to_string(port);
+    let front_base = "https://localhost:" + to_string(front_port);
     // Login ok (alice) + token capture.
     let r1 = post_login(base, ca, "alice", pws[0], copts)?;
     if r1.status != 200 {
@@ -253,6 +384,40 @@ fn run() -> Result<string, string> {
     }
     println("metrics=200:match");
     print(body);
+    // Traced cross-service demo: main starts the root client span,
+    // the front service continues it across a go block, and the
+    // data service continues it across the service boundary.
+    let troot = trace_begin(tracer, ctx_background(), "test-front-call", "client", "refsvc-front")?;
+    let tctx = trace_ctx(ctx_background(), troot);
+    let tih = trace_inject(tctx)?;
+    let ths: Array<HttpHeader> = [HttpHeader { name: "Authorization", value: "Bearer " + tok }, tih[0]];
+    let tr = http_do(HttpClientReq { method: "GET", url: front_base + "/front/users/alice", headers: ths, body: [], ca_pem: ca }, copts)?;
+    if tr.status != 200 {
+        net_close(flistener)?;
+        net_close(listener)?;
+        return Err("traced front status");
+    } else {
+    }
+    trace_end(tracer, troot.span, 1, "")?;
+    println("front=200");
+    println(trace_finished_report(tracer));
+    let ep = env_or("TOTO_TEST_OTLP_BASE", "");
+    if ep != "" {
+        trace_export(tracer, ep)?;
+        let tid = troot.span.trace_id;
+        println("trace_id=" + tid);
+        let v = trace_verify_jaeger(tid, copts)?;
+        println(v);
+        net_close(flistener)?;
+        net_close(listener)?;
+        if v != "trace-verified=yes" {
+            return Err("trace verify");
+        } else {
+        }
+        return Ok("REFSVC-DATA-OK");
+    } else {
+    }
+    net_close(flistener)?;
     // Wrong CA: handshake fails; survival proven by the request after.
     let other_ca = refsvc_other_ca();
     let n2 = neg_probe(fn() -> Result<HttpClientResp, string> {

@@ -1,0 +1,592 @@
+// gzv.std/trace — distributed tracing (Enterprise Wave 4, Stage 1).
+//
+// OpenTelemetry-compatible spans over the Wave-1 context ADR
+// (ADR-009): trace/span IDs ride as ordinary context values with
+// spawn inheritance; cross-service propagation uses W3C
+// `traceparent` headers; export is OTLP/HTTP+JSON to a real
+// collector (proven against Jaeger, never asserted from local
+// output alone).
+//
+// Design record: docs/phases/enterprise-wave-4-operations.md §1.
+// No new builtins, no D1-D8 change, no spec change — stdlib only.
+// Error strings are fixed producer text (never library wording)
+// so goldens hold on every platform.
+//
+// Identifiers: trace ids are 16 random bytes rendered as 32
+// lowercase hex chars; span ids are 8 random bytes as 16 hex.
+// Timestamps are monotonic milliseconds rendered as nanos
+// (`ms * 1000000`) — millisecond precision is a stated v1 limit.
+
+import "gzv.std/context.gzv";
+import "gzv.std/crypto.gzv";
+import "gzv.std/http.gzv";
+import "gzv.std/json.gzv";
+import "gzv.std/strings.gzv";
+import "gzv.std/time.gzv";
+
+// OTel SpanKind numbers (stable): internal=1, server=2,
+// client=3, producer=4, consumer=5.
+fn trace_kind_num(kind: string) -> Result<int, string> {
+    if kind == "internal" {
+        return Ok(1);
+    } else {
+    }
+    if kind == "server" {
+        return Ok(2);
+    } else {
+    }
+    if kind == "client" {
+        return Ok(3);
+    } else {
+    }
+    if kind == "producer" {
+        return Ok(4);
+    } else {
+    }
+    if kind == "consumer" {
+        return Ok(5);
+    } else {
+    }
+    return Err("trace: bad kind (want internal|server|client|producer|consumer)");
+}
+
+// One hex digit (lowercase output alphabet).
+fn trace_hexdig(v: int) -> string {
+    let digits: string = "0123456789abcdef";
+    return substring(digits, v, v + 1);
+}
+
+// Lowercase hex of arbitrary bytes (same shape as the Wave-3
+// password codec, local so tracing stays dependency-free).
+pub fn trace_hex(bytes: Array<int>) -> string {
+    let mut out: string = "";
+    for b in bytes {
+        let hi: int = b / 16;
+        let lo: int = b - hi * 16;
+        out = out + trace_hexdig(hi) + trace_hexdig(lo);
+    }
+    return out;
+}
+
+// Numeric value of one hex char, or -1 when not hex.
+fn trace_hexval(c: string) -> int {
+    let digits: string = "0123456789abcdefABCDEF";
+    let mut i: int = 0;
+    while i < len(digits) {
+        if substring(digits, i, i + 1) == c {
+            if i < 16 {
+                return i;
+            } else {
+            }
+            return i - 6;
+        } else {
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// True when every char is hex.
+fn trace_is_hex(s: string) -> bool {
+    if len(s) == 0 {
+        return false;
+    } else {
+    }
+    let mut i: int = 0;
+    while i < len(s) {
+        if trace_hexval(substring(s, i, i + 1)) < 0 {
+            return false;
+        } else {
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Context keys (dotted to avoid collisions).
+fn trace_key_tid() -> string {
+    return "trace.trace_id";
+}
+
+fn trace_key_sid() -> string {
+    return "trace.span_id";
+}
+
+fn trace_key_sampled() -> string {
+    return "trace.sampled";
+}
+
+// One recorded span (attributes grow in place; the finished
+// record is appended on trace_end).
+pub struct TraceAttr {
+    key: string,
+    is_int: bool,
+    s: string,
+    i: int
+}
+
+pub struct TraceSpan {
+    trace_id: string,
+    span_id: string,
+    parent_span_id: string,
+    name: string,
+    kind: string,
+    service: string,
+    start_ms: int,
+    attrs: Array<TraceAttr>,
+    sampled: bool
+}
+
+// A finished span: the span plus end verdict.
+pub struct TraceRecord {
+    span: TraceSpan,
+    end_ms: int,
+    status_code: int,
+    status_msg: string
+}
+
+// The finished-span table plus sampling policy. Exported spans
+// are never removed (v1 exports once per test/run; rotation is
+// a named follow-up, not silent loss).
+pub struct Tracer {
+    spans: Array<TraceRecord>,
+    num: int,
+    den: int
+}
+
+// A tracer that always samples.
+pub fn trace_tracer() -> Tracer {
+    let spans: Array<TraceRecord> = [];
+    return Tracer { spans: spans, num: 1, den: 1 };
+}
+
+// A tracer with head-based ratio sampling (num/den, e.g. 1/100
+// for production; tests use 1/1).
+pub fn trace_tracer_ratio(num: int, den: int) -> Result<Tracer, string> {
+    if num < 0 || den < 1 || num > den {
+        return Err("trace: bad ratio (want 0 <= num <= den, den >= 1)");
+    } else {
+    }
+    let spans: Array<TraceRecord> = [];
+    return Ok(Tracer { spans: spans, num: num, den: den });
+}
+
+// Value of the last 8 hex chars as an int (for head sampling).
+fn trace_tail_value(tid: string) -> int {
+    let tail: string = substring(tid, len(tid) - 8, len(tid));
+    let mut v: int = 0;
+    let mut i: int = 0;
+    while i < len(tail) {
+        v = v * 16 + trace_hexval(substring(tail, i, i + 1));
+        i = i + 1;
+    }
+    return v;
+}
+
+// A begun span plus its derived context.
+pub struct Begun {
+    trace_id: string,
+    span_id: string,
+    sampled: bool,
+    span: TraceSpan
+}
+
+// Start a span: child of the context's span when the context
+// carries (trace_id, span_id), else a new root. Sampling is
+// parent-based when present, head-based otherwise.
+pub fn trace_begin(tracer: Tracer, ctx: Context, name: string, kind: string, service: string) -> Result<Begun, string> {
+    let kind_ok = trace_kind_num(kind)?;
+    let has_tid: bool = ctx_has(ctx, trace_key_tid());
+    let has_sid: bool = ctx_has(ctx, trace_key_sid());
+    let mut tid: string = "";
+    let mut parent: string = "";
+    let mut sampled: bool = true;
+    if has_tid && has_sid {
+        tid = ctx_get(ctx, trace_key_tid())?;
+        parent = ctx_get(ctx, trace_key_sid())?;
+        sampled = ctx_get(ctx, trace_key_sampled())? == "1";
+    } else {
+        let raw = crypto_random(16)?;
+        tid = trace_hex(raw);
+        sampled = trace_tail_value(tid) % tracer.den < tracer.num;
+    }
+    let sraw = crypto_random(8)?;
+    let sid: string = trace_hex(sraw);
+    let attrs: Array<TraceAttr> = [];
+    let span: TraceSpan = TraceSpan {
+        trace_id: tid,
+        span_id: sid,
+        parent_span_id: parent,
+        name: name,
+        kind: kind,
+        service: service,
+        start_ms: clock_monotonic_ms(),
+        attrs: attrs,
+        sampled: sampled
+    };
+    return Ok(Begun { trace_id: tid, span_id: sid, sampled: sampled, span: span });
+}
+
+// Derive the child context for a begun span (the spawner's
+// context plus this span's identity). Separate function because
+// a foreign struct (`Context`) cannot sit in a struct field.
+pub fn trace_ctx(ctx: Context, b: Begun) -> Context {
+    let c1 = ctx_with_value(ctx, trace_key_tid(), b.trace_id);
+    let c2 = ctx_with_value(c1, trace_key_sid(), b.span_id);
+    if b.sampled {
+        return ctx_with_value(c2, trace_key_sampled(), "1");
+    } else {
+    }
+    return ctx_with_value(c2, trace_key_sampled(), "0");
+}
+
+// Record a string attribute on an open span.
+pub fn trace_attr(span: TraceSpan, key: string, val: string) -> Result<unit, string> {
+    if key == "" {
+        return Err("trace: empty attribute key");
+    } else {
+    }
+    let a: TraceAttr = TraceAttr { key: key, is_int: false, s: val, i: 0 };
+    push(span.attrs, a);
+    return Ok(());
+}
+
+// Record an int attribute on an open span.
+pub fn trace_attr_int(span: TraceSpan, key: string, val: int) -> Result<unit, string> {
+    if key == "" {
+        return Err("trace: empty attribute key");
+    } else {
+    }
+    let a: TraceAttr = TraceAttr { key: key, is_int: true, s: "", i: val };
+    push(span.attrs, a);
+    return Ok(());
+}
+
+// Close a span: stamp end time + status and append the finished
+// record. Status codes follow OTel (0 unset, 1 ok, 2 error);
+// anything else is a loud error.
+pub fn trace_end(tracer: Tracer, span: TraceSpan, status_code: int, status_msg: string) -> Result<unit, string> {
+    if status_code < 0 || status_code > 2 {
+        return Err("trace: bad status (want 0 unset, 1 ok, 2 error)");
+    } else {
+    }
+    let rec: TraceRecord = TraceRecord {
+        span: span,
+        end_ms: clock_monotonic_ms(),
+        status_code: status_code,
+        status_msg: status_msg
+    };
+    push(tracer.spans, rec);
+    return Ok(());
+}
+
+// W3C traceparent for the span in this context:
+// `00-<trace-id>-<span-id>-<flags>`. Loud when the context
+// carries no span (call trace_begin first).
+pub fn trace_inject(ctx: Context) -> Result<Array<HttpHeader>, string> {
+    if !ctx_has(ctx, trace_key_tid()) {
+        return Err("trace: no active span to inject");
+    } else {
+    }
+    if !ctx_has(ctx, trace_key_sid()) {
+        return Err("trace: no active span to inject");
+    } else {
+    }
+    let tid: string = ctx_get(ctx, trace_key_tid())?;
+    let sid: string = ctx_get(ctx, trace_key_sid())?;
+    let mut flag: string = "00";
+    if ctx_has(ctx, trace_key_sampled()) {
+        if ctx_get(ctx, trace_key_sampled())? == "1" {
+            flag = "01";
+        } else {
+        }
+    } else {
+    }
+    let v: string = "00-" + tid + "-" + sid + "-" + flag;
+    let h: Array<HttpHeader> = [HttpHeader { name: "traceparent", value: v }];
+    return Ok(h);
+}
+
+// Extract an incoming traceparent. Always succeeds: absent or
+// malformed headers yield the input context unchanged (a
+// tracing defect must never fail a request). The derived context
+// carries the remote span as parent; trace_begin turns it into
+// a child span. `Result` only so `?` works inside.
+pub fn trace_extract(ctx: Context, headers: Array<HttpHeader>) -> Result<Context, string> {
+    let want: Result<string, string> = http_header_or(headers, "traceparent", "");
+    let empty: Result<string, string> = Ok("");
+    if want == empty {
+        return Ok(ctx);
+    } else {
+    }
+    let v: string = want?;
+    let parts: Array<string> = split(v, "-");
+    if len(parts) != 4 {
+        return Ok(ctx);
+    } else {
+    }
+    if parts[0] != "00" {
+        return Ok(ctx);
+    } else {
+    }
+    if len(parts[1]) != 32 || !trace_is_hex(parts[1]) {
+        return Ok(ctx);
+    } else {
+    }
+    if len(parts[2]) != 16 || !trace_is_hex(parts[2]) {
+        return Ok(ctx);
+    } else {
+    }
+    if len(parts[3]) != 2 || !trace_is_hex(parts[3]) {
+        return Ok(ctx);
+    } else {
+    }
+    // Any nonzero flag means sampled (only "01" is generated
+    // in v1; future flags must not silently drop).
+    let mut fl: string = "0";
+    if parts[3] != "00" {
+        fl = "1";
+    } else {
+    }
+    let c1 = ctx_with_value(ctx, trace_key_tid(), parts[1]);
+    let c2 = ctx_with_value(c1, trace_key_sid(), parts[2]);
+    return Ok(ctx_with_value(c2, trace_key_sampled(), fl));
+}
+
+// --- OTLP/HTTP+JSON export (validated against a real collector) ---
+
+// One attribute as an OTLP KeyValue.
+fn trace_attr_json(a: TraceAttr) -> Result<JsonVal, string> {
+    // OTLP AnyValue wrapper: {"stringValue": ...} or
+    // {"intValue": ...} — never a bare value.
+    let mut v: JsonVal = json_null();
+    if a.is_int {
+        v = json_object(["intValue"], [json_int(a.i)])?;
+    } else {
+        v = json_object(["stringValue"], [json_string(a.s)])?;
+    }
+    let ks: Array<string> = ["key", "value"];
+    let vs: Array<JsonVal> = [json_string(a.key), v];
+    return json_object(ks, vs);
+}
+
+// One finished span as OTLP JSON. Timestamps render as strings
+// (OTLP uint64); the parent field is omitted for roots. Public
+// so tests pin the exact wire mapping (the collector proof then
+// covers acceptance, not just shape).
+pub fn trace_span_json(s: TraceSpan, end_ms: int, status_code: int, status_msg: string) -> Result<JsonVal, string> {
+    let kind: int = trace_kind_num(s.kind)?;
+    let attrs: Array<JsonVal> = [];
+    for a in s.attrs {
+        push(attrs, trace_attr_json(a)?);
+    }
+    let empty_keys: Array<string> = [];
+    let empty_vals: Array<JsonVal> = [];
+    let mut st: JsonVal = json_object(empty_keys, empty_vals)?;
+    if status_code == 1 {
+        st = json_object(["code"], [json_int(1)])?;
+    } else {
+    }
+    if status_code == 2 {
+        st = json_object(["code", "message"], [json_int(2), json_string(status_msg)])?;
+    } else {
+    }
+    let sk: Array<string> = ["traceId", "spanId", "name", "kind", "startTimeUnixNano", "endTimeUnixNano", "attributes", "status"];
+    let sv: Array<JsonVal> = [
+        json_string(s.trace_id),
+        json_string(s.span_id),
+        json_string(s.name),
+        json_int(kind),
+        json_string(to_string(s.start_ms * 1000000)),
+        json_string(to_string(end_ms * 1000000)),
+        json_array(attrs),
+        st
+    ];
+    if s.parent_span_id != "" {
+        push(sk, "parentSpanId");
+        push(sv, json_string(s.parent_span_id));
+    } else {
+    }
+    let out: JsonVal = json_object(sk, sv)?;
+    return Ok(out);
+}
+
+// Export all sampled finished spans to an OTLP/HTTP collector:
+// POST {endpoint}/v1/traces, 2xx expected. Unsampled spans stay
+// local (never exported). Loud on any failure.
+pub fn trace_export(tracer: Tracer, endpoint: string) -> Result<string, string> {
+    if endpoint == "" {
+        return Err("trace: empty export endpoint");
+    } else {
+    }
+    // One ResourceSpans entry per distinct service, first-seen
+    // order (deterministic for a fixed test program).
+    let services: Array<string> = [];
+    for r in tracer.spans {
+        if r.span.sampled {
+            let mut seen: bool = false;
+            for s in services {
+                if s == r.span.service {
+                    seen = true;
+                } else {
+                }
+            }
+            if !seen {
+                push(services, r.span.service);
+            } else {
+            }
+        } else {
+        }
+    }
+    let rss: Array<JsonVal> = [];
+    for svc in services {
+        let spans: Array<JsonVal> = [];
+        for r in tracer.spans {
+            if r.span.sampled && r.span.service == svc {
+                push(spans, trace_span_json(r.span, r.end_ms, r.status_code, r.status_msg)?);
+            } else {
+            }
+        }
+        let rsk: Array<string> = ["resource", "scopeSpans"];
+        let scope: JsonVal = json_object(["name"], [json_string("gzv.std/trace")])?;
+        let one_scope: JsonVal = json_object(["scope", "spans"], [scope, json_array(spans)])?;
+        // The attribute value is an OTLP AnyValue wrapper
+        // (`{"stringValue": ...}`), never a bare value — a bare
+        // string here makes collectors reject the whole push.
+        let svc_val: JsonVal = json_object(["stringValue"], [json_string(svc)])?;
+        let rsv: Array<JsonVal> = [
+            json_object(["attributes"], [json_array([json_object(["key", "value"], [json_string("service.name"), svc_val])?])])?,
+            json_array([one_scope])
+        ];
+        push(rss, json_object(rsk, rsv)?);
+    }
+    let body: JsonVal = json_object(["resourceSpans"], [json_array(rss)])?;
+    let text: string = json_stringify(body);
+    let req = HttpClientReq {
+        method: "POST",
+        url: endpoint + "/v1/traces",
+        headers: [HttpHeader { name: "Content-Type", value: "application/json" }],
+        body: http_text_to_bytes(text)?,
+        ca_pem: ""
+    };
+    let copts = HttpClientOpts { max_body: 1048576, redirects: 0, host_allow: [] };
+    let r = http_do(req, copts)?;
+    if r.status < 200 || r.status > 299 {
+        return Err("trace: export rejected status " + to_string(r.status));
+    } else {
+    }
+    return Ok("exported");
+}
+
+// Deterministic finished-span report for goldens: one line per
+// span sorted by name (no IDs, no timestamps — both vary run to
+// run), parent resolved to a name (`-` for roots), plus a
+// same-trace check and a count.
+fn trace_parent_name(spans: Array<TraceRecord>, parent: string) -> string {
+    if parent == "" {
+        return "-";
+    } else {
+    }
+    for r in spans {
+        if r.span.span_id == parent {
+            return r.span.name;
+        } else {
+        }
+    }
+    return "?orphan";
+}
+
+fn names_of(tracer: Tracer) -> Array<string> {
+    let out: Array<string> = [];
+    for r in tracer.spans {
+        push(out, r.span.name);
+    }
+    return out;
+}
+
+fn trace_report_line(r: TraceRecord, spans: Array<TraceRecord>) -> string {
+    let mut st: string = "unset";
+    if r.status_code == 1 {
+        st = "ok";
+    } else {
+    }
+    if r.status_code == 2 {
+        st = "error";
+    } else {
+    }
+    let mut attrs: string = "";
+    let mut first: bool = true;
+    for a in r.span.attrs {
+        if first {
+            first = false;
+        } else {
+            attrs = attrs + ",";
+        }
+        if a.is_int {
+            attrs = attrs + a.key + "=" + to_string(a.i);
+        } else {
+            attrs = attrs + a.key + "=" + a.s;
+        }
+    }
+    return "span name=" + r.span.name + " parent=" + trace_parent_name(spans, r.span.parent_span_id) + " kind=" + r.span.kind + " service=" + r.span.service + " attrs=" + attrs + " status=" + st;
+}
+
+pub fn trace_finished_report(tracer: Tracer) -> string {
+    // Insertion sort by name into a fresh array (no indexed
+    // writes — mirrors the sort_ints shape in load.gzv).
+    let mut sorted: Array<string> = [];
+    for n in names_of(tracer) {
+        let mut pos: int = len(sorted);
+        let mut k: int = 0;
+        while k < len(sorted) {
+            if sorted[k] > n {
+                pos = k;
+                k = len(sorted);
+            } else {
+                k = k + 1;
+            }
+        }
+        let mut nxt: Array<string> = [];
+        let mut k2: int = 0;
+        while k2 < len(sorted) + 1 {
+            if k2 == pos {
+                push(nxt, n);
+            } else {
+            }
+            if k2 < len(sorted) {
+                push(nxt, sorted[k2]);
+            } else {
+            }
+            k2 = k2 + 1;
+        }
+        sorted = nxt;
+    }
+    let mut out: string = "";
+    for n in sorted {
+        for r in tracer.spans {
+            if r.span.name == n {
+                out = out + trace_report_line(r, tracer.spans) + "\n";
+            } else {
+            }
+        }
+    }
+    let mut same: bool = true;
+    if len(tracer.spans) > 0 {
+        let first: string = tracer.spans[0].span.trace_id;
+        for r in tracer.spans {
+            if r.span.trace_id != first {
+                same = false;
+            } else {
+            }
+        }
+    } else {
+    }
+    let mut eq: string = "no";
+    if same {
+        eq = "yes";
+    } else {
+    }
+    out = out + "trace_ids_equal=" + eq + "\n";
+    out = out + "span_count=" + to_string(len(tracer.spans)) + "\n";
+    return out;
+}

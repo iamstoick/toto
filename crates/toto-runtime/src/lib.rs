@@ -11,8 +11,10 @@ pub mod conv;
 pub mod exec;
 pub mod heap;
 pub mod measure;
+pub mod profile;
 pub mod roots;
 pub mod sched;
+pub mod threaddump;
 pub mod value;
 
 use std::collections::HashMap;

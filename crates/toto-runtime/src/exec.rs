@@ -306,6 +306,23 @@ impl<'a> Executor<'a> {
         self.y.suspend(req)
     }
 
+    /// Publish-then-suspend (Wave 4 Stage 3): clone this task's
+    /// TraceFrame stack into its slot before parking, so
+    /// green-thread dumps can read suspended tasks (coroutine
+    /// internals are otherwise unreadable). Best-effort: a
+    /// contended sched lock is skipped, not waited on — a
+    /// slightly stale stack beats a stalled park path, and the
+    /// next park refreshes it.
+    fn suspend(&self, req: ToSched) -> ToTask {
+        if let Ok(mut sched) = self.shared.sched.try_lock()
+            && let Some(slot) = sched.slots.get_mut(self.task.0)
+        {
+            slot.parked_stack.clear();
+            slot.parked_stack.extend(self.trace.iter().cloned());
+        }
+        self.y.suspend(req)
+    }
+
     /// Yield a request that may park (send, receive, select). In a
     /// failed scope the op fails fast with E0214 instead of blocking.
     /// A suspension is a safepoint: collect on threshold (roots are
@@ -316,7 +333,7 @@ impl<'a> Executor<'a> {
         }
         self.check_deadline(span, op)?;
         self.maybe_collect();
-        match self.y.suspend(req) {
+        match self.suspend(req) {
             ToTask::Cancelled { op } => Err(self.cancelled(op, span)),
             resp => Ok(resp),
         }
@@ -620,7 +637,73 @@ impl<'a> Executor<'a> {
     /// completes inline, exactly like the old direct collect; with M:N
     /// every worker joins at its next opportunity while this task's
     /// roots stay published.
+    /// Profiling sample point (Wave 4 Stage 2): called at every
+    /// safepoint via `maybe_collect`. Fast path is two cheap
+    /// checks (enabled flag, 1-in-1024 tick) with no locks; only
+    /// an actual sample or a requested dump touches shared state.
+    fn maybe_sample(&self) {
+        let prof = &self.shared.profiler;
+        if !prof.enabled() {
+            return;
+        }
+        // Requested dump first: the dumping worker writes the
+        // file, everyone else just keeps sampling.
+        if prof.take_dump_request() {
+            crate::sched::Scheduler::profile_dump(self.shared);
+        }
+        if !crate::profile::sample_tick() {
+            return;
+        }
+        let quantum = 1_000_000 / prof.config.hz.max(1);
+        let now = prof.micros_since_start();
+        if now < crate::profile::last_sample().saturating_add(quantum) {
+            return;
+        }
+        crate::profile::stamp_sample(now);
+        let Some(worker) = crate::profile::current_worker() else {
+            return;
+        };
+        if worker >= prof.rings.len() {
+            return;
+        }
+        let Some(first) = self.trace.first().map(|f| f.name.clone()) else {
+            return;
+        };
+        let mut stack = String::new();
+        for (k, f) in self.trace.iter().enumerate() {
+            if k > 0 {
+                stack.push(';');
+            }
+            stack.push_str(&f.name);
+        }
+        {
+            let mut names = prof.names.lock().expect("profile names lock");
+            names.entry(self.task.0 as u32).or_insert(first.clone());
+        }
+        let s = crate::profile::Sample {
+            task: self.task.0 as u32,
+            micros: now,
+            first,
+            stack,
+        };
+        let mut ring = prof.rings[worker].lock().expect("profile ring lock");
+        ring.push(s);
+    }
+
+    /// Thread-dump check (Wave 4 Stage 3): runs at every
+    /// safepoint regardless of profiling, so a SIGUSR2 dump lands
+    /// even when workers never go idle (busy services). Exactly
+    /// one claimant dumps via the atomic take.
+    fn maybe_thread_dump(&self) {
+        #[cfg(unix)]
+        if self.shared.tdump.take() {
+            crate::sched::Scheduler::thread_dump(self.shared);
+        }
+    }
+
     fn maybe_collect(&self) {
+        self.maybe_thread_dump();
+        self.maybe_sample();
         self.publish_roots();
         let need = self.shared.force_collect_for_test
             || {
@@ -1509,7 +1592,7 @@ impl<'a> Executor<'a> {
             name: format!("{name} (builtin)"),
             span,
         });
-        match self.y.suspend(crate::sched::ToSched::Blocking { op, span }) {
+        match self.suspend(crate::sched::ToSched::Blocking { op, span }) {
             ToTask::Value(v) => {
                 self.trace.pop();
                 if let Some(d) = dst {
@@ -1741,7 +1824,7 @@ impl<'a> Executor<'a> {
             args: fargs,
             slots,
         };
-        match self.y.suspend(crate::sched::ToSched::Blocking { op, span }) {
+        match self.suspend(crate::sched::ToSched::Blocking { op, span }) {
             ToTask::Value(v) => {
                 self.trace.pop();
                 if let Some(d) = dst {
@@ -1819,7 +1902,7 @@ impl<'a> Executor<'a> {
             name: "net wait".to_string(),
             span,
         });
-        let out = match self.y.suspend(crate::sched::ToSched::Net { op, span }) {
+        let out = match self.suspend(crate::sched::ToSched::Net { op, span }) {
             ToTask::Value(v) => Ok(v),
             ToTask::Cancelled { op } => Err(self.cancelled(op, span)),
             other => {
@@ -2017,7 +2100,7 @@ impl<'a> Executor<'a> {
                     name: "net resolve (pool)".to_string(),
                     span,
                 });
-                let v = match self.y.suspend(crate::sched::ToSched::Blocking {
+                let v = match self.suspend(crate::sched::ToSched::Blocking {
                     op: crate::sched::BlockingOp::DnsResolve { host },
                     span,
                 }) {
@@ -2089,6 +2172,17 @@ impl<'a> Executor<'a> {
                             self.net_set_error(Some(e));
                             self.net_assign(dst, RtVal::Int(-1));
                             return Ok(());
+                        }
+                        // Track the listener for graceful shutdown
+                        // (Wave 4 Stage 4): SIGTERM/SIGINT closes
+                        // every tracked listener so parked accepts
+                        // wake with errors. Removed at net_close.
+                        #[cfg(unix)]
+                        {
+                            let mut net = self.shared.net.lock().expect("net lock");
+                            if !net.listeners.contains(&fd) {
+                                net.listeners.push(fd);
+                            }
                         }
                         self.net_set_error(None);
                         self.net_assign(dst, RtVal::Int(fd as i64));
@@ -2201,6 +2295,14 @@ impl<'a> Executor<'a> {
                 // Unregister first so parked waiters fail loudly
                 // instead of operating on a recycled fd number.
                 crate::sched::Scheduler::net_unregister_fd(self.shared, fd, "socket closed");
+                // Drop it from the drain listener set too (same
+                // recycled-fd discipline: a closed listener must
+                // never be closed again at drain time).
+                #[cfg(unix)]
+                {
+                    let mut net = self.shared.net.lock().expect("net lock");
+                    net.listeners.retain(|f| *f != fd);
+                }
                 nn::forget_peer(fd);
                 // A TLS session names this fd: free it first so a plain
                 // `net_close` of a TLS connection never leaks the `SSL*`
@@ -2455,7 +2557,7 @@ impl<'a> Executor<'a> {
             name: "tls (pool)".to_string(),
             span,
         });
-        let out = match self.y.suspend(crate::sched::ToSched::Blocking {
+        let out = match self.suspend(crate::sched::ToSched::Blocking {
             op: crate::sched::BlockingOp::Tls { op },
             span,
         }) {
@@ -3195,7 +3297,7 @@ impl<'a> Executor<'a> {
             name: "db (pool)".to_string(),
             span,
         });
-        let out = match self.y.suspend(crate::sched::ToSched::Blocking {
+        let out = match self.suspend(crate::sched::ToSched::Blocking {
             op: crate::sched::BlockingOp::Db { op },
             span,
         }) {
@@ -3426,7 +3528,7 @@ impl<'a> Executor<'a> {
             name: "ldap (pool)".to_string(),
             span,
         });
-        let out = match self.y.suspend(crate::sched::ToSched::Blocking {
+        let out = match self.suspend(crate::sched::ToSched::Blocking {
             op: crate::sched::BlockingOp::Ldap { op },
             span,
         }) {

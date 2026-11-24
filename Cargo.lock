@@ -592,6 +592,7 @@ checksum = "8c447be3a2abfa84b2d91680c56600bd6b2873866de27b36ec911be705e291da"
 name = "toto-cli"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "toto-compiler",
  "toto-jit",
  "toto-runtime",

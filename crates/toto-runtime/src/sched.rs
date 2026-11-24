@@ -26,6 +26,7 @@
 //! compile asserts, not silently.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
 
 use corosensei::stack::{DefaultStack, Stack as _};
@@ -683,6 +684,41 @@ pub struct Shared {
     /// `Lane` for the cycle-freedom invariant.
     pub pool_srv: Mutex<PoolState>,
     pub pool_srv_cv: Condvar,
+    /// No-fd-role blocking lane (Wave 4 Stage 1): Db, Foreign,
+    /// LDAP. Same shape as the server lane (own queue, own bell).
+    pub pool_db: Mutex<PoolState>,
+    pub pool_db_cv: Condvar,
+    /// CPU + heap profiler (Wave 4 Stage 2): rings, flags, last
+    /// sweep tally. Disabled unless `TOTO_PROFILE=1` (config read
+    /// once here); all fields inert otherwise.
+    pub profiler: crate::profile::Profiler,
+    /// Profile-trigger self-pipe (Wave 4 Stage 2, unix-only):
+    /// the SIGUSR1 handler writes one byte; the poller watches
+    /// the read end and raises `dump_requested`. Process-wide
+    /// (created once, never closed); `[-1, -1]` here when
+    /// profiling is disabled for this run.
+    #[cfg(unix)]
+    pub profile_wake: [std::os::fd::RawFd; 2],
+    /// Thread-dump trigger (Wave 4 Stage 3): SIGUSR2 flag + pipe.
+    /// Unlike profiling this is always armed (unix-only) — a
+    /// wedged process cannot be asked to opt in first.
+    pub tdump: crate::threaddump::ThreadDumpFlag,
+    /// SIGUSR2 self-pipe read/write ends (process-wide pair;
+    /// `[-1, -1]` on non-unix builds).
+    #[cfg(unix)]
+    pub thread_wake: [std::os::fd::RawFd; 2],
+    /// Graceful-shutdown drain (Wave 4 Stage 4, unix-only):
+    /// SIGTERM/SIGINT set `draining` and arm `drain_deadline`;
+    /// the poller enforces it (close listeners now, cancel all
+    /// at expiry). `drain_forced` records a timeout kill for the
+    /// exit report + post-mortem dump.
+    pub draining: AtomicBool,
+    pub drain_deadline: std::sync::Mutex<Option<std::time::Instant>>,
+    pub drain_forced: AtomicBool,
+    /// SIGTERM/SIGINT self-pipe read/write ends (process-wide
+    /// pair; `[-1, -1]` on non-unix builds).
+    #[cfg(unix)]
+    pub drain_wake: [std::os::fd::RawFd; 2],
     pub done: Mutex<VecDeque<Completion>>,
     /// M:N network poller (Wave 1, unix-only): registrations in,
     /// readiness completions out. The poller thread touches neither
@@ -758,12 +794,23 @@ pub struct GcState {
 /// instead of wedging the other lane forever).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Lane {
-    /// Shared lane: client-role TLS plus every non-TLS op (Db,
-    /// Ldap, FS, DNS, Foreign — none of which wait on pool
-    /// actions, so sharing the lane cannot form a cycle).
+    /// Client-role TLS only (connect/send/recv/close by session
+    /// role). Files and DNS stay here too: names resolve at
+    /// connect time and fixtures load at startup, never
+    /// mid-request while reads are held.
     Cli,
     /// Server-role TLS only. Exactly one thread (`POOL_SRV_THREADS`).
     Srv,
+    /// Blocking ops with no fd role (Db, Foreign, LDAP): the work
+    /// a server task needs while client reads are held (log emit,
+    /// crypto, queries, binds). `pool_threads` threads — the same
+    /// parallelism these ops always had on the shared lane — so Db
+    /// pool exhaustion semantics (parallel checkout contention)
+    /// are unchanged. A dedicated lane because sharing the client
+    /// lane forms a silent cycle: two held client record Recvs
+    /// plus server work queued behind them, each waiting on the
+    /// other (Wave 4 Stage 1 diagnosis, F1 child).
+    Db,
 }
 
 /// Server-lane thread count (Wave 3 F1 fix): one. Server-role TLS
@@ -906,6 +953,15 @@ impl Shared {
                 {
                     let mut st = self.state.lock().expect("shared state lock");
                     st.heap.collect(&roots);
+                    // Profiling tally (Wave 4 Stage 2): exact
+                    // per-task live table from this collection, for
+                    // the next dump. Separate lock section after
+                    // the collect (heap lock released first).
+                    if self.profiler.enabled() {
+                        let tally = st.heap.profile_tally();
+                        drop(st);
+                        *self.profiler.last_heap.lock().expect("profile heap lock") = tally;
+                    }
                 }
                 {
                     let mut g = self.gc.lock().expect("gc lock");
@@ -970,6 +1026,12 @@ pub struct Slot {
     /// `blocking_seq`, for `Blocked { op: "net" }` parks.
     #[cfg(unix)]
     net_seq: u64,
+    /// Stack published at the last suspend (Wave 4 Stage 3): the
+    /// executor clones its TraceFrame stack here before parking,
+    /// since suspended coroutine internals are otherwise
+    /// unreadable. Read by green-thread dumps; never by scheduling
+    /// decisions.
+    pub(crate) parked_stack: Vec<TraceFrame>,
     /// Last network error for this task (`None` = clean). Set on every
     /// net completion (or inline net failure); read (and cleared) by
     /// `toto_rt_net_last_error`. Plain data, never a heap ref.
@@ -1179,6 +1241,13 @@ fn poller_do(reg: &NetReg) -> PollerDone {
 pub struct NetState {
     regs: Vec<NetReg>,
     shutdown: bool,
+    /// Listening sockets, for graceful shutdown (Wave 4 Stage 4):
+    /// registered at `net_tcp_listen`, removed at `net_close`.
+    /// On SIGTERM/SIGINT the drain closes every tracked listener
+    /// so parked accepts wake with errors and accept loops exit.
+    /// Plain fds (never recycled while registered — removal
+    /// happens before the kernel close, same discipline as regs).
+    pub listeners: Vec<std::os::fd::RawFd>,
 }
 
 pub struct Scheduler {
@@ -1227,6 +1296,24 @@ impl Scheduler {
         let force_collect_for_test = config.collect_at_every_safepoint_for_test;
         let workers = config.workers;
         let pool_threads = config.blocking_pool_threads;
+        // Profiler config is read once here (env); the process-wide
+        // SIGUSR1 self-pipe is ensured only when enabled (created
+        // once, never closed — see `profile::trigger_pipe`).
+        let profiler = crate::profile::Profiler::new(workers, 16384);
+        #[cfg(unix)]
+        let profile_wake: [std::os::fd::RawFd; 2] = if profiler.config.enabled {
+            let (r, w) = crate::profile::trigger_pipe();
+            [r, w]
+        } else {
+            [-1, -1]
+        };
+        // Thread dumps are always armed on unix (a wedged process
+        // cannot opt in after the fact); the pipe is process-wide.
+        #[cfg(unix)]
+        let thread_wake: [std::os::fd::RawFd; 2] = {
+            let (r, w) = crate::threaddump::trigger_pipe();
+            [r, w]
+        };
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 heap,
@@ -1279,6 +1366,26 @@ impl Scheduler {
                 shutdown: false,
             }),
             pool_srv_cv: Condvar::new(),
+            pool_db: Mutex::new(PoolState {
+                jobs: VecDeque::new(),
+                in_flight: 0,
+                shutdown: false,
+            }),
+            pool_db_cv: Condvar::new(),
+            profiler,
+            #[cfg(unix)]
+            profile_wake,
+            tdump: crate::threaddump::ThreadDumpFlag::default(),
+            #[cfg(unix)]
+            thread_wake,
+            draining: AtomicBool::new(false),
+            drain_deadline: std::sync::Mutex::new(None),
+            drain_forced: AtomicBool::new(false),
+            #[cfg(unix)]
+            drain_wake: {
+                let (r, w) = Self::drain_trigger_pipe();
+                [r, w]
+            },
             done: Mutex::new(VecDeque::new()),
             #[cfg(unix)]
             net: Mutex::new(NetState::default()),
@@ -1377,6 +1484,7 @@ impl Scheduler {
             state: TaskState::Ready,
             scope,
             pending: ToTask::Unit,
+            parked_stack: Vec::new(),
             stack_base: base,
             writable_start,
             high_water: None,
@@ -1539,6 +1647,12 @@ impl Scheduler {
             for _ in 0..POOL_SRV_THREADS {
                 scope.spawn(|| Self::pool_loop(&self.shared, Lane::Srv));
             }
+            // Same thread count as the client lane: Db ops keep the
+            // parallelism they always had there (exhaustion tests
+            // need two concurrent checkouts to contend).
+            for _ in 0..self.shared.pool_threads {
+                scope.spawn(|| Self::pool_loop(&self.shared, Lane::Db));
+            }
             #[cfg(unix)]
             scope.spawn(|| Self::poller_loop(&self.shared));
             for worker in 0..self.shared.workers {
@@ -1550,6 +1664,25 @@ impl Scheduler {
         // corpus runs 100+ programs in one test process).
         #[cfg(unix)]
         toto_compiler::netsys::close(self.shared.net_wake[1]).ok();
+        // Profiling exit dump (Wave 4 Stage 2): when enabled, write
+        // the profile now (rings are stable — every worker exited;
+        // the tally is the last collection's). The trigger pipe is
+        // process-wide and stays open (never closed, never
+        // recycled — see `profile::trigger_pipe`).
+        if self.shared.profiler.enabled() {
+            Self::profile_dump(self.shared.as_ref());
+        }
+        // Forced-drain post-mortem (Wave 4 Stage 4): the deadline
+        // fired and cancelled live work — dump what did not drain
+        // in time. Same always-on discipline as the E0216 dump.
+        #[cfg(unix)]
+        if self
+            .shared
+            .drain_forced
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Self::thread_dump(self.shared.as_ref());
+        }
         // All workers exited and the last one shut the pool down, so
         // every thread joined. Compose the outcome.
         let (collections, allocated, reclaimed) = {
@@ -1568,7 +1701,7 @@ impl Scheduler {
                 sched.high_water_max,
             )
         };
-        SchedOutcome {
+        let outcome = SchedOutcome {
             main,
             root_failure,
             stats: RunStats {
@@ -1581,7 +1714,20 @@ impl Scheduler {
                 reclaimed,
             },
             output: std::mem::take(&mut *self.shared.output.lock().expect("output lock")),
+        };
+        // E0216 auto-dump (Wave 4 Stage 3): a deadlock claim ends the
+        // run with every task parked — dump the wedged state for
+        // post-mortem now (workers exited, slots stable, no locks
+        // held by anyone). Always on: the guard only fires when the
+        // run is already lost, and the temp-dir default never litters.
+        let deadlocked = matches!(
+            &outcome.main,
+            crate::exec::TaskResult::Panic { diag, .. } if diag.code == "E0216"
+        );
+        if deadlocked {
+            Self::thread_dump(&self.shared);
         }
+        outcome
     }
 
     /// Check a queued task out for running: Ready -> Running, coroutine
@@ -1610,7 +1756,22 @@ impl Scheduler {
     /// drained inside the decide critical section (see
     /// `drain_completions_locked`).
     fn worker_loop(&self, worker: usize) {
+        // Profiling identity (Wave 4 Stage 2): this OS thread is
+        // worker `worker` for its whole life.
+        crate::profile::set_worker(worker);
         loop {
+            // Thread-dump request (Wave 4 Stage 3): SIGUSR2 via
+            // the poller. Exactly one woken worker claims it; the
+            // dump runs outside the decide section (it takes its
+            // own short locks).
+            if self.shared.tdump.take() {
+                Self::thread_dump(&self.shared);
+            }
+            // Graceful-drain deadline (Wave 4 Stage 4): enforced
+            // here, not in decide (cancelling needs no sched lock
+            // held). Lock-free fast path when idle.
+            #[cfg(unix)]
+            self.check_drain_deadline();
             enum Step {
                 Run(TaskId, TaskCo, ToTask),
                 JoinGc,
@@ -1716,6 +1877,12 @@ impl Scheduler {
                                         let pool_srv =
                                             self.shared.pool_srv.lock().expect("pool srv lock");
                                         !pool_srv.jobs.is_empty() || pool_srv.in_flight > 0
+                                    } || {
+                                        // Db lane counts too (Wave 4
+                                        // Stage 1): same reasoning.
+                                        let pool_db =
+                                            self.shared.pool_db.lock().expect("pool db lock");
+                                        !pool_db.jobs.is_empty() || pool_db.in_flight > 0
                                     } || {
                                         #[cfg(unix)]
                                         {
@@ -1839,6 +2006,11 @@ impl Scheduler {
                         pool_srv.shutdown = true;
                         drop(pool_srv);
                         self.shared.pool_srv_cv.notify_all();
+                        // Same for the Db lane (Wave 4 Stage 1).
+                        let mut pool_db = self.shared.pool_db.lock().expect("pool db lock");
+                        pool_db.shutdown = true;
+                        drop(pool_db);
+                        self.shared.pool_db_cv.notify_all();
                         // Same for the poller (unix-only): set the
                         // flag and poke the pipe so its `poll`
                         // wakes, sees shutdown, and returns.
@@ -1855,7 +2027,12 @@ impl Scheduler {
                 }
                 Step::Run(id, co, input) => {
                     let mut co = co.0;
+                    // Profiling owner (Wave 4 Stage 2): heap inserts
+                    // and samples attribute to the resumed task;
+                    // cleared when it suspends again below.
+                    crate::profile::set_owner(id.0 as u32);
                     let outcome = co.resume(input);
+                    crate::profile::set_owner(crate::profile::SYSTEM_TASK);
                     match outcome {
                         CoroutineResult::Yield(req) => {
                             {
@@ -2294,6 +2471,10 @@ impl Scheduler {
                         shared.pool_srv.lock().expect("pool srv lock"),
                         &shared.pool_srv_cv,
                     ),
+                    Lane::Db => (
+                        shared.pool_db.lock().expect("pool db lock"),
+                        &shared.pool_db_cv,
+                    ),
                 };
                 while pool.jobs.is_empty() && !pool.shutdown {
                     pool = cv.wait(pool).expect("pool cv wait");
@@ -2361,6 +2542,7 @@ impl Scheduler {
                 let mut pool = match lane {
                     Lane::Cli => shared.pool.lock().expect("pool lock"),
                     Lane::Srv => shared.pool_srv.lock().expect("pool srv lock"),
+                    Lane::Db => shared.pool_db.lock().expect("pool db lock"),
                 };
                 let mut done = shared.done.lock().expect("done lock");
                 done.push_back(Completion {
@@ -2422,6 +2604,18 @@ impl Scheduler {
     fn poller_loop(shared: &Arc<Shared>) {
         use toto_compiler::netsys as nn;
         let pipe_rd = shared.net_wake[0];
+        // Profile trigger pipe (Wave 4 Stage 2, unix-only):
+        // watched only when this run profiles (`-1` otherwise).
+        #[cfg(unix)]
+        let profile_rd = shared.profile_wake[0];
+        // Thread-dump trigger pipe (Wave 4 Stage 3, unix-only):
+        // always armed — a wedged process cannot opt in first.
+        #[cfg(unix)]
+        let thread_rd = shared.thread_wake[0];
+        // Drain trigger pipe (Wave 4 Stage 4, unix-only): always
+        // armed — SIGTERM/SIGINT must work with no opt-in.
+        #[cfg(unix)]
+        let drain_rd = shared.drain_wake[0];
         loop {
             // Snapshot the poll set under one lock section. `ids`
             // carries the registration identity per pollfd so a
@@ -2440,6 +2634,21 @@ impl Scheduler {
                     net.regs.iter().map(|r| Some((r.task, r.seq))).collect();
                 fds.push((pipe_rd, true, false));
                 ids.push(None);
+                #[cfg(unix)]
+                if profile_rd >= 0 {
+                    fds.push((profile_rd, true, false));
+                    ids.push(None);
+                }
+                #[cfg(unix)]
+                if thread_rd >= 0 {
+                    fds.push((thread_rd, true, false));
+                    ids.push(None);
+                }
+                #[cfg(unix)]
+                if drain_rd >= 0 {
+                    fds.push((drain_rd, true, false));
+                    ids.push(None);
+                }
                 (fds, ids, net.shutdown)
             };
             if shutdown {
@@ -2449,7 +2658,32 @@ impl Scheduler {
             // Indefinite wait: every table change pokes the pipe, so
             // wakeups cannot be missed; the 60 s timeout only bounds
             // a hypothetical missed wakeup (fail-safe, not a timer).
-            let ready = match nn::poll_wait(&fds, -1) {
+            // While draining, bound the wait by the deadline instead
+            // (Wave 4 Stage 4): an idle system must still notice
+            // expiry, so the timeout wakes us and workers get
+            // notified below.
+            #[cfg(unix)]
+            let timeout_ms: i32 = if shared.draining.load(std::sync::atomic::Ordering::Acquire)
+                && !shared
+                    .drain_forced
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                let guard = shared.drain_deadline.lock().expect("drain deadline lock");
+                match *guard {
+                    // Milliseconds left (0 = already due: wake
+                    // immediately so the worker enforces it).
+                    Some(t) => t
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis()
+                        .min(i32::MAX as u128) as i32,
+                    None => -1,
+                }
+            } else {
+                -1
+            };
+            #[cfg(not(unix))]
+            let timeout_ms: i32 = -1;
+            let ready = match nn::poll_wait(&fds, timeout_ms) {
                 Ok(r) => r,
                 Err(_) => {
                     // `poll` itself failed (fd table torn down under
@@ -2478,6 +2712,37 @@ impl Scheduler {
             let mut woke = false;
             for &i in &ready {
                 if fds[i].0 == pipe_rd {
+                    continue;
+                }
+                // Profile trigger (Wave 4 Stage 2): drain the byte
+                // and raise the dump flag; a worker dumps at its
+                // next safepoint. Never blocks the poller.
+                #[cfg(unix)]
+                if profile_rd >= 0 && fds[i].0 == profile_rd {
+                    nn::drain_pipe(profile_rd);
+                    shared.profiler.request_dump();
+                    continue;
+                }
+                // Thread-dump trigger (Wave 4 Stage 3): drain the
+                // byte, raise the flag, and wake a worker — the
+                // dump happens in the decide section (works wedged:
+                // workers sleep but wake on this notify).
+                #[cfg(unix)]
+                if thread_rd >= 0 && fds[i].0 == thread_rd {
+                    nn::drain_pipe(thread_rd);
+                    shared.tdump.request();
+                    shared.sched_cv.notify_all();
+                    continue;
+                }
+                // Drain trigger (Wave 4 Stage 4): a graceful-stop
+                // signal arrived — begin the drain now (flag file,
+                // close listeners, arm the deadline). The poll
+                // timeout below already tracks the deadline, so an
+                // idle system still enforces it.
+                #[cfg(unix)]
+                if drain_rd >= 0 && fds[i].0 == drain_rd {
+                    nn::drain_pipe(drain_rd);
+                    Self::drain_begin(shared);
                     continue;
                 }
                 // Peek, execute, then post-before-remove: close paths
@@ -2546,6 +2811,19 @@ impl Scheduler {
                         }
                     }
                 }
+            }
+            // Drain timeout tick (Wave 4 Stage 4): an empty wakeup
+            // while draining means the deadline bound fired — wake
+            // a worker so the decide section enforces it. Bounded:
+            // the timeout goes back to indefinite once forced.
+            #[cfg(unix)]
+            if ready.is_empty()
+                && shared.draining.load(std::sync::atomic::Ordering::Acquire)
+                && !shared
+                    .drain_forced
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                woke = true;
             }
             if woke {
                 shared.sched_cv.notify_all();
@@ -3655,6 +3933,302 @@ impl Scheduler {
         }
     }
 
+    /// Write the profile file now (Wave 4 Stage 2): gather rings +
+    /// names + last sweep tally and render per §2.3. Called when a
+    /// worker observes `dump_requested` at a safepoint, and once at
+    /// run exit when enabled. Only the first claimant dumps (the
+    /// dump lock); the file write is a brief inline `std::fs`
+    /// write on the calling worker — no pool, no scheduler locks
+    /// held (rings/names/heap-table are leaf locks by discipline).
+    /// Best-effort observability: a write error prints to stderr
+    /// and the run continues — the profile must never fail the
+    /// service it observes.
+    pub fn profile_dump(shared: &Shared) {
+        if !shared.profiler.enabled() {
+            return;
+        }
+        let _guard = match shared.profiler.dump_lock.try_lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let mut samples = Vec::new();
+        let mut dropped = 0u64;
+        for ring in shared.profiler.rings.iter() {
+            let mut r = ring.lock().expect("profile ring lock");
+            samples.extend(r.drain());
+            dropped += r.dropped;
+            r.dropped = 0;
+        }
+        let names: Vec<(u32, String)> = shared
+            .profiler
+            .names
+            .lock()
+            .expect("profile names lock")
+            .iter()
+            .map(|(id, n)| (*id, n.clone()))
+            .collect();
+        let heap = shared
+            .profiler
+            .last_heap
+            .lock()
+            .expect("profile heap lock")
+            .clone();
+        let text = crate::profile::render(&samples, &names, &heap, dropped);
+        let path = shared.profiler.config.out.clone();
+        if let Err(e) = std::fs::write(&path, text) {
+            eprintln!("profile: dump to {} failed: {}", path, e);
+        }
+    }
+
+    /// Process-wide drain-trigger self-pipe (Wave 4 Stage 4,
+    /// unix-only): created once, never closed (same discipline as
+    /// the profile/thread pipes). SIGTERM and SIGINT both write
+    /// one byte; the poller enforces the drain.
+    #[cfg(unix)]
+    fn drain_trigger_pipe() -> (i32, i32) {
+        use std::sync::OnceLock;
+        static DRAIN_PIPE: OnceLock<(i32, i32)> = OnceLock::new();
+        *DRAIN_PIPE.get_or_init(|| {
+            let (r, w) = toto_compiler::netsys::self_pipe();
+            unsafe extern "C" fn on_term(_sig: std::os::raw::c_int) {
+                if let Some((_, w)) = DRAIN_PIPE.get() {
+                    let one = [1u8; 1];
+                    unsafe {
+                        libc::write(*w, one.as_ptr() as *const std::ffi::c_void, 1);
+                    }
+                }
+            }
+            unsafe {
+                // Same stateless-handler discipline as the
+                // profile/thread triggers; function cast is exact.
+                #[allow(function_casts_as_integer)]
+                {
+                    libc::signal(libc::SIGTERM, on_term as usize);
+                    libc::signal(libc::SIGINT, on_term as usize);
+                }
+            }
+            (r, w)
+        })
+    }
+
+    /// Begin the graceful drain (Wave 4 Stage 4): write the flag
+    /// file `.gzv` readiness checks, close every tracked listener
+    /// (parked accepts wake with errors; accept loops exit), and
+    /// arm the deadline. Idempotent: the first call wins.
+    #[cfg(unix)]
+    fn drain_begin(shared: &Arc<Shared>) {
+        use std::sync::atomic::Ordering;
+        if shared.draining.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Flag file first, so a racing readiness probe fails
+        // closed the moment draining starts.
+        let dir = std::env::var("TOTO_DRAIN_DIR")
+            .unwrap_or_else(|_| std::env::temp_dir().display().to_string());
+        let flag = format!("{}/draining", dir.trim_end_matches('/'));
+        if let Err(e) = std::fs::write(&flag, "draining\n") {
+            eprintln!("drain: flag file {} unwritable: {}", flag, e);
+        }
+        // Close every tracked listener (ignore errors: already
+        // closed is fine). Parked accepts wake with errors next.
+        let fds = {
+            let mut net = shared.net.lock().expect("net lock");
+            std::mem::take(&mut net.listeners)
+        };
+        for fd in fds {
+            toto_compiler::netsys::close(fd).ok();
+        }
+        // Arm the deadline (D7 5 s provisional default).
+        let secs: u64 = std::env::var("TOTO_DRAIN_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(5);
+        *shared.drain_deadline.lock().expect("drain deadline lock") =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+        shared.sched_cv.notify_all();
+    }
+
+    /// Enforce the drain deadline (Wave 4 Stage 4): called from
+    /// the worker loop on every pass while draining. On expiry
+    /// with live tasks remaining, cancel everything through the
+    /// tested dev-drain path and dump the wedged remainder for
+    /// post-mortem. Exactly once; lock-free fast path when idle.
+    #[cfg(unix)]
+    fn check_drain_deadline(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.shared.draining.load(Ordering::Acquire) {
+            return;
+        }
+        let expired = {
+            let guard = self
+                .shared
+                .drain_deadline
+                .lock()
+                .expect("drain deadline lock");
+            match *guard {
+                Some(t) => std::time::Instant::now() >= t,
+                None => false,
+            }
+        };
+        if !expired || self.shared.drain_forced.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        eprintln!("drain: deadline exceeded with live tasks; forcing cancellation");
+        self.shared.tdump.request();
+        self.cancel_all();
+    }
+
+    /// Write a green-thread dump file now (Wave 4 Stage 3):
+    /// every non-Done task with state, wait detail, scope and
+    /// parked stack, plus channels, pool lanes and worker
+    /// assignments. Called from the worker decide section on a
+    /// SIGUSR2 request, and once at run exit on an E0216 claim.
+    /// Gathering takes only short lock sections (sched, then
+    /// state, then each pool — the established orders);
+    /// formatting + file write happen lock-free. Best-effort
+    /// observability like profiles: a write error prints to
+    /// stderr and the service keeps running.
+    pub fn thread_dump(shared: &Shared) {
+        use crate::threaddump as td;
+        // Snapshot tasks.
+        let slots: Vec<(
+            TaskId,
+            String,
+            TaskState,
+            ScopeId,
+            Vec<toto_compiler::interp::TraceFrame>,
+        )> = {
+            let sched = shared.sched.lock().expect("sched lock");
+            sched
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !matches!(s.state, TaskState::Done))
+                .map(|(i, s)| {
+                    (
+                        TaskId(i),
+                        s.name.clone(),
+                        s.state,
+                        s.scope,
+                        s.parked_stack.clone(),
+                    )
+                })
+                .collect()
+        };
+        // Waiter identity per task: channels (chan + direction),
+        // poller regs (fd + op), pool jobs (lane + op). First
+        // match wins in that order (a task parks on one thing).
+        let mut waits: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+        let mut channels: Vec<crate::threaddump::ChannelDump> = Vec::new();
+        {
+            let st = shared.state.lock().expect("state lock");
+            for i in 0..st.channels.len() {
+                let ch = st
+                    .channels
+                    .get(crate::channel::ChannelId(i))
+                    .expect("channel index live");
+                let senders: Vec<usize> = ch.send_waiters.iter().map(|w| w.task.0).collect();
+                let recvers: Vec<usize> = ch.recv_waiters.iter().map(|w| w.task.0).collect();
+                for t in &senders {
+                    waits.entry(*t).or_insert_with(|| format!("chan{} send", i));
+                }
+                for t in &recvers {
+                    waits.entry(*t).or_insert_with(|| format!("chan{} recv", i));
+                }
+                channels.push((i, ch.cap, ch.closed, ch.buf.len(), senders, recvers));
+            }
+        }
+        #[cfg(unix)]
+        {
+            let net = shared.net.lock().expect("net lock");
+            for r in net.regs.iter() {
+                waits
+                    .entry(r.task.0)
+                    .or_insert_with(|| format!("net fd={} {:?}", r.fd, r.op));
+            }
+        }
+        let mut pools: Vec<crate::threaddump::PoolDump> = Vec::new();
+        #[cfg(unix)]
+        {
+            let lanes: [(&str, &std::sync::Mutex<PoolState>); 3] = [
+                ("cli", &shared.pool),
+                ("srv", &shared.pool_srv),
+                ("db", &shared.pool_db),
+            ];
+            for (name, pool) in lanes {
+                let pool = pool.lock().expect("pool lock");
+                let mut jobs = Vec::new();
+                for j in pool.jobs.iter() {
+                    waits
+                        .entry(j.task.0)
+                        .or_insert_with(|| format!("pool:{} {:?}", name, j.op));
+                    jobs.push((j.task.0, format!("{:?}", j.op)));
+                }
+                pools.push((name.to_string(), jobs, pool.in_flight as u64));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let pool = shared.pool.lock().expect("pool lock");
+            let mut jobs = Vec::new();
+            for j in pool.jobs.iter() {
+                waits
+                    .entry(j.task.0)
+                    .or_insert_with(|| format!("pool {:?}", j.op));
+                jobs.push((j.task.0, format!("{:?}", j.op)));
+            }
+            pools.push(("cli".to_string(), jobs, pool.in_flight as u64));
+        }
+        // Workers: Running slots name their worker.
+        let mut running: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut tasks = Vec::new();
+        for (id, name, state, scope, stack) in &slots {
+            let (state_s, wait_s) = match state {
+                TaskState::Ready => ("ready".to_string(), "queued".to_string()),
+                TaskState::Running { worker } => {
+                    running.insert(*worker, id.0);
+                    ("running".to_string(), "executing".to_string())
+                }
+                TaskState::Blocked { op, .. } => {
+                    let w = waits
+                        .get(&id.0)
+                        .cloned()
+                        .unwrap_or_else(|| format!("park:{}", op));
+                    ("blocked".to_string(), w)
+                }
+                TaskState::Done => ("done".to_string(), "-".to_string()),
+            };
+            tasks.push(td::TaskDump {
+                id: id.0,
+                name: name.clone(),
+                state: state_s,
+                wait: wait_s,
+                scope: format!("{:?}", scope),
+                stack: stack.iter().map(|f| f.name.clone()).collect(),
+            });
+        }
+        let mut workers: Vec<(usize, Option<usize>)> = Vec::new();
+        let n_workers = {
+            let sched = shared.sched.lock().expect("sched lock");
+            sched.queues.len()
+        };
+        for w in 0..n_workers {
+            workers.push((w, running.get(&w).copied()));
+        }
+        let dump = td::ThreadDump {
+            tasks,
+            channels,
+            pools,
+            workers,
+        };
+        let text = td::render(&dump);
+        let path = td::default_path();
+        if let Err(e) = std::fs::write(&path, text) {
+            eprintln!("threaddump: dump to {} failed: {}", path, e);
+        }
+    }
+
     /// Fail a scope (first-panic-wins) and release every task parked in
     /// its subtree with cancellation. The release order is task-id order
     /// (deterministic). Collect-then-release: no enqueue while holding
@@ -3788,11 +4362,27 @@ impl Scheduler {
         toto_compiler::netsys::poke_pipe(self.shared.net_wake[1]);
     }
 
-    /// Lane routing for a blocking job (Wave 3 F1 fix): server-role
-    /// TLS runs on the server lane; everything else shares the
-    /// client lane. Decided here, before any lock is taken, so no
-    /// new lock nesting is introduced (the session table is a leaf
+    /// Lane routing for a blocking job (Wave 3 F1 fix, extended
+    /// Wave 4 Stage 1): server-role TLS runs on the server lane;
+    /// client-role TLS keeps the client lane; blocking work with
+    /// no fd role (Db, Foreign, LDAP) rides the dedicated Db
+    /// lane. Decided here, before any lock is taken, so no new
+    /// lock nesting is introduced (the session table is a leaf
     /// lock — it never nests with scheduler state).
+    ///
+    /// Rationale (F1 child, proved with pool introspection on the
+    /// traced cross-service hop): the hop holds both client-lane
+    /// threads in record Recvs (outer client read + hop read)
+    /// while the downstream server task needs pool work (log emit,
+    /// crypto, Db) to produce the response. On the shared client
+    /// lane that work queues behind the very reads it would
+    /// unblock — a silent circular wait no guard can see (a busy
+    /// pool reads as future work). The Db lane keeps two threads,
+    /// the parallelism Db ops always had, so pool exhaustion
+    /// semantics (parallel checkout contention) are unchanged.
+    /// DNS and files keep the client lane: names resolve at
+    /// connect time and fixtures load at startup, never
+    /// mid-request while reads are held.
     #[cfg(unix)]
     fn tls_lane(op: &BlockingOp) -> Lane {
         match op {
@@ -3812,6 +4402,15 @@ impl Scheduler {
                     }
                 }
             },
+            // No fd role: server-request work (a handler's Db,
+            // crypto, log emit, LDAP bind) rides the Db lane —
+            // never the client lane it would wedge behind held
+            // reads (see rationale above). Db keeps two threads
+            // there so pool exhaustion semantics still contend.
+            BlockingOp::Db { .. } => Lane::Db,
+            BlockingOp::Foreign { .. } => Lane::Db,
+            #[cfg(target_os = "linux")]
+            BlockingOp::Ldap { .. } => Lane::Db,
             _ => Lane::Cli,
         }
     }
@@ -3835,6 +4434,7 @@ impl Scheduler {
         let cv = match lane {
             Lane::Cli => &self.shared.pool_cv,
             Lane::Srv => &self.shared.pool_srv_cv,
+            Lane::Db => &self.shared.pool_db_cv,
         };
         #[cfg(not(unix))]
         let cv = &self.shared.pool_cv;
@@ -3857,6 +4457,7 @@ impl Scheduler {
             let mut pool = match lane {
                 Lane::Cli => self.shared.pool.lock().expect("pool lock"),
                 Lane::Srv => self.shared.pool_srv.lock().expect("pool srv lock"),
+                Lane::Db => self.shared.pool_db.lock().expect("pool db lock"),
             };
             #[cfg(not(unix))]
             let mut pool = self.shared.pool.lock().expect("pool lock");
