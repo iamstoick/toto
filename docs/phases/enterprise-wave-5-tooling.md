@@ -5,8 +5,9 @@ in order — Stage 1 linter, Stage 2 richer LSP, Stage 3 coverage,
 Stage 4 doc generator. Each stage gated; no stage re-opens a
 settled decision.
 
-Status: BRIEF APPROVED, STAGE 0 PENDING (starting-state
-verification waits on the post-push CI run — see Stage 0).
+Status: STAGE 0 VERIFIED (run #118 green on the starting
+tree — see Stage 0); STAGE 1 DESIGN APPROVED, IMPLEMENTATION
+PENDING.
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -33,12 +34,18 @@ recorded, stale flake-addendum (d) fixed). Last CI-confirmed
 green: run 45379738715 (#117, head 526660d) — check +
 release-gates + bench + macOS/Linux ARM64 probes green,
 Windows probe informational under continue-on-error. Run
-45399390212 (head 2c7a456, the current HEAD) was in progress at
-brief time; Stage 0 verification completes when it concludes
-green, and its outcome is recorded here before Stage 1 work is
-staged. If it fails, diagnose first (same rule as Wave 4: the
-diff is docs-only, so a check failure would point at
-flake/infra, not at this brief).
+45399390212 (#118, head 2c7a456) concluded SUCCESS
+(run conclusion success, updated 2026-11-24T13:49:53Z) — per
+job, all completed: check success; release-gates success; bench
+success; tier1-probe macos-latest success; tier1-probe
+ubuntu-24.04-arm success; tier1-probe windows-latest failure,
+informational under continue-on-error, the ONLY failing job.
+Stage 0 verification is therefore COMPLETE: the starting tree
+is CI-confirmed green, and Stage 1 work may be staged.
+Lag-by-one noted: pushing this brief (commit ac4a9f9) triggers
+a further CI run on the new HEAD; that run's outcome belongs in
+the next record, not here — the new HEAD is NOT claimed as
+confirmed.
 
 Standing authority carried in: D1–D8 FROZEN; 27 builtins frozen
 (zero new builtins this wave); Phase 5 module model APPROVED;
@@ -81,19 +88,42 @@ this file is append-only and earlier text is preserved verbatim
 was "recorded in dated notes" or "fixed in place". No section
 claims an in-place fix that did not happen.
 
-## Stage 1 — linter (design recorded before implementation; no code yet)
+## Stage 1 — linter (DESIGN APPROVED 2026-11-24; no code yet)
 
 Goal: `toto lint` over whole programs: a seeded rule set for
 enterprise code standards with spanned diagnostics in stable,
 documented codes, runnable in CI as a gate.
 
-Acceptance (brief-level; stage design makes it exact): runs on
-the repo's own `.gzv` corpus (stdlib + tests) with zero false
-positives on clean files; every diagnostic carries a span and a
-stable code; timing budget stated and met; at least one rule
-with an auto-fixable shape reserved for Stage 2 code actions.
-Non-goals: formatting (no `toto fmt` here), editor integration
-(Stage 2 surfaces these diagnostics).
+Design decisions (user-approved 2026-11-24):
+
+- Rule scope: hygiene only. Dead code, unused bindings,
+  unreachable code. Zero false-positive tolerance on the
+  repo's own corpus (272 `.gzv` files: stdlib + tests +
+  bench). Style rules and suspicious-idiom rules are NOT in
+  the seed set — proposed as named follow-ups, not silent
+  extensions.
+- Code scheme: fresh E05xx block (entirely free — in use are
+  E00xx, E01xx incl. E015x, E02xx, E03xx, E04xx, E0601).
+  Reuses `Diag` (code + message + span + help) and the spec
+  §9.1 rendering unchanged, and flows into the existing LSP
+  `publishDiagnostics` path with no fork. No L-prefix family.
+- CLI shape: mirrors `toto fmt` (hand-rolled dispatch in
+  `crates/toto-cli/src/main.rs`, no framework): `toto lint
+  [--deny-warnings] <file.gzv>...`. Exit nonzero on findings;
+  `--deny-warnings` upgrades warnings for CI gating. No
+  project-wide bare mode (the CLI has no project-root
+  resolution yet — owned by a later turn, not this stage).
+
+Acceptance: seed rules fire on purpose-built positive cases;
+the full 272-file corpus lints with zero false positives;
+every diagnostic carries a span and a stable E05xx code;
+timing budget stated and met (measured against the bench
+corpus); at least one rule records an auto-fixable shape for
+Stage 2 code actions. Added to the CI gate only after the
+corpus-clean proof lands.
+Non-goals: formatting (no `toto fmt` here — it exists),
+editor integration (Stage 2 surfaces these diagnostics),
+project-wide mode.
 
 ## Stage 2 — richer LSP
 
