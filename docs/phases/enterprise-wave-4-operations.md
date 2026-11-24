@@ -400,3 +400,118 @@ correctly; unit tests pin the span mapping.)
   shared-machine parallel run wedged it for hours (port/file
   contention with concurrent manual server tests), not a code
   hang — lesson recorded, rerun quiet.
+
+## Stage 2 — profiling (design recorded before implementation; no code yet)
+
+## 2.0 Requirement (PDF p.37)
+CPU and heap profiling of running services, usable in production,
+with GREEN-THREAD-AWARE attribution. A profile that cannot tell
+tasks apart is not sufficient (same reasoning as the D3 race
+detector). Overhead measured and stated; capture from a running
+service without stopping it. Proven on the reference application
+under load (not a toy).
+
+Hard constraints for this stage: 27 builtins FROZEN (a new
+builtin → STOP-and-ask) — so the design uses NO new builtins:
+env vars + SIGUSR1 + profile file only, all runtime-internal.
+No D1/D8 change (verified: ADR-008 freezes the handle codec
+`(generation << 32) | index` and requires type-descriptor
+headers — not the in-memory header struct layout — so a header
+owner field needs no ADR). No spec change.
+
+## 2.1 CPU sampling: cooperative safepoint sampling (no async unwind)
+The M:N workers already pass safepoints (allocation + switch
+per ADR-008: `maybe_collect` at every `alloc_with`, park, and
+yield; collection happens ONLY at function-entry and
+loop-header safepoints). A worker checks one `sampling_on` flag
+at each safepoint; when the time quantum (default 10 ms →
+100 Hz, `TOTO_PROFILE_HZ`) has elapsed since its last sample,
+it records (task id, monotonic timestamp, copy of the task's
+`TraceFrame` stack — `{name, span}` per frame, already
+maintained per task) into its own sample ring, then continues.
+No cross-thread stack reads, no signals for capture, no
+stopping: attribution is exact because the worker always knows
+which task it runs.
+
+Why not async signal sampling: coroutine stacks are not
+async-unwindable; a signal handler cannot safely walk them.
+Cooperative sampling trades completeness (safepoint-only) for
+soundness (every sample is a real task stack). Tight pure loops
+without safepoints are invisible — documented limitation; the
+compiler emits safepoints on entries/loops/calls, so
+production (I/O-bound) services sample faithfully.
+
+## 2.2 Heap attribution: owner tag + sweep tally on D1 accounting
+Extend the object `Header` with the allocating task id (`owner:
+u32`, +4 B/object — stated cost). `insert` takes the current
+task id from the allocating worker (known at every alloc site).
+The sweep tallies per-task live objects + approximate bytes
+(reusing the existing per-alloc `bytes` estimate) and per-type
+(`DescKind`) live counts. Roots unchanged (reachability as-is);
+shared objects count toward their allocator
+(allocator-pays, documented). No collection-algorithm change.
+
+v1 heap profile = per-task live table + per-type live counts
+(no allocation-site stacks — deferred as a named follow-up;
+the CPU sampler already captures stacks, correlation is later).
+
+## 2.3 Output format (text, versioned `v1` header line)
+```
+profile v1
+task <id> <first-name> samples=<n>
+stack <id> <func>;<func>;... <count>
+heap <id> objects=<n> bytes=<n>
+kind <DescKind> objects=<n>
+dropped <n>
+```
+Folded stacks per task (parent-first order as walked), task
+table, heap tables, drop counter. Parseable with split; no
+IDs except task ids and counts (trace names only — stable
+across runs for a fixed workload).
+
+## 2.4 Overhead budget (production-usable means measured)
+- CPU sampling at 100 Hz: one predictable flag check per
+  safepoint + ~100 stack copies/sec/worker (shallow
+  `TraceFrame` vecs). Target <1% wall-clock on the refsvc
+  load shape; CI bench flags >5% regression with sampling on.
+- Heap owner tag +4 B/object; tally O(live) per collection
+  (already O(live) sweep — constant factor, measured).
+- Rings bounded (drop-oldest on overflow, counter records
+  drops — never unbounded growth).
+
+## 2.5 Capture without stopping (signal + env + file; no new API)
+- Enable: `TOTO_PROFILE=1` (both), `TOTO_PROFILE_OUT=path`
+  (default `./toto-profile-<pid>.txt`); `TOTO_PROFILE_HZ`
+  (default 100).
+- Trigger: SIGUSR1 at any time, plus automatic dump at
+  process exit when enabled. Handler writes one byte to a
+  dedicated self-pipe (async-safe; mirrors `net_wake`);
+  the poller sets `profile_dump_requested`; the first worker to
+  observe it at a safepoint locks the rings, writes the file
+  (inline `std::fs` write on the worker — brief, explicit,
+  documented), clears the flag. The service never stops.
+- Rejected: HTTP endpoint (needs router/auth surface);
+  stdlib API (needs code changes in the service; also a new
+  builtin, forbidden). Signal works on unmodified binaries.
+- Corpus proof needs no trigger API: the test workload runs
+  with `TOTO_PROFILE=1`, exits (auto-dump), asserts the file.
+
+## 2.6 Proof plan (mirrors Stage 1)
+- Corpus `proj2X_prof`: fixed synthetic workload (CPU burn
+  across N distinctly-named tasks + known heap shapes).
+  Asserts: file parses per §2.3 grammar; every task present
+  with samples>0 (ranges, not exact — wall-clock sampling is
+  nondeterministic); heap per-task live counts EXACT
+  (deterministic — every object tagged, full tally).
+- Reference application under load (60-req conc-2 shape,
+  sampling on): publish top stacks, per-task CPU split,
+  per-task heap live + overhead numbers (wall-clock
+  on/off, bench rows as flagged).
+- No wire protocol in v1 (files, not OTLP profiles) — stated.
+
+## 2.7 Benchmark rows + decision record
+New bench rows: sampling on/off wall-clock on the refsvc load
+shape (flag rule as usual). Deferred: allocation-site stacks,
+OTLP profile export, HTTP trigger endpoint — named follow-ups,
+not silence.
+
