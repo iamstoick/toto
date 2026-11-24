@@ -698,6 +698,14 @@ pub struct Shared {
     /// profiling is disabled for this run.
     #[cfg(unix)]
     pub profile_wake: [std::os::fd::RawFd; 2],
+    /// Thread-dump trigger (Wave 4 Stage 3): SIGUSR2 flag + pipe.
+    /// Unlike profiling this is always armed (unix-only) — a
+    /// wedged process cannot be asked to opt in first.
+    pub tdump: crate::threaddump::ThreadDumpFlag,
+    /// SIGUSR2 self-pipe read/write ends (process-wide pair;
+    /// `[-1, -1]` on non-unix builds).
+    #[cfg(unix)]
+    pub thread_wake: [std::os::fd::RawFd; 2],
     pub done: Mutex<VecDeque<Completion>>,
     /// M:N network poller (Wave 1, unix-only): registrations in,
     /// readiness completions out. The poller thread touches neither
@@ -1005,6 +1013,12 @@ pub struct Slot {
     /// `blocking_seq`, for `Blocked { op: "net" }` parks.
     #[cfg(unix)]
     net_seq: u64,
+    /// Stack published at the last suspend (Wave 4 Stage 3): the
+    /// executor clones its TraceFrame stack here before parking,
+    /// since suspended coroutine internals are otherwise
+    /// unreadable. Read by green-thread dumps; never by scheduling
+    /// decisions.
+    pub(crate) parked_stack: Vec<TraceFrame>,
     /// Last network error for this task (`None` = clean). Set on every
     /// net completion (or inline net failure); read (and cleared) by
     /// `toto_rt_net_last_error`. Plain data, never a heap ref.
@@ -1273,6 +1287,13 @@ impl Scheduler {
         } else {
             [-1, -1]
         };
+        // Thread dumps are always armed on unix (a wedged process
+        // cannot opt in after the fact); the pipe is process-wide.
+        #[cfg(unix)]
+        let thread_wake: [std::os::fd::RawFd; 2] = {
+            let (r, w) = crate::threaddump::trigger_pipe();
+            [r, w]
+        };
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 heap,
@@ -1334,6 +1355,9 @@ impl Scheduler {
             profiler,
             #[cfg(unix)]
             profile_wake,
+            tdump: crate::threaddump::ThreadDumpFlag::default(),
+            #[cfg(unix)]
+            thread_wake,
             done: Mutex::new(VecDeque::new()),
             #[cfg(unix)]
             net: Mutex::new(NetState::default()),
@@ -1432,6 +1456,7 @@ impl Scheduler {
             state: TaskState::Ready,
             scope,
             pending: ToTask::Unit,
+            parked_stack: Vec::new(),
             stack_base: base,
             writable_start,
             high_water: None,
@@ -1637,7 +1662,7 @@ impl Scheduler {
                 sched.high_water_max,
             )
         };
-        SchedOutcome {
+        let outcome = SchedOutcome {
             main,
             root_failure,
             stats: RunStats {
@@ -1650,7 +1675,20 @@ impl Scheduler {
                 reclaimed,
             },
             output: std::mem::take(&mut *self.shared.output.lock().expect("output lock")),
+        };
+        // E0216 auto-dump (Wave 4 Stage 3): a deadlock claim ends the
+        // run with every task parked — dump the wedged state for
+        // post-mortem now (workers exited, slots stable, no locks
+        // held by anyone). Always on: the guard only fires when the
+        // run is already lost, and the temp-dir default never litters.
+        let deadlocked = matches!(
+            &outcome.main,
+            crate::exec::TaskResult::Panic { diag, .. } if diag.code == "E0216"
+        );
+        if deadlocked {
+            Self::thread_dump(&self.shared);
         }
+        outcome
     }
 
     /// Check a queued task out for running: Ready -> Running, coroutine
@@ -1683,6 +1721,13 @@ impl Scheduler {
         // worker `worker` for its whole life.
         crate::profile::set_worker(worker);
         loop {
+            // Thread-dump request (Wave 4 Stage 3): SIGUSR2 via
+            // the poller. Exactly one woken worker claims it; the
+            // dump runs outside the decide section (it takes its
+            // own short locks).
+            if self.shared.tdump.take() {
+                Self::thread_dump(&self.shared);
+            }
             enum Step {
                 Run(TaskId, TaskCo, ToTask),
                 JoinGc,
@@ -2519,6 +2564,10 @@ impl Scheduler {
         // watched only when this run profiles (`-1` otherwise).
         #[cfg(unix)]
         let profile_rd = shared.profile_wake[0];
+        // Thread-dump trigger pipe (Wave 4 Stage 3, unix-only):
+        // always armed — a wedged process cannot opt in first.
+        #[cfg(unix)]
+        let thread_rd = shared.thread_wake[0];
         loop {
             // Snapshot the poll set under one lock section. `ids`
             // carries the registration identity per pollfd so a
@@ -2540,6 +2589,11 @@ impl Scheduler {
                 #[cfg(unix)]
                 if profile_rd >= 0 {
                     fds.push((profile_rd, true, false));
+                    ids.push(None);
+                }
+                #[cfg(unix)]
+                if thread_rd >= 0 {
+                    fds.push((thread_rd, true, false));
                     ids.push(None);
                 }
                 (fds, ids, net.shutdown)
@@ -2589,6 +2643,17 @@ impl Scheduler {
                 if profile_rd >= 0 && fds[i].0 == profile_rd {
                     nn::drain_pipe(profile_rd);
                     shared.profiler.request_dump();
+                    continue;
+                }
+                // Thread-dump trigger (Wave 4 Stage 3): drain the
+                // byte, raise the flag, and wake a worker — the
+                // dump happens in the decide section (works wedged:
+                // workers sleep but wake on this notify).
+                #[cfg(unix)]
+                if thread_rd >= 0 && fds[i].0 == thread_rd {
+                    nn::drain_pipe(thread_rd);
+                    shared.tdump.request();
+                    shared.sched_cv.notify_all();
                     continue;
                 }
                 // Peek, execute, then post-before-remove: close paths
@@ -3810,6 +3875,156 @@ impl Scheduler {
         let path = shared.profiler.config.out.clone();
         if let Err(e) = std::fs::write(&path, text) {
             eprintln!("profile: dump to {} failed: {}", path, e);
+        }
+    }
+
+    /// Write a green-thread dump file now (Wave 4 Stage 3):
+    /// every non-Done task with state, wait detail, scope and
+    /// parked stack, plus channels, pool lanes and worker
+    /// assignments. Called from the worker decide section on a
+    /// SIGUSR2 request, and once at run exit on an E0216 claim.
+    /// Gathering takes only short lock sections (sched, then
+    /// state, then each pool — the established orders);
+    /// formatting + file write happen lock-free. Best-effort
+    /// observability like profiles: a write error prints to
+    /// stderr and the service keeps running.
+    pub fn thread_dump(shared: &Shared) {
+        use crate::threaddump as td;
+        // Snapshot tasks.
+        let slots: Vec<(
+            TaskId,
+            String,
+            TaskState,
+            ScopeId,
+            Vec<toto_compiler::interp::TraceFrame>,
+        )> = {
+            let sched = shared.sched.lock().expect("sched lock");
+            sched
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !matches!(s.state, TaskState::Done))
+                .map(|(i, s)| {
+                    (
+                        TaskId(i),
+                        s.name.clone(),
+                        s.state,
+                        s.scope,
+                        s.parked_stack.clone(),
+                    )
+                })
+                .collect()
+        };
+        // Waiter identity per task: channels (chan + direction),
+        // poller regs (fd + op), pool jobs (lane + op). First
+        // match wins in that order (a task parks on one thing).
+        let mut waits: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+        let mut channels: Vec<crate::threaddump::ChannelDump> = Vec::new();
+        {
+            let st = shared.state.lock().expect("state lock");
+            for i in 0..st.channels.len() {
+                let ch = st
+                    .channels
+                    .get(crate::channel::ChannelId(i))
+                    .expect("channel index live");
+                let senders: Vec<usize> = ch.send_waiters.iter().map(|w| w.task.0).collect();
+                let recvers: Vec<usize> = ch.recv_waiters.iter().map(|w| w.task.0).collect();
+                for t in &senders {
+                    waits.entry(*t).or_insert_with(|| format!("chan{} send", i));
+                }
+                for t in &recvers {
+                    waits.entry(*t).or_insert_with(|| format!("chan{} recv", i));
+                }
+                channels.push((i, ch.cap, ch.closed, ch.buf.len(), senders, recvers));
+            }
+        }
+        #[cfg(unix)]
+        {
+            let net = shared.net.lock().expect("net lock");
+            for r in net.regs.iter() {
+                waits
+                    .entry(r.task.0)
+                    .or_insert_with(|| format!("net fd={} {:?}", r.fd, r.op));
+            }
+        }
+        let mut pools: Vec<crate::threaddump::PoolDump> = Vec::new();
+        #[cfg(unix)]
+        {
+            let lanes: [(&str, &std::sync::Mutex<PoolState>); 3] = [
+                ("cli", &shared.pool),
+                ("srv", &shared.pool_srv),
+                ("db", &shared.pool_db),
+            ];
+            for (name, pool) in lanes {
+                let pool = pool.lock().expect("pool lock");
+                let mut jobs = Vec::new();
+                for j in pool.jobs.iter() {
+                    waits
+                        .entry(j.task.0)
+                        .or_insert_with(|| format!("pool:{} {:?}", name, j.op));
+                    jobs.push((j.task.0, format!("{:?}", j.op)));
+                }
+                pools.push((name.to_string(), jobs, pool.in_flight as u64));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let pool = shared.pool.lock().expect("pool lock");
+            let mut jobs = Vec::new();
+            for j in pool.jobs.iter() {
+                waits
+                    .entry(j.task.0)
+                    .or_insert_with(|| format!("pool {:?}", j.op));
+                jobs.push((j.task.0, format!("{:?}", j.op)));
+            }
+            pools.push(("cli".to_string(), jobs, pool.in_flight as u64));
+        }
+        // Workers: Running slots name their worker.
+        let mut running: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut tasks = Vec::new();
+        for (id, name, state, scope, stack) in &slots {
+            let (state_s, wait_s) = match state {
+                TaskState::Ready => ("ready".to_string(), "queued".to_string()),
+                TaskState::Running { worker } => {
+                    running.insert(*worker, id.0);
+                    ("running".to_string(), "executing".to_string())
+                }
+                TaskState::Blocked { op, .. } => {
+                    let w = waits
+                        .get(&id.0)
+                        .cloned()
+                        .unwrap_or_else(|| format!("park:{}", op));
+                    ("blocked".to_string(), w)
+                }
+                TaskState::Done => ("done".to_string(), "-".to_string()),
+            };
+            tasks.push(td::TaskDump {
+                id: id.0,
+                name: name.clone(),
+                state: state_s,
+                wait: wait_s,
+                scope: format!("{:?}", scope),
+                stack: stack.iter().map(|f| f.name.clone()).collect(),
+            });
+        }
+        let mut workers: Vec<(usize, Option<usize>)> = Vec::new();
+        let n_workers = {
+            let sched = shared.sched.lock().expect("sched lock");
+            sched.queues.len()
+        };
+        for w in 0..n_workers {
+            workers.push((w, running.get(&w).copied()));
+        }
+        let dump = td::ThreadDump {
+            tasks,
+            channels,
+            pools,
+            workers,
+        };
+        let text = td::render(&dump);
+        let path = td::default_path();
+        if let Err(e) = std::fs::write(&path, text) {
+            eprintln!("threaddump: dump to {} failed: {}", path, e);
         }
     }
 

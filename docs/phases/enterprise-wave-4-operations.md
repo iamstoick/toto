@@ -1,9 +1,9 @@
 # Enterprise Wave 4 report — operations
 
-Status: STAGE 2 IMPLEMENTED (design + code + local proof green;
-CI re-proof pending push). Earlier text preserved verbatim; the
-Stage 1 and Stage 2 implementation records are appended at the
-end in order.
+Status: STAGE 3 IMPLEMENTED (design + code + local proof green;
+CI re-proof pending). Earlier text preserved verbatim; the
+Stage 1–3 implementation records are appended at the end in
+order.
 
 Branch: `enterprise/wave-4-operations`, from `main` at `a958396`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -250,7 +250,10 @@ second implementation).
    PROVEN LOCALLY (Stage 2 record appended at end: cooperative
    sampling + owner-tagged heap, refsvc load profile, <1%
    overhead; local gate green; CI re-proof pending).
-4. Debugger (DWARF + green-thread dumps) — NOT YET (Stage 3).
+4. Debugger (DWARF + green-thread dumps) — IMPLEMENTED +
+   PROVEN LOCALLY (Stage 3 record appended at end: E0216
+   auto-dump + SIGUSR2 live dump + gdb session on AOT; local
+   gate green; CI re-proof pending).
 5. Graceful shutdown (signals + drain under load + health/
    readiness) — NOT YET (Stage 4).
 6. Deployment (static binaries + container images, measured
@@ -819,4 +822,86 @@ New refsvc routes (pattern for services; not framework magic):
 - Windows: signals absent → no drain trigger; file flag is
   still honored if created out-of-band (test hook), but no
   Tier-1 gate (deferred with the platform).
+
+
+# Stage 3 record — debugger support (implementation + proof)
+
+## What was built (Stage 3 implementation)
+- `crates/toto-runtime/src/threaddump.rs` (new): `threaddump v1`
+  format (`task`/`frame`/`chan`/`pool`/`worker` lines),
+  SIGUSR2 self-pipe + handler (process-wide, async-safe),
+  `default_path` (temp dir, `TOTO_THREAD_DUMP` override).
+- `sched.rs`: per-task `parked_stack` slot field (published at
+  every suspend via a single `suspend` wrapper — 8 sites); `Shared.tdump`
+  flag + `thread_wake` pipe; poller watch (+ wake a worker, so
+  wedged runs dump); worker decide + exec safepoint dump
+  triggers; `Scheduler::thread_dump` (gather under short lock
+  sections, render + write lock-free); E0216 epilogue auto-dump.
+- `channel.rs`: `len`/`is_empty` for the dump walk.
+- Corpus `tests/corpus/project/proj27_dbg/` (deterministic
+  two-task chan wedge; E0216 golden).
+- `crates/toto-runtime/tests/threaddump.rs` (in-process: E0216
+  auto-dump asserts both tasks, chan waits, idle lanes).
+- `crates/toto-cli/tests/threaddump_signal.rs` (child SIGUSR2
+  mid-burn: dump lands, service survives, clean exit).
+- GDB session (real AOT wordfreq binary, batch mode recorded):
+  `break toto_fn_main` hits; backtrace mixes `.gzv` fn names
+  with Rust runtime frames (eh_frame); registers/disassembly
+  readable. `info locals` / `break file.gzv:LINE` correctly
+  absent (no `.debug_*` for Toto code on this toolchain —
+  documented gap, separate proposal).
+
+## Proofs
+- Wedged process: deterministic chan deadlock → E0216 fires
+  → auto-dump shows `task 1 go-1 blocked chan0 recv` +
+  `task 2 go-2 blocked chan1 recv` with stacks, channels
+  naming waiters, all lanes drained.
+- Live service: SIGUSR2 mid-load against refsvc (conc-2) →
+  dump shows main parked in `phase_c`, accept loop in
+  `tls_server_accept`, workers on requests; service stays up
+  and completes LOAD-OK.
+- GDB: transcript above (symbols + backtrace + registers on a
+  real AOT binary).
+
+## Deferred (named follow-ups, not silence)
+- Full DWARF (line tables, `.gzv` locals): needs a Cranelift
+  with DWARF object emission (0.137 has none — `unwind`
+  only) + srcloc/variable-location backend work → separate
+  toolchain proposal.
+- JIT dev-server debug integration; native (JIT) task stacks
+  in dumps (state + op shown, no frames); file:line
+  resolution in parked stacks (names + byte spans today).
+
+## Overhead
+- Stack publish per park: one small vec clone behind a
+  try_lock (skipped when contended). Measured via gate bench
+  (no separate row; 5x flag rule applies) — stated here from
+  the refsvc runs: within run-to-run variance.
+
+## Gate totals (fresh full run, this wave)
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `cargo test --workspace --no-fail-fast`: 77 result lines,
+  271 passed, 0 failed (+1 line `oidc_keycloak` 0/2,
+  ENVIRONMENTAL — same stale local Keycloak realm as Stage 1;
+  CI provisions fresh). Bridge from Wave 3 (74 / 269):
+  lines 74 − 1 (oidc ok-line, env-fail here) + 4 new suites
+  (`profile`, `profile_signal`, `threaddump`,
+  `threaddump_signal`) = 77; tests 269 − 2 (oidc) + 4 = 271.
+  Every other binary holds its Wave 3 count test-for-test
+  (verified per-binary, incl. `fmt_equiv` green on the
+  format-stable proj27 golden and `corpus` green incl. proj26
+  + proj27).
+- stdlib `toto test`: 25 passed / 0 failed; wordfreq 1/1 +
+  interp==built identity holds. Corpus census 187 (was 186;
+  +1 proj27; 160 top-level + 27 project).
+
+## Lesson learned ( corpus golden hygiene)
+`fmt_equiv` runs the FORMATTED source and compares against the
+same goldens as the corpus runner (which runs the file as-is).
+A golden asserting source positions (E0216 byte spans here)
+requires a format-stable source: the initial proj27 header
+comment was stripped by `toto fmt`, shifting spans and failing
+the gate. Fix: no leading comments in position-asserting
+goldens (verified `toto fmt` idempotent on the file).
 
