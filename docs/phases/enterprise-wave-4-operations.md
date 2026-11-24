@@ -255,11 +255,16 @@ second implementation).
    auto-dump + SIGUSR2 live dump + gdb session on AOT; local
    gate green; CI re-proof pending).
 5. Graceful shutdown (signals + drain under load + health/
-   readiness) — NOT YET (Stage 4).
+   readiness) — DONE (Stage 4 record: runtime drain + joinable
+   serve + refsvc /healthz//readyz + exit-criterion test green;
+   the committed-test RST was a test race, fixed in-test).
 6. Deployment (static binaries + container images, measured
    targets) + reference application end to end + gates —
-   NOT YET (Stage 5).
-7. Report complete — NOT YET (appended per stage).
+   IMPLEMENTED + PROVEN LOCALLY (Stage 5 record: `toto dist`
+   + both images verified + sizes measured; CI re-proof
+   pending — closes on green).
+7. Report complete — NOT YET (appended per stage; closes with
+   the CI verdict addendum).
 
 # Stage 1 record — implementation, diagnosis, fixes, proof (appended after design; design text above preserved verbatim)
 
@@ -1117,3 +1122,91 @@ libgcc_s, libstdc++, ld-linux) and their transitives.
 - New bench rows green locally + recorded in `baseline.txt`;
   CI `bench` enforces them. Full gates green on Tier-1;
   totals re-derived; checklist closed.
+
+# Stage 5 record — deployment artifacts (implementation + proof)
+
+## What was built (Stage 5 implementation)
+- `toto dist [--release] [--offline]` (new subcommand,
+  `crates/toto-cli/src/{main,build_cmd}.rs`): builds, then lays
+  out `target/dist/<name>/{bin/<name>,lib/*.so.*}`. The shim
+  link bakes a classic RPATH (`$ORIGIN/lib:$ORIGIN/../lib`,
+  `--disable-new-dtags` so it propagates to transitive deps —
+  RUNPATH was proven insufficient: libpq → libgssapi failed to
+  resolve). Closure = bundle-by-default except the glibc
+  runtime allowlist (libc, libm, pthread, dl, rt, resolv, NSS,
+  ld-linux stay system; everything else ships, incl. libgcc_s
+  and libstdc++). Missing libs fail loudly (`ldd: not found`
+  aborts the dist — needs the link env). Fingerprint covers
+  the link recipe (`link-recipe-rpath-v1` — stale pre-RPATH
+  binaries rebuild once). Plain `toto build` output is
+  behaviorally unchanged (rpath dirs absent → system search).
+- `crates/toto-cli/tests/cli.rs`: `dist_produces_self_contained_layout`
+  — dist exits 0, `libpq.so.5` bundled (ships only in the dep
+  dir, never system — proves collection, not luck), dist
+  binary runs with a fully empty environment and byte-matches
+  the interpreter output.
+- `docker/Dockerfile.wordfreq`: AOT dist image (Ubuntu 26.04
+  pinned by digest). Base floor rule: base glibc must satisfy
+  max(GLIBC_2.x) across bin + lib (this host's closure needs
+  2.38 — bookworm-slim's 2.36 failed loudly at startup, which
+  is how the floor was found). Layout `/app/{bin,lib,work}`,
+  non-root user. Verify = byte-identity vs local run.
+- `docker/Dockerfile.refsvc`: reference-service image. AOT
+  refuses blocking DB waits by design (recorded v1 limit), so
+  this image carries the release interpreter + sources +
+  fixtures (not an AOT binary). `LD_LIBRARY_PATH=/app/lib`,
+  `TOTO_REFSVC_FIXDIR`, `TOTO_DRAIN_DIR` set in-image; file DB
+  + drain flag live in the writable workdir; loopback-only
+  listeners serve the in-image client (all-interfaces bind is
+  the carried Wave 0 follow-up, so no host-reachable daemon in
+  v1). Verify = container exit 0 + `Ok(REFSVC-DATA-OK)`.
+- `scripts/bench.sh`: `size-aot-*` (debug) + `size-aotrel-*`
+  (release) rows feed `$MEDIANS` under the same 5x flag rule;
+  `bench/baseline.txt` gains all ten rows with the §5.3
+  targets (debug ≤ 100 MB, release ≤ 30 MB).
+
+## Proofs (all local, CI re-proof recorded below)
+- `toto dist` on wordfreq: bin + 18 bundled libs; `env -i`
+  run exit 0; dist output byte-identical to the in-tree
+  binary (which itself fails without env — the closure is
+  load-bearing, not decorative). RPATH verified via readelf
+  (classic RPATH, not RUNPATH).
+- wordfreq image (`toto-wordfreq:wave4`, 286 MB): `docker run
+  --rm` exit 0, stdout byte-identical to the local dist run.
+- refsvc image (`toto-refsvc:wave4`, 204 MB): `docker run
+  --rm` exit 0, logs end with `Ok(REFSVC-DATA-OK)` — the full
+  reference flow (TLS data + front doors, sqlite migrations +
+  seed, password auth, logging, metrics, traced hop) inside
+  the container with zero external services.
+- Sizes (this host): debug ~77–79 MB (target ≤ 100 MB ✓),
+  release ~3.1–4.0 MB (target ≤ 30 MB ✓). Startup rows
+  already in baseline: `start-aot 4`, `start-aotrel 4`,
+  `start-aotrel-wordfreq 9` (ms; targets §5.3: ≤ 50/20/50).
+- `cli` suite 18/18 (17 + the new dist test); corpus green;
+  `refsvc_load` 4/4; stdlib 25/25; wordfreq 1/1 + identity.
+- Full workspace totals (`cargo test --workspace
+  --no-fail-fast`, fresh run this stage): 78 result lines,
+  273 passed, 0 failed — plus the `cli` dist test, which
+  landed after that run started and passes standalone
+  (18/18): reported total 274 passed. Bridge from Stage 3
+  (77 / 271): +1 line (`drain_shutdown`), +2 tests, then +1
+  (`dist` inside `cli`). The ONLY red line anywhere is
+  `oidc_keycloak` 0/2, ENVIRONMENTAL (same stale local realm
+  as Stages 1–3; CI provisions a fresh realm per run).
+  Corpus census unchanged (no cases added/removed).
+- CI re-proof: run PENDING-CI-1 on the Stage 4 tip and
+  PENDING-CI-2 on the dist commit — status recorded in the
+  dated addendum below; checklist criterion 6 closes only on
+  green.
+
+## Deferred (named follow-ups, not silence)
+- Fully-static musl (needs musl std + static archives of
+  OpenSSL/libpq/libmysqlclient — none available offline).
+- Toolchain image (build the AOT inside docker instead of
+  COPYing the host dist) — reproducibility tradeoff recorded:
+  the shipped images use the gated toolchain's output.
+- Host-reachable daemon image (needs all-interfaces bind —
+  the carried Wave 0 follow-up) + `drain_requested()` builtin,
+  async-TLS/elastic-pool, E0216 root-cause, intermittent CI
+  stall, SIGBUS log-text, TOML/YAML items, native AOT,
+  Windows, Group C: all carried unchanged.

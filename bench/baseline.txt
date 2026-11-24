@@ -55,3 +55,18 @@ start-jit 6
 start-aot 4
 start-aotrel 4
 start-aotrel-wordfreq 9
+# Wave 4 Stage 5: binary sizes in bytes (`toto build` output;
+# `size-aot-*` debug/Off, `size-aotrel-*` release/Speed).
+# Measured locally on the 12-core x86_64 bench box (same machine
+# as the exec-refsvc-load rows). CI enforces the same 5x median
+# rule. Targets (report §5.3): debug <= 100 MB, release <= 30 MB.
+size-aot-compute 77601864
+size-aot-conc 77677720
+size-aot-stdlib 77755224
+size-aot-trivial 77565744
+size-aot-wordfreq 78523848
+size-aotrel-compute 3150632
+size-aotrel-conc 3182584
+size-aotrel-stdlib 3260440
+size-aotrel-trivial 3119032
+size-aotrel-wordfreq 3971656
