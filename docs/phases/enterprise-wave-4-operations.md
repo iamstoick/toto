@@ -1,6 +1,6 @@
 # Enterprise Wave 4 report — operations
 
-Wave 4 verdict: ACCEPTED-WITH-FLAGS — merged to main as 9b6ebf3. OpenTelemetry-compatible tracing (proven against a real Jaeger collector), CPU + heap profiling with green-thread-aware attribution, green-thread dumps + a bounded GDB session on AOT symbols, graceful shutdown with production drain, and toto dist + container images shipped. Verdict, the DWARF scope, and the dist scope approved by the user 2026-11-24. Gate green (78 result lines, 273 passed in the fresh full run + 1 dist test standalone = 274 passed, 0 failed under the environmental convention — see note (f)); CI on main: run 45360369704 (head 352d9b7) — check failed as a confirmed flake (everything else green incl. bench; Windows probe also failed, informational); run 45361946322 (head d602a90) — Success: check + release-gates + bench + macOS/Linux ARM64 probes green, Windows probe informational under continue-on-error; run 45368721678 (head cdfc850) — Success: check + release-gates + bench + macOS/Linux ARM64 probes green, Windows probe informational under continue-on-error. See the dated addenda for the flake diagnosis and the wording corrections.
+Wave 4 verdict: ACCEPTED-WITH-FLAGS — merged to main as 9b6ebf3. OpenTelemetry-compatible tracing (proven against a real Jaeger collector), CPU + heap profiling with green-thread-aware attribution, green-thread dumps + a bounded GDB session on AOT symbols, graceful shutdown with production drain, and toto dist + container images shipped. Verdict, the DWARF scope, and the dist scope approved by the user 2026-11-24. Gate green (78 result lines, 273 passed in the fresh full run + 1 dist test standalone = 274 passed, 0 failed under the environmental convention — see note (f)); CI on main: run 45360369704 (head 352d9b7) — check failed as a confirmed flake (everything else green incl. bench; Windows probe also failed, informational); run 45361946322 (head d602a90) — Success: check + release-gates + bench + macOS/Linux ARM64 probes green, Windows probe informational under continue-on-error; run 45368721678 (head cdfc850) — Success: check + release-gates + bench + macOS/Linux ARM64 probes green, Windows probe informational under continue-on-error; run 45379738715 (head 526660d) — Success: check + release-gates + bench + macOS/Linux ARM64 probes green, Windows probe informational under continue-on-error. See the dated addenda for the flake diagnosis and the wording corrections.
 
 Status: MERGED TO MAIN (was: STAGE 3 IMPLEMENTED (design + code + local proof green; CI re-proof pending) — updated at merge; the re-proof happened on runs 45334432983, 45336314659, 45338895666, and the tip run 45345947783, all Success). Earlier text preserved verbatim; the Stage 1–3 implementation records are appended at the end in order.
 
@@ -1374,8 +1374,8 @@ libgcc_s, libstdc++, ld-linux) and their transitives.
   Reconciliation (ii) (Stage 4 "12 passed" slip corrected to
   11: 262 + 11 = 273) is verified and stands — the six
   suites sum to 1+1+1+1+3+4 = 11.
-- (d) Count correction: note (f) says "three green
-  branch-tip runs" but the file itself cites FOUR Success
+- (d) Count correction: note (f) said "three green
+  branch-tip runs" (since corrected to four in the run-#116 addendum) but the file itself cites FOUR Success
   runs (45334432983, 45336314659, 45338895666, 45345947783).
   Recorded here: four, not three.
 - (e) Local-gate wording, corrected: `./scripts/check.sh` on
@@ -1440,3 +1440,45 @@ libgcc_s, libstdc++, ld-linux) and their transitives.
   exit=101), distinct from CI run 114's check exit 101; the
   local code is not presented as CI evidence. No local
   re-run needed to corroborate it.
+
+# Dated addendum — run #117 closes the record + stale-(d) fix (2026-11-24, on main; append-only)
+- (a) Run 45379738715 (#117, head 526660d — the run on the
+  current HEAD, i.e. the run-#116 record commit): completed
+  SUCCESS (run conclusion success, updated 11:43:39Z) — per
+  job, all completed: check success (fmt + clippy + test
+  gate green, completed 11:43:38Z); release-gates success;
+  bench success (completed 11:23:20Z); tier1-probe
+  macos-latest success; tier1-probe ubuntu-24.04-arm success;
+  tier1-probe windows-latest failure, informational under
+  continue-on-error (Tier-1 conformance step failed, corpus
+  gate + e2e skipped), the ONLY failing job. This closes
+  the record: the final tree is now CI-confirmed green on
+  run #117. Lag-by-one stated one last time: this commit
+  itself triggers a new run that will confirm the new final
+  tree, and that run's outcome belongs in a future record
+  (for example the Wave 5 brief's Stage 0 starting-state
+  verification), not this one. The new HEAD is NOT claimed
+  as confirmed here.
+- (b) Stale sentence in flake addendum (d), fixed in place:
+  it said, in the present tense, 'note (f) says "three green
+  branch-tip runs" but the file itself cites FOUR Success
+  runs' — but note (f) now says "four" (corrected in the
+  run-#116 addendum, item (e)). Reworded to the past tense:
+  'note (f) said "three green branch-tip runs" (since
+  corrected to four in the run-#116 addendum) but the file
+  itself cites FOUR Success runs'. Recorded here, fixed in
+  place.
+- (c) Sweep: searched the file for "three green branch-tip
+  runs", "same HEAD", "identical HEAD", "green end to end",
+  "on HEAD" / "actual HEAD". Every remaining hit is either a
+  quoted error label inside a correction record (run-#116
+  addendum items (b), (c), (e), (f)) or a historical
+  statement (flake addendum (a)'s "FOUR green branch-tip
+  runs behind it"; note (f)'s "four green branch-tip runs
+  on the same code"), not a live claim. No other live
+  misdescription found; none fixed in place.
+- (d) Header: added run 45379738715 (head 526660d) with its
+  outcome (Success, same shape as runs #115/#116), keeping
+  the rule that run ids are recorded against their head
+  commit hash, never against "HEAD". Recorded here, fixed
+  in place.
