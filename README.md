@@ -1,5 +1,21 @@
 # Toto (.gzv) — language implementation in Rust
 
+> Enterprise Wave 4 (operations) complete —
+> ACCEPTED-WITH-FLAGS: OpenTelemetry-compatible tracing, CPU +
+> heap profiling with green-thread attribution, green-thread
+> dumps + a bounded GDB session on AOT symbols, graceful
+> shutdown with production drain, and toto dist + container
+> images shipped. Gate green (78 result lines, 273 passed in the
+> fresh full run + 1 dist test standalone = 274 passed,
+> 0 failed under the environmental convention).
+> DWARF scope and dist scope accepted 2026-11-24: bounded GDB
+> session on AOT symbols (no line tables / source display /
+> .gzv locals — separate toolchain proposal); dist layout with
+> bundled FFI closure under classic RPATH (fully-static musl
+> is a named follow-up).
+> See [Wave 4 report](docs/phases/enterprise-wave-4-operations.md).
+> Roadmap: [Implementation Roadmap v2.5](docs/) (D1–D8 + ratified decisions; Enterprise Track gated waves).
+
 > Enterprise Wave 3 (data and identity) complete —
 > ACCEPTED-WITH-FLAGS: database drivers (Postgres/MySQL/SQLite)
 > + pooling + migrations + auth (OAuth2/OIDC, JWT, passwords,

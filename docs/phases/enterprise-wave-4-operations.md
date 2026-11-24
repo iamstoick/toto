@@ -1,9 +1,8 @@
 # Enterprise Wave 4 report — operations
 
-Status: STAGE 3 IMPLEMENTED (design + code + local proof green;
-CI re-proof pending). Earlier text preserved verbatim; the
-Stage 1–3 implementation records are appended at the end in
-order.
+Wave 4 verdict: ACCEPTED-WITH-FLAGS — merged to main as 9b6ebf3. OpenTelemetry-compatible tracing (proven against a real Jaeger collector), CPU + heap profiling with green-thread-aware attribution, green-thread dumps + a bounded GDB session on AOT symbols, graceful shutdown with production drain, and toto dist + container images shipped. Verdict, the DWARF scope, and the dist scope approved by the user 2026-11-24. Gate green (78 result lines, 273 passed in the fresh full run + 1 dist test standalone = 274 passed, 0 failed under the environmental convention — see note (f)); CI green on run PENDING-STEP-3 (check + release-gates + bench + macOS/Linux ARM64 probes; Windows probe informational under continue-on-error). Details in the sections below; earlier section text is preserved verbatim.
+
+Status: MERGED TO MAIN (was: STAGE 3 IMPLEMENTED (design + code + local proof green; CI re-proof pending) — updated at merge; the re-proof happened on runs 45334432983, 45336314659, 45338895666, and the tip run 45345947783, all Success). Earlier text preserved verbatim; the Stage 1–3 implementation records are appended at the end in order.
 
 Branch: `enterprise/wave-4-operations`, from `main` at `a958396`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -243,17 +242,15 @@ second implementation).
 
 1. Starting state verified; follow-ups dispositioned — DONE
    (Stage 0 above).
-2. Distributed tracing — IMPLEMENTED + PROVEN LOCALLY (Stage 1
-   record appended at end: design as above; OTLP collector proof
-   `trace-verified=yes`; local gate green; CI re-proof pending).
-3. Profiling (CPU + heap, green-thread-aware) — IMPLEMENTED +
-   PROVEN LOCALLY (Stage 2 record appended at end: cooperative
-   sampling + owner-tagged heap, refsvc load profile, <1%
-   overhead; local gate green; CI re-proof pending).
-4. Debugger (DWARF + green-thread dumps) — IMPLEMENTED +
-   PROVEN LOCALLY (Stage 3 record appended at end: E0216
-   auto-dump + SIGUSR2 live dump + gdb session on AOT; local
-   gate green; CI re-proof pending).
+2. Distributed tracing — DONE (Stage 1 record appended at end;
+   CI re-proof on runs 45334432983, 45336314659, 45338895666,
+   45345947783, all Success; mark was stale, not wrong).
+3. Profiling (CPU + heap, green-thread-aware) — DONE (Stage 2
+   record appended at end; CI re-proof on the same runs;
+   mark was stale, not wrong).
+4. Debugger (DWARF + green-thread dumps) — DONE on the
+   user-accepted bounded scope (Stage 3 record; full DWARF is
+   a separate toolchain proposal, not a met criterion).
 5. Graceful shutdown (signals + drain under load + health/
    readiness) — DONE (Stage 4 record: runtime drain + joinable
    serve + refsvc /healthz//readyz + exit-criterion test green;
@@ -1251,3 +1248,56 @@ libgcc_s, libstdc++, ld-linux) and their transitives.
   (27ba5e5, 4e35e4f, b1cf20e, 0ebdeba, ea0b127, 400198c,
   35d5b18, a99bd49, 5947a48, 340f9c8, 061f2e8 + the verdict
   fill commit below); linear, no merge commit.
+
+# Merge-hygiene dated notes (2026-11-24, on main; append-only)
+- (a) The tip run is recorded: run 45345947783 (head 76bdde4,
+  Status Success; check, release-gates, bench, macOS probe,
+  Linux ARM64 probe all green; Windows probe fails exit 101
+  as informational, the ONLY failing job). The branch
+  addendum's latest recorded run was 45338895666 (head
+  061f2e8, Success) — the tip run postdates the fill commit,
+  which is why it was not in the file.
+- (b) Stale text corrected here (corrections, not rewrites):
+  the report header's "Status: STAGE 3 IMPLEMENTED ... CI
+  re-proof pending" is updated to the merged state, and the
+  §7 checklist marks for criteria 2, 3 ("CI re-proof pending")
+  are closed — criteria 2 and 3 DONE on runs 45334432983,
+  45336314659, 45338895666, and 45345947783 (all Success);
+  criterion 4 DONE on the user-accepted bounded scope (the
+  DWARF gap is a separate toolchain proposal, not a met
+  criterion). The marks were stale, not wrong in substance.
+- (c) User-accepted scope decisions, 2026-11-24, as written:
+  the DWARF scope (bounded GDB session on AOT symbols —
+  symbolic breakpoints on toto_fn_*, backtraces,
+  register/disassembly inspection — PLUS full green-thread
+  dumps; full DWARF — line tables, source display, .gzv
+  locals — is a separate gated toolchain proposal); the dist
+  scope (target/dist/<name>/{bin/<name>,lib/*.so.*},
+  glibc-dynamic binary plus pinned collected FFI closure
+  under classic RPATH; fully-static musl is a named
+  follow-up; the refsvc image runs the release interpreter
+  because AOT refuses blocking DB waits by design).
+- (d) Carried follow-ups by name: drain_requested() builtin,
+  fully-static musl, toolchain image, host-reachable daemon
+  image (needs all-interfaces bind), async-TLS/elastic-pool,
+  E0216 root-cause, intermittent CI stall, SIGBUS log-text
+  confirmation, TOML/YAML items, native AOT, Windows,
+  Group C. Stage-3-tip run 45322838992 (head a99bd49) failed
+  in the check job as well as the Windows probe, with no root
+  cause claimed (CI logs return HTTP 403 with the agent's
+  token — the same recorded gap as the Wave 3 SIGBUS note);
+  it is superseded by the green runs on descendant tips, and
+  its cause remains unestablished (recorded, not explained).
+- (e) Recorded as facts: Stage 4 design commit 35d5b18 lands
+  before Stage 3 implementation commit a99bd49 in linear
+  order (design-first sequencing, not an error); the
+  container base changed from the designed
+  debian:bookworm-slim to Ubuntu 26.04 pinned by digest
+  (base glibc must satisfy max GLIBC_2.x across bin + lib;
+  this host's closure needs 2.38, bookworm-slim's 2.36 failed
+  loudly at startup).
+- (f) Totals, re-derived from the Step 3 gate run on main:
+  PENDING-STEP-3-F (per-binary account below; the branch
+  report's "274 passed" is a stated composite, and "0 failed"
+  excludes oidc_keycloak 0/2 under the environmental
+  convention — see the account).
