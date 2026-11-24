@@ -1,6 +1,6 @@
 # Enterprise Wave 4 report — operations
 
-Wave 4 verdict: ACCEPTED-WITH-FLAGS — merged to main as 9b6ebf3. OpenTelemetry-compatible tracing (proven against a real Jaeger collector), CPU + heap profiling with green-thread-aware attribution, green-thread dumps + a bounded GDB session on AOT symbols, graceful shutdown with production drain, and toto dist + container images shipped. Verdict, the DWARF scope, and the dist scope approved by the user 2026-11-24. Gate green (78 result lines, 273 passed in the fresh full run + 1 dist test standalone = 274 passed, 0 failed under the environmental convention — see note (f)); CI on main: run 45360369704 (check failed as a confirmed flake — everything else green incl. bench, see note (f)) and run 45361946322 on HEAD d602a90 (fully green: check + release-gates + bench + macOS/Linux ARM64 probes; Windows probe informational under continue-on-error). Details in the sections below; earlier section text is preserved verbatim.
+Wave 4 verdict: ACCEPTED-WITH-FLAGS — merged to main as 9b6ebf3. OpenTelemetry-compatible tracing (proven against a real Jaeger collector), CPU + heap profiling with green-thread-aware attribution, green-thread dumps + a bounded GDB session on AOT symbols, graceful shutdown with production drain, and toto dist + container images shipped. Verdict, the DWARF scope, and the dist scope approved by the user 2026-11-24. Gate green (78 result lines, 273 passed in the fresh full run + 1 dist test standalone = 274 passed, 0 failed under the environmental convention — see note (f)); CI on main: run 45360369704 (head 352d9b7) — check failed as a confirmed flake (everything else green incl. bench; Windows probe also failed, informational); run 45361946322 (head d602a90) — Success: check + release-gates + bench + macOS/Linux ARM64 probes green, Windows probe informational under continue-on-error; run 45368721678 (head cdfc850) — Success: check + release-gates + bench + macOS/Linux ARM64 probes green, Windows probe informational under continue-on-error. See the dated addenda for the flake diagnosis and the wording corrections.
 
 Status: MERGED TO MAIN (was: STAGE 3 IMPLEMENTED (design + code + local proof green; CI re-proof pending) — updated at merge; the re-proof happened on runs 45334432983, 45336314659, 45338895666, and the tip run 45345947783, all Success). Earlier text preserved verbatim; the Stage 1–3 implementation records are appended at the end in order.
 
@@ -1314,9 +1314,10 @@ libgcc_s, libstdc++, ld-linux) and their transitives.
   release-gates, macOS probe, and Linux ARM64 probe green;
   Windows probe fails informationally; `bench` still running
   at last check. The failing tree is branch-identical code
-  (merge + docs only — three green branch-tip runs on the
-  same code, plus a green local main gate modulo the known
-  oidc-env failure), so the red does not reproduce locally;
+  (merge + docs only — four green branch-tip runs on the same
+  code (45334432983, 45336314659, 45338895666, 45345947783),
+  plus a green local main gate modulo the known oidc-env
+  failure), so the red does not reproduce locally;
   cause unestablished (CI logs return HTTP 403 with the
   agent's token). STOPPED per the merge brief — no further
   commits after this fill; the verdict on this run belongs to
@@ -1341,14 +1342,16 @@ libgcc_s, libstdc++, ld-linux) and their transitives.
   Linux ARM64 probe green; Windows probe fails
   informationally. Bench concluded Success (it was still
   running when the fill was written). Run 45361946322 (head
-  d602a90, the actual HEAD): completed SUCCESS — check,
-  release-gates, bench, macOS probe, Linux ARM64 probe all
-  green; Windows probe fails informationally, the ONLY
-  failing job. Run 114's check failure is a flake, confirmed
-  by a green run on the same HEAD (the failing tree is
-  branch-identical code with three green branch-tip runs
-  behind it). No log reading was needed; no re-run was
-  needed or performed.
+  d602a90): completed SUCCESS — check, release-gates,
+  bench, macOS probe, Linux ARM64 probe all green; Windows
+  probe fails informationally, the ONLY failing job. Run
+  114's check failure is a flake, confirmed by a green run on
+  the next commit (the code under test was identical —
+  d602a90 differs from 352d9b7 only by the report file,
+  +13/−3 — and the check went green on the next run). The
+  file itself cites FOUR green branch-tip runs behind it
+  (45334432983, 45336314659, 45338895666, 45345947783). No
+  log reading was needed; no re-run was needed or performed.
 - (b) Header correction (fixed in place): the header note
   claimed bench green for run 45360369704 while bench was
   still running — premature as written (note (f) correctly
@@ -1383,9 +1386,57 @@ libgcc_s, libstdc++, ld-linux) and their transitives.
 - (f) Cause and action: run 114's check failure is diagnosed
   as a CI flake by the green re-proof, not by logs (no log
   lines are quoted because none were needed — run 115 on the
-  identical HEAD is green end to end). What was re-run:
-  nothing — a green run on the same HEAD already existed by
+  next commit is green except the informational Windows
+  probe). What was re-run:
+  nothing — a green run on the next commit already existed by
   the time of diagnosis (run 115 started on the fill commit
   before the diagnosis began), so a further re-run would
   have been redundant, and a blind re-run is forbidden. No
   code, test, golden, or pin changed in this turn.
+
+# Dated addendum — run #116 + flake-addendum wording corrections (2026-11-24, on main; append-only)
+- (a) Run 45368721678 (#116, head cdfc850, report-only hygiene
+  commit): completed SUCCESS — check, release-gates, bench,
+  macOS probe, Linux ARM64 probe all green; Windows probe
+  fails (exit 101), informational under continue-on-error,
+  the ONLY failing job. Pattern stated explicitly: every
+  docs-only commit triggers a new CI run, so the record
+  always lags by one run — this commit's own run will be the
+  one that confirms the final tree, and its outcome belongs
+  in a future record, not this one.
+- (b) "Same / identical HEAD", fixed in place: run 114 is on
+  352d9b7, run 115 on d602a90 — consecutive commits, not the
+  same HEAD. What is true, and what the flake inference
+  rests on: the code under test was identical (d602a90
+  differs from 352d9b7 only by the report file, +13/−3), and
+  the check went green on the next run. The self-contradiction
+  in (f) ("same HEAD" alongside "run 115 started on the fill
+  commit") is resolved the same way. Recorded here, fixed in
+  place.
+- (c) HEAD references, fixed in place: "run 45361946322 on
+  HEAD d602a90" and "(head d602a90, the actual HEAD)" were
+  true when written, but HEAD moves with every commit. Rule
+  going forward, applied in the corrected header above: run
+  ids are recorded against their head commit hash, never
+  against "HEAD". Recorded here, fixed in place.
+- (d) Header run-114 line, fixed in place: "everything else
+  green incl. bench" omitted run 114's Windows probe failure
+  (1m29s, exit 101, informational). The header now names all
+  three runs with head hashes and states the Windows failure
+  for each. Recorded here, fixed in place.
+- (e) "Three → four", fixed in place: the flake addendum's
+  (a) ("three green branch-tip runs behind it") and note
+  (f)'s "three green branch-tip runs on the same code" now
+  read "FOUR green branch-tip runs" with all four ids cited
+  (45334432983, 45336314659, 45338895666, 45345947783).
+  Recorded here, fixed in place.
+- (f) "Green end to end", fixed in place: run 115's Windows
+  probe failed (exit 101); the run is Success only because
+  Windows is continue-on-error. The wording is now "green
+  except the informational Windows probe" wherever the run's
+  outcome is stated. Recorded here, fixed in place.
+- (g) Addendum (e)'s local check.sh exit 101 left as written:
+  asserted from the local gate run (maincheck2.log,
+  exit=101), distinct from CI run 114's check exit 101; the
+  local code is not presented as CI evidence. No local
+  re-run needed to corroborate it.
