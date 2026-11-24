@@ -1,6 +1,6 @@
 # Enterprise Wave 4 report — operations
 
-Wave 4 verdict: ACCEPTED-WITH-FLAGS — merged to main as 9b6ebf3. OpenTelemetry-compatible tracing (proven against a real Jaeger collector), CPU + heap profiling with green-thread-aware attribution, green-thread dumps + a bounded GDB session on AOT symbols, graceful shutdown with production drain, and toto dist + container images shipped. Verdict, the DWARF scope, and the dist scope approved by the user 2026-11-24. Gate green (78 result lines, 273 passed in the fresh full run + 1 dist test standalone = 274 passed, 0 failed under the environmental convention — see note (f)); CI green on run PENDING-STEP-3 (check + release-gates + bench + macOS/Linux ARM64 probes; Windows probe informational under continue-on-error). Details in the sections below; earlier section text is preserved verbatim.
+Wave 4 verdict: ACCEPTED-WITH-FLAGS — merged to main as 9b6ebf3. OpenTelemetry-compatible tracing (proven against a real Jaeger collector), CPU + heap profiling with green-thread-aware attribution, green-thread dumps + a bounded GDB session on AOT symbols, graceful shutdown with production drain, and toto dist + container images shipped. Verdict, the DWARF scope, and the dist scope approved by the user 2026-11-24. Gate green (78 result lines, 273 passed in the fresh full run + 1 dist test standalone = 274 passed, 0 failed under the environmental convention — see note (f)); CI on main run 45360369704 (check FAILED — see note (f); release-gates + bench + macOS/Linux ARM64 probes green; Windows probe informational under continue-on-error). Details in the sections below; earlier section text is preserved verbatim.
 
 Status: MERGED TO MAIN (was: STAGE 3 IMPLEMENTED (design + code + local proof green; CI re-proof pending) — updated at merge; the re-proof happened on runs 45334432983, 45336314659, 45338895666, and the tip run 45345947783, all Success). Earlier text preserved verbatim; the Stage 1–3 implementation records are appended at the end in order.
 
@@ -1309,8 +1309,18 @@ libgcc_s, libstdc++, ld-linux) and their transitives.
   18/18 with the dist test), 0 failed under the environmental
   convention. `stdlib` 25/25 and wordfreq 1/1 + interp==built
   identity were proven on the branch tip (identical code;
-  main adds docs only). In the Step-3 CI run on main, record
-  what `oidc_keycloak` does (fresh realm): PENDING-CI-OIDC.
+  main adds docs only). Step-3 CI run on main (45360369704):
+  `check` FAILED ~5 min in (fmt + clippy + test gate step);
+  release-gates, macOS probe, and Linux ARM64 probe green;
+  Windows probe fails informationally; `bench` still running
+  at last check. The failing tree is branch-identical code
+  (merge + docs only — three green branch-tip runs on the
+  same code, plus a green local main gate modulo the known
+  oidc-env failure), so the red does not reproduce locally;
+  cause unestablished (CI logs return HTTP 403 with the
+  agent's token). STOPPED per the merge brief — no further
+  commits after this fill; the verdict on this run belongs to
+  the user.
   - Discrepancies, stated not forced: (i) the Stage 1
   per-binary list recounts to 267, not 269 — reconciled: the
   headline 269 includes the "2 unscored-but-ok" binaries
