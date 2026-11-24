@@ -683,6 +683,10 @@ pub struct Shared {
     /// `Lane` for the cycle-freedom invariant.
     pub pool_srv: Mutex<PoolState>,
     pub pool_srv_cv: Condvar,
+    /// No-fd-role blocking lane (Wave 4 Stage 1): Db, Foreign,
+    /// LDAP. Same shape as the server lane (own queue, own bell).
+    pub pool_db: Mutex<PoolState>,
+    pub pool_db_cv: Condvar,
     pub done: Mutex<VecDeque<Completion>>,
     /// M:N network poller (Wave 1, unix-only): registrations in,
     /// readiness completions out. The poller thread touches neither
@@ -758,12 +762,23 @@ pub struct GcState {
 /// instead of wedging the other lane forever).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Lane {
-    /// Shared lane: client-role TLS plus every non-TLS op (Db,
-    /// Ldap, FS, DNS, Foreign — none of which wait on pool
-    /// actions, so sharing the lane cannot form a cycle).
+    /// Client-role TLS only (connect/send/recv/close by session
+    /// role). Files and DNS stay here too: names resolve at
+    /// connect time and fixtures load at startup, never
+    /// mid-request while reads are held.
     Cli,
     /// Server-role TLS only. Exactly one thread (`POOL_SRV_THREADS`).
     Srv,
+    /// Blocking ops with no fd role (Db, Foreign, LDAP): the work
+    /// a server task needs while client reads are held (log emit,
+    /// crypto, queries, binds). `pool_threads` threads — the same
+    /// parallelism these ops always had on the shared lane — so Db
+    /// pool exhaustion semantics (parallel checkout contention)
+    /// are unchanged. A dedicated lane because sharing the client
+    /// lane forms a silent cycle: two held client record Recvs
+    /// plus server work queued behind them, each waiting on the
+    /// other (Wave 4 Stage 1 diagnosis, F1 child).
+    Db,
 }
 
 /// Server-lane thread count (Wave 3 F1 fix): one. Server-role TLS
@@ -1279,6 +1294,12 @@ impl Scheduler {
                 shutdown: false,
             }),
             pool_srv_cv: Condvar::new(),
+            pool_db: Mutex::new(PoolState {
+                jobs: VecDeque::new(),
+                in_flight: 0,
+                shutdown: false,
+            }),
+            pool_db_cv: Condvar::new(),
             done: Mutex::new(VecDeque::new()),
             #[cfg(unix)]
             net: Mutex::new(NetState::default()),
@@ -1539,6 +1560,12 @@ impl Scheduler {
             for _ in 0..POOL_SRV_THREADS {
                 scope.spawn(|| Self::pool_loop(&self.shared, Lane::Srv));
             }
+            // Same thread count as the client lane: Db ops keep the
+            // parallelism they always had there (exhaustion tests
+            // need two concurrent checkouts to contend).
+            for _ in 0..self.shared.pool_threads {
+                scope.spawn(|| Self::pool_loop(&self.shared, Lane::Db));
+            }
             #[cfg(unix)]
             scope.spawn(|| Self::poller_loop(&self.shared));
             for worker in 0..self.shared.workers {
@@ -1717,6 +1744,12 @@ impl Scheduler {
                                             self.shared.pool_srv.lock().expect("pool srv lock");
                                         !pool_srv.jobs.is_empty() || pool_srv.in_flight > 0
                                     } || {
+                                        // Db lane counts too (Wave 4
+                                        // Stage 1): same reasoning.
+                                        let pool_db =
+                                            self.shared.pool_db.lock().expect("pool db lock");
+                                        !pool_db.jobs.is_empty() || pool_db.in_flight > 0
+                                    } || {
                                         #[cfg(unix)]
                                         {
                                             !self
@@ -1839,6 +1872,11 @@ impl Scheduler {
                         pool_srv.shutdown = true;
                         drop(pool_srv);
                         self.shared.pool_srv_cv.notify_all();
+                        // Same for the Db lane (Wave 4 Stage 1).
+                        let mut pool_db = self.shared.pool_db.lock().expect("pool db lock");
+                        pool_db.shutdown = true;
+                        drop(pool_db);
+                        self.shared.pool_db_cv.notify_all();
                         // Same for the poller (unix-only): set the
                         // flag and poke the pipe so its `poll`
                         // wakes, sees shutdown, and returns.
@@ -2294,6 +2332,10 @@ impl Scheduler {
                         shared.pool_srv.lock().expect("pool srv lock"),
                         &shared.pool_srv_cv,
                     ),
+                    Lane::Db => (
+                        shared.pool_db.lock().expect("pool db lock"),
+                        &shared.pool_db_cv,
+                    ),
                 };
                 while pool.jobs.is_empty() && !pool.shutdown {
                     pool = cv.wait(pool).expect("pool cv wait");
@@ -2361,6 +2403,7 @@ impl Scheduler {
                 let mut pool = match lane {
                     Lane::Cli => shared.pool.lock().expect("pool lock"),
                     Lane::Srv => shared.pool_srv.lock().expect("pool srv lock"),
+                    Lane::Db => shared.pool_db.lock().expect("pool db lock"),
                 };
                 let mut done = shared.done.lock().expect("done lock");
                 done.push_back(Completion {
@@ -3788,11 +3831,27 @@ impl Scheduler {
         toto_compiler::netsys::poke_pipe(self.shared.net_wake[1]);
     }
 
-    /// Lane routing for a blocking job (Wave 3 F1 fix): server-role
-    /// TLS runs on the server lane; everything else shares the
-    /// client lane. Decided here, before any lock is taken, so no
-    /// new lock nesting is introduced (the session table is a leaf
+    /// Lane routing for a blocking job (Wave 3 F1 fix, extended
+    /// Wave 4 Stage 1): server-role TLS runs on the server lane;
+    /// client-role TLS keeps the client lane; blocking work with
+    /// no fd role (Db, Foreign, LDAP) rides the dedicated Db
+    /// lane. Decided here, before any lock is taken, so no new
+    /// lock nesting is introduced (the session table is a leaf
     /// lock — it never nests with scheduler state).
+    ///
+    /// Rationale (F1 child, proved with pool introspection on the
+    /// traced cross-service hop): the hop holds both client-lane
+    /// threads in record Recvs (outer client read + hop read)
+    /// while the downstream server task needs pool work (log emit,
+    /// crypto, Db) to produce the response. On the shared client
+    /// lane that work queues behind the very reads it would
+    /// unblock — a silent circular wait no guard can see (a busy
+    /// pool reads as future work). The Db lane keeps two threads,
+    /// the parallelism Db ops always had, so pool exhaustion
+    /// semantics (parallel checkout contention) are unchanged.
+    /// DNS and files keep the client lane: names resolve at
+    /// connect time and fixtures load at startup, never
+    /// mid-request while reads are held.
     #[cfg(unix)]
     fn tls_lane(op: &BlockingOp) -> Lane {
         match op {
@@ -3812,6 +3871,15 @@ impl Scheduler {
                     }
                 }
             },
+            // No fd role: server-request work (a handler's Db,
+            // crypto, log emit, LDAP bind) rides the Db lane —
+            // never the client lane it would wedge behind held
+            // reads (see rationale above). Db keeps two threads
+            // there so pool exhaustion semantics still contend.
+            BlockingOp::Db { .. } => Lane::Db,
+            BlockingOp::Foreign { .. } => Lane::Db,
+            #[cfg(target_os = "linux")]
+            BlockingOp::Ldap { .. } => Lane::Db,
             _ => Lane::Cli,
         }
     }
@@ -3835,6 +3903,7 @@ impl Scheduler {
         let cv = match lane {
             Lane::Cli => &self.shared.pool_cv,
             Lane::Srv => &self.shared.pool_srv_cv,
+            Lane::Db => &self.shared.pool_db_cv,
         };
         #[cfg(not(unix))]
         let cv = &self.shared.pool_cv;
@@ -3857,6 +3926,7 @@ impl Scheduler {
             let mut pool = match lane {
                 Lane::Cli => self.shared.pool.lock().expect("pool lock"),
                 Lane::Srv => self.shared.pool_srv.lock().expect("pool srv lock"),
+                Lane::Db => self.shared.pool_db.lock().expect("pool db lock"),
             };
             #[cfg(not(unix))]
             let mut pool = self.shared.pool.lock().expect("pool lock");

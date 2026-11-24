@@ -47,6 +47,7 @@ import "gzv.std/metrics.gzv";
 import "gzv.std/net.gzv";
 import "gzv.std/strings.gzv";
 import "gzv.std/time.gzv";
+import "gzv.std/trace.gzv";
 
 fn env_or(name: string, dflt: string) -> string {
     if config_env_has(name) {
@@ -338,7 +339,11 @@ fn run() -> Result<string, string> {
     refsvc_register(reg)?;
     let router = http_router();
     let svc = RefsDat { dsn: dsn, key: key, ttl_ms: ttl, meter: false };
-    refsvc_routes(router, svc, reg)?;
+    // Load runs untraced: spans would still record (shared table)
+    // but nothing reads or exports them; the numbered phases and
+    // markers below are unchanged.
+    let tracer = trace_tracer();
+    refsvc_routes(router, svc, reg, tracer)?;
     let listener = refsvc_serve(port, router)?;
     let copts = refsvc_client_opts();
     let ca = refsvc_ca();

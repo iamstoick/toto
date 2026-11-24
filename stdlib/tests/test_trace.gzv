@@ -1,0 +1,250 @@
+import "gzv.std/trace.gzv";
+import "gzv.std/context.gzv";
+
+// Wave 4 Stage 1: tracing surface tests (deterministic — no
+// collector, no network, no randomness in assertions).
+// The wire format is proven separately against a real collector
+// (see the Stage 1 design record + the refsvc interop test).
+
+fn t_inject_extract() -> Result<bool, string> {
+    let ctx0 = ctx_with_value(ctx_background(), "trace.trace_id", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let ctx1 = ctx_with_value(ctx0, "trace.span_id", "bbbbbbbbbbbbbbbb");
+    let ctx = ctx_with_value(ctx1, "trace.sampled", "1");
+    let hs = trace_inject(ctx)?;
+    if len(hs) != 1 {
+        return Err("inject header count");
+    } else {
+    }
+    let want: Result<string, string> = Ok("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01");
+    let got = http_header_or(hs, "traceparent", "missing")?;
+    if got != "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01" {
+        return Err("inject shape");
+    } else {
+    }
+    let back = trace_extract(ctx_background(), hs)?;
+    if !ctx_has(back, "trace.trace_id") {
+        return Err("extract lost trace");
+    } else {
+    }
+    if ctx_get(back, "trace.trace_id")? != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+        return Err("extract trace id");
+    } else {
+    }
+    if ctx_get(back, "trace.span_id")? != "bbbbbbbbbbbbbbbb" {
+        return Err("extract parent span");
+    } else {
+    }
+    return Ok(true);
+}
+
+fn t_extract_malformed() -> Result<bool, string> {
+    // Missing header: fresh context (no trace keys).
+    let b0: Array<HttpHeader> = [];
+    let c0 = trace_extract(ctx_background(), b0)?;
+    if ctx_has(c0, "trace.trace_id") {
+        return Err("absent header must yield fresh ctx");
+    } else {
+    }
+    // Truncated / wrong-version / non-hex: all fail open.
+    let bads: Array<string> = [
+        "00-zzz",
+        "01-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+        "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-0",
+        "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-02-extra"
+    ];
+    for b in bads {
+        let h: Array<HttpHeader> = [HttpHeader { name: "traceparent", value: b }];
+        let c = trace_extract(ctx_background(), h)?;
+        if ctx_has(c, "trace.trace_id") {
+            return Err("malformed header must yield fresh ctx");
+        } else {
+        }
+    }
+    return Ok(true);
+}
+
+fn t_inject_needs_span() -> Result<bool, string> {
+    let r = trace_inject(ctx_background());
+    let want: Result<Array<HttpHeader>, string> = Err("trace: no active span to inject");
+    if r != want {
+        return Err("inject without span must fail loudly");
+    } else {
+    }
+    return Ok(true);
+}
+
+fn t_sampler() -> Result<bool, string> {
+    // 1/1 always samples; 0/1 never does.
+    let all = trace_tracer();
+    let b1 = trace_begin(all, ctx_background(), "s-root", "internal", "svc")?;
+    if b1.span.sampled != true {
+        return Err("1/1 must sample");
+    } else {
+    }
+    let none = trace_tracer_ratio(0, 1)?;
+    let b0 = trace_begin(none, ctx_background(), "s-root", "internal", "svc")?;
+    if b0.span.sampled != false {
+        return Err("0/1 must not sample");
+    } else {
+    }
+    // Parent flag wins over the local ratio.
+    let ctx1 = ctx_with_value(ctx_background(), "trace.trace_id", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let ctx2 = ctx_with_value(ctx1, "trace.span_id", "bbbbbbbbbbbbbbbb");
+    let ctx3 = ctx_with_value(ctx2, "trace.sampled", "1");
+    let bp = trace_begin(none, ctx3, "s-child", "internal", "svc")?;
+    if bp.span.sampled != true {
+        return Err("parent sampled=1 must win");
+    } else {
+    }
+    if bp.span.parent_span_id != "bbbbbbbbbbbbbbbb" {
+        return Err("child must name the remote parent");
+    } else {
+    }
+    // Child of an unsampled parent stays unsampled.
+    let ctx4 = ctx_with_value(ctx2, "trace.sampled", "0");
+    let bq = trace_begin(all, ctx4, "s-child", "internal", "svc")?;
+    if bq.span.sampled != false {
+        return Err("parent sampled=0 must win");
+    } else {
+    }
+    // Bad ratio and bad kind fail loudly.
+    let bad_ratio = trace_tracer_ratio(2, 1);
+    let want_r: Result<Tracer, string> = Err("trace: bad ratio (want 0 <= num <= den, den >= 1)");
+    if bad_ratio != want_r {
+        return Err("bad ratio must fail");
+    } else {
+    }
+    let bad_kind = trace_begin(all, ctx_background(), "s-x", "nope", "svc");
+    let want_k: Result<Begun, string> = Err("trace: bad kind (want internal|server|client|producer|consumer)");
+    if bad_kind != want_k {
+        return Err("bad kind must fail");
+    } else {
+    }
+    return Ok(true);
+}
+
+fn t_span_json() -> Result<bool, string> {
+    let attrs: Array<TraceAttr> = [
+        TraceAttr { key: "http.method", is_int: false, s: "GET", i: 0 },
+        TraceAttr { key: "http.status_code", is_int: true, s: "", i: 200 }
+    ];
+    let span: TraceSpan = TraceSpan {
+        trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        span_id: "bbbbbbbbbbbbbbbb",
+        parent_span_id: "",
+        name: "test-op",
+        kind: "server",
+        service: "svc",
+        start_ms: 1000,
+        attrs: attrs,
+        sampled: true
+    };
+    let got = trace_span_json(span, 1005, 1, "")?;
+    let want: string = "{\"traceId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"spanId\":\"bbbbbbbbbbbbbbbb\",\"name\":\"test-op\",\"kind\":2,\"startTimeUnixNano\":\"1000000000\",\"endTimeUnixNano\":\"1005000000\",\"attributes\":[{\"key\":\"http.method\",\"value\":{\"stringValue\":\"GET\"}},{\"key\":\"http.status_code\",\"value\":{\"intValue\":200}}],\"status\":{\"code\":1}}";
+    if json_stringify(got) != want {
+        return Err("span JSON shape");
+    } else {
+    }
+    // Error status carries message; parent appears when set.
+    let span2: TraceSpan = TraceSpan {
+        trace_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        span_id: "cccccccccccccccc",
+        parent_span_id: "bbbbbbbbbbbbbbbb",
+        name: "child",
+        kind: "internal",
+        service: "svc",
+        start_ms: 1000,
+        attrs: [],
+        sampled: true
+    };
+    let got2 = trace_span_json(span2, 1001, 2, "boom")?;
+    let want2: string = "{\"traceId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"spanId\":\"cccccccccccccccc\",\"name\":\"child\",\"kind\":1,\"startTimeUnixNano\":\"1000000000\",\"endTimeUnixNano\":\"1001000000\",\"attributes\":[],\"status\":{\"code\":2,\"message\":\"boom\"},\"parentSpanId\":\"bbbbbbbbbbbbbbbb\"}";
+    if json_stringify(got2) != want2 {
+        return Err("error JSON shape");
+    } else {
+    }
+    return Ok(true);
+}
+
+fn t_report_graph() -> Result<bool, string> {
+    let tr = trace_tracer();
+    let root = trace_begin(tr, ctx_background(), "r", "server", "svc-a")?;
+    let mid = trace_begin(tr, trace_ctx(ctx_background(), root), "m", "client", "svc-a")?;
+    let leaf = trace_begin(tr, trace_ctx(ctx_background(), mid), "l", "internal", "svc-b")?;
+    trace_end(tr, root.span, 1, "")?;
+    trace_end(tr, mid.span, 1, "")?;
+    trace_end(tr, leaf.span, 0, "")?;
+    let rep = trace_finished_report(tr);
+    let want: string = "span name=l parent=m kind=internal service=svc-b attrs= status=unset\nspan name=m parent=r kind=client service=svc-a attrs= status=ok\nspan name=r parent=- kind=server service=svc-a attrs= status=ok\ntrace_ids_equal=yes\nspan_count=3\n";
+    if rep != want {
+        return Err("report graph");
+    } else {
+    }
+    return Ok(true);
+}
+
+fn t_export_rejects() -> Result<bool, string> {
+    let tr = trace_tracer();
+    let r0 = trace_export(tr, "");
+    let want0: Result<string, string> = Err("trace: empty export endpoint");
+    if r0 != want0 {
+        return Err("empty endpoint must fail");
+    } else {
+    }
+    // Nothing listening on :1 — refused fast and loudly.
+    let b = trace_begin(tr, ctx_background(), "x", "internal", "svc")?;
+    trace_end(tr, b.span, 1, "")?;
+    let r1 = trace_export(tr, "http://127.0.0.1:1");
+    let want_ok: Result<string, string> = Ok("exported");
+    if r1 == want_ok {
+        return Err("refused export must fail");
+    } else {
+    }
+    return Ok(true);
+}
+
+fn main() -> int {
+    let mut failures: int = 0;
+    let yes: Result<bool, string> = Ok(true);
+    if t_inject_extract() != yes {
+        println("FAIL inject_extract");
+        failures = failures + 1;
+    } else {
+    }
+    if t_extract_malformed() != yes {
+        println("FAIL extract_malformed");
+        failures = failures + 1;
+    } else {
+    }
+    if t_inject_needs_span() != yes {
+        println("FAIL inject_needs_span");
+        failures = failures + 1;
+    } else {
+    }
+    if t_sampler() != yes {
+        println("FAIL sampler");
+        failures = failures + 1;
+    } else {
+    }
+    if t_span_json() != yes {
+        println("FAIL span_json");
+        failures = failures + 1;
+    } else {
+    }
+    if t_report_graph() != yes {
+        println("FAIL report_graph");
+        failures = failures + 1;
+    } else {
+    }
+    if t_export_rejects() != yes {
+        println("FAIL export_rejects");
+        failures = failures + 1;
+    } else {
+    }
+    if failures > 0 {
+        println(to_string(failures) + " trace failures");
+        return 1;
+    } else {
+    }
+    return 0;
+}

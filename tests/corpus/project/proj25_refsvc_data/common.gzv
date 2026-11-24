@@ -46,6 +46,7 @@ import "gzv.std/json.gzv";
 import "gzv.std/time.gzv";
 import "gzv.std/strings.gzv";
 import "gzv.std/config.gzv";
+import "gzv.std/trace.gzv";
 
 // NOTE (checker rule): imported struct types (`MetricsRegistry`)
 // are visible in fn signatures but NOT as user-struct fields, so
@@ -221,23 +222,101 @@ fn h_login_factory(svc: RefsDat, reg: MetricsRegistry) -> fn(HttpRequest) -> Res
     };
 }
 
-fn h_user_factory(svc: RefsDat, reg: MetricsRegistry) -> fn(HttpRequest) -> Result<HttpResponse, string> {
+fn h_user_factory(svc: RefsDat, reg: MetricsRegistry, tracer: Tracer) -> fn(HttpRequest) -> Result<HttpResponse, string> {
     return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        // Server span for this request. The abort paths (`?`)
+        // bypass the explicit closes below and leave the span
+        // unfinished (documented wart: fail-closed aborts report
+        // nothing rather than something wrong).
+        let xctx = trace_extract(ctx_background(), req.headers)?;
+        let begun = trace_begin(tracer, xctx, "GET /users/{id}", "server", "refsvc-data")?;
+        trace_attr(begun.span, "http.method", "GET")?;
+        trace_attr(begun.span, "http.target", req.target)?;
+        let ab = trace_begin(tracer, trace_ctx(xctx, begun), "auth", "internal", "refsvc-data")?;
         let sub = refsvc_auth(svc.key, svc.ttl_ms, req)?;
+        trace_end(tracer, ab.span, 1, "")?;
         if !authed(sub) {
+            trace_end(tracer, begun.span, 1, "")?;
             refsvc_meter(svc, reg, "GET", "/users/{id}", "401")?;
             return send_401(sub);
         } else {
         }
         let raw = http_param(req.params, "id")?;
         let did = http_decode_pct(raw)?;
+        let db = trace_begin(tracer, trace_ctx(xctx, begun), "db", "internal", "refsvc-data")?;
         let rows = db_query(svc.dsn, "SELECT name FROM users WHERE name = ?", [db_text(did)])?;
+        trace_end(tracer, db.span, 1, "")?;
         if len(rows) != 1 {
+            trace_end(tracer, begun.span, 1, "")?;
             refsvc_meter(svc, reg, "GET", "/users/{id}", "404")?;
             return http_text(404, "Not Found", "no such user");
         }
+        trace_end(tracer, begun.span, 1, "")?;
         refsvc_meter(svc, reg, "GET", "/users/{id}", "200")?;
         return http_text(200, "OK", "{\"name\":\"" + rows[0][0].s + "\"}");
+    };
+}
+
+// Front door: verifies the bearer token like the data service,
+// then calls through over TLS with the trace propagated in a
+// `traceparent` header. The hop runs in a spawned task so the
+// trace crosses a go block (spawn inheritance carries the
+// context); the result comes back over a channel (which carries
+// data only, per ADR-009 — the receiver keeps its own ctx).
+// One front-to-data hop: runs in a spawned task so the trace
+// crosses a go block (spawn inheritance carries the context;
+// see the ctx_set_current call at the spawn site). Returns int
+// like the F1 load workers; the Result travels the channel.
+fn front_hop(tracer: Tracer, tokh: string, did: string, data_base: string, ca: string, copts: HttpClientOpts, out: chan<Result<HttpClientResp, string>>) -> int {
+    out <- do_front_hop(tracer, tokh, did, data_base, ca, copts);
+    return 0;
+}
+
+fn do_front_hop(tracer: Tracer, tokh: string, did: string, data_base: string, ca: string, copts: HttpClientOpts) -> Result<HttpClientResp, string> {
+    let cb = trace_begin(tracer, ctx_current(), "front-to-data", "client", "refsvc-front")?;
+    trace_attr(cb.span, "http.url", data_base + "/users/" + did)?;
+    let ih = trace_inject(trace_ctx(ctx_current(), cb))?;
+    let hs: Array<HttpHeader> = [HttpHeader { name: "Authorization", value: tokh }, ih[0]];
+    let r = http_do(HttpClientReq { method: "GET", url: data_base + "/users/" + did, headers: hs, body: [], ca_pem: ca }, copts);
+    let resp = r?;
+    trace_end(tracer, cb.span, 1, "")?;
+    return Ok(resp);
+}
+
+pub fn h_front_factory(svc: RefsDat, tracer: Tracer, data_base: string, ca: string, copts: HttpClientOpts) -> fn(HttpRequest) -> Result<HttpResponse, string> {
+    return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        let xctx = trace_extract(ctx_background(), req.headers)?;
+        let begun = trace_begin(tracer, xctx, "GET /front/users/{id}", "server", "refsvc-front")?;
+        trace_attr(begun.span, "http.method", "GET")?;
+        trace_attr(begun.span, "http.target", req.target)?;
+        let sub = refsvc_auth(svc.key, svc.ttl_ms, req)?;
+        if !authed(sub) {
+            trace_end(tracer, begun.span, 1, "")?;
+            return send_401(sub);
+        } else {
+        }
+        let raw = http_param(req.params, "id")?;
+        let did = http_decode_pct(raw)?;
+        let tokh = http_header_or(req.headers, "Authorization", "")?;
+        // Publish the derived context to this task so the spawned
+        // hop inherits the trace (ADR-009 spawn inheritance); the
+        // channel below carries the response only, never context.
+        ctx_set_current(trace_ctx(xctx, begun))?;
+        let out = chan<Result<HttpClientResp, string>>(1);
+        go {
+            front_hop(tracer, tokh, did, data_base, ca, copts, out);
+        }
+        let r = <-out;
+        let resp = r?;
+        trace_end(tracer, begun.span, 1, "")?;
+        // Fresh response, not a forward: the inner response's
+        // headers carry the data server's framing (Content-Length,
+        // Connection, Server), which the front server re-adds with
+        // its own values — forwarding them duplicates Content-Length
+        // and the strict client parser rejects the reply. (No
+        // end-to-end content headers exist to preserve in v1:
+        // inner responses are built with `http_text`, headerless.)
+        return Ok(HttpResponse { status: resp.status, reason: resp.reason, headers: [], body: resp.body });
     };
 }
 
@@ -300,10 +379,10 @@ fn mw_log(req: HttpRequest, next: fn(HttpRequest) -> Result<HttpResponse, string
 // NOTE (runtime edge, proj20 shape): the router crosses by
 // parameter and only `Result<unit>` returns — a `Result`
 // holding function values cannot be `?`-unwrapped in v1.
-pub fn refsvc_routes(router: HttpRouter, svc: RefsDat, reg: MetricsRegistry) -> Result<unit, string> {
+pub fn refsvc_routes(router: HttpRouter, svc: RefsDat, reg: MetricsRegistry, tracer: Tracer) -> Result<unit, string> {
     let login = h_login_factory(svc, reg);
     route_add(router, "POST", "/login", login)?;
-    let user = h_user_factory(svc, reg);
+    let user = h_user_factory(svc, reg, tracer);
     route_add(router, "GET", "/users/{id}", user)?;
     let notes = h_notes_factory(svc, reg);
     route_add(router, "POST", "/notes", notes)?;
@@ -321,6 +400,24 @@ pub fn refsvc_serve(port: int, router: HttpRouter) -> Result<int, string> {
     let key = read_file(refsvc_fix("server-key.pem"));
     let opts = HttpServeOpts { expose_errors: false, max_body: 65536, keepalive_ms: 0, server_name: "toto-refsvc-data" };
     return http_serve_tls(port, router, opts, cert, key);
+}
+
+// Front door service: same TLS PKI, its own router, no access
+// log and no metrics of its own (the traced hop is observed via
+// spans; the data side keeps its logging + metering so the
+// existing golden stays meaningful). Shares the DB/auth
+// material through RefsDat.
+pub fn refsvc_serve_front(port: int, router: HttpRouter) -> Result<int, string> {
+    let cert = read_file(refsvc_fix("server-cert.pem"));
+    let key = read_file(refsvc_fix("server-key.pem"));
+    let opts = HttpServeOpts { expose_errors: false, max_body: 65536, keepalive_ms: 0, server_name: "toto-refsvc-front" };
+    return http_serve_tls(port, router, opts, cert, key);
+}
+
+pub fn refsvc_front_routes(router: HttpRouter, svc: RefsDat, tracer: Tracer, data_base: string, ca: string, copts: HttpClientOpts) -> Result<unit, string> {
+    let front = h_front_factory(svc, tracer, data_base, ca, copts);
+    route_add(router, "GET", "/front/users/{id}", front)?;
+    return Ok(());
 }
 
 pub fn refsvc_client_opts() -> HttpClientOpts {

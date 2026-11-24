@@ -1,8 +1,9 @@
 # Enterprise Wave 4 report — operations
 
-Status: STAGE 0 COMPLETE (starting-state verification + carry-forward
-disposition, this turn). Earlier section text is preserved verbatim;
-the report is appended stage by stage.
+Status: STAGE 1 IMPLEMENTED (design + code + local proof green;
+CI re-proof pending push). Stage 0 and Stage 1 design text below
+preserved verbatim; the Stage 1 implementation record is appended
+at the end.
 
 Branch: `enterprise/wave-4-operations`, from `main` at `a958396`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -149,8 +150,9 @@ ADR-009 change (in-process semantics untouched), no spec change
   no baggage in v1 (stated gap, not smuggled in later).
 - Inject on every outgoing service call
   (`trace_inject(ctx) -> Array<HttpHeader>`); extract on entry
-  (`trace_extract(headers) -> Context`, then start a SERVER
-  span with the extracted span as remote parent). A malformed
+  (`trace_extract(headers)` — always `Ok`, absent/malformed
+  yields the input context — then start a SERVER span with the
+  remote parent). A malformed
   or absent header starts a NEW root trace and NEVER fails the
   request (fail-open on malformed_propagation — a tracing
   defect must not become an availability defect).
@@ -241,8 +243,9 @@ second implementation).
 
 1. Starting state verified; follow-ups dispositioned — DONE
    (Stage 0 above).
-2. Distributed tracing — DESIGN RECORDED (Stage 1 design
-   above; implementation + proof pending).
+2. Distributed tracing — IMPLEMENTED + PROVEN LOCALLY (Stage 1
+   record appended at end: design as above; OTLP collector proof
+   `trace-verified=yes`; local gate green; CI re-proof pending).
 3. Profiling (CPU + heap, green-thread-aware) — NOT YET
    (Stage 2).
 4. Debugger (DWARF + green-thread dumps) — NOT YET (Stage 3).
@@ -252,3 +255,148 @@ second implementation).
    targets) + reference application end to end + gates —
    NOT YET (Stage 5).
 7. Report complete — NOT YET (appended per stage).
+
+# Stage 1 record — implementation, diagnosis, fixes, proof (appended after design; design text above preserved verbatim)
+
+## What was built (Stage 1 implementation)
+- `stdlib/trace.gzv` (new, ~590 lines): span/trace model on
+  ADR-009 context (`trace_tracer`, `trace_tracer_ratio`,
+  `trace_begin`, `trace_ctx`, `trace_attr`, `trace_attr_int`,
+  `trace_end`, `trace_inject` (W3C `traceparent`), `trace_extract`
+  (always-Ok, fail-closed), `trace_span_json` (OTLP mapping),
+  `trace_export` (OTLP/HTTP+JSON over the Wave 2 HTTP client),
+  `trace_finished_report` (deterministic golden report).
+- `stdlib/tests/test_trace.gzv` (new): round-trip
+  inject/extract, malformed-input fail-closed, ratio sampling,
+  wire-mapping pins. In the stdlib suite green.
+- `crates/toto-compiler/src/stdlib.rs`: `std_module!("trace")`;
+  MODULES pin 29→30 (`project.rs`).
+- `tests/corpus/project/proj25_refsvc_data/`: `common.gzv`
+  (traced data handlers `h_user_factory` with server/auth/db
+  spans, front door `h_front_factory` + `front_hop` go-block hop
+  with `traceparent` propagation, `refsvc_serve_front`),
+  `main.gzv` (tracer setup, login + negative probes, traced
+  cross-service demo, golden report, OTLP/Jaeger leg),
+  `load.gzv` (tracer threaded through, load runs untraced),
+  goldens regenerated (`main.stdout` 193 lines, stderr empty,
+  status 0).
+- `crates/toto-runtime/src/sched.rs`: Db lane (see fix 1 below).
+
+## Diagnosis — the traced-demo hang (F1 child, proved with pool introspection)
+Symptom: the full demo hung after the front-service hop; the
+hop-only repro (login + one traced front call) hung
+deterministically; direct requests (1–2 headers, with and
+without `traceparent`) all completed. Request bytes arrived
+intact at the data server (332 B, complete `GET /users/alice`
+with `traceparent`), yet the handler never ran.
+
+Evidence chain (temporary pool/task instrumentation, scratch
+copies only, all reverted):
+1. Pool census at hang: every submitted job completed except
+   two legit client TLS record Recvs (outer client read +
+   hop read). No stuck job — the pool was drained, tasks
+   parked, CPU idle. Not a stuck job: a circular wait.
+2. Park/drain/run tracing: the data conn task woke with its
+   332 B, resumed, and parked again on a pool WriteFile —
+   which queued forever behind the two held client Recvs on
+   the 2-thread client lane.
+3. Root cause: client-lane pool starvation. Two concurrent
+   client TLS record Recvs (main→front response read, hop→data
+   response read) occupy both client-lane threads indefinitely
+   (record Recvs have no timeout — the F1 5 s bounds cover
+   handshakes/shutdown only). The downstream server task needs
+   pool work (log emit, crypto, Db) to produce the response;
+   on the shared client lane that work queues behind the very
+   reads it would unblock — a silent circular wait no guard
+   can see (a busy pool reads as future work). Same F1 pattern
+   ("a pool job blocking on a peer action wedges when the
+   producing job is queued behind it"), new shape (record-read
+   vs server work, within one lane) that the F1 handshake
+   bounds + role lanes do not cover.
+
+## Fix 1 — dedicated Db lane (runtime, minimal, preserves semantics)
+`tls_lane` routes the no-fd-role blocking ops (Db, Foreign,
+LDAP) to a new `Lane::Db` with `pool_threads` threads (the
+parallelism these ops always had — Db pool exhaustion
+semantics rely on two concurrent checkouts contending, proved
+by `db_pool` 3/3 green). Client TLS stays on Cli (2 threads),
+server TLS stays on Srv (1 thread, F1 intact). Files + DNS stay
+on Cli (connect-time/startup-only, never mid-request). Full
+lane plumbing: queue + bell + spawn + deadlock-check +
+shutdown + pickup + handoff + submit sites. An earlier
+one-lane variant (all server work to Srv×1) was tried and
+REVERTED: the single Srv thread serialized concurrent Db ops
+and broke `exhaustion_is_loud_and_counted` (both queries
+succeeded, zero exhausted). The Db lane keeps exact Db
+parallelism — no blind enlargement (thread counts unchanged),
+no TLS execution-model change.
+
+## Fix 2 — front handler must not forward framing headers (demo)
+The front hop forwarded the inner response's headers verbatim;
+the front server then re-added its own Content-Length /
+Connection / Server → duplicate Content-Length → the strict
+client parser rejected the reply and `http_do` returned Err.
+Fix: the front builds a fresh response (status/reason/body,
+no headers). Inner v1 responses are headerless (`http_text`),
+so nothing end-to-end is lost.
+
+## Fix 3 — OTLP resource attribute wrapper (exporter)
+`trace_export` emitted `"value": "<string>"` (bare) for the
+resource `service.name`; OTLP requires the AnyValue wrapper
+`{"stringValue": ...}` — Jaeger rejected the push with 400
+(the exporter's own status check surfaced it). Fixed to emit
+the wrapper. (Attribute values elsewhere already wrapped
+correctly; unit tests pin the span mapping.)
+
+## Proof
+- Hop-only repro: `Ok("HOP-OK")`, exit 0, clean teardown
+  (live=0), after fixes 1+2.
+- Full traced demo: `Ok("REFSVC-DATA-OK")`, exit 0; golden
+  byte-identical across two runs (193 lines, empty stderr);
+  span parents show the cross-service linkage
+  (`parent=front-to-data` on the data span, `parent=test-front-call`
+  on the front span). Goldens updated in-tree.
+- Real collector: OTLP/HTTP push to local Jaeger
+  (jaegertracing/all-in-one) accepted; `trace_verify_jaeger`
+  polled `/api/traces/{tid}` and confirmed the 6-span trace
+  with CHILD_OF linkage: `trace-verified=yes`.
+- Regression: F1 `tls_peer_wait_bounds` 3/3, `db_pool` 3/3,
+  `refsvc_load` 4/4, corpus (incl. new golden) green; full
+  `check.sh` green (see totals below).
+
+## Gate totals (fresh full run, this turn)
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `cargo test --workspace`: 65 result lines + 2 unscored-but-ok,
+  269 passed, 0 failed. Per-binary passed counts identical to
+  the Wave 3 table test-for-test (unittests lib 34 + main 16,
+  cli 17, project 15, gc 11, dev 11, reload 10, packages 10,
+  jit 8, interp 8, gate 8, spike1 7, lexer 7, ffi 7, db_sqlite 7,
+  stack1b 6, mn_jit 6, parser 5, mn 5, refsvc_load 4,
+  http_interop 4, db_postgres 4, db_mysql 4, blocking 4,
+  tls_openssl 3, tls_interop 3, opt 3, lsp 3, gc_perf 3,
+  db_pool 3, concurrent 3, tls_peer_wait_bounds 3, stack_jit 2,
+  race 2, oidc 0 (env, see below), ldap_auth 2, fmt 2,
+  differential 2, ctx_stage3 2, 1 each: corpus,
+  differential_concurrent, differential_task, fmt_equiv, mir,
+  mir_conform, net_hammer_mw, panics, sequential, stack,
+  timings, yield_jit, zz_ffidiag). Two binaries
+  (`yield_jit`, `zz_ffidiag`) show individual `ok` with no
+  summary line in this log; counted in the 269.
+- `oidc_keycloak` 0/2 is ENVIRONMENTAL, not a regression: the
+  47-hour-old local Keycloak realm serves discovery JSON
+  containing a non-ASCII em-dash; the strict HTTP client
+  rejects it before any wave code runs (server bytes proven
+  with curl). CI provisions a fresh minimal realm per run.
+- Local service-port notes (also environmental): the host's
+  own :5432 is not w3pg (w3pg maps to :55432) — postgres
+  tests ran with `TOTO_TEST_PG_DSN` at :55432 (4/4 green);
+  LDAP at :53389 per CI's own env (2/2 green).
+- stdlib `toto test`: 25 passed / 0 failed (was 24; +1 is the
+  new `test_trace.gzv` suite). wordfreq: 1/1 + interp==built
+  identity holds. Corpus census 186 unchanged (no case added
+  or removed; proj25 edited in place, goldens regenerated).
+- `fmt_equiv` needed an isolated rerun (346 s green): a
+  shared-machine parallel run wedged it for hours (port/file
+  contention with concurrent manual server tests), not a code
+  hang — lesson recorded, rerun quiet.
