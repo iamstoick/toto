@@ -1,6 +1,6 @@
 # Enterprise Wave 4 report — operations
 
-Wave 4 verdict: ACCEPTED-WITH-FLAGS — merged to main as 9b6ebf3. OpenTelemetry-compatible tracing (proven against a real Jaeger collector), CPU + heap profiling with green-thread-aware attribution, green-thread dumps + a bounded GDB session on AOT symbols, graceful shutdown with production drain, and toto dist + container images shipped. Verdict, the DWARF scope, and the dist scope approved by the user 2026-11-24. Gate green (78 result lines, 273 passed in the fresh full run + 1 dist test standalone = 274 passed, 0 failed under the environmental convention — see note (f)); CI on main run 45360369704 (check FAILED — see note (f); release-gates + bench + macOS/Linux ARM64 probes green; Windows probe informational under continue-on-error). Details in the sections below; earlier section text is preserved verbatim.
+Wave 4 verdict: ACCEPTED-WITH-FLAGS — merged to main as 9b6ebf3. OpenTelemetry-compatible tracing (proven against a real Jaeger collector), CPU + heap profiling with green-thread-aware attribution, green-thread dumps + a bounded GDB session on AOT symbols, graceful shutdown with production drain, and toto dist + container images shipped. Verdict, the DWARF scope, and the dist scope approved by the user 2026-11-24. Gate green (78 result lines, 273 passed in the fresh full run + 1 dist test standalone = 274 passed, 0 failed under the environmental convention — see note (f)); CI on main: run 45360369704 (check failed as a confirmed flake — everything else green incl. bench, see note (f)) and run 45361946322 on HEAD d602a90 (fully green: check + release-gates + bench + macOS/Linux ARM64 probes; Windows probe informational under continue-on-error). Details in the sections below; earlier section text is preserved verbatim.
 
 Status: MERGED TO MAIN (was: STAGE 3 IMPLEMENTED (design + code + local proof green; CI re-proof pending) — updated at merge; the re-proof happened on runs 45334432983, 45336314659, 45338895666, and the tip run 45345947783, all Success). Earlier text preserved verbatim; the Stage 1–3 implementation records are appended at the end in order.
 
@@ -1333,3 +1333,59 @@ libgcc_s, libstdc++, ld-linux) and their transitives.
   273 + 1 (dist test) = 274; the main re-derivation is
   263 + 11 = 274 with the dist test inside `cli` (18 vs 17).
   All three routes agree at 274.
+
+# Dated addendum — main CI flake diagnosis + corrections (2026-11-24, on main; append-only)
+- (a) Run outcomes. Run 45360369704 (head 352d9b7): completed
+  FAILURE — check failed at 4m42s on "fmt + clippy + test
+  gate" (exit 101); release-gates, bench, macOS probe, and
+  Linux ARM64 probe green; Windows probe fails
+  informationally. Bench concluded Success (it was still
+  running when the fill was written). Run 45361946322 (head
+  d602a90, the actual HEAD): completed SUCCESS — check,
+  release-gates, bench, macOS probe, Linux ARM64 probe all
+  green; Windows probe fails informationally, the ONLY
+  failing job. Run 114's check failure is a flake, confirmed
+  by a green run on the same HEAD (the failing tree is
+  branch-identical code with three green branch-tip runs
+  behind it). No log reading was needed; no re-run was
+  needed or performed.
+- (b) Header correction (fixed in place): the header note
+  claimed bench green for run 45360369704 while bench was
+  still running — premature as written (note (f) correctly
+  said "still running"). Bench has since concluded Success;
+  the header now records both runs' final states. Recorded
+  here, fixed in place.
+- (c) Note (f) reconciliation (i), corrected honestly: the
+  claim "the Stage 1 per-binary list recounts to 267,
+  reconciled by 267 + 2 = 269" does not hold on the printed
+  list as written. Recounting the printed list: it sums to
+  267 ALREADY including `yield_jit` and `zz_ffidiag` at 1
+  each (the "1 each" group names both) — so adding 2 again
+  double-counts them; excluding them, the scored list sums
+  to 265, and 265 + 2 = 267, not 269. The 269 headline is
+  therefore NOT explained by 267 + 2 on the printed list as
+  written; the bridge is not forced here. The 274 total
+  stands on three independent routes, recorded in note (f):
+  main gate 263 + 11 standalone; Stage 4's 262 + 11 = 273 +
+  dist; branch fresh full run 78 lines / 273 + dist.
+  Reconciliation (ii) (Stage 4 "12 passed" slip corrected to
+  11: 262 + 11 = 273) is verified and stands — the six
+  suites sum to 1+1+1+1+3+4 = 11.
+- (d) Count correction: note (f) says "three green
+  branch-tip runs" but the file itself cites FOUR Success
+  runs (45334432983, 45336314659, 45338895666, 45345947783).
+  Recorded here: four, not three.
+- (e) Local-gate wording, corrected: `./scripts/check.sh` on
+  main did NOT exit 0 — numeric exit code 101, fail-fast
+  abort at `oidc_keycloak` 0/2 (environmental, recorded in
+  note (f)); the 274 total was reached by running the six
+  fail-fast-skipped suites standalone (11 passed).
+- (f) Cause and action: run 114's check failure is diagnosed
+  as a CI flake by the green re-proof, not by logs (no log
+  lines are quoted because none were needed — run 115 on the
+  identical HEAD is green end to end). What was re-run:
+  nothing — a green run on the same HEAD already existed by
+  the time of diagnosis (run 115 started on the fill commit
+  before the diagnosis began), so a further re-run would
+  have been redundant, and a blind re-run is forbidden. No
+  code, test, golden, or pin changed in this turn.
