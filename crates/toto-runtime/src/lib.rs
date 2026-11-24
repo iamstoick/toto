@@ -11,6 +11,7 @@ pub mod conv;
 pub mod exec;
 pub mod heap;
 pub mod measure;
+pub mod profile;
 pub mod roots;
 pub mod sched;
 pub mod value;

@@ -12,3 +12,6 @@ path = "src/main.rs"
 toto-compiler = { path = "../toto-compiler" }
 toto-jit = { path = "../toto-jit" }
 toto-runtime = { path = "../toto-runtime" }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

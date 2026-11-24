@@ -86,6 +86,10 @@ pub enum Payload {
 struct Header {
     desc: DescKind,
     marked: bool,
+    /// Allocating task id (Wave 4 Stage 2): stamped from the
+    /// profiling owner at insert; the sweep tallies per-task
+    /// live counts from it. `u32::MAX` means off-task (system).
+    owner: u32,
 }
 
 struct Slot {
@@ -177,6 +181,7 @@ impl Heap {
             Header {
                 desc,
                 marked: false,
+                owner: crate::profile::current_owner(),
             },
             payload,
         ));
@@ -378,6 +383,48 @@ impl Heap {
         self.collections += 1;
         self.live = live;
         GcReport { collected, live }
+    }
+
+    /// Approximate per-object bytes (Wave 4 Stage 2): mirrors the
+    /// estimates in the `alloc_*` constructors (same basis as
+    /// `bytes_since_gc`, so tallies stay consistent with it).
+    fn payload_bytes(payload: &Payload) -> u64 {
+        match payload {
+            Payload::Str(v) => 32 + v.len() as u64,
+            Payload::Array(elems) => 32 + 16 * elems.len() as u64,
+            Payload::Struct { fields, .. } => {
+                32 + fields.iter().map(|(n, _)| 16 + n.len() as u64).sum::<u64>()
+            }
+            Payload::Range { .. } => 32 + 16,
+            Payload::Result { .. } => 32 + 16,
+            Payload::Option { .. } => 32 + 16,
+            Payload::Closure { captures, .. } => 32 + 16 * captures.len() as u64,
+        }
+    }
+
+    /// Per-task + per-type live tally over the current heap (Wave 4
+    /// Stage 2): call right after a collection for exact numbers
+    /// (every object tagged at insert; the sweep's `live` set is
+    /// what is tallied — unreachable objects already freed).
+    pub fn profile_tally(&self) -> crate::profile::HeapProfile {
+        use std::collections::HashMap;
+        let mut tasks: HashMap<u32, crate::profile::TaskHeap> = HashMap::new();
+        let mut kinds: HashMap<String, usize> = HashMap::new();
+        for slot in self.slots.iter() {
+            // `cell.is_some()` is exactly the sweep's live set
+            // (freed slots hold `None` until reused).
+            let Some((header, payload)) = slot.cell.as_ref() else {
+                continue;
+            };
+            let t = tasks.entry(header.owner).or_default();
+            t.objects += 1;
+            t.bytes += Self::payload_bytes(payload);
+            *kinds.entry(format!("{:?}", header.desc)).or_insert(0) += 1;
+        }
+        crate::profile::HeapProfile {
+            tasks: tasks.into_iter().collect(),
+            kinds: kinds.into_iter().collect(),
+        }
     }
 }
 

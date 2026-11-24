@@ -1,0 +1,91 @@
+// Wave 4 Stage 2 profiling workload (golden): deterministic
+// phased CPU + heap shape for the profiler proof. Two tasks each
+// fill a 100k-int array (CPU burn the sampler observes), hold it
+// across a barrier (so a collection sees both live), then sum it.
+// Main forces a final collection with its own fill so the last
+// sweep tally is exact. Prints only computed values (the profile
+// file itself is asserted by the runtime `profile` test, not
+// here — goldens cannot depend on wall-clock sampling).
+fn worker_a(out: chan<int>, hold: chan<int>, n: int) -> int {
+    let a: Array<int> = [];
+    let mut i: int = 0;
+    while i < n {
+        push(a, i);
+        i = i + 1;
+    }
+    out <- len(a);
+    let rel = <-hold;
+    let mut s: int = 0;
+    for x in a {
+        s = s + x;
+    }
+    out <- s;
+    return 0;
+}
+
+fn worker_b(out: chan<int>, hold: chan<int>, n: int) -> int {
+    let b: Array<int> = [];
+    let mut i: int = 0;
+    while i < n {
+        push(b, i);
+        i = i + 1;
+    }
+    out <- len(b);
+    let rel = <-hold;
+    let mut s: int = 0;
+    for x in b {
+        s = s + x;
+    }
+    out <- s;
+    return 0;
+}
+
+fn run() -> Result<string, string> {
+    let n: int = 100000;
+    let ra = chan<int>(1);
+    let ha = chan<int>(1);
+    go {
+        worker_a(ra, ha, n);
+    }
+    let lena = <-ra;
+    let rb = chan<int>(1);
+    let hb = chan<int>(1);
+    go {
+        worker_b(rb, hb, n);
+    }
+    let lenb = <-rb;
+    // Phase C: own fill past the GC threshold so the last sweep
+    // sees all three arrays live (A and B hold theirs across the
+    // barrier below).
+    let c: Array<int> = [];
+    let mut i: int = 0;
+    while i < n {
+        push(c, i);
+        i = i + 1;
+    }
+    ha <- 1;
+    hb <- 1;
+    let suma = <-ra;
+    let sumb = <-rb;
+    let mut sumc: int = 0;
+    for x in c {
+        sumc = sumc + x;
+    }
+    if lena != n || lenb != n || len(c) != n {
+        return Err("length mismatch");
+    } else {
+    }
+    let want: int = n * (n - 1) / 2;
+    if suma != want || sumb != want || sumc != want {
+        return Err("sum mismatch");
+    } else {
+    }
+    println("lens=100000,100000,100000");
+    println("sums=4999950000,4999950000,4999950000");
+    return Ok("PROF-OK");
+}
+
+fn main() -> int {
+    println(run());
+    return 0;
+}

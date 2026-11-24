@@ -32,6 +32,10 @@ interp-wordfreq 1189
 exec-gc-alloc 2682
 exec-gc-chan 3553
 exec-refsvc-load 65000
+# `exec-refsvc-load-prof` is the same 60-req conc-2 shape with the
+# Wave 4 Stage 2 profiler on (100 Hz + heap tally): median of 3 local
+# runs (65859, 66388, 66382) on the 12-core x86_64 bench box.
+exec-refsvc-load-prof 66000
 aot-wordfreq 515
 aotrel-wordfreq 145
 interp-wf-6 16

@@ -1,9 +1,9 @@
 # Enterprise Wave 4 report — operations
 
-Status: STAGE 1 IMPLEMENTED (design + code + local proof green;
-CI re-proof pending push). Stage 0 and Stage 1 design text below
-preserved verbatim; the Stage 1 implementation record is appended
-at the end.
+Status: STAGE 2 IMPLEMENTED (design + code + local proof green;
+CI re-proof pending push). Earlier text preserved verbatim; the
+Stage 1 and Stage 2 implementation records are appended at the
+end in order.
 
 Branch: `enterprise/wave-4-operations`, from `main` at `a958396`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -246,8 +246,10 @@ second implementation).
 2. Distributed tracing — IMPLEMENTED + PROVEN LOCALLY (Stage 1
    record appended at end: design as above; OTLP collector proof
    `trace-verified=yes`; local gate green; CI re-proof pending).
-3. Profiling (CPU + heap, green-thread-aware) — NOT YET
-   (Stage 2).
+3. Profiling (CPU + heap, green-thread-aware) — IMPLEMENTED +
+   PROVEN LOCALLY (Stage 2 record appended at end: cooperative
+   sampling + owner-tagged heap, refsvc load profile, <1%
+   overhead; local gate green; CI re-proof pending).
 4. Debugger (DWARF + green-thread dumps) — NOT YET (Stage 3).
 5. Graceful shutdown (signals + drain under load + health/
    readiness) — NOT YET (Stage 4).
@@ -514,4 +516,80 @@ New bench rows: sampling on/off wall-clock on the refsvc load
 shape (flag rule as usual). Deferred: allocation-site stacks,
 OTLP profile export, HTTP trigger endpoint — named follow-ups,
 not silence.
+
+
+# Stage 2 record — CPU + heap profiling (implementation + proof)
+
+## What was built (Stage 2 implementation)
+- `crates/toto-runtime/src/profile.rs` (new): `Profiler`
+  (config from `TOTO_PROFILE`/`TOTO_PROFILE_HZ`/`TOTO_PROFILE_OUT`,
+  per-worker sample rings cap 16384 drop-oldest, names map, last
+  sweep tally, dump lock + flag), `Sample` (task, micros, first
+  fn, `;`-joined stack — one allocation per sample), `HeapProfile`
+  (per-task + per-kind live), `render` (§2.3 `profile v1` format),
+  SIGUSR1 handler + process-wide trigger pipe (unix-only).
+- `heap.rs`: `Header.owner: u32` stamped from TLS at `insert`;
+  `payload_bytes` mirror; `profile_tally` (per-task + per-kind
+  live, exact — the sweep's live set).
+- `sched.rs`: `Shared.profiler` + `profile_wake`; worker-loop TLS
+  owner/worker identity; `profile_dump` (first claimant wins,
+  inline write, best-effort); tally store after each collect;
+  poller watches the trigger pipe; exit dump in run epilogue.
+- `exec.rs`: `maybe_sample` at every safepoint (enabled flag +
+  1-in-1024 tick fast path; quantum check; stack copy; ring
+  push; dump on request).
+- No new builtins, no ADR change (codec frozen, not header
+  layout — verified in ADR-008), no spec change.
+- Corpus `tests/corpus/project/proj26_prof/`: phased workload
+  (two named 100k-array workers + main top-up forcing the final
+  collection) with computed-output golden; profile assertions
+  live in the runtime test (goldens cannot depend on
+  wall-clock sampling).
+- `crates/toto-runtime/tests/profile.rs` (new): in-process run
+  asserts task presence per worker, named stacks
+  (`go;worker_a`), exact heap (`objects=2 bytes=3200064` per
+  task — array + its `for` snapshot; frame-rooted locals stay
+  live, conservative roots documented), `kind Array objects=6`,
+  `profile v1` header.
+- `crates/toto-cli/tests/profile_signal.rs` (new, unix-only):
+  child `toto run` + SIGUSR1 mid-run asserts the dump lands
+  while the service keeps running, then clean exit (+ exit
+  dump). Needs `libc` dev-dep (already locked).
+- Bench: `exec-refsvc-load-prof` row (same 60-req conc-2 shape
+  with profiler on) + `66000` baseline (median of 3 local runs).
+
+## Proofs
+- CPU: `task 1 go samples=66 / stack 1 go;worker_a` style lines
+  — every task attributed, stacks named (in-process + refsvc
+  load: 11+ distinct tasks with full call paths).
+- Heap: exact per-task objects/bytes + per-kind totals;
+  allocator-pays semantics verified (each task's array counted
+  to its allocator).
+- Signal: SIGUSR1 mid-run writes the profile while the service
+  runs (manual + committed child test); exit dump always fires
+  when enabled.
+- Refsvc under load (60-req conc-2): LOAD-OK with profiler on;
+  `dropped 0` at 100 Hz with 16k rings; top stacks show
+  `phase_c_worker;http_do;http_exchange;...` paths.
+- Overhead: <1% on the deterministic proj26 shape (2.35s vs
+  2.37s medians, interleaved A/B); 4% on a single 60s load pair
+  (65654 vs 63117 ms) — within run-to-run variance of the long
+  shape; CI 5x flag rule unaffected. Bench baseline 66000
+  recorded.
+
+## Gate totals (fresh full run, this wave)
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `cargo test --workspace --no-fail-fast`: 75 result lines,
+  269 passed, 0 failed (+1 line `oidc_keycloak` 0/2,
+  ENVIRONMENTAL — stale local Keycloak realm serves an em-dash
+  in discovery JSON; CI provisions a fresh minimal realm; see
+  the Stage 1 record for the server-side proof). Bridge from
+  Wave 3 (74 / 269 / 0): lines 74 − 1 (oidc ok-line, env-fail
+  here) + 2 (new `profile`, `profile_signal` suites) = 75;
+  tests 269 − 2 (oidc) + 2 (new suites) = 269. Every other
+  binary holds its Wave 3 count test-for-test.
+- stdlib `toto test`: 25 passed / 0 failed; wordfreq 1/1 +
+  interp==built identity; corpus census 187 (was 186: +1 project case, proj26;
+  160 top-level + 27 project mains).
 

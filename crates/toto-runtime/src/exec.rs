@@ -620,7 +620,61 @@ impl<'a> Executor<'a> {
     /// completes inline, exactly like the old direct collect; with M:N
     /// every worker joins at its next opportunity while this task's
     /// roots stay published.
+    /// Profiling sample point (Wave 4 Stage 2): called at every
+    /// safepoint via `maybe_collect`. Fast path is two cheap
+    /// checks (enabled flag, 1-in-1024 tick) with no locks; only
+    /// an actual sample or a requested dump touches shared state.
+    fn maybe_sample(&self) {
+        let prof = &self.shared.profiler;
+        if !prof.enabled() {
+            return;
+        }
+        // Requested dump first: the dumping worker writes the
+        // file, everyone else just keeps sampling.
+        if prof.take_dump_request() {
+            crate::sched::Scheduler::profile_dump(self.shared);
+        }
+        if !crate::profile::sample_tick() {
+            return;
+        }
+        let quantum = 1_000_000 / prof.config.hz.max(1);
+        let now = prof.micros_since_start();
+        if now < crate::profile::last_sample().saturating_add(quantum) {
+            return;
+        }
+        crate::profile::stamp_sample(now);
+        let Some(worker) = crate::profile::current_worker() else {
+            return;
+        };
+        if worker >= prof.rings.len() {
+            return;
+        }
+        let Some(first) = self.trace.first().map(|f| f.name.clone()) else {
+            return;
+        };
+        let mut stack = String::new();
+        for (k, f) in self.trace.iter().enumerate() {
+            if k > 0 {
+                stack.push(';');
+            }
+            stack.push_str(&f.name);
+        }
+        {
+            let mut names = prof.names.lock().expect("profile names lock");
+            names.entry(self.task.0 as u32).or_insert(first.clone());
+        }
+        let s = crate::profile::Sample {
+            task: self.task.0 as u32,
+            micros: now,
+            first,
+            stack,
+        };
+        let mut ring = prof.rings[worker].lock().expect("profile ring lock");
+        ring.push(s);
+    }
+
     fn maybe_collect(&self) {
+        self.maybe_sample();
         self.publish_roots();
         let need = self.shared.force_collect_for_test
             || {

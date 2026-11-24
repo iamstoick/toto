@@ -176,6 +176,29 @@ timed exec-refsvc-load "$TOTO" run load.gzv
 )
 rm -f "$SAMPLE"/toto-refsvc-bench.db*
 
+echo "== refsvc load with profiler on (100 Hz sampling + heap tally) =="
+# Overhead backstop for Stage 2: same 60-req conc-2 shape with
+# TOTO_PROFILE=1. Asserts LOAD-OK (profiling must not break the
+# service) and records wall-clock for the 5x flag rule. The tight
+# overhead number (<1% on the deterministic proj26 shape) lives
+# in the Wave 4 report; this row catches order-of-magnitude
+# regressions in CI.
+(
+cd "$ROOT/tests/corpus/project/proj25_refsvc_data"
+export TOTO_REFSVC_PORT=48527
+export TOTO_REFSVC_DSN="sqlite:path=$SAMPLE/toto-refsvc-bench.db"
+export TOTO_REFSVC_REQS=60
+export TOTO_PROFILE=1
+export TOTO_PROFILE_OUT="$SAMPLE/bench_refsvc.prof"
+export TOTO_PROFILE_HZ=100
+"$TOTO" run load.gzv > "$SAMPLE/bench_refsvc_prof.out" 2>&1
+grep -q "LOAD-OK" "$SAMPLE/bench_refsvc_prof.out" || { echo "FAIL refsvc-load-prof: no LOAD-OK"; exit 1; }
+grep -q "^profile v1" "$SAMPLE/bench_refsvc.prof" || { echo "FAIL refsvc-load-prof: no profile"; exit 1; }
+grep -hE "^(LOAD|recover|phase-a)" "$SAMPLE/bench_refsvc_prof.out" | tail -n 4
+timed exec-refsvc-load-prof "$TOTO" run load.gzv
+)
+rm -f "$SAMPLE"/toto-refsvc-bench.db* "$SAMPLE"/bench_refsvc_prof.out "$SAMPLE"/bench_refsvc.prof
+
 echo "== cpu: jit (compile+run) =="
 timed jit-compute "$PROBE" "$ROOT/bench/compute.gzv"
 timed jit-conc "$PROBE" --task "$ROOT/bench/conc.gzv"

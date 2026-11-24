@@ -687,6 +687,17 @@ pub struct Shared {
     /// LDAP. Same shape as the server lane (own queue, own bell).
     pub pool_db: Mutex<PoolState>,
     pub pool_db_cv: Condvar,
+    /// CPU + heap profiler (Wave 4 Stage 2): rings, flags, last
+    /// sweep tally. Disabled unless `TOTO_PROFILE=1` (config read
+    /// once here); all fields inert otherwise.
+    pub profiler: crate::profile::Profiler,
+    /// Profile-trigger self-pipe (Wave 4 Stage 2, unix-only):
+    /// the SIGUSR1 handler writes one byte; the poller watches
+    /// the read end and raises `dump_requested`. Process-wide
+    /// (created once, never closed); `[-1, -1]` here when
+    /// profiling is disabled for this run.
+    #[cfg(unix)]
+    pub profile_wake: [std::os::fd::RawFd; 2],
     pub done: Mutex<VecDeque<Completion>>,
     /// M:N network poller (Wave 1, unix-only): registrations in,
     /// readiness completions out. The poller thread touches neither
@@ -921,6 +932,15 @@ impl Shared {
                 {
                     let mut st = self.state.lock().expect("shared state lock");
                     st.heap.collect(&roots);
+                    // Profiling tally (Wave 4 Stage 2): exact
+                    // per-task live table from this collection, for
+                    // the next dump. Separate lock section after
+                    // the collect (heap lock released first).
+                    if self.profiler.enabled() {
+                        let tally = st.heap.profile_tally();
+                        drop(st);
+                        *self.profiler.last_heap.lock().expect("profile heap lock") = tally;
+                    }
                 }
                 {
                     let mut g = self.gc.lock().expect("gc lock");
@@ -1242,6 +1262,17 @@ impl Scheduler {
         let force_collect_for_test = config.collect_at_every_safepoint_for_test;
         let workers = config.workers;
         let pool_threads = config.blocking_pool_threads;
+        // Profiler config is read once here (env); the process-wide
+        // SIGUSR1 self-pipe is ensured only when enabled (created
+        // once, never closed — see `profile::trigger_pipe`).
+        let profiler = crate::profile::Profiler::new(workers, 16384);
+        #[cfg(unix)]
+        let profile_wake: [std::os::fd::RawFd; 2] = if profiler.config.enabled {
+            let (r, w) = crate::profile::trigger_pipe();
+            [r, w]
+        } else {
+            [-1, -1]
+        };
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 heap,
@@ -1300,6 +1331,9 @@ impl Scheduler {
                 shutdown: false,
             }),
             pool_db_cv: Condvar::new(),
+            profiler,
+            #[cfg(unix)]
+            profile_wake,
             done: Mutex::new(VecDeque::new()),
             #[cfg(unix)]
             net: Mutex::new(NetState::default()),
@@ -1577,6 +1611,14 @@ impl Scheduler {
         // corpus runs 100+ programs in one test process).
         #[cfg(unix)]
         toto_compiler::netsys::close(self.shared.net_wake[1]).ok();
+        // Profiling exit dump (Wave 4 Stage 2): when enabled, write
+        // the profile now (rings are stable — every worker exited;
+        // the tally is the last collection's). The trigger pipe is
+        // process-wide and stays open (never closed, never
+        // recycled — see `profile::trigger_pipe`).
+        if self.shared.profiler.enabled() {
+            Self::profile_dump(self.shared.as_ref());
+        }
         // All workers exited and the last one shut the pool down, so
         // every thread joined. Compose the outcome.
         let (collections, allocated, reclaimed) = {
@@ -1637,6 +1679,9 @@ impl Scheduler {
     /// drained inside the decide critical section (see
     /// `drain_completions_locked`).
     fn worker_loop(&self, worker: usize) {
+        // Profiling identity (Wave 4 Stage 2): this OS thread is
+        // worker `worker` for its whole life.
+        crate::profile::set_worker(worker);
         loop {
             enum Step {
                 Run(TaskId, TaskCo, ToTask),
@@ -1893,7 +1938,12 @@ impl Scheduler {
                 }
                 Step::Run(id, co, input) => {
                     let mut co = co.0;
+                    // Profiling owner (Wave 4 Stage 2): heap inserts
+                    // and samples attribute to the resumed task;
+                    // cleared when it suspends again below.
+                    crate::profile::set_owner(id.0 as u32);
                     let outcome = co.resume(input);
+                    crate::profile::set_owner(crate::profile::SYSTEM_TASK);
                     match outcome {
                         CoroutineResult::Yield(req) => {
                             {
@@ -2465,6 +2515,10 @@ impl Scheduler {
     fn poller_loop(shared: &Arc<Shared>) {
         use toto_compiler::netsys as nn;
         let pipe_rd = shared.net_wake[0];
+        // Profile trigger pipe (Wave 4 Stage 2, unix-only):
+        // watched only when this run profiles (`-1` otherwise).
+        #[cfg(unix)]
+        let profile_rd = shared.profile_wake[0];
         loop {
             // Snapshot the poll set under one lock section. `ids`
             // carries the registration identity per pollfd so a
@@ -2483,6 +2537,11 @@ impl Scheduler {
                     net.regs.iter().map(|r| Some((r.task, r.seq))).collect();
                 fds.push((pipe_rd, true, false));
                 ids.push(None);
+                #[cfg(unix)]
+                if profile_rd >= 0 {
+                    fds.push((profile_rd, true, false));
+                    ids.push(None);
+                }
                 (fds, ids, net.shutdown)
             };
             if shutdown {
@@ -2521,6 +2580,15 @@ impl Scheduler {
             let mut woke = false;
             for &i in &ready {
                 if fds[i].0 == pipe_rd {
+                    continue;
+                }
+                // Profile trigger (Wave 4 Stage 2): drain the byte
+                // and raise the dump flag; a worker dumps at its
+                // next safepoint. Never blocks the poller.
+                #[cfg(unix)]
+                if profile_rd >= 0 && fds[i].0 == profile_rd {
+                    nn::drain_pipe(profile_rd);
+                    shared.profiler.request_dump();
                     continue;
                 }
                 // Peek, execute, then post-before-remove: close paths
@@ -3695,6 +3763,53 @@ impl Scheduler {
                 }
                 None => break,
             }
+        }
+    }
+
+    /// Write the profile file now (Wave 4 Stage 2): gather rings +
+    /// names + last sweep tally and render per §2.3. Called when a
+    /// worker observes `dump_requested` at a safepoint, and once at
+    /// run exit when enabled. Only the first claimant dumps (the
+    /// dump lock); the file write is a brief inline `std::fs`
+    /// write on the calling worker — no pool, no scheduler locks
+    /// held (rings/names/heap-table are leaf locks by discipline).
+    /// Best-effort observability: a write error prints to stderr
+    /// and the run continues — the profile must never fail the
+    /// service it observes.
+    pub fn profile_dump(shared: &Shared) {
+        if !shared.profiler.enabled() {
+            return;
+        }
+        let _guard = match shared.profiler.dump_lock.try_lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let mut samples = Vec::new();
+        let mut dropped = 0u64;
+        for ring in shared.profiler.rings.iter() {
+            let mut r = ring.lock().expect("profile ring lock");
+            samples.extend(r.drain());
+            dropped += r.dropped;
+            r.dropped = 0;
+        }
+        let names: Vec<(u32, String)> = shared
+            .profiler
+            .names
+            .lock()
+            .expect("profile names lock")
+            .iter()
+            .map(|(id, n)| (*id, n.clone()))
+            .collect();
+        let heap = shared
+            .profiler
+            .last_heap
+            .lock()
+            .expect("profile heap lock")
+            .clone();
+        let text = crate::profile::render(&samples, &names, &heap, dropped);
+        let path = shared.profiler.config.out.clone();
+        if let Err(e) = std::fs::write(&path, text) {
+            eprintln!("profile: dump to {} failed: {}", path, e);
         }
     }
 
