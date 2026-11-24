@@ -1025,3 +1025,95 @@ comment was stripped by `toto fmt`, shifting spans and failing
 the gate. Fix: no leading comments in position-asserting
 goldens (verified `toto fmt` idempotent on the file).
 
+
+# Stage 5 — deployment artifacts (design recorded before implementation; no code yet)
+
+## 5.0 Requirement (PDF p.37) + starting point
+Static binaries and container images as the SUPPORTED
+artifacts, with published startup-time and binary-size
+targets measured in CI. Starting point is the Phase 7
+production build story (`toto build`: Cranelift AOT object +
+Rust shim crate + nested `cargo build`, `Cargo.lock` pin +
+warm-cache offline) and the Phase 7 bench story
+(`scripts/bench.sh`, `bench/baseline.txt`, 5x median flag
+rule enforced by the CI `bench` job at `--runs 3`).
+
+## 5.1 What "static" means for a Toto binary (v1 definition)
+Ground truth (`ldd` on a `toto build` binary): the Rust code,
+the Cranelift AOT object, and the shim are already fully
+static. The dynamic set is exactly the mature-FFI C libraries
+(libssl, libcrypto, libsqlite3, libpq, libmysqlclient, libldap,
+liblber — pinned SONAMEs via the `toto-compiler` build.rs
+symlink model) plus the platform C runtime (libc, libm,
+libgcc_s, libstdc++, ld-linux) and their transitives.
+- REJECTED: glibc `-static` (breaks NSS/DNS via `getaddrinfo`,
+  which Toto's `net_resolve` needs — a static binary that
+  cannot resolve names is not deployable).
+- REJECTED for v1: fully-static musl (no musl std installed in
+  any supported toolchain, no static archives of OpenSSL /
+  libpq / libmysqlclient available offline — separate
+  toolchain proposal, named follow-up, not this stage).
+- v1 MEANING (supportable, verifiable): the `toto build`
+  output as today, PLUS a pinned, collected shared-lib closure
+  laid out beside it (`dist/<app>/bin/<app>`,
+  `dist/<app>/lib/*.so.*`) with an `$ORIGIN`-relative rpath
+  baked at link time — so the dist runs on any same-arch glibc
+  host with empty env (no `LD_LIBRARY_PATH`, no lib-dir vars).
+  What stays dynamic: glibc/ld-linux and what they pull (any
+  same-arch glibc ≥ build host works — the container image
+  below pins the exact userland instead).
+- Implementation shape: `toto build` learns the rpath link-arg
+  for the shim link (harmless when no `lib/` sits beside the
+  binary — falls back to system search, so all existing build
+  tests are unaffected) and a dist step collects the FFI
+  closure (the build.rs-known lib name set, resolved via the
+  same search dirs) into `dist/`. Verification is behavioral:
+  run the dist binary with `env -i` (empty environment) —
+  startup + serve must work.
+
+## 5.2 Container images (base, layout, build, verify)
+- Base: `debian:bookworm-slim` (glibc userland matching the
+  build host family; exact digest pinned in the Dockerfile).
+  Runtime layer installs ONLY the FFI libs the binary needs
+  (libssl3, libsqlite3-0, libldap-2, libpq5, mysql client —
+  via apt for the system ones, matching SONAMEs) OR copies
+  the dist `lib/` closure — decision recorded at build time
+  (apt preferred: security-patched userland; closure
+  preferred when the registry mirror is unavailable).
+- Layout: `/app/bin/<app>`, `/app/lib/` (when closure),
+  `/app/fixtures/` (only what the app needs at boot),
+  non-root user, `EXPOSE` the serve port, `HEALTHCHECK`
+  against `/healthz` for service images.
+- Build: multi-stage (stage 1 = toolchain + repo + toto-deps,
+  runs `toto build`; stage 2 = slim runtime + dist copy).
+  Verify (behavioral, in CI-able form): batch image runs and
+  its stdout byte-matches the local run; service image boots
+  and `/healthz` returns 200 (from outside the container).
+- First images: wordfreq (batch, byte-identity proof) and the
+  refsvc data door (service, `/healthz` proof with the
+  repo fixtures + file DB — no external services needed).
+
+## 5.3 Targets (published here, measured in CI)
+- Startup: `start-aot*` rows exist; new `size-*` rows added to
+  `scripts/bench.sh` + `bench/baseline.txt` (exact bytes of
+  the `toto build` outputs) under the same 5x flag rule
+  (uniform mechanism; sizes are near-deterministic so any
+  real growth is caught the same way). CI `bench` job
+  (`--runs 3`) enforces both.
+- Published v1 targets (this machine class; CI re-measures):
+  AOT startup ≤ 50 ms (trivial), release AOT ≤ 20 ms,
+  wordfreq-release startup ≤ 50 ms; debug AOT binary ≤ 100 MB,
+  release AOT binary ≤ 30 MB (wordfreq scale). Numbers are
+  recorded from measurement below, never asserted ahead of it.
+
+## 5.4 Proof plan (mirrors Stages 1–4)
+- `toto build` output unchanged behaviorally (existing `cli`
+  build tests green — rpath is additive).
+- Dist binary runs with `env -i` (empty env): startup +
+  output byte-identity vs the in-tree binary.
+- Both images build from scratch (`docker build`) and pass
+  their behavioral verify (wordfreq byte-identity;
+  refsvc `/healthz` 200 from the host).
+- New bench rows green locally + recorded in `baseline.txt`;
+  CI `bench` enforces them. Full gates green on Tier-1;
+  totals re-derived; checklist closed.

@@ -212,9 +212,14 @@ timed aot-stdlib "$SAMPLE/stdlib/target/stdlib"
 # there: run inside its project dir (artifacts stay in /tmp).
 (cd "$SAMPLE/wordfreq" && timed aot-wordfreq ./target/wordfreq && rm -f report.json)
 # Debug sizes before the release rebuilds overwrite the binaries.
+# Size rows also feed $MEDIANS (same 5x flag rule as timings):
+# `size-aot-*` are debug binaries, `size-aotrel-*` release.
+: > $SAMPLE/bench_sizes_debug.txt
 for w in compute conc stdlib wordfreq; do
-  echo "debug-size-$w: $(wc -c < "$SAMPLE/$w/target/$w")"
-done > $SAMPLE/bench_sizes_debug.txt
+  sz=$(wc -c < "$SAMPLE/$w/target/$w")
+  echo "debug-size-$w: $sz" >> $SAMPLE/bench_sizes_debug.txt
+  echo "size-aot-$w $sz" >> "$MEDIANS"
+done
 
 echo "== aot release builds (production opt: Speed + release link) =="
 for w in compute conc stdlib; do
@@ -272,9 +277,13 @@ timed start-aotrel "$SAMPLE/trivial/target/trivial"
 echo "== binary size (bytes) =="
 cat $SAMPLE/bench_sizes_debug.txt
 for w in compute conc stdlib trivial; do
-  echo "aotrel-$w: $(wc -c < "$SAMPLE/$w/target/$w")"
+  sz=$(wc -c < "$SAMPLE/$w/target/$w")
+  echo "aotrel-$w: $sz"
+  echo "size-aotrel-$w $sz" >> "$MEDIANS"
 done
-echo "aotrel-wordfreq: $(wc -c < "$SAMPLE/wordfreq/target/wordfreq-release")"
+sz=$(wc -c < "$SAMPLE/wordfreq/target/wordfreq-release")
+echo "aotrel-wordfreq: $sz"
+echo "size-aotrel-wordfreq $sz" >> "$MEDIANS"
 rm -f "$SAMPLE/wordfreq/target/wordfreq-release"
 
 if [ -n "$BASELINE" ]; then

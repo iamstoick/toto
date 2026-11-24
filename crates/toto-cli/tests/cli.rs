@@ -179,6 +179,60 @@ fn build_produces_equivalent_executable() {
 }
 
 #[test]
+fn dist_produces_self_contained_layout() {
+    // Wave 4 Stage 5: `toto dist` lays out bin/ + the bundled
+    // lib closure; the dist binary runs with an EMPTY environment
+    // (no LD_LIBRARY_PATH, no lib-dir vars), proving the baked
+    // rpath + closure instead of system luck. libpq ships only
+    // in the dep dir (never a system lib here), so its presence
+    // in lib/ proves collection.
+    let dir = scratch_project("dist");
+    let out = toto()
+        .arg("init")
+        .arg(dir.join("calc"))
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0));
+    let root = dir.join("calc");
+    std::fs::write(root.join("main.gzv"), BUILD_PROG).expect("write main");
+    let out = toto()
+        .arg("dist")
+        .current_dir(&root)
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0), "dist failed");
+    let bin = root
+        .join("target")
+        .join("dist")
+        .join("calc")
+        .join("bin")
+        .join("calc");
+    let libdir = root.join("target").join("dist").join("calc").join("lib");
+    assert!(bin.is_file(), "no dist binary at {}", bin.display());
+    assert!(libdir.join("libpq.so.5").is_file(), "no bundled libpq");
+    assert!(
+        libdir.read_dir().expect("read lib").count() > 1,
+        "closure unexpectedly thin"
+    );
+    // Expected output from the interpreter (inherits this env,
+    // which carries the link-time lib vars).
+    let run = toto()
+        .arg("run")
+        .arg(root.join("main.gzv"))
+        .output()
+        .expect("runs");
+    assert_eq!(run.status.code(), Some(0));
+    // Dist binary with a fully empty environment.
+    let dist_out = std::process::Command::new(&bin)
+        .env_clear()
+        .output()
+        .expect("dist binary runs");
+    assert_eq!(dist_out.status.code(), Some(0), "dist needs env?");
+    assert_eq!(dist_out.stdout, run.stdout, "dist output differs");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn build_offline_needs_no_network() {
     // Production requirement (Phase 7, Stage 2): `toto build --offline`
     // performs no network fetch — cargo's own offline gate hard-errors
