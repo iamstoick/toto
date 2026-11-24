@@ -1296,8 +1296,30 @@ libgcc_s, libstdc++, ld-linux) and their transitives.
   (base glibc must satisfy max GLIBC_2.x across bin + lib;
   this host's closure needs 2.38, bookworm-slim's 2.36 failed
   loudly at startup).
-- (f) Totals, re-derived from the Step 3 gate run on main:
-  PENDING-STEP-3-F (per-binary account below; the branch
-  report's "274 passed" is a stated composite, and "0 failed"
-  excludes oidc_keycloak 0/2 under the environmental
-  convention — see the account).
+- (f) Totals, re-derived from the Step-3 gate run on main
+  (`check.sh`, fail-fast): 64 ok lines, 263 passed; the one
+  failing line is `oidc_keycloak` 0/2, ENVIRONMENTAL (same
+  stale local realm — discovery JSON with a non-ASCII
+  em-dash; server bytes proven with curl; CI provisions a
+  fresh realm per run). Fail-fast aborts at oidc, so six
+  toto-runtime suites never ran in that gate — run standalone
+  on main, all green: `profile` 1, `sequential` 1, `stack` 1,
+  `threaddump` 1, `tls_openssl` 3, `refsvc_load` 4 (11
+  passed). Main total: 70 lines, 274 passed (incl. `cli`
+  18/18 with the dist test), 0 failed under the environmental
+  convention. `stdlib` 25/25 and wordfreq 1/1 + interp==built
+  identity were proven on the branch tip (identical code;
+  main adds docs only). In the Step-3 CI run on main, record
+  what `oidc_keycloak` does (fresh realm): PENDING-CI-OIDC.
+  - Discrepancies, stated not forced: (i) the Stage 1
+  per-binary list recounts to 267, not 269 — reconciled: the
+  headline 269 includes the "2 unscored-but-ok" binaries
+  named in the same paragraph (267 + 2 = 269). (ii) The
+  Stage 4 record says "the 6 fail-fast-skipped suites ...
+  12 passed" — the six sum to 11 (1+1+1+1+3+4), not 12;
+  corrected here: 262 (fail-fast gate) + 11 = 273, which
+  reconciles exactly with the fresh `--no-fail-fast` full
+  run (78 lines, 273 passed). The branch composite is
+  273 + 1 (dist test) = 274; the main re-derivation is
+  263 + 11 = 274 with the dist test inside `cli` (18 vs 17).
+  All three routes agree at 274.
