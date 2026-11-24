@@ -694,3 +694,129 @@ heap contents (the heap profile's job).
   golden asserts the diagnostic shape on stderr) + dump
   assertions in the runtime test (like `profile.rs`).
 
+
+## Stage 4 — graceful shutdown + health/readiness (design recorded before implementation; no code yet)
+
+## 4.0 Requirement (PDF p.37) + D7 relation (stated explicitly, not conflated)
+Production drain of in-flight work (the OPERATIONAL counterpart
+of the D7 drain rules), signal handling, health/readiness
+endpoints. Exit criterion: drain-under-load-then-exit green.
+
+D7 (ADR-007, dev reload) vs Stage 4 (production stop) — same
+mechanics, opposite lifecycles (stated once, not conflated):
+- Shared mechanics (deliberately identical): in-flight work
+  finishes first; a bounded drain timeout (5 s default, D7
+  provisional value adopted); forced scope-boundary
+  cancellation at expiry; full-stop fallback with a loud
+  message (D7 restarts the dev process; Stage 4 exits the
+  production process).
+- Different purpose and lifecycle: D7 reloads (old version
+  drains, tasks restart on new code, the PROCESS CONTINUES;
+  code versions retained per the v2.2 lifetime rules).
+  Stage 4 shuts down (drain, then the PROCESS EXITS; nothing
+  takes over; the orchestrator removes the endpoint).
+  Production builds never hot-reload (D7 decision) — no
+  conflict: D7 governs dev reloads, Stage 4 governs
+  production stops.
+
+## 4.1 Signal set (unix-only; Windows stays deferred with the platform)
+- SIGTERM (orchestrators, `docker stop`) and SIGINT (Ctrl-C):
+  initiate drain. Same async-safe self-pipe pattern as
+  USR1/USR2 (dedicated pipe, no new surface).
+- SIGUSR1/USR2/SIGQUIT: unchanged (profile/threads/dump).
+- SIGHUP: nothing in v1 (no reload semantics in production).
+- SIGKILL/SIGSTOP: uncatchable by definition — documented,
+  not handled. A SIGKILLed drain is an orchestrator
+  misconfiguration (kill grace shorter than the drain
+  timeout), not a defect.
+
+## 4.2 Drain semantics (what drains, in what order, timeout, leftovers)
+Trigger (runtime-internal, no new builtins): on SIGTERM/SIGINT
+the runtime (1) writes the drain-flag file
+(`$TOTO_DRAIN_DIR/draining`, default temp dir — the ONLY
+runtime→.gzv drain channel in v1; a `drain_requested()`
+builtin is the named follow-up if the file proves awkward),
+(2) closes every tracked listener fd (recorded at
+`net_tcp_listen` in net state — the parked accepts wake with
+`Err` and the existing stdlib accept loops exit on exactly
+that), (3) arms the deadline (`TOTO_DRAIN_SECS`, default 5 —
+D7 precedent).
+Order: (1) stop accepting (listener close; accept loops exit);
+(2) in-flight requests run to completion (conn tasks keep
+their workers/pool lanes; nothing is deprioritized);
+(3) when accept loops are gone AND the serve task returns AND
+no conn tasks remain, the run ends cleanly (live==0) with the
+main's own exit code (0 on the reference path).
+Timeout: at the deadline with live tasks remaining, the
+runtime fails the root scope (forced cancellation — same
+sweep as E0216 paths; pool jobs finish, completions drop) and
+the run exits LOUD (nonzero + stderr line, never silent).
+Which work drains: green-thread conn tasks with open requests
+(all of them — no priority classes in v1). What is NOT waited
+for: the main task parking forever (a graceful server main
+waits on its accept loop via the new joinable serve below and
+returns; a main that never returns is cancelled at the
+deadline like any straggler — documented).
+
+## 4.3 Serve-loop shape (stdlib extension, existing behavior unchanged)
+`http_serve*` keeps its fire-and-forget shape (returns the
+listener fd). NEW stdlib fn (allowed — stdlib is not the frozen
+builtin catalog): a joinable serve that runs the accept loop in
+the CALLING task and returns when the loop exits (listener
+closed), so a graceful `main` waits on it and returns to let
+the run end. In-flight tracking: none needed at the .gzv layer
+— conn tasks are ordinary tasks; the run ends when all are
+done (live==0), which the scheduler already computes. Early
+exit needs no counter: the deadline backstop guarantees it.
+Refsvc adopts the joinable serve for both doors.
+
+## 4.4 Health/readiness (over the Wave 2 HTTP framework)
+New refsvc routes (pattern for services; not framework magic):
+- `GET /healthz` → 200 `ok` while serving (the handler runs,
+  so the loop turns; no dependency checks — liveness only).
+- `GET /readyz` → 200 `ok` when NOT draining AND the DB
+  answers `SELECT 1` (real dependency probe, seconds-apart
+  polling makes one pool op negligible); 503 `draining` when
+  the drain-flag file exists; 503 `unready` when the DB probe
+  fails. Draining is observed via the EXISTING `file_exists`
+  builtin — zero new surface.
+- During drain: health stays 200 (in-flight still served),
+  readiness goes 503 (orchestrator stops routing). After
+  drain: process gone (both fail closed — correct: the
+  endpoint is removed). Fail-closed (connection refused) also
+  reads as not-ready — but liveness MUST NOT fail during
+  drain (a SIGKILL from a failed liveness probe would defeat
+  the grace), hence the separate health listener path is NOT
+  needed: one server, two routes, health independent of the
+  flag file.
+
+## 4.5 Proof plan (mirrors Stages 1–3)
+- Unit/corpus: serve loop exits on closed listener (existing
+  behavior — pin it); readiness 503 with flag file present /
+  200 without (fixture flag files in /tmp, never committed);
+  drain deadline forces exit on a wedged server (load test
+  with a hung handler? — deterministic: handler parks past
+  the deadline with a 1 s test timeout via env).
+- Exit-criteria test (the gate): refsvc under concurrent load
+  (60-req conc-2 shape), SIGTERM mid-load → every in-flight
+  request completes (responses received), readiness 503s
+  during drain, health 200s until exit, process exits 0.
+  Implemented as a child-process runtime test (like the
+  signal tests): spawn, load, SIGTERM, poll endpoints,
+  assert, wait for exit.
+- Overhead: none when idle (flag file absent → one extra
+  `file_exists` per readiness probe only; accept path
+  unchanged). Bench: the existing refsvc-load row covers the
+  serve path; no new bench rows (drain is a rare event, not a
+  steady-state cost).
+
+## 4.6 Open items resolved here (not left hanging)
+- No new builtins (file flag instead; builtin named as
+  follow-up). No ADR/spec/module changes. No TLS execution
+  change (deadline uses existing scope-failure sweep).
+- Exit codes: 0 clean drain (main's own), nonzero loud forced
+  (cancellation propagates — same as any scope failure).
+- Windows: signals absent → no drain trigger; file flag is
+  still honored if created out-of-band (test hook), but no
+  Tier-1 gate (deferred with the platform).
+
