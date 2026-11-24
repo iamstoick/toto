@@ -260,11 +260,9 @@ second implementation).
    the committed-test RST was a test race, fixed in-test).
 6. Deployment (static binaries + container images, measured
    targets) + reference application end to end + gates —
-   IMPLEMENTED + PROVEN LOCALLY (Stage 5 record: `toto dist`
-   + both images verified + sizes measured; CI re-proof
-   pending — closes on green).
-7. Report complete — NOT YET (appended per stage; closes with
-   the CI verdict addendum).
+   DONE (Stage 5 record; CI green on the waved tip, all
+   platforms, Windows informational only).
+7. Report complete — DONE (per-stage records + this addendum).
 
 # Stage 1 record — implementation, diagnosis, fixes, proof (appended after design; design text above preserved verbatim)
 
@@ -1194,10 +1192,11 @@ libgcc_s, libstdc++, ld-linux) and their transitives.
   `oidc_keycloak` 0/2, ENVIRONMENTAL (same stale local realm
   as Stages 1–3; CI provisions a fresh realm per run).
   Corpus census unchanged (no cases added/removed).
-- CI re-proof: run PENDING-CI-1 on the Stage 4 tip and
-  PENDING-CI-2 on the dist commit — status recorded in the
-  dated addendum below; checklist criterion 6 closes only on
-  green.
+- CI re-proof: run 45334432983 on the Stage 4 tip
+  (5947a48, Success), run 45336314659 on the dist commit
+  (340f9c8, Success), run 45338895666 on the record+baseline
+  tip (061f2e8, Success) — per-job status in the dated
+  addendum below; checklist criterion 6 closes here.
 
 ## Deferred (named follow-ups, not silence)
 - Fully-static musl (needs musl std + static archives of
@@ -1210,3 +1209,45 @@ libgcc_s, libstdc++, ld-linux) and their transitives.
   async-TLS/elastic-pool, E0216 root-cause, intermittent CI
   stall, SIGBUS log-text, TOML/YAML items, native AOT,
   Windows, Group C: all carried unchanged.
+
+# Dated addendum — CI verdicts + wave close (2026-11-24, on the branch; append-only)
+- Run 45334432983 (tip 5947a48, Stage 4): Success — check,
+  release-gates, bench, macOS probe, Linux ARM64 probe green;
+  Windows probe fails (informational under continue-on-error,
+  the ONLY failing job).
+- Run 45336314659 (tip 340f9c8, Stage 5 dist+images):
+  Success — same shape (check, release-gates, bench green;
+  macOS + ARM probes green; Windows the only failure,
+  informational). The bench job ran with the size rows
+  present but unbaselined ("no baseline", non-failing).
+- Run 45338895666 (tip 061f2e8, report+baseline): Success —
+  check, release-gates, bench (size rows now baselined and
+  enforced), macOS + ARM probes green; Windows the only
+  failure, informational. This is the waved tip: the full
+  gate is green on every SUPPORTED Tier-1 platform.
+- Totals (fresh full run, this wave): `cargo test --workspace
+  --no-fail-fast` 78 result lines, 273 passed, 0 failed,
+  plus the `cli` dist test (landed after that run started,
+  green standalone 18/18): 274 passed. Bridge from Stage 3
+  (77 / 271): +1 line (`drain_shutdown`, +2 tests), +1 test
+  (`dist_produces_self_contained_layout` inside `cli`). The
+  only red line is `oidc_keycloak` 0/2, ENVIRONMENTAL (stale
+  local Keycloak realm; CI provisions fresh). stdlib 25/25;
+  wordfreq 1/1 + interp==built identity; corpus census
+  unchanged (no cases added/removed).
+- The earlier Stage-3-tip run 45322838992 (failure) is
+  superseded: both descendant waved tips are green, and the
+  local gate on the same content is green modulo the
+  environmental oidc item. Logs were not retrievable with
+  this token (HTTP 403 on the log endpoints — recorded gap,
+  same as the Wave 3 SIGBUS note), so no root-cause is
+  claimed for that superseded run.
+- No merges, no frozen-decision changes, no new builtins
+  (27 catalog untouched), no ADR-009 / spec §17/§18 changes,
+  no framework or auth-API redesign, no SAML XML-DSig, no
+  cloud secret-store drivers, no TLS execution-model rebuild,
+  no Windows Tier-1 work, no release/tag/artifact, no history
+  rewrite. Branch holds 12 commits over main at a958396
+  (27ba5e5, 4e35e4f, b1cf20e, 0ebdeba, ea0b127, 400198c,
+  35d5b18, a99bd49, 5947a48, 340f9c8, 061f2e8 + the verdict
+  fill commit below); linear, no merge commit.
