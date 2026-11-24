@@ -255,6 +255,38 @@ fn plain_resolve(importer_display: &str, import: &str) -> String {
     normalize(&joined.to_string_lossy())
 }
 
+/// Resolve one import to the display path the loader would file it
+/// under, or `None` when it would not load (missing file, ambiguous
+/// dependency). Lint-only helper: Tier B maps each listed import to
+/// its file with the exact loader semantics (dep rule with the plain
+/// fallback, Amendment-1 ambiguity, no canonicalization). A `None`
+/// result means "assume used", never a finding.
+pub fn resolve_import_display(
+    importer_display: &str,
+    import: &str,
+    read: &dyn Fn(&str) -> Option<String>,
+    deps: &[DepEntry],
+) -> Option<String> {
+    match resolve(importer_display, import, deps) {
+        Resolution::Dep { dir, rest } => {
+            let dep_path = normalize(&format!("{dir}/{rest}"));
+            if read(&dep_path).is_none() {
+                let plain = plain_resolve(importer_display, import);
+                return read(&plain).and(option_display(&plain));
+            }
+            if read(&normalize(import)).is_some() {
+                return None;
+            }
+            Some(dep_path)
+        }
+        Resolution::Plain(resolved) => read(&resolved).and(option_display(&resolved)),
+    }
+}
+
+fn option_display(resolved: &str) -> Option<String> {
+    Some(display(resolved))
+}
+
 /// Display a resolved path: relative to the working directory when it
 /// sits under it, else the resolved path as-is.
 fn display(resolved: &str) -> String {

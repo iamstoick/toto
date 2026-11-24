@@ -20,6 +20,7 @@ pub mod interp;
 #[cfg(target_os = "linux")]
 pub mod ldaplib;
 pub mod lexer;
+pub mod lint;
 pub mod mir;
 pub mod mir_interp;
 #[cfg(unix)]
@@ -224,4 +225,14 @@ pub fn render_file_errors(diags: &[Diag], src: &str, filename: &str) -> String {
 /// Format static diagnostics (spec §9.1).
 pub fn render_errors(diags: &[Diag], src: &str, filename: &str) -> String {
     render_all(diags, src, filename, false)
+}
+
+/// Format lint findings as warnings: one `warning[E05xx]` block per
+/// finding, same spans and snippets as errors.
+pub fn render_warnings(diags: &[Diag], src: &str, filename: &str) -> String {
+    diags
+        .iter()
+        .map(|d| d.render_warning(src, filename))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

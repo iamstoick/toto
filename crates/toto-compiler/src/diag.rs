@@ -32,6 +32,17 @@ impl Diag {
     /// Render one diagnostic in the spec §9.1 format.
     pub fn render(&self, src: &str, filename: &str, is_panic: bool) -> String {
         let kind = if is_panic { "panic" } else { "error" };
+        self.render_kind(kind, src, filename)
+    }
+
+    /// Render a lint finding as a warning: same spans and snippets as
+    /// errors, but `warning[CODE]` so warnings never masquerade as
+    /// static errors (Stage 1 never fails a program that checks clean).
+    pub fn render_warning(&self, src: &str, filename: &str) -> String {
+        self.render_kind("warning", src, filename)
+    }
+
+    fn render_kind(&self, kind: &str, src: &str, filename: &str) -> String {
         let mut out = format!("{}[{}]: {}\n", kind, self.code, self.message);
         let (line, col) = self.span.line_col(src);
         out.push_str(&format!(" --> {filename}:{line}:{col}\n"));

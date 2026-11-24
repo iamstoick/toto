@@ -1,0 +1,4 @@
+fn helper() -> int {
+    let dead = 1;
+    return 2;
+}

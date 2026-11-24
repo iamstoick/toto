@@ -6,8 +6,7 @@ Stage 4 doc generator. Each stage gated; no stage re-opens a
 settled decision.
 
 Status: STAGE 0 VERIFIED (run #118 green on the starting
-tree — see Stage 0); STAGE 1 DESIGN APPROVED, IMPLEMENTATION
-PENDING.
+tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI).
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -124,6 +123,58 @@ corpus-clean proof lands.
 Non-goals: formatting (no `toto fmt` here — it exists),
 editor integration (Stage 2 surfaces these diagnostics),
 project-wide mode.
+
+Implementation record (Stage 1 built as designed, with two
+evidence-driven narrowings — no silent drift):
+- Codes: E0501 unreachable statement/expression, E0502 unused
+  binding, E0503 unused import. Findings reuse `Diag` and
+  render as `warning[E05xx]` (same spans/snippets as errors);
+  exit 0 with findings, exit 1 only under `--deny-warnings`.
+  This resolves the design's "exit nonzero on findings" line:
+  nonzero happens under the CI flag. Refusals (unreadable,
+  unlexable, unparseable, uncheckable files) stay exit 2/3,
+  mirroring `toto fmt` and `toto run`.
+- E0502 scope narrowed by corpus evidence: function/closure
+  parameters and `for` variables are NOT flagged. Parameters
+  are interface conformance (every HTTP handler in the corpus
+  keeps an unused `req`); index-ignoring counting loops are
+  idiomatic (`for i in 0..n`). E0502 covers plain `let` and
+  `select`-receive bindings (including receive-initialized
+  lets: the binding is checked, the receipt still happens).
+  Shadowing is tracked per scope (spec §5.6 allows it); names
+  starting with `_` are the documented opt-out. E0501 is
+  unchanged (statements AND block tails after terminators).
+- Tiers: Tier A runs on each listed file's own AST (no type
+  info needed), so libraries lint the same as programs. Tier B
+  (E0503) runs over the merged checked program: a listed
+  file's import edge is dead only when no item reachable
+  through it is referenced anywhere; need flows transitively
+  through conduit files; files carrying `state`/`migrate`
+  items are exempt (loading runs initializers); unresolvable
+  edges are skipped, never flagged. A main-less file whose
+  only check failures are missing-`main` E0312 gets Tier A
+  only; any other check failure refuses like `fmt`.
+- Corpus proof: `corpus_tier_a_clean` (in `lint.rs`) lints
+  every parseable repo program outside the error-goldens —
+  144 files silent, 0 findings, 0.11 s in-process; CLI sweep
+  over all 263 files: 167 exit 0, 96 exit 2, and every
+  refused file verified genuinely broken (zero status-0
+  goldens among them). 11 files excluded via
+  `tests/lint-exceptions.txt`, each a TRUE positive on
+  intentional scaffolding with its reason in that file
+  (dead-send fixture, drains/holds, validation-by-call `sn`,
+  leftover test scaffolding, 2 broken support fixtures).
+  `toto lint` on 3 large stdlib files: 67 ms wall.
+- Gate: `scripts/check.sh` runs `toto lint --deny-warnings`
+  over the same file set (error-goldens skipped, same
+  exceptions file — proof and gate cannot drift). 8 CLI
+  tests (`crates/toto-cli/tests/lint.rs` + fixtures) cover
+  each rule, shadowing, the `_` opt-out, library mode,
+  used/unused imports, refusal, and exit codes.
+- Stage 2 hooks recorded, not built: E0501's fix shape is
+  "remove it"; E0502's is "remove it or prefix `_`"
+  (call-preserving deletion for effectful initializers stays
+  Stage 2 design work).
 
 ## Stage 2 — richer LSP
 

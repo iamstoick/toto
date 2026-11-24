@@ -1,0 +1,5 @@
+import "lib.gzv";
+fn main() -> int {
+    println(helper());
+    return 0;
+}

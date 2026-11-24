@@ -33,6 +33,8 @@ const HELP: &str = "toto — a new programming language (.gzv)\n\
                     \x20   toto test                         run the project tests\n\
                     \x20   toto fmt [--check] <file.gzv>...   format files in place\n\
                     (--check: list files that would change, no writes)\n\
+                    \x20   toto lint [--deny-warnings] <file.gzv>...\n\
+                    \x20                                      hygiene lints (E05xx warnings)\n\
                     \x20   toto lsp                          basic LSP server on stdio\n\
                     (hover, go-to-definition, diagnostics)\n\
                     \x20   toto --help                        show this help\n\
@@ -246,6 +248,22 @@ fn main() -> ExitCode {
             }
             fmt_files(&files, check)
         }
+        Some("lint") => {
+            let mut deny_warnings = false;
+            let mut files = Vec::new();
+            for a in args.iter().skip(2) {
+                if a == "--deny-warnings" {
+                    deny_warnings = true;
+                } else {
+                    files.push(a.clone());
+                }
+            }
+            if files.is_empty() {
+                eprintln!("toto: `lint` needs a file: toto lint [--deny-warnings] <file.gzv>...");
+                return ExitCode::from(3);
+            }
+            lint_files(&files, deny_warnings)
+        }
         Some("lsp") => lsp::serve(),
         Some(other) => {
             eprintln!("toto: unknown command `{other}`\n\n{HELP}");
@@ -324,6 +342,95 @@ fn fmt_files(files: &[String], check: bool) -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::from(0)
+}
+
+/// Lint files (Stage 1): Tier A hygiene (E0501/E0502) on each listed
+/// file's own AST, plus Tier B (E0503 unused imports) over the merged
+/// program when the file checks as a program. Libraries (no `main`)
+/// get Tier A only; any other check failure refuses like `fmt`
+/// (exit 2). Findings print as warnings; the exit is 0 unless
+/// `--deny-warnings` turns findings into a failure (exit 1).
+fn lint_files(files: &[String], deny_warnings: bool) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dep_entries = match build_cmd::run_deps(&cwd) {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let mut any_findings = false;
+    for path in files {
+        let src = match std::fs::read_to_string(path) {
+            Ok(src) => src,
+            Err(e) => {
+                eprintln!("toto: couldn't read `{path}`: {e}");
+                return ExitCode::from(3);
+            }
+        };
+        let (tokens, lex_errors) = toto_compiler::lexer::lex(&src);
+        if !lex_errors.is_empty() {
+            let diags: Vec<toto_compiler::diag::Diag> = lex_errors
+                .into_iter()
+                .map(|e| toto_compiler::diag::Diag::new(e.code, e.message, e.span, e.help))
+                .collect();
+            eprint!("{}", toto_compiler::render_errors(&diags, &src, path));
+            return ExitCode::from(2);
+        }
+        let (program, parse_errors) = toto_compiler::parser::parse(tokens, &src);
+        if !parse_errors.is_empty() {
+            eprint!(
+                "{}",
+                toto_compiler::render_errors(&parse_errors, &src, path)
+            );
+            return ExitCode::from(2);
+        }
+        let mut hits = toto_compiler::lint::lint_file(&program);
+        let has_own_main = program.items.iter().any(|item| {
+            matches!(&item.kind, toto_compiler::ast::ItemKind::Fn(decl) if decl.name == "main")
+        });
+        match toto_compiler::project::load_and_check(
+            path,
+            &src,
+            &|p| build_cmd::read_source(&cwd, p),
+            &dep_entries,
+        ) {
+            Ok((project, _checked)) => {
+                hits.extend(toto_compiler::lint::unused_imports(
+                    &project,
+                    &|p| build_cmd::read_source(&cwd, p),
+                    &dep_entries,
+                ));
+            }
+            Err(failed) => {
+                // A main-less file is a library, not a broken program:
+                // Tier A stands on its own. Any other check failure
+                // invalidates the analysis, so refuse like `fmt`.
+                let only_missing_main = !has_own_main
+                    && failed
+                        .errors
+                        .iter()
+                        .flat_map(|fd| fd.diags.iter())
+                        .all(|d| d.code == "E0312");
+                if !only_missing_main {
+                    for fd in &failed.errors {
+                        let f = &failed.files[fd.file];
+                        eprint!(
+                            "{}",
+                            toto_compiler::render_errors(&fd.diags, &f.src, &f.path)
+                        );
+                    }
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        if !hits.is_empty() {
+            any_findings = true;
+            eprint!("{}", toto_compiler::render_warnings(&hits, &src, path));
+        }
+    }
+    if deny_warnings && any_findings {
+        ExitCode::from(1)
+    } else {
+        ExitCode::from(0)
+    }
 }
 
 fn run_file(path: &str, workers: usize) -> ExitCode {
