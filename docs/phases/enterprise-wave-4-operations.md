@@ -593,3 +593,104 @@ not silence.
   interp==built identity; corpus census 187 (was 186: +1 project case, proj26;
   160 top-level + 27 project mains).
 
+
+## Stage 3 — debugger support (design recorded before implementation; no code yet)
+
+## 3.0 Requirement (PDF p.37) + current state (established first, as required)
+DWARF debug info with gdb/lldb debugging of Toto programs, plus
+green-thread dumps (every task in a wedged process) for
+post-mortem diagnosis. Proven: a debugger session against a
+real running service + a green-thread dump from a wedged process.
+
+CURRENT STATE (read from the tree + a live gdb session, not
+assumed):
+- AOT (`toto build`, Cranelift 0.137, flags `opt_level` +
+  `is_pic` only): emits ELF symbols (`toto_fn_<name>`,
+  `Linkage::Export`, readable) + `.eh_frame`/`.eh_frame_hdr`
+  (unwind feature). NO `.debug_*` for Toto code (sections
+  exist but empty — from the Rust shim), NO line tables, NO
+  variable DIEs. `cranelift-object 0.137` has no DWARF emission
+  backend (only the `unwind` gizmo); `cranelift-codegen 0.137`
+  has no `debug/` DWARF module. Closing that gap needs a
+  Cranelift upgrade (toolchain dependency change) + srcloc
+  plumbing through `compile.rs` (MInstr spans exist everywhere;
+  file/line tables + variable locations do not) — a separate
+  gated toolchain proposal, NOT this stage.
+- PROVEN live (gdb batch on built wordfreq): `break
+  toto_fn_main` hits; backtrace mixes `.gzv` fn names with Rust
+  runtime frames (via eh_frame); registers/disassembly
+  readable. NOT possible today: `break file.gzv:LINE`, `list`
+  source display, `info locals` / `print` of .gzv variables.
+- Interpreter (`toto run`) and JIT (`toto dev`) paths emit no
+  native code at all — gdb sees only the runtime; green-thread
+  state is the only meaningful debugger view there (same
+  scheduler as AOT services).
+
+## 3.1 v1 scope decision (stated explicitly)
+- Green-thread dumps: FULL (all paths — same scheduler).
+  Content per task: id, name (slot names exist), state
+  (Ready/Running/Blocked + op detail: chan id + send/recv,
+  poller fd + op, pool op + lane), scope, parked TraceFrame
+  stack (fn names; spans as byte ranges — file:line resolution
+  is a named follow-up). Plus: channels (waiters per chan +
+  direction), pool lanes (queued/in-flight with task + op),
+  workers (worker→task). Format: text `threaddump v1`.
+- GDB session on what exists: symbolic breakpoints on
+  `toto_fn_*`, backtraces, register/disassembly inspection,
+  plus the dump file for green-thread state. PROVEN on the
+  reference AOT binary (wordfreq precedent under gdb batch).
+- OUT (named follow-ups, not this stage): line tables +
+  source display, `.gzv` locals in gdb (needs the Cranelift
+  DWARF toolchain upgrade + srcloc/variable-location backend
+  work); JIT GDB-integration; native-task `.gzv` stacks in
+  dumps (JIT tasks don't maintain TraceFrame — state + op
+  shown, stack omitted); kernel/worker-native stacks.
+
+## 3.2 "Every task" (definition)
+All scheduler slots not Done: Ready (queued), Running (on a
+worker), Blocked (chan send/recv + chan id, select cases,
+poller net + fd, pool blocking + op + lane, scope-cancelled).
+Blocked-on-what is the diagnostic payload: a wedged process
+reads as cycles in chan waits + idle lanes. CANNOT show (v1,
+stated): JIT-native frames (no TraceFrame — state + op only),
+Rust worker stacks, kernel stacks, foreign-thread states,
+heap contents (the heap profile's job).
+
+## 3.3 Mechanism
+- Park-time stack publication: every executor suspend point
+  (`park`, `tls_wait`, `net_wait`, pool-Blocking suspends —
+  one wrapper) clones the task's TraceFrame stack into its
+  slot BEFORE suspending (suspended coroutine internals are
+  otherwise unreadable). Cost: one small vec clone per park;
+  measured on the chan-heavy shape, gated only if >1-2%.
+- Trigger: SIGUSR2 (dedicated self-pipe + poller watch, same
+  pattern as the profiler; runtime owns USR1/USR2 for
+  diagnostics, documented) AND automatic on E0216 (the guard
+  already enumerates blocked tasks under the sched lock —
+  snapshot there, write after release). Default path
+  `std::env::temp_dir()` (never litters the repo),
+  overridable via `TOTO_THREAD_DUMP`. Best-effort: write
+  errors print to stderr, never fail the service.
+- Wedged-process cost: one slot walk + file write. The dump
+  runs on a woken worker from the decide section (no
+  safepoint needed — works when every task is parked and
+  workers sleep; the SIGUSR2 poke wakes one). No stopping:
+  the service keeps running after a signal dump.
+- No new builtins, no ADR/spec change (runtime-internal;
+  scheduler + exec + a dump renderer).
+
+## 3.4 Proof plan (mirrors Stages 1–2)
+- Wedged process: deterministic two-task chan deadlock
+  (each blocks on the other's chan) → E0216 fires → auto-dump
+  asserted (both tasks, opposite chan waits, stacks present).
+- Signal dump: refsvc under load + SIGUSR2 → dump while
+  serving, service survives and stay green; dump shows server
+  conn tasks parked in handler Recvs with stacks.
+- GDB session: AOT binary under gdb batch (breakpoint on a
+  `toto_fn_*` symbol, backtrace with .gzv names, registers)
+  recorded verbatim in the report.
+- Corpus `proj27_dbg`: wedge workload with computed-output
+  golden (exit code for E0216? — E0216 is a panic path:
+  golden asserts the diagnostic shape on stderr) + dump
+  assertions in the runtime test (like `profile.rs`).
+
