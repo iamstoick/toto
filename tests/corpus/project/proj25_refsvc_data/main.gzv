@@ -215,7 +215,7 @@ fn run() -> Result<string, string> {
     let tracer = trace_tracer();
     let router = http_router();
     let svc = RefsDat { dsn: dsn, key: key, ttl_ms: ttl, meter: true };
-    refsvc_routes(router, svc, reg, tracer)?;
+    refsvc_routes(router, svc, reg, tracer, refsvc_drain_dir(cfg)?)?;
     let listener = refsvc_serve(port, router)?;
     let frouter = http_router();
     let data_base = "https://localhost:" + to_string(port);

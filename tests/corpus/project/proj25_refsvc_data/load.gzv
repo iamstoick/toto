@@ -343,7 +343,7 @@ fn run() -> Result<string, string> {
     // but nothing reads or exports them; the numbered phases and
     // markers below are unchanged.
     let tracer = trace_tracer();
-    refsvc_routes(router, svc, reg, tracer)?;
+    refsvc_routes(router, svc, reg, tracer, refsvc_drain_dir(cfg)?)?;
     let listener = refsvc_serve(port, router)?;
     let copts = refsvc_client_opts();
     let ca = refsvc_ca();

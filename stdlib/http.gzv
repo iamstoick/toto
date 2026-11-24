@@ -1610,6 +1610,18 @@ pub fn http_serve(port: int, router: HttpRouter, opts: HttpServeOpts) -> Result<
     return Ok(listener);
 }
 
+// Joinable twin of `http_serve`: runs the accept loop in the CALLER
+// (no spawned task) and returns when it exits — the loop ends
+// when the listener closes (a parked accept wakes with `Err`),
+// which is exactly what the graceful drain does on SIGTERM.
+// A graceful server main blocks on this and returns when the
+// drain closes its door, letting in-flight connections finish
+// first and the run exit cleanly.
+pub fn http_serve_join(listener: int, router: HttpRouter, opts: HttpServeOpts) -> Result<unit, string> {
+    http_accept_loop(listener, router, opts);
+    return Ok(());
+}
+
 // TLS twin of http_serve: each accepted connection completes the
 // server handshake (proving cert_pem/key_pem) before serving.
 // Clients verify the chain against their CA (tls_client_connect
@@ -1629,6 +1641,13 @@ pub fn http_serve_tls(port: int, router: HttpRouter, opts: HttpServeOpts, cert_p
         http_accept_loop_tls(listener, router, opts, cert_pem, key_pem);
     }
     return Ok(listener);
+}
+
+// Joinable twin of `http_serve_tls`: same contract as
+// `http_serve_join`, over TLS.
+pub fn http_serve_join_tls(listener: int, router: HttpRouter, opts: HttpServeOpts, cert_pem: string, key_pem: string) -> Result<unit, string> {
+    http_accept_loop_tls(listener, router, opts, cert_pem, key_pem);
+    return Ok(());
 }
 
 // --- Client ---

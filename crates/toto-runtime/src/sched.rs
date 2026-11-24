@@ -26,6 +26,7 @@
 //! compile asserts, not silently.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
 
 use corosensei::stack::{DefaultStack, Stack as _};
@@ -706,6 +707,18 @@ pub struct Shared {
     /// `[-1, -1]` on non-unix builds).
     #[cfg(unix)]
     pub thread_wake: [std::os::fd::RawFd; 2],
+    /// Graceful-shutdown drain (Wave 4 Stage 4, unix-only):
+    /// SIGTERM/SIGINT set `draining` and arm `drain_deadline`;
+    /// the poller enforces it (close listeners now, cancel all
+    /// at expiry). `drain_forced` records a timeout kill for the
+    /// exit report + post-mortem dump.
+    pub draining: AtomicBool,
+    pub drain_deadline: std::sync::Mutex<Option<std::time::Instant>>,
+    pub drain_forced: AtomicBool,
+    /// SIGTERM/SIGINT self-pipe read/write ends (process-wide
+    /// pair; `[-1, -1]` on non-unix builds).
+    #[cfg(unix)]
+    pub drain_wake: [std::os::fd::RawFd; 2],
     pub done: Mutex<VecDeque<Completion>>,
     /// M:N network poller (Wave 1, unix-only): registrations in,
     /// readiness completions out. The poller thread touches neither
@@ -1228,6 +1241,13 @@ fn poller_do(reg: &NetReg) -> PollerDone {
 pub struct NetState {
     regs: Vec<NetReg>,
     shutdown: bool,
+    /// Listening sockets, for graceful shutdown (Wave 4 Stage 4):
+    /// registered at `net_tcp_listen`, removed at `net_close`.
+    /// On SIGTERM/SIGINT the drain closes every tracked listener
+    /// so parked accepts wake with errors and accept loops exit.
+    /// Plain fds (never recycled while registered — removal
+    /// happens before the kernel close, same discipline as regs).
+    pub listeners: Vec<std::os::fd::RawFd>,
 }
 
 pub struct Scheduler {
@@ -1358,6 +1378,14 @@ impl Scheduler {
             tdump: crate::threaddump::ThreadDumpFlag::default(),
             #[cfg(unix)]
             thread_wake,
+            draining: AtomicBool::new(false),
+            drain_deadline: std::sync::Mutex::new(None),
+            drain_forced: AtomicBool::new(false),
+            #[cfg(unix)]
+            drain_wake: {
+                let (r, w) = Self::drain_trigger_pipe();
+                [r, w]
+            },
             done: Mutex::new(VecDeque::new()),
             #[cfg(unix)]
             net: Mutex::new(NetState::default()),
@@ -1644,6 +1672,17 @@ impl Scheduler {
         if self.shared.profiler.enabled() {
             Self::profile_dump(self.shared.as_ref());
         }
+        // Forced-drain post-mortem (Wave 4 Stage 4): the deadline
+        // fired and cancelled live work — dump what did not drain
+        // in time. Same always-on discipline as the E0216 dump.
+        #[cfg(unix)]
+        if self
+            .shared
+            .drain_forced
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Self::thread_dump(self.shared.as_ref());
+        }
         // All workers exited and the last one shut the pool down, so
         // every thread joined. Compose the outcome.
         let (collections, allocated, reclaimed) = {
@@ -1728,6 +1767,11 @@ impl Scheduler {
             if self.shared.tdump.take() {
                 Self::thread_dump(&self.shared);
             }
+            // Graceful-drain deadline (Wave 4 Stage 4): enforced
+            // here, not in decide (cancelling needs no sched lock
+            // held). Lock-free fast path when idle.
+            #[cfg(unix)]
+            self.check_drain_deadline();
             enum Step {
                 Run(TaskId, TaskCo, ToTask),
                 JoinGc,
@@ -2568,6 +2612,10 @@ impl Scheduler {
         // always armed — a wedged process cannot opt in first.
         #[cfg(unix)]
         let thread_rd = shared.thread_wake[0];
+        // Drain trigger pipe (Wave 4 Stage 4, unix-only): always
+        // armed — SIGTERM/SIGINT must work with no opt-in.
+        #[cfg(unix)]
+        let drain_rd = shared.drain_wake[0];
         loop {
             // Snapshot the poll set under one lock section. `ids`
             // carries the registration identity per pollfd so a
@@ -2596,6 +2644,11 @@ impl Scheduler {
                     fds.push((thread_rd, true, false));
                     ids.push(None);
                 }
+                #[cfg(unix)]
+                if drain_rd >= 0 {
+                    fds.push((drain_rd, true, false));
+                    ids.push(None);
+                }
                 (fds, ids, net.shutdown)
             };
             if shutdown {
@@ -2605,7 +2658,32 @@ impl Scheduler {
             // Indefinite wait: every table change pokes the pipe, so
             // wakeups cannot be missed; the 60 s timeout only bounds
             // a hypothetical missed wakeup (fail-safe, not a timer).
-            let ready = match nn::poll_wait(&fds, -1) {
+            // While draining, bound the wait by the deadline instead
+            // (Wave 4 Stage 4): an idle system must still notice
+            // expiry, so the timeout wakes us and workers get
+            // notified below.
+            #[cfg(unix)]
+            let timeout_ms: i32 = if shared.draining.load(std::sync::atomic::Ordering::Acquire)
+                && !shared
+                    .drain_forced
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                let guard = shared.drain_deadline.lock().expect("drain deadline lock");
+                match *guard {
+                    // Milliseconds left (0 = already due: wake
+                    // immediately so the worker enforces it).
+                    Some(t) => t
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis()
+                        .min(i32::MAX as u128) as i32,
+                    None => -1,
+                }
+            } else {
+                -1
+            };
+            #[cfg(not(unix))]
+            let timeout_ms: i32 = -1;
+            let ready = match nn::poll_wait(&fds, timeout_ms) {
                 Ok(r) => r,
                 Err(_) => {
                     // `poll` itself failed (fd table torn down under
@@ -2654,6 +2732,17 @@ impl Scheduler {
                     nn::drain_pipe(thread_rd);
                     shared.tdump.request();
                     shared.sched_cv.notify_all();
+                    continue;
+                }
+                // Drain trigger (Wave 4 Stage 4): a graceful-stop
+                // signal arrived — begin the drain now (flag file,
+                // close listeners, arm the deadline). The poll
+                // timeout below already tracks the deadline, so an
+                // idle system still enforces it.
+                #[cfg(unix)]
+                if drain_rd >= 0 && fds[i].0 == drain_rd {
+                    nn::drain_pipe(drain_rd);
+                    Self::drain_begin(shared);
                     continue;
                 }
                 // Peek, execute, then post-before-remove: close paths
@@ -2722,6 +2811,19 @@ impl Scheduler {
                         }
                     }
                 }
+            }
+            // Drain timeout tick (Wave 4 Stage 4): an empty wakeup
+            // while draining means the deadline bound fired — wake
+            // a worker so the decide section enforces it. Bounded:
+            // the timeout goes back to indefinite once forced.
+            #[cfg(unix)]
+            if ready.is_empty()
+                && shared.draining.load(std::sync::atomic::Ordering::Acquire)
+                && !shared
+                    .drain_forced
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                woke = true;
             }
             if woke {
                 shared.sched_cv.notify_all();
@@ -3876,6 +3978,105 @@ impl Scheduler {
         if let Err(e) = std::fs::write(&path, text) {
             eprintln!("profile: dump to {} failed: {}", path, e);
         }
+    }
+
+    /// Process-wide drain-trigger self-pipe (Wave 4 Stage 4,
+    /// unix-only): created once, never closed (same discipline as
+    /// the profile/thread pipes). SIGTERM and SIGINT both write
+    /// one byte; the poller enforces the drain.
+    #[cfg(unix)]
+    fn drain_trigger_pipe() -> (i32, i32) {
+        use std::sync::OnceLock;
+        static DRAIN_PIPE: OnceLock<(i32, i32)> = OnceLock::new();
+        *DRAIN_PIPE.get_or_init(|| {
+            let (r, w) = toto_compiler::netsys::self_pipe();
+            unsafe extern "C" fn on_term(_sig: std::os::raw::c_int) {
+                if let Some((_, w)) = DRAIN_PIPE.get() {
+                    let one = [1u8; 1];
+                    unsafe {
+                        libc::write(*w, one.as_ptr() as *const std::ffi::c_void, 1);
+                    }
+                }
+            }
+            unsafe {
+                // Same stateless-handler discipline as the
+                // profile/thread triggers; function cast is exact.
+                #[allow(function_casts_as_integer)]
+                {
+                    libc::signal(libc::SIGTERM, on_term as usize);
+                    libc::signal(libc::SIGINT, on_term as usize);
+                }
+            }
+            (r, w)
+        })
+    }
+
+    /// Begin the graceful drain (Wave 4 Stage 4): write the flag
+    /// file `.gzv` readiness checks, close every tracked listener
+    /// (parked accepts wake with errors; accept loops exit), and
+    /// arm the deadline. Idempotent: the first call wins.
+    #[cfg(unix)]
+    fn drain_begin(shared: &Arc<Shared>) {
+        use std::sync::atomic::Ordering;
+        if shared.draining.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Flag file first, so a racing readiness probe fails
+        // closed the moment draining starts.
+        let dir = std::env::var("TOTO_DRAIN_DIR")
+            .unwrap_or_else(|_| std::env::temp_dir().display().to_string());
+        let flag = format!("{}/draining", dir.trim_end_matches('/'));
+        if let Err(e) = std::fs::write(&flag, "draining\n") {
+            eprintln!("drain: flag file {} unwritable: {}", flag, e);
+        }
+        // Close every tracked listener (ignore errors: already
+        // closed is fine). Parked accepts wake with errors next.
+        let fds = {
+            let mut net = shared.net.lock().expect("net lock");
+            std::mem::take(&mut net.listeners)
+        };
+        for fd in fds {
+            toto_compiler::netsys::close(fd).ok();
+        }
+        // Arm the deadline (D7 5 s provisional default).
+        let secs: u64 = std::env::var("TOTO_DRAIN_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(5);
+        *shared.drain_deadline.lock().expect("drain deadline lock") =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+        shared.sched_cv.notify_all();
+    }
+
+    /// Enforce the drain deadline (Wave 4 Stage 4): called from
+    /// the worker loop on every pass while draining. On expiry
+    /// with live tasks remaining, cancel everything through the
+    /// tested dev-drain path and dump the wedged remainder for
+    /// post-mortem. Exactly once; lock-free fast path when idle.
+    #[cfg(unix)]
+    fn check_drain_deadline(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.shared.draining.load(Ordering::Acquire) {
+            return;
+        }
+        let expired = {
+            let guard = self
+                .shared
+                .drain_deadline
+                .lock()
+                .expect("drain deadline lock");
+            match *guard {
+                Some(t) => std::time::Instant::now() >= t,
+                None => false,
+            }
+        };
+        if !expired || self.shared.drain_forced.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        eprintln!("drain: deadline exceeded with live tasks; forcing cancellation");
+        self.shared.tdump.request();
+        self.cancel_all();
     }
 
     /// Write a green-thread dump file now (Wave 4 Stage 3):

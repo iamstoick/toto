@@ -61,7 +61,10 @@ fn sigusr2_dumps_live_threads_without_stopping() {
     let text = std::fs::read_to_string(&out).expect("mid-run thread dump");
     assert!(text.starts_with("threaddump v1\n"), "dump header");
     assert!(text.contains("task 1 go-1"), "burner task present");
-    assert!(text.contains("blocked") || text.contains("running"), "states");
+    assert!(
+        text.contains("blocked") || text.contains("running"),
+        "states"
+    );
     // Let it finish: clean exit, still green after the signal.
     let status = child.wait_timeout_or_kill(180);
     assert!(status.success(), "clean exit: {status:?}");

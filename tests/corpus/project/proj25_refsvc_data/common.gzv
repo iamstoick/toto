@@ -65,7 +65,7 @@ pub struct RefsDat {
 // per the `gzv.std/config` story.
 pub fn refsvc_config() -> Result<JsonVal, string> {
     let cfg = config_from_toml_file(refsvc_fix("service.toml"))?;
-    let over = config_apply_env(cfg, ["TOTO_REFSVC_DSN=db.dsn", "TOTO_REFSVC_PORT=server.port"])?;
+    let over = config_apply_env(cfg, ["TOTO_REFSVC_DSN=db.dsn", "TOTO_REFSVC_PORT=server.port", "TOTO_DRAIN_DIR=drain.dir"])?;
     return Ok(over);
 }
 
@@ -79,6 +79,19 @@ pub fn refsvc_dsn(cfg: JsonVal) -> Result<string, string> {
 
 pub fn refsvc_ttl(cfg: JsonVal) -> Result<int, string> {
     return config_get_int(cfg, "auth.ttl_ms", 600000);
+}
+
+// Directory holding the drain flag file (`draining`), written by
+// the runtime on SIGTERM/SIGINT and read by `/readyz`. Env
+// overlay like the other knobs; the `./toto-drain` default is
+// the no-env fallback (production sets TOTO_DRAIN_DIR — without
+// it shutdown still drains, but readiness cannot see it).
+pub fn refsvc_drain_dir(cfg: JsonVal) -> Result<string, string> {
+    return config_get(cfg, "drain.dir", "./toto-drain");
+}
+
+pub fn refsvc_drain_flag(dir: string) -> string {
+    return dir + "/draining";
 }
 
 pub fn refsvc_register(reg: MetricsRegistry) -> Result<unit, string> {
@@ -379,7 +392,47 @@ fn mw_log(req: HttpRequest, next: fn(HttpRequest) -> Result<HttpResponse, string
 // NOTE (runtime edge, proj20 shape): the router crosses by
 // parameter and only `Result<unit>` returns — a `Result`
 // holding function values cannot be `?`-unwrapped in v1.
-pub fn refsvc_routes(router: HttpRouter, svc: RefsDat, reg: MetricsRegistry, tracer: Tracer) -> Result<unit, string> {
+// Liveness: always 200 while serving (no auth — orchestrators
+// do not present tokens; no dependencies checked — liveness is
+// "the loop turns", nothing more). Unmetered: health polls must
+// not perturb the metrics the golden pins.
+pub fn h_health_factory() -> fn(HttpRequest) -> Result<HttpResponse, string> {
+    return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        return http_text(200, "OK", "ok");
+    };
+}
+
+// Readiness: 200 only when NOT draining and the database answers.
+// Draining is observed through the runtime-written flag file
+// (`TOTO_DRAIN_DIR`), read with the existing `file_exists`
+// builtin — no new surface. 503 while draining or when the DB
+// probe fails. Unauthenticated like `/healthz`.
+pub fn h_ready_factory(svc: RefsDat, reg: MetricsRegistry, drain_dir: string) -> fn(HttpRequest) -> Result<HttpResponse, string> {
+    return fn(req: HttpRequest) -> Result<HttpResponse, string> {
+        if file_exists(refsvc_drain_flag(drain_dir)) {
+            refsvc_meter(svc, reg, "GET", "/readyz", "503")?;
+            return http_text(503, "Unavailable", "draining");
+        } else {
+        }
+        let probe = db_query(svc.dsn, "SELECT 1", []);
+        let wante: Result<Array<Array<DbVal>>, string> = Err("db down");
+        if probe == wante {
+            refsvc_meter(svc, reg, "GET", "/readyz", "503")?;
+            return http_text(503, "Unavailable", "unready");
+        } else {
+        }
+        let rows = probe?;
+        if len(rows) != 1 {
+            refsvc_meter(svc, reg, "GET", "/readyz", "503")?;
+            return http_text(503, "Unavailable", "unready");
+        } else {
+        }
+        refsvc_meter(svc, reg, "GET", "/readyz", "200")?;
+        return http_text(200, "OK", "ready");
+    };
+}
+
+pub fn refsvc_routes(router: HttpRouter, svc: RefsDat, reg: MetricsRegistry, tracer: Tracer, drain_dir: string) -> Result<unit, string> {
     let login = h_login_factory(svc, reg);
     route_add(router, "POST", "/login", login)?;
     let user = h_user_factory(svc, reg, tracer);
@@ -389,6 +442,13 @@ pub fn refsvc_routes(router: HttpRouter, svc: RefsDat, reg: MetricsRegistry, tra
     route_add(router, "GET", "/notes", notes)?;
     let metrics = h_metrics_factory(svc, reg);
     route_add(router, "GET", "/metrics", metrics)?;
+    // Health/readiness live beside the app routes (same framework,
+    // unauthenticated by design — orchestrators hold no tokens).
+    // The drain dir comes from config like every other knob; the
+    // golden flow never probes these, so goldens are untouched.
+    route_add(router, "GET", "/healthz", h_health_factory())?;
+    let ready = h_ready_factory(svc, reg, drain_dir);
+    route_add(router, "GET", "/readyz", ready)?;
     use_mw(router, mw_log);
     return Ok(());
 }

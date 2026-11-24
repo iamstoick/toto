@@ -9,7 +9,7 @@
 //! the dump content).
 
 use toto_compiler::project;
-use toto_runtime::{run_checked, RuntimeConfig};
+use toto_runtime::{RuntimeConfig, run_checked};
 
 const WEDGE: &str = r#"fn main() -> int {
     let a = chan<int>(0);
@@ -40,8 +40,7 @@ fn dump_path(tag: &str) -> String {
 }
 
 fn lines(path: &str) -> Vec<String> {
-    let text =
-        std::fs::read_to_string(path).unwrap_or_else(|_| panic!("dump missing: {path}"));
+    let text = std::fs::read_to_string(path).unwrap_or_else(|_| panic!("dump missing: {path}"));
     text.lines().map(str::to_string).collect()
 }
 
@@ -74,14 +73,20 @@ fn e0216_wedge_auto_dumps_every_task() {
         Err((diag, _)) => assert_eq!(diag.code, "E0216", "code"),
     }
     let ls = lines(&out);
-    assert_eq!(ls.first().map(String::as_str), Some("threaddump v1"), "header");
+    assert_eq!(
+        ls.first().map(String::as_str),
+        Some("threaddump v1"),
+        "header"
+    );
     // Both wedged tasks, named, with their chan waits.
     assert!(
-        ls.iter().any(|l| l.starts_with("task 1 go-1 blocked chan0 recv")),
+        ls.iter()
+            .any(|l| l.starts_with("task 1 go-1 blocked chan0 recv")),
         "task 1: {ls:?}"
     );
     assert!(
-        ls.iter().any(|l| l.starts_with("task 2 go-2 blocked chan1 recv")),
+        ls.iter()
+            .any(|l| l.starts_with("task 2 go-2 blocked chan1 recv")),
         "task 2: {ls:?}"
     );
     // Channels name their waiters (the post-mortem payload).

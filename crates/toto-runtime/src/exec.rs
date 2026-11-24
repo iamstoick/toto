@@ -697,7 +697,7 @@ impl<'a> Executor<'a> {
     fn maybe_thread_dump(&self) {
         #[cfg(unix)]
         if self.shared.tdump.take() {
-            crate::sched::Scheduler::thread_dump(&self.shared);
+            crate::sched::Scheduler::thread_dump(self.shared);
         }
     }
 
@@ -2173,6 +2173,17 @@ impl<'a> Executor<'a> {
                             self.net_assign(dst, RtVal::Int(-1));
                             return Ok(());
                         }
+                        // Track the listener for graceful shutdown
+                        // (Wave 4 Stage 4): SIGTERM/SIGINT closes
+                        // every tracked listener so parked accepts
+                        // wake with errors. Removed at net_close.
+                        #[cfg(unix)]
+                        {
+                            let mut net = self.shared.net.lock().expect("net lock");
+                            if !net.listeners.contains(&fd) {
+                                net.listeners.push(fd);
+                            }
+                        }
                         self.net_set_error(None);
                         self.net_assign(dst, RtVal::Int(fd as i64));
                         Ok(())
@@ -2284,6 +2295,14 @@ impl<'a> Executor<'a> {
                 // Unregister first so parked waiters fail loudly
                 // instead of operating on a recycled fd number.
                 crate::sched::Scheduler::net_unregister_fd(self.shared, fd, "socket closed");
+                // Drop it from the drain listener set too (same
+                // recycled-fd discipline: a closed listener must
+                // never be closed again at drain time).
+                #[cfg(unix)]
+                {
+                    let mut net = self.shared.net.lock().expect("net lock");
+                    net.listeners.retain(|f| *f != fd);
+                }
                 nn::forget_peer(fd);
                 // A TLS session names this fd: free it first so a plain
                 // `net_close` of a TLS connection never leaks the `SSL*`
