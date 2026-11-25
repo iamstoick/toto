@@ -133,8 +133,8 @@ fn lsp_hover_definition_diagnostics() {
         "fn double(n: int) -> int {\n    return n + n;\n}\n",
     )
     .expect("write lib");
-    // Plain-ASCII sources so scalar columns are exact. `double(21)`
-    // sits at line 2, columns 12-17; the use of `m` at line 3:11.
+    // Plain-ASCII sources so UTF-16 columns equal scalar columns.
+    // `double(21)` sits at line 2, columns 12-17.
     let main = "import \"lib/math.gzv\";\nfn main() -> int {\n    let m = double(21);\n    println(m + bad);\n    return 0;\n}\n";
     let _main_path = dir.join("main.gzv");
     let uri = format!("file://{}/main.gzv", dir.to_string_lossy());
@@ -195,6 +195,207 @@ fn lsp_hover_definition_diagnostics() {
     let status = s.shutdown();
     assert!(status.success(), "lsp exit: {status:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn refs_request(uri: &str, line: u64, character: u64, include_decl: bool) -> String {
+    format!(
+        "{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":{line},\"character\":{character}}},\"context\":{{\"includeDeclaration\":{include_decl}}}}}",
+    )
+}
+
+#[test]
+fn lsp_references_capability_advertised() {
+    let mut s = Session::start();
+    let init = s.request("initialize", "{\"capabilities\":{}}");
+    assert!(init.contains("\"referencesProvider\":true"), "caps: {init}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
+#[test]
+fn lsp_references_local_respects_shadowing() {
+    // `m` in main (line 1) vs `m` in other (line 7): same name,
+    // different bindings. Requests target main's `m` only.
+    let src = "fn main() -> int {\n    let m = 1;\n    let n = m + m;\n    println(n);\n    return 0;\n}\nfn other() -> int {\n    let m = 99;\n    return m;\n}\n";
+    let uri = "file:///tmp/toto-lsp-refs-local.gzv";
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(uri, src));
+    // Drain diagnostics (clean file: one empty notification).
+    for _ in 0..2 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") {
+            break;
+        }
+    }
+    // Use site of main's `m` (line 2, col 12), with declaration.
+    let res = s.request("textDocument/references", &refs_request(uri, 2, 12, true));
+    assert!(
+        res.contains("\"start\":{\"line\":2,\"character\":12}"),
+        "use 1: {res}"
+    );
+    assert!(
+        res.contains("\"start\":{\"line\":2,\"character\":16}"),
+        "use 2: {res}"
+    );
+    assert!(
+        res.contains("\"start\":{\"line\":1,\"character\":8}"),
+        "decl: {res}"
+    );
+    // other()'s `m` (lines 7-8) must not appear.
+    assert!(!res.contains("\"line\":7"), "shadow leak: {res}");
+    assert!(!res.contains("\"line\":8"), "shadow leak: {res}");
+    // Without includeDeclaration: the declaration drops out.
+    let res = s.request("textDocument/references", &refs_request(uri, 2, 12, false));
+    assert!(
+        res.contains("\"start\":{\"line\":2,\"character\":12}"),
+        "use 1: {res}"
+    );
+    assert!(
+        !res.contains("\"start\":{\"line\":1,\"character\":8}"),
+        "decl excluded: {res}"
+    );
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
+#[test]
+fn lsp_references_function_cross_file() {
+    let dir = std::env::temp_dir().join("toto-lsp-refs");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).expect("mkdir");
+    std::fs::write(
+        dir.join("lib").join("math.gzv"),
+        "fn double(n: int) -> int {\n    return n + n;\n}\n",
+    )
+    .expect("write lib");
+    // Two call sites (lines 2-3); declaration lives in lib/math.gzv.
+    let main = "import \"lib/math.gzv\";\nfn main() -> int {\n    let a = double(21);\n    println(double(1));\n    return 0;\n}\n";
+    let uri = format!("file://{}/main.gzv", dir.to_string_lossy());
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(&uri, main));
+    for _ in 0..4 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") && msg.contains(&uri) {
+            break;
+        }
+    }
+    let res = s.request("textDocument/references", &refs_request(&uri, 2, 14, true));
+    assert!(
+        res.contains("\"start\":{\"line\":2,\"character\":12}"),
+        "call 1: {res}"
+    );
+    assert!(
+        res.contains("\"start\":{\"line\":3,\"character\":12}"),
+        "call 2: {res}"
+    );
+    assert!(res.contains("lib/math.gzv"), "decl file: {res}");
+    assert!(res.contains("\"line\":0"), "decl line: {res}");
+    let res = s.request("textDocument/references", &refs_request(&uri, 2, 14, false));
+    assert!(!res.contains("lib/math.gzv"), "decl excluded: {res}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lsp_references_struct_field_and_param_decl() {
+    let src = "struct Pt { x: int, y: int }\nfn id(v: int) -> int {\n    return v;\n}\nfn main() -> int {\n    let p = Pt { x: 1, y: 2 };\n    println(p.x);\n    return id(1);\n}\n";
+    let uri = "file:///tmp/toto-lsp-refs-struct.gzv";
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(uri, src));
+    for _ in 0..2 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") {
+            break;
+        }
+    }
+    // Struct name at its literal (line 5, col 12): literal site plus
+    // declaration (line 0, col 7) when asked.
+    let res = s.request("textDocument/references", &refs_request(uri, 5, 12, true));
+    assert!(
+        res.contains("\"start\":{\"line\":5,\"character\":12}"),
+        "lit: {res}"
+    );
+    assert!(
+        res.contains("\"start\":{\"line\":0,\"character\":7}"),
+        "decl: {res}"
+    );
+    // Field `x` in `p.x` (line 6, col 14): whole `p.x` span, the
+    // literal entry (line 5, col 17), and the field declaration
+    // (line 0, col 12) when asked. `y` (decl 0:20, entry 5:23)
+    // must not appear.
+    let res = s.request("textDocument/references", &refs_request(uri, 6, 14, true));
+    assert!(
+        res.contains("\"start\":{\"line\":6,\"character\":12}"),
+        "use: {res}"
+    );
+    assert!(
+        res.contains("\"start\":{\"line\":5,\"character\":17}"),
+        "lit entry: {res}"
+    );
+    assert!(
+        res.contains("\"start\":{\"line\":0,\"character\":12}"),
+        "field decl: {res}"
+    );
+    assert!(
+        !res.contains("\"line\":0,\"character\":20"),
+        "y leak: {res}"
+    );
+    assert!(
+        !res.contains("\"line\":5,\"character\":23"),
+        "y leak: {res}"
+    );
+    // Parameter declaration site (line 1, col 6): declaration plus
+    // the use in the body.
+    let res = s.request("textDocument/references", &refs_request(uri, 1, 6, true));
+    assert!(
+        res.contains("\"start\":{\"line\":1,\"character\":6}"),
+        "param: {res}"
+    );
+    assert!(
+        res.contains("\"start\":{\"line\":2,\"character\":11}"),
+        "use: {res}"
+    );
+    // Builtin references are an empty list, not null.
+    let res = s.request("textDocument/references", &refs_request(uri, 6, 5, true));
+    assert!(res.contains("\"result\":[]"), "builtin: {res}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
+#[test]
+fn lsp_positions_are_utf16() {
+    // 𝕩 is 1 scalar but 2 UTF-16 units: the `e` use sits at UTF-16
+    // column 26 (scalar 25). A scalar server would resolve nothing.
+    let src = "fn main() -> int {\n    let e = \"\u{1d565}\"; println(e);\n    return 0;\n}\n";
+    let uri = "file:///tmp/toto-lsp-utf16.gzv";
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(uri, src));
+    for _ in 0..2 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") {
+            break;
+        }
+    }
+    let res = s.request("textDocument/references", &refs_request(uri, 1, 26, true));
+    assert!(
+        res.contains("\"start\":{\"line\":1,\"character\":26}"),
+        "use: {res}"
+    );
+    assert!(
+        res.contains("\"start\":{\"line\":1,\"character\":8}"),
+        "decl: {res}"
+    );
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
 }
 
 #[test]

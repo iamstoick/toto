@@ -271,6 +271,10 @@ impl<'a> Parser<'a> {
 // Positions (Unicode-scalar columns; see module docs).
 // ---------------------------------------------------------------------------
 
+/// LSP positions: lines as-is, characters in UTF-16 code units
+/// (Stage 2; previously Unicode scalars). A `character` landing
+/// inside a surrogate pair resolves to the following boundary —
+/// clients must send code-point boundaries per the protocol.
 fn offset_to_position(text: &str, off: usize) -> (u64, u64) {
     let off = off.min(text.len());
     let mut line = 0u64;
@@ -283,7 +287,7 @@ fn offset_to_position(text: &str, off: usize) -> (u64, u64) {
             line += 1;
             col = 0;
         } else {
-            col += 1;
+            col += ch.len_utf16() as u64;
         }
     }
     (line, col)
@@ -293,14 +297,14 @@ fn position_to_offset(text: &str, line: u64, character: u64) -> usize {
     let mut cur_line = 0u64;
     let mut col = 0u64;
     for (i, ch) in text.char_indices() {
-        if cur_line == line && col == character {
+        if cur_line == line && col >= character {
             return i;
         }
         if ch == '\n' {
             cur_line += 1;
             col = 0;
         } else {
-            col += 1;
+            col += ch.len_utf16() as u64;
         }
     }
     text.len()
@@ -420,6 +424,7 @@ pub fn serve() -> std::process::ExitCode {
                 let caps = J::Obj(vec![
                     ("hoverProvider".to_string(), J::Bool(true)),
                     ("definitionProvider".to_string(), J::Bool(true)),
+                    ("referencesProvider".to_string(), J::Bool(true)),
                     (
                         "textDocumentSync".to_string(),
                         J::Obj(vec![
@@ -519,6 +524,12 @@ pub fn serve() -> std::process::ExitCode {
             }
             "textDocument/definition" => {
                 let result = definition_at(&docs, &params);
+                if has_id {
+                    send_message(&mut out, &result_response(&id, result));
+                }
+            }
+            "textDocument/references" => {
+                let result = references_at(&docs, &params);
                 if has_id {
                     send_message(&mut out, &result_response(&id, result));
                 }
@@ -758,6 +769,17 @@ fn resolve_at(doc: &OpenDoc, line: u64, character: u64) -> Option<Resolved> {
                     hover: sig,
                     target: Some(Target::Func(doc_display(doc), fn_name_span(decl))),
                 });
+            }
+            // Parameters resolve on their declaration site, like
+            // closure parameters do (references needs this for
+            // rename-from-declaration).
+            for p in &decl.params {
+                if span_contains(&p.name_span, off) {
+                    return Some(Resolved {
+                        hover: format!("{}: {}", p.name, ty_text(&p.ty)),
+                        target: Some(Target::Local(p.name_span)),
+                    });
+                }
             }
             cx.enclosing = Some(decl.name.clone());
             push_params(&mut scopes, &decl.params);
@@ -1538,6 +1560,558 @@ fn definition_at(docs: &HashMap<String, OpenDoc>, params: &J) -> J {
         .map(|(_, s)| s.clone())
         .unwrap_or_default();
     location(&file_uri(&doc.path, &path), &src, span)
+}
+
+/// `textDocument/references`: every use of the symbol at the cursor
+/// across the open file's project. Declaration sites join the list
+/// only when the context asks (`includeDeclaration`). Builtins and
+/// unresolvable positions yield an empty list, never null.
+fn references_at(docs: &HashMap<String, OpenDoc>, params: &J) -> J {
+    let (uri, line, character) = doc_position(params);
+    let include_decl = matches!(
+        params
+            .get("context")
+            .and_then(|c| c.get("includeDeclaration")),
+        Some(J::Bool(true))
+    );
+    let Some(doc) = docs.get(&uri) else {
+        return J::Null;
+    };
+    let Some(target) = resolve_at(doc, line, character).and_then(|r| r.target) else {
+        return J::Null;
+    };
+    J::Arr(
+        find_references(doc, &target, include_decl)
+            .into_iter()
+            .map(|(uri, src, span)| location(&uri, &src, span))
+            .collect(),
+    )
+}
+
+/// One collected occurrence. `local_decl` is the declaration span a
+/// value occurrence resolves to; `None` means no visible local, i.e.
+/// a global, builtin, or undefined reference.
+struct NameUse {
+    name: String,
+    span: Span,
+    local_decl: Option<Span>,
+}
+
+#[derive(PartialEq, Eq)]
+enum DeclKind {
+    Func,
+    Struct,
+    StructField,
+    Extern,
+    State,
+    MigrateFn,
+}
+
+struct DeclSite {
+    kind: DeclKind,
+    name: String,
+    span: Span,
+    struct_name: Option<String>,
+}
+
+/// Scope-aware occurrence collector: one walk per file gathers every
+/// value use with its resolved local declaration, plus every
+/// declaration site. Shadowing is honored exactly like `resolve_*`.
+#[derive(Default)]
+struct RefWalk {
+    scopes: Vec<HashMap<String, Span>>,
+    vars: Vec<NameUse>,
+    struct_lits: Vec<(String, Span)>,
+    type_refs: Vec<(String, Span)>,
+    field_uses: Vec<(String, Span)>,
+    lit_fields: Vec<(String, String, Span)>,
+    decls: Vec<DeclSite>,
+}
+
+fn name_span_at(start: u32, name: &str) -> Span {
+    Span::new(start, start + name.len() as u32)
+}
+
+impl RefWalk {
+    fn declare(&mut self, name: &str, span: Span) {
+        if let Some(frame) = self.scopes.last_mut() {
+            frame.entry(name.to_string()).or_insert(span);
+        }
+    }
+
+    fn collect_program(&mut self, program: &toto_compiler::ast::Program) {
+        for item in &program.items {
+            match &item.kind {
+                ItemKind::Fn(decl) => {
+                    self.decls.push(DeclSite {
+                        kind: DeclKind::Func,
+                        name: decl.name.clone(),
+                        span: decl.name_span,
+                        struct_name: None,
+                    });
+                    self.scopes.push(HashMap::new());
+                    for p in &decl.params {
+                        self.declare(&p.name, p.name_span);
+                        self.collect_ty(&p.ty);
+                    }
+                    self.collect_ty(&decl.ret);
+                    self.collect_block(&decl.body);
+                    self.scopes.pop();
+                }
+                ItemKind::Struct(decl) => {
+                    self.decls.push(DeclSite {
+                        kind: DeclKind::Struct,
+                        name: decl.name.clone(),
+                        span: decl.name_span,
+                        struct_name: None,
+                    });
+                    for f in &decl.fields {
+                        self.decls.push(DeclSite {
+                            kind: DeclKind::StructField,
+                            name: f.name.clone(),
+                            span: f.span,
+                            struct_name: Some(decl.name.clone()),
+                        });
+                        self.collect_ty(&f.ty);
+                    }
+                }
+                ItemKind::Extern(block) => {
+                    for d in &block.decls {
+                        self.decls.push(DeclSite {
+                            kind: DeclKind::Extern,
+                            name: d.name.clone(),
+                            span: d.name_span,
+                            struct_name: None,
+                        });
+                        for p in &d.params {
+                            self.collect_ty(&p.ty);
+                        }
+                        self.collect_ty(&d.ret);
+                    }
+                }
+                ItemKind::State(decl) => {
+                    for b in &decl.bindings {
+                        self.decls.push(DeclSite {
+                            kind: DeclKind::State,
+                            name: b.name.clone(),
+                            span: b.name_span,
+                            struct_name: None,
+                        });
+                        self.collect_ty(&b.ty);
+                        if let Some(init) = &b.init {
+                            self.scopes.push(HashMap::new());
+                            self.collect_expr(init);
+                            self.scopes.pop();
+                        }
+                    }
+                }
+                ItemKind::Migrate(decl) => {
+                    self.decls.push(DeclSite {
+                        kind: DeclKind::MigrateFn,
+                        name: decl.func.name.clone(),
+                        span: decl.func.name_span,
+                        struct_name: None,
+                    });
+                    self.scopes.push(HashMap::new());
+                    for p in &decl.func.params {
+                        self.declare(&p.name, p.name_span);
+                        self.collect_ty(&p.ty);
+                    }
+                    self.collect_ty(&decl.func.ret);
+                    self.collect_block(&decl.func.body);
+                    self.scopes.pop();
+                }
+                ItemKind::Import(_) => {}
+            }
+        }
+    }
+
+    fn collect_block(&mut self, block: &toto_compiler::ast::Block) {
+        self.scopes.push(HashMap::new());
+        for stmt in &block.stmts {
+            self.collect_stmt(stmt);
+        }
+        if let Some(tail) = &block.tail {
+            self.collect_expr(tail);
+        }
+        self.scopes.pop();
+    }
+
+    fn collect_stmt(&mut self, stmt: &toto_compiler::ast::Stmt) {
+        match &stmt.node {
+            toto_compiler::ast::StmtKind::Let {
+                name,
+                name_span,
+                ty,
+                value,
+                ..
+            } => {
+                self.collect_expr(value);
+                if let Some(t) = ty {
+                    self.collect_ty(t);
+                }
+                self.declare(name, *name_span);
+            }
+            toto_compiler::ast::StmtKind::Assign { target, value } => {
+                match target {
+                    toto_compiler::ast::AssignTarget::Var(name, span) => {
+                        self.vars.push(NameUse {
+                            name: name.clone(),
+                            span: *span,
+                            local_decl: lookup(&self.scopes, name),
+                        });
+                    }
+                    toto_compiler::ast::AssignTarget::Field(base, name, span) => {
+                        self.collect_expr(base);
+                        self.field_uses.push((name.clone(), *span));
+                    }
+                    toto_compiler::ast::AssignTarget::Index(base, index, _) => {
+                        self.collect_expr(base);
+                        self.collect_expr(index);
+                    }
+                }
+                self.collect_expr(value);
+            }
+            toto_compiler::ast::StmtKind::Expr(e) | toto_compiler::ast::StmtKind::Return(e) => {
+                self.collect_expr(e)
+            }
+            toto_compiler::ast::StmtKind::Break | toto_compiler::ast::StmtKind::Continue => {}
+            toto_compiler::ast::StmtKind::While { cond, body } => {
+                self.collect_expr(cond);
+                self.collect_block(body);
+            }
+            toto_compiler::ast::StmtKind::For {
+                name,
+                name_span,
+                iter,
+                body,
+            } => {
+                self.collect_expr(iter);
+                self.scopes.push(HashMap::new());
+                self.declare(name, *name_span);
+                for stmt in &body.stmts {
+                    self.collect_stmt(stmt);
+                }
+                if let Some(tail) = &body.tail {
+                    self.collect_expr(tail);
+                }
+                self.scopes.pop();
+            }
+            toto_compiler::ast::StmtKind::Go { body } => self.collect_block(body),
+            toto_compiler::ast::StmtKind::Select { cases, default } => {
+                for case in cases {
+                    match case {
+                        toto_compiler::ast::SelectCase::Recv { name, chan, body } => {
+                            self.collect_expr(chan);
+                            self.scopes.push(HashMap::new());
+                            if let Some((n, s)) = name {
+                                self.declare(n, *s);
+                            }
+                            for stmt in &body.stmts {
+                                self.collect_stmt(stmt);
+                            }
+                            if let Some(tail) = &body.tail {
+                                self.collect_expr(tail);
+                            }
+                            self.scopes.pop();
+                        }
+                        toto_compiler::ast::SelectCase::Send { chan, value, body } => {
+                            self.collect_expr(chan);
+                            self.collect_expr(value);
+                            self.collect_block(body);
+                        }
+                    }
+                }
+                if let Some(body) = default {
+                    self.collect_block(body);
+                }
+            }
+        }
+    }
+
+    fn collect_expr(&mut self, expr: &toto_compiler::ast::Expr) {
+        match &expr.node {
+            toto_compiler::ast::ExprKind::Var(name) => {
+                self.vars.push(NameUse {
+                    name: name.clone(),
+                    span: expr.span,
+                    local_decl: lookup(&self.scopes, name),
+                });
+            }
+            toto_compiler::ast::ExprKind::Call { callee, args } => {
+                self.collect_expr(callee);
+                for arg in args {
+                    self.collect_expr(arg);
+                }
+            }
+            toto_compiler::ast::ExprKind::Field { base, name } => {
+                self.collect_expr(base);
+                // No dedicated name span in the AST: the whole
+                // `base.name` occurrence (rename refines this).
+                self.field_uses.push((name.clone(), expr.span));
+            }
+            toto_compiler::ast::ExprKind::StructLit { name, fields } => {
+                self.struct_lits
+                    .push((name.clone(), name_span_at(expr.span.start, name)));
+                for (fname, value, fspan) in fields {
+                    self.lit_fields.push((name.clone(), fname.clone(), *fspan));
+                    self.collect_expr(value);
+                }
+            }
+            toto_compiler::ast::ExprKind::If {
+                cond,
+                then_b,
+                else_b,
+            } => {
+                self.collect_expr(cond);
+                self.collect_block(then_b);
+                if let Some(else_b) = else_b {
+                    self.collect_block(else_b);
+                }
+            }
+            toto_compiler::ast::ExprKind::Closure { params, body, .. } => {
+                self.scopes.push(HashMap::new());
+                for p in params {
+                    self.declare(&p.name, p.name_span);
+                    self.collect_ty(&p.ty);
+                }
+                self.collect_block(body);
+                self.scopes.pop();
+            }
+            toto_compiler::ast::ExprKind::Array(items) => {
+                for item in items {
+                    self.collect_expr(item);
+                }
+            }
+            toto_compiler::ast::ExprKind::Range(a, b) => {
+                self.collect_expr(a);
+                self.collect_expr(b);
+            }
+            toto_compiler::ast::ExprKind::Binary { left, right, .. } => {
+                self.collect_expr(left);
+                self.collect_expr(right);
+            }
+            toto_compiler::ast::ExprKind::Unary { expr, .. } => self.collect_expr(expr),
+            toto_compiler::ast::ExprKind::Send { chan, value } => {
+                self.collect_expr(chan);
+                self.collect_expr(value);
+            }
+            toto_compiler::ast::ExprKind::Recv { chan } => self.collect_expr(chan),
+            toto_compiler::ast::ExprKind::ChanNew { cap, .. } => {
+                if let Some(cap) = cap {
+                    self.collect_expr(cap);
+                }
+            }
+            toto_compiler::ast::ExprKind::Question(inner) => self.collect_expr(inner),
+            toto_compiler::ast::ExprKind::Index { base, index } => {
+                self.collect_expr(base);
+                self.collect_expr(index);
+            }
+            toto_compiler::ast::ExprKind::Ok(inner)
+            | toto_compiler::ast::ExprKind::Err(inner)
+            | toto_compiler::ast::ExprKind::Some(inner) => self.collect_expr(inner),
+            toto_compiler::ast::ExprKind::Int(_)
+            | toto_compiler::ast::ExprKind::Float(_)
+            | toto_compiler::ast::ExprKind::Str(_)
+            | toto_compiler::ast::ExprKind::Bool(_)
+            | toto_compiler::ast::ExprKind::Unit
+            | toto_compiler::ast::ExprKind::None => {}
+        }
+    }
+
+    fn collect_ty(&mut self, ty: &toto_compiler::ast::Type) {
+        match &ty.kind {
+            toto_compiler::ast::TypeKind::Named { name, args } => {
+                self.type_refs
+                    .push((name.clone(), name_span_at(ty.span.start, name)));
+                for arg in args {
+                    self.collect_ty(arg);
+                }
+            }
+            toto_compiler::ast::TypeKind::Ptr(inner) => self.collect_ty(inner),
+            toto_compiler::ast::TypeKind::Fn { params, ret } => {
+                for param in params {
+                    self.collect_ty(param);
+                }
+                self.collect_ty(ret);
+            }
+        }
+    }
+}
+
+/// All use sites of `target` across the open file's project, in file
+/// then span order, as (uri, file text, span) triples. Locals never
+/// cross files; globals are matched by name only where no visible
+/// local shadows them. Field uses match by name only when exactly
+/// one struct declares the field — otherwise the request yields
+/// nothing rather than a wrong set (rename safety).
+fn find_references(
+    doc: &OpenDoc,
+    target: &Target,
+    include_decl: bool,
+) -> Vec<(String, String, Span)> {
+    let mut per_file: Vec<(String, String, RefWalk)> = Vec::new();
+    for (display, src) in &doc.file_srcs {
+        let Some(program) = parse_buffer(src) else {
+            continue;
+        };
+        let mut walk = RefWalk::default();
+        walk.collect_program(&program);
+        per_file.push((display.clone(), src.clone(), walk));
+    }
+    if !per_file.iter().any(|(d, _, _)| d == &doc_display(doc)) {
+        if let Some(program) = parse_buffer(&doc.text) {
+            let mut walk = RefWalk::default();
+            walk.collect_program(&program);
+            per_file.push((doc_display(doc), doc.text.clone(), walk));
+        }
+    }
+    let src_of = |display: &str| {
+        per_file
+            .iter()
+            .find(|(d, _, _)| d == display)
+            .map(|(_, s, _)| s.clone())
+    };
+    // The target's own name, sliced from its declaration site.
+    let target_name = |display: &str, span: Span| -> Option<String> {
+        src_of(display).and_then(|src| {
+            src.get(span.start as usize..span.end as usize)
+                .map(str::to_string)
+        })
+    };
+    let mut hits: Vec<(usize, Span)> = Vec::new();
+    let push_var_uses =
+        |hits: &mut Vec<(usize, Span)>, per_file: &[(String, String, RefWalk)], name: &str| {
+            for (i, (_, _, walk)) in per_file.iter().enumerate() {
+                for u in &walk.vars {
+                    if u.name == name && u.local_decl.is_none() {
+                        hits.push((i, u.span));
+                    }
+                }
+            }
+        };
+    match target {
+        Target::Builtin => {}
+        Target::Local(decl) => {
+            if let Some(i) = per_file.iter().position(|(d, _, _)| d == &doc_display(doc)) {
+                for u in &per_file[i].2.vars {
+                    if u.local_decl == Some(*decl) {
+                        hits.push((i, u.span));
+                    }
+                }
+                if include_decl {
+                    hits.push((i, *decl));
+                }
+            }
+        }
+        Target::Func(path, span) | Target::Extern(path, span) | Target::State(path, span) => {
+            let Some(name) = target_name(path, *span) else {
+                return vec![];
+            };
+            push_var_uses(&mut hits, &per_file, &name);
+            if include_decl {
+                for (i, (display, _, walk)) in per_file.iter().enumerate() {
+                    let want = match target {
+                        Target::Func(..) => DeclKind::Func,
+                        Target::Extern(..) => DeclKind::Extern,
+                        _ => DeclKind::State,
+                    };
+                    for d in &walk.decls {
+                        if d.kind == want && d.name == name && display == path {
+                            hits.push((i, d.span));
+                        }
+                    }
+                }
+            }
+        }
+        Target::Struct(path, span) => {
+            let Some(name) = target_name(path, *span) else {
+                return vec![];
+            };
+            for (i, (_, _, walk)) in per_file.iter().enumerate() {
+                for (n, s) in walk.struct_lits.iter().chain(walk.type_refs.iter()) {
+                    if n == &name {
+                        hits.push((i, *s));
+                    }
+                }
+                for d in &walk.decls {
+                    if d.kind == DeclKind::MigrateFn && d.name == name {
+                        hits.push((i, d.span));
+                    }
+                }
+                if include_decl {
+                    for d in &walk.decls {
+                        if d.kind == DeclKind::Struct && d.name == name {
+                            hits.push((i, d.span));
+                        }
+                    }
+                }
+            }
+        }
+        Target::Field(path, span) => {
+            let Some(name) = target_name(path, *span) else {
+                return vec![];
+            };
+            let owner = per_file.iter().find_map(|(display, src, _walk)| {
+                if display != path {
+                    return None;
+                }
+                let program = parse_buffer(src)?;
+                program.items.iter().find_map(|item| match &item.kind {
+                    ItemKind::Struct(decl) if decl.fields.iter().any(|f| f.span == *span) => {
+                        Some(decl.name.clone())
+                    }
+                    _ => None,
+                })
+            });
+            let Some(owner) = owner else {
+                return vec![];
+            };
+            // Unique field name program-wide? Otherwise a bare
+            // `x.f` cannot be attributed — yield nothing.
+            let mut declarers = 0;
+            for (_, _, walk) in &per_file {
+                for d in &walk.decls {
+                    if d.kind == DeclKind::StructField && d.name == name {
+                        declarers += 1;
+                        break;
+                    }
+                }
+            }
+            if declarers != 1 {
+                return vec![];
+            }
+            for (i, (_, _, walk)) in per_file.iter().enumerate() {
+                for (n, s) in &walk.field_uses {
+                    if n == &name {
+                        hits.push((i, *s));
+                    }
+                }
+                for (sname, fname, fspan) in &walk.lit_fields {
+                    if sname == &owner && fname == &name {
+                        hits.push((i, *fspan));
+                    }
+                }
+                if include_decl {
+                    for d in &walk.decls {
+                        if d.kind == DeclKind::StructField
+                            && d.name == name
+                            && d.struct_name.as_deref() == Some(owner.as_str())
+                        {
+                            hits.push((i, d.span));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    hits.sort_by_key(|(i, s)| (*i, s.start, s.end));
+    hits.into_iter()
+        .map(|(i, span)| {
+            let (display, src, _) = &per_file[i];
+            (file_uri(&doc.path, display), src.clone(), span)
+        })
+        .collect()
 }
 
 fn doc_position(params: &J) -> (String, u64, u64) {

@@ -6,7 +6,9 @@ Stage 4 doc generator. Each stage gated; no stage re-opens a
 settled decision.
 
 Status: STAGE 0 VERIFIED (run #118 green on the starting
-tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI).
+tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI);
+STAGE 2 PARTIAL: references + UTF-16 columns implemented
+(rename next).
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -176,19 +178,83 @@ evidence-driven narrowings — no silent drift):
   (call-preserving deletion for effectful initializers stays
   Stage 2 design work).
 
-## Stage 2 — richer LSP
+## Stage 2 — richer LSP (DESIGN APPROVED 2026-11-25; no code yet)
 
 Goal: completion, references, rename, and code actions on the
 existing stdio server, multi-document modeling, wrapping
 Stage 1 diagnostics at minimum.
 
-Acceptance: the four capabilities proven inside a real editor
-session (editor + version recorded), not headless-only; the
-column-encoding decision (UTF-16 vs. scalars) recorded in the
-stage design and honored; broken-file behavior keeps last-good
-data out (established `lsp.md` contract holds). Non-goals:
-debugging protocol, untitled-buffer support unless the design
-justifies it.
+Design decisions (user-approved 2026-11-25):
+
+- Landing order: references → rename → completion → code
+  actions. Dependency order, each tested before the next:
+  rename needs the reference finder; code actions need lint
+  surfacing built on the same program model. (Server ground:
+  `OpenDoc` already holds the merged `project` + `checked`
+  program with per-file sources; `resolve_at`/`resolve_global`
+  give the definition model the finder inverts.)
+- Column encoding: UTF-16 units, per the LSP standard. This
+  changes existing hover/definition columns on non-ASCII
+  files (disclosed here, covered by tests); scalar counting
+  stays only as the documented past behavior in `lsp.md`.
+- Lint in LSP: E05xx findings surface as warning-severity
+  `publishDiagnostics` (the `starts_with('E') → error`
+  severity mapping is fixed: E05xx are warnings), and code
+  actions fix them in place ("remove it", "prefix `_`",
+  "remove the import" — the Stage 1 recorded fix shapes).
+- Document model: unchanged (one project root per open file,
+  cross-file resolution from disk with the open buffer
+  overriding; `file://` URIs only stays). Rename returns a
+  multi-file `WorkspaceEdit`; unopened files resolve from
+  disk at request time — documented limitation, not silent.
+- Proof vehicle: VS Code (installed on this machine;
+  exact version recorded at implementation) driven through
+  its LSP APIs, exercising all four capabilities in one
+  recorded session. The existing piped-stdio tests stay as
+  regression cover, not as the proof.
+
+Acceptance: the four capabilities in order, each with
+protocol tests; UTF-16 columns proven on non-ASCII fixtures;
+E05xx warnings visible with severity 2 and fixable via code
+actions; real-editor session recorded (editor + version);
+broken-file behavior keeps last-good data out (established
+`lsp.md` contract holds). Non-goals: debugging protocol,
+untitled-buffer support, formatting (no `toto fmt` here).
+
+Implementation record — references + UTF-16 (rename next):
+- UTF-16 first (all new ranges depend on it):
+  `offset_to_position`/`position_to_offset` count UTF-16 code
+  units; mid-pair requests resolve to the following boundary
+  (documented; clients must send code-point boundaries).
+  `docs/lsp.md` updated (scalars stay as the documented past
+  behavior). Proven by an astral-character protocol test that
+  fails on scalar counting.
+- `textDocument/references` with `includeDeclaration`:
+  capability advertised; null-doc/unresolvable/builtin yield
+  null/empty (builtins `[]`). Finder reuses `resolve_at` for
+  the target, then walks every project file with the same
+  scoping rules: locals match by declaration-span identity
+  (shadowing exact, cross-function leaks impossible);
+  functions/externs/state match by name only where no local
+  shadows; structs add literal names, `Named` type refs, and
+  the tied `migrate fn` name; fields match by name only when
+  exactly one struct declares the field, else empty
+  (rename safety — never a wrong set). Field use spans are
+  whole `base.name` expressions for now; rename refines them
+  to name spans. Unparseable files are skipped, never fatal.
+- Declaration-site fix (needed for rename-from-declaration):
+  `resolve_at` now resolves `fn` parameter names to
+  `Target::Local`, like closure parameters already did — this
+  also fixes hover there (no existing test covered it).
+  Migrate bodies stay position-unresolvable (existing hover
+  gap, unchanged); their uses still count as references.
+- Tests: 4 new protocol tests (shadowing, cross-file,
+  struct/field/param-decl, UTF-16) + capability assert; 8/8
+  `lsp` tests green. Neighbors unchanged: `cli` suite same
+  13/5 split as the untouched base (5 pre-existing
+  build/dist network failures); `fmt` clean; zero new
+  compiler warnings. Clippy rides on CI (no local component:
+  static.rust-lang.org unresolvable on this machine).
 
 ## Stage 3 — coverage
 

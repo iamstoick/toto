@@ -26,9 +26,10 @@ EOF ends the session (regression test `lsp_malformed_frame_is_skipped`).
 (3 tests driving `toto lsp` over piped stdio and asserting hover
 contents, definition targets, and diagnostic codes). The server has
 NOT been exercised inside a real editor — no editor, version, or
-session is claimed. Columns are Unicode scalars, not UTF-16 code
-units; editors expecting UTF-16 columns will misalign non-ASCII
-text. One document at a time is fully modeled; the open buffer
+session is claimed. Columns are UTF-16 code units per the LSP
+standard (Stage 2; previously Unicode scalars — scalar counting
+was the documented past behavior, wrong for non-ASCII text in
+UTF-16 editors). One document at a time is fully modeled; the open buffer
 overrides disk and `gzv.std` is embedded for import-aware answers.
 
 ## Limits (accepted)
