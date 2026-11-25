@@ -240,21 +240,18 @@ pub fn collect_inventory(program: &crate::ast::Program) -> Inventory {
     let mut fns = Vec::new();
     for item in &program.items {
         let file = item.file.clone().unwrap_or_default();
-        match &item.kind {
-            ItemKind::Fn(decl) => {
-                fns.push(FnPoint {
-                    file: file.clone(),
-                    name: decl.name.clone(),
-                    span: decl.name_span,
-                });
-                let mut walk = Walk {
-                    out_stmts: &mut stmts,
-                    out_branches: &mut branches,
-                    file,
-                };
-                walk.block(&decl.body);
-            }
-            _ => {}
+        if let ItemKind::Fn(decl) = &item.kind {
+            fns.push(FnPoint {
+                file: file.clone(),
+                name: decl.name.clone(),
+                span: decl.name_span,
+            });
+            let mut walk = Walk {
+                out_stmts: &mut stmts,
+                out_branches: &mut branches,
+                file,
+            };
+            walk.block(&decl.body);
         }
     }
     Inventory {
@@ -277,11 +274,20 @@ pub struct CoverageSummary {
 
 impl CoverageSummary {
     pub fn line_pct(&self) -> u64 {
-        if self.lines_found == 0 {
-            100
-        } else {
-            self.lines_hit * 100 / self.lines_found
-        }
+        // Empty suites are vacuously 100%: the division fails and
+        // falls through to the default. (Overflow would also land
+        // here, capped at 100.)
+        self.lines_hit
+            .checked_mul(100)
+            .and_then(|scaled| scaled.checked_div(self.lines_found))
+            .unwrap_or(100)
+    }
+
+    pub fn branch_pct(&self) -> u64 {
+        self.branches_hit
+            .checked_mul(100)
+            .and_then(|scaled| scaled.checked_div(self.branches_found))
+            .unwrap_or(100)
     }
 }
 
