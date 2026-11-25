@@ -42,6 +42,13 @@ for f in $lint_files; do
 done
 # shellcheck disable=SC2086
 ./target/debug/toto lint --deny-warnings $lint_targets
+# Stage 3 coverage gate (Wave 5): the LCOV report for the demo
+# program must match the checked-in golden byte for byte
+# (SF line normalized: only the file name is stable), and the
+# --fail-under gate shape is exercised at the demo's own level.
+./target/debug/toto coverage crates/toto-cli/tests/fixtures/coverage/branches.gzv 2>/dev/null | sed 's|^SF:.*/\(.*\)|SF:\1|' > /tmp/toto-cov-demo.lcov
+cmp /tmp/toto-cov-demo.lcov crates/toto-cli/tests/fixtures/coverage/branches.gzv.lcov
+./target/debug/toto coverage --fail-under 100 crates/toto-cli/tests/fixtures/coverage/branches.gzv >/dev/null
 (cd stdlib && ../target/debug/toto test)
 # wordfreq sample app (Phase 5, Stage 5): project tests green, and
 # the built executable matches the interpreter byte-for-byte.

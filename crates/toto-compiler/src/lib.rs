@@ -7,6 +7,7 @@ pub mod ast;
 pub mod builtins;
 pub mod check;
 pub mod compress;
+pub mod coverage;
 #[cfg(unix)]
 pub mod cryptolib;
 pub mod ctxlog;
@@ -130,6 +131,31 @@ pub fn run_program(
         })
         .expect("failed to spawn interpreter thread")
         .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
+/// Interpret with statement + branch coverage recorded. Same
+/// threading contract as `run_program`; coverage spans program
+/// execution (panics still yield partial hits).
+pub fn run_program_cov(
+    program: &Program,
+    externs: &HashMap<String, crate::hir::HExternFn>,
+) -> (MirOutcome, coverage::CovHits) {
+    let program = program.clone();
+    let externs = externs.clone();
+    std::thread::Builder::new()
+        .name("toto-interp-cov".to_string())
+        .stack_size(256 << 20)
+        .spawn(move || {
+            let mut interp = Interp::new(&program, externs);
+            interp.cov = Some(coverage::CovHits::default());
+            let result = interp.run();
+            let cov = interp.cov.take().unwrap_or_default();
+            (result, interp.output, cov)
+        })
+        .expect("failed to spawn interpreter thread")
+        .join()
+        .map(|(result, output, cov)| ((result, output), cov))
         .unwrap_or_else(|e| std::panic::resume_unwind(e))
 }
 

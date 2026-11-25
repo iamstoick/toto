@@ -9,7 +9,7 @@ Status: STAGE 0 VERIFIED (run #118 green on the starting
 tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI);
 STAGE 2 CAPABILITIES IMPLEMENTED + proven against an
 independent client stack (GUI editor session outstanding);
-STAGE 3 DESIGN APPROVED, IMPLEMENTATION PENDING.
+STAGE 3 IMPLEMENTED (awaiting CI).
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -460,6 +460,56 @@ threshold and passing at it. Non-goals: concurrent-program
 coverage (named follow-up), branch precision beyond honest
 attribution (disclosed, not smoothed), HTML reports
 (LCOV consumers already exist).
+
+Implementation record — Stage 3 built as designed, with two
+evidence-driven refinements (no silent drift):
+- Design amendment, select excluded: the sequential
+  tree-walker never executes `go`/`select` (E0215 routing
+  tripwire sends concurrent programs to the runtime
+  executor), so select arms cannot be branch points in v1.
+  Their statements stay listed at zero — truthful, since
+  reaching them is a runtime error, not uncovered code. The
+  runtime-executor follow-up owns them. `for` loops count
+  as branches (same shape as `while`); tails, state
+  initializers, and migrate bodies are not coverable units.
+- Mechanism: a `CovHits` set on `Interp` (zero cost when
+  `None`), one hook per statement in `exec_stmt`, branch
+  arms at if/while/for decision points (loop exits funnel
+  through a single post-loop recording — each termination
+  counts exactly once; return/panic paths excluded). Named
+  functions (including `main`) are marked at `call_fn`.
+  Multi-file programs work: hits are attributed to files
+  at report time via item spans.
+- CLI: `toto coverage [--fail-under PCT] <file.gzv>...`,
+  mirroring lint's driver (unreadable exit 3, broken
+  exit 2, concurrent refused exit 2 with the named reason,
+  zero- or nonzero-exit runs still emit the partial report
+  and exit 1 on failure or unmet threshold). LCOV goes to
+  stdout (per-file `SF` sections, entry first); program
+  stdout is suppressed by design (inspect with `toto run`);
+  the human summary goes to stderr. `--fail-under` gates on
+  line percentage.
+- Corpus self-measurement (`loop02_for_range.gzv`,
+  in-process unit test): 83% lines (10/12), 66% branches
+  (4/6), 1/1 functions — the two empty ranges pin the
+  skipped-branch arms at 0 taken / 1 skipped. CLI golden
+  test pins the branches fixture's full LCOV byte-for-byte
+  (path-normalized); check.sh diffs the same golden and
+  exercises `--fail-under 100` on it.
+- Overhead budget: <1.35x wall time on the bench corpus
+  (measured: compute 1.21x, stdlib 1.29x; gc_alloc refused
+  as concurrent, instant). Coverage is a measurement mode,
+  not the fast path.
+- Verification: 1 unit + 5 CLI tests green; compiler lib
+  6/6; the full golden corpus runner green (validates the
+  `exec_stmt` hooks end to end — its one failure during
+  verification was a stale `toto run` server from an
+  earlier backgrounded test holding the http port, killed
+  with its owning session, then green on rerun); `cli`
+  13/5 pre-existing; `fmt` clean per 1.87 (the two spots
+  where CI's newer rustfmt disagrees are kept in CI's exact
+  shape from its log); `lsp` 20/20 untouched. Clippy rides
+  on CI.
 
 ## Stage 4 — doc generator
 

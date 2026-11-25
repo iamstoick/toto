@@ -35,6 +35,8 @@ const HELP: &str = "toto — a new programming language (.gzv)\n\
                     (--check: list files that would change, no writes)\n\
                     \x20   toto lint [--deny-warnings] <file.gzv>...\n\
                     \x20                                      hygiene lints (E05xx warnings)\n\
+                    \x20   toto coverage [--fail-under PCT] <file.gzv>...\n\
+                    \x20                                      LCOV report on stdout (sequential programs only)\n\
                     \x20   toto lsp                          basic LSP server on stdio\n\
                     (hover, go-to-definition, diagnostics)\n\
                     \x20   toto --help                        show this help\n\
@@ -248,6 +250,31 @@ fn main() -> ExitCode {
             }
             fmt_files(&files, check)
         }
+        Some("coverage") => {
+            let mut fail_under: Option<u32> = None;
+            let mut files = Vec::new();
+            let mut args = args.iter().skip(2).peekable();
+            while let Some(a) = args.next() {
+                if *a == "--fail-under" {
+                    match args.next().and_then(|n| n.parse::<u32>().ok()) {
+                        Some(n) if n <= 100 => fail_under = Some(n),
+                        _ => {
+                            eprintln!("toto: `--fail-under` needs a percentage 0-100");
+                            return ExitCode::from(3);
+                        }
+                    }
+                } else {
+                    files.push((*a).to_string());
+                }
+            }
+            if files.is_empty() {
+                eprintln!(
+                    "toto: `coverage` needs a file: toto coverage [--fail-under PCT] <file.gzv>..."
+                );
+                return ExitCode::from(3);
+            }
+            coverage_files(&files, fail_under)
+        }
         Some("lint") => {
             let mut deny_warnings = false;
             let mut files = Vec::new();
@@ -427,6 +454,120 @@ fn lint_files(files: &[String], deny_warnings: bool) -> ExitCode {
         }
     }
     if deny_warnings && any_findings {
+        ExitCode::from(1)
+    } else {
+        ExitCode::from(0)
+    }
+}
+
+/// Measure statement + branch coverage (Wave 5 Stage 3).
+/// Each listed file runs as a program root through
+/// the checked tree-walking interpreter; LCOV goes to stdout, the
+/// human summary to stderr, and the covered program's own stdout is
+/// suppressed (inspect it with `toto run`). Unreadable files exit 3;
+/// broken (lex/parse/check) or concurrent programs are refused with
+/// exit 2 — concurrent programs execute lowered MIR on the runtime
+/// executor, which this tool cannot attribute honestly.
+fn coverage_files(files: &[String], fail_under: Option<u32>) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dep_entries = match build_cmd::run_deps(&cwd) {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let mut any_failed = false;
+    for path in files {
+        let src = match std::fs::read_to_string(path) {
+            Ok(src) => src,
+            Err(e) => {
+                eprintln!("toto: couldn't read `{path}`: {e}");
+                return ExitCode::from(3);
+            }
+        };
+        let (tokens, lex_errors) = toto_compiler::lexer::lex(&src);
+        if !lex_errors.is_empty() {
+            let diags: Vec<toto_compiler::diag::Diag> = lex_errors
+                .into_iter()
+                .map(|e| toto_compiler::diag::Diag::new(e.code, e.message, e.span, e.help))
+                .collect();
+            eprint!("{}", toto_compiler::render_errors(&diags, &src, path));
+            return ExitCode::from(2);
+        }
+        let (_program, parse_errors) = toto_compiler::parser::parse(tokens, &src);
+        if !parse_errors.is_empty() {
+            eprint!(
+                "{}",
+                toto_compiler::render_errors(&parse_errors, &src, path)
+            );
+            return ExitCode::from(2);
+        }
+        let (project, checked) = match toto_compiler::project::load_and_check(
+            path,
+            &src,
+            &|p| build_cmd::read_source(&cwd, p),
+            &dep_entries,
+        ) {
+            Ok(loaded) => loaded,
+            Err(failed) => {
+                for fd in &failed.errors {
+                    let f = &failed.files[fd.file];
+                    eprint!(
+                        "{}",
+                        toto_compiler::render_errors(&fd.diags, &f.src, &f.path)
+                    );
+                }
+                return ExitCode::from(2);
+            }
+        };
+        if checked.uses_concurrency {
+            eprintln!(
+                "toto: `{path}` uses concurrency: coverage runs sequential programs only \
+                (the runtime executor lowers to MIR, which this tool cannot attribute); \
+                refusing instead of reporting smoothed numbers"
+            );
+            return ExitCode::from(2);
+        }
+        let (outcome, hits) = toto_compiler::run_program_cov(&project.program, &checked.externs);
+        let files_for_report: Vec<(String, String)> = project
+            .files
+            .iter()
+            .map(|f| (f.path.clone(), f.src.clone()))
+            .collect();
+        let inv = toto_compiler::coverage::collect_inventory(&project.program);
+        let (lcov, summary) = toto_compiler::coverage::render_lcov(&files_for_report, &inv, &hits);
+        print!("{lcov}");
+        eprintln!(
+            "toto: coverage for `{path}`: {}% lines ({}/{}), {}% branches ({}/{}), {}/{} functions",
+            summary.line_pct(),
+            summary.lines_hit,
+            summary.lines_found,
+            if summary.branches_found == 0 {
+                100
+            } else {
+                summary.branches_hit * 100 / summary.branches_found
+            },
+            summary.branches_hit,
+            summary.branches_found,
+            summary.fns_hit,
+            summary.fns_found,
+        );
+        match outcome {
+            (Ok(_), _) => {}
+            (Err((diag, _trace)), _) => {
+                eprintln!("{}", toto_compiler::render_errors(&[diag], &src, path));
+                any_failed = true;
+            }
+        }
+        if let Some(pct) = fail_under {
+            if summary.line_pct() < u64::from(pct) {
+                eprintln!(
+                    "toto: coverage {}% below --fail-under {pct}",
+                    summary.line_pct()
+                );
+                any_failed = true;
+            }
+        }
+    }
+    if any_failed {
         ExitCode::from(1)
     } else {
         ExitCode::from(0)

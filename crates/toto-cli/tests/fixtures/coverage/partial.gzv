@@ -1,0 +1,9 @@
+fn main() -> int {
+    let x = 5;
+    if x > 0 {
+        println("pos");
+    } else {
+        println("neg");
+    }
+    return 0;
+}

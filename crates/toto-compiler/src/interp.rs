@@ -247,6 +247,9 @@ pub struct Interp {
     /// State declarations for load-time initialization (evaluated in
     /// `run`, in order, before `main`).
     state_decls: Vec<StateDecl>,
+    /// Coverage hits, when enabled by the driver (`toto coverage`
+    /// sets this; plain runs leave it `None` for zero overhead).
+    pub cov: Option<crate::coverage::CovHits>,
 }
 
 impl Interp {
@@ -298,6 +301,7 @@ impl Interp {
             ret_stack: Vec::new(),
             state: HashMap::new(),
             state_decls,
+            cov: None,
         }
     }
 
@@ -460,6 +464,7 @@ impl Interp {
                 std::mem::take(&mut self.trace),
             ));
         }
+        self.cover_call(&decl.name);
         self.trace.push(TraceFrame {
             name: decl.name.clone(),
             span,
@@ -679,7 +684,31 @@ impl Interp {
         result
     }
 
+    /// Coverage: record one statement execution (no-op unless the
+    /// driver enabled coverage).
+    fn cover_stmt(&mut self, span: crate::span::Span) {
+        if let Some(cov) = self.cov.as_mut() {
+            cov.hit_stmt(span);
+        }
+    }
+
+    /// Coverage: record one branch-arm execution (0 = then/body
+    /// taken, 1 = else taken, skipped, or loop exited).
+    fn cover_branch(&mut self, span: crate::span::Span, arm: u8) {
+        if let Some(cov) = self.cov.as_mut() {
+            cov.hit_branch(span, arm);
+        }
+    }
+
+    /// Coverage: record one named-function entry.
+    fn cover_call(&mut self, name: &str) {
+        if let Some(cov) = self.cov.as_mut() {
+            cov.hit_fn(name);
+        }
+    }
+
     fn exec_stmt(&mut self, stmt: &Stmt, scopes: &mut Vec<HashMap<String, Slot>>) -> Exec<()> {
+        self.cover_stmt(stmt.span);
         match &stmt.node {
             StmtKind::Let {
                 name,
@@ -717,7 +746,7 @@ impl Interp {
                 loop {
                     let c = self.eval_expr(cond, scopes)?;
                     match c {
-                        Value::Bool(true) => {}
+                        Value::Bool(true) => self.cover_branch(stmt.span, 0),
                         Value::Bool(false) => break,
                         other => {
                             return Err(panic(
@@ -735,6 +764,9 @@ impl Interp {
                         Err(sig) => return Err(sig),
                     }
                 }
+                // Every exit except return/panic/divergence funnels
+                // here: body taken at least once, or skipped.
+                self.cover_branch(stmt.span, 1);
                 Ok(())
             }
             StmtKind::For {
@@ -753,6 +785,7 @@ impl Interp {
                                     mutable: false,
                                 },
                             );
+                            self.cover_branch(stmt.span, 0);
                             let r = self.eval_block_value(body, scopes);
                             scopes.pop();
                             match r {
@@ -768,6 +801,9 @@ impl Interp {
                                 break;
                             }
                         }
+                        // Every exit except return/panic/divergence
+                        // funnels here, including zero iterations.
+                        self.cover_branch(stmt.span, 1);
                         Ok(())
                     }
                     Value::Array(cell) => {
@@ -784,6 +820,7 @@ impl Interp {
                                     mutable: false,
                                 },
                             );
+                            self.cover_branch(stmt.span, 0);
                             let r = self.eval_block_value(body, scopes);
                             scopes.pop();
                             match r {
@@ -793,6 +830,9 @@ impl Interp {
                                 Err(sig) => return Err(sig),
                             }
                         }
+                        // Every exit except return/panic funnels here,
+                        // including zero iterations over an empty array.
+                        self.cover_branch(stmt.span, 1);
                         Ok(())
                     }
                     other => Err(panic(
@@ -933,11 +973,17 @@ impl Interp {
             } => {
                 let c = self.eval_expr(cond, scopes)?;
                 match c {
-                    Value::Bool(true) => self.eval_block_value(then_b, scopes),
-                    Value::Bool(false) => match else_b {
-                        Some(b) => self.eval_block_value(b, scopes),
-                        None => Ok(Value::Unit),
-                    },
+                    Value::Bool(true) => {
+                        self.cover_branch(expr.span, 0);
+                        self.eval_block_value(then_b, scopes)
+                    }
+                    Value::Bool(false) => {
+                        self.cover_branch(expr.span, 1);
+                        match else_b {
+                            Some(b) => self.eval_block_value(b, scopes),
+                            None => Ok(Value::Unit),
+                        }
+                    }
                     other => Err(panic(
                         "E0207",
                         format!("if condition must be bool, got {}", other.type_name()),
