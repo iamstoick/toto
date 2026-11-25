@@ -9,7 +9,8 @@ Status: STAGE 0 VERIFIED (run #118 green on the starting
 tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI);
 STAGE 2 CAPABILITIES IMPLEMENTED + proven against an
 independent client stack (GUI editor session outstanding);
-STAGE 3 IMPLEMENTED (awaiting CI).
+STAGE 3 IMPLEMENTED (awaiting CI);
+STAGE 4 DESIGN APPROVED, IMPLEMENTATION PENDING.
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -519,16 +520,51 @@ evidence-driven refinements (no silent drift):
   shape from its log); `lsp` 20/20 untouched. Clippy rides
   on CI.
 
-## Stage 4 — doc generator
+## Stage 4 — doc generator (DESIGN APPROVED 2026-11-25; no code yet)
 
 Goal: `toto doc` rendering API docs for `.gzv` sources
 (stdlib first), from a documented doc-comment convention.
 
-Acceptance: renders the full `gzv.std` surface; output
-golden-tested; the comment convention recorded (it interacts
-with the LSP's "no notion of comments" limit — resolved or
-carried explicitly). Non-goals: a hosted site, versioned
-publishing (registry work is Phase 7).
+Design decisions (user-approved 2026-11-25):
+
+- Vehicle: `///` item docs and `//!` module docs (new
+  convention; zero `///` lines exist today). The lexer emits
+  `///` runs as tokens instead of skipping them; the parser
+  attaches them to the following item (file-header blocks
+  become the module doc). `//` stays a plain comment.
+  Rationale over `@doc("...")` (which would need no
+  compiler work): prose belongs in comments, not escaped
+  string arguments — and 1268 `//` lines already document
+  the stdlib in place.
+- Scope is the full job, not the tool alone: the stdlib's
+  existing per-item `//` prose migrates to `///`
+  mechanically (252 top-level fns, 49 structs, 31 files;
+  file headers become `//!`), because `toto doc` over an
+  undocumented tree would only prove signatures. The
+  migration is comment-only and behavior-neutral by
+  construction (comments never reach the checker).
+- `toto fmt` preserves `///`/`//!` verbatim in place (no
+  prose reflow). This is load-bearing: today `toto fmt`
+  drops ALL comments, which would delete the docs on first
+  format. The formatter change is covered by fmt golden
+  tests showing round-trip fidelity.
+- Output: one Markdown file per stdlib module plus an
+  index, mirroring `docs/`; signatures with types plus the
+  migrated prose; golden-tested text output. No new
+  dependencies, no hosted site (per brief non-goals).
+- LSP interaction resolved: the doc-comment convention
+  lives in the compiler pipeline (lexer → AST → fmt);
+  `docs/lsp.md`'s "no notion of comments" stands unchanged
+  this wave — hover does not render doc prose. (Surfacing
+  docs on hover is an explicit named follow-up, not silent
+  scope.)
+
+Acceptance: `///`/`//!` lexed, attached, and
+fmt-preserved (golden round-trip); `toto doc` renders the
+full `gzv.std` surface including migrated prose;
+per-module Markdown golden-tested; the convention recorded
+here. Non-goals: a hosted site, versioned publishing
+(registry work is Phase 7).
 
 ## Wave gates (no merge until all green)
 
