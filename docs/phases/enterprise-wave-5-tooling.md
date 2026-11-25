@@ -379,6 +379,24 @@ Implementation record — reference-client proof (2026-11-25):
   triggers a fresh run that exercises clippy, the full
   suite, and the new lint gate for the first time; its
   outcome belongs in the next record, not here.
+- Follow-up (same night): that fresh run's check failed on
+  four `clippy -D warnings` errors, all in the new
+  `lint.rs` (collapsible_if, type_complexity,
+  reserve_after_initialization, too_many_arguments on the
+  9-arg need-check). The local toolchain (1.87) cannot run
+  this clippy at all (edition-2024 let-chains do not
+  compile), so these were diagnosed purely from the CI log
+  and fixed by restructuring, not suppression
+  (let-chain collapse, a `DeclEntry` alias,
+  `Vec::with_capacity`, a `NeedCtx` struct). Two more
+  narrowing casts (`usize as u32` in the LSP span helpers)
+  were fixed preemptively in the same commit
+  (`u32::try_from(...).expect(...)` helper); `&mut Vec`
+  params and glob imports were left alone — the codebase
+  passes CI clippy with both idioms all over it. The
+  `toto-cli` half of the new code has still never been
+  through CI clippy (the lib failure gates it); the next
+  run is the first full crossing.
 
 ## Stage 3 — coverage (DESIGN APPROVED 2026-11-25; no code yet)
 
