@@ -427,6 +427,13 @@ pub fn serve() -> std::process::ExitCode {
                     ("referencesProvider".to_string(), J::Bool(true)),
                     ("renameProvider".to_string(), J::Bool(true)),
                     (
+                        "completionProvider".to_string(),
+                        J::Obj(vec![(
+                            "triggerCharacters".to_string(),
+                            J::Arr(vec![J::Str(".".to_string())]),
+                        )]),
+                    ),
+                    (
                         "textDocumentSync".to_string(),
                         J::Obj(vec![
                             ("openClose".to_string(), J::Bool(true)),
@@ -543,6 +550,12 @@ pub fn serve() -> std::process::ExitCode {
                             send_message(&mut out, &error_response(&id, code, &message));
                         }
                     }
+                }
+            }
+            "textDocument/completion" => {
+                let result = completion_at(&docs, &params);
+                if has_id {
+                    send_message(&mut out, &result_response(&id, result));
                 }
             }
             _ => {
@@ -2383,6 +2396,585 @@ fn valid_rename_name(name: &str) -> bool {
         _ => return false,
     }
     name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `textDocument/completion`: names in scope at the cursor —
+/// visible locals and parameters, project globals, builtins, and
+/// keywords — or, after `name.`, the struct's fields when the base
+/// type is known from the checked program. Positions are UTF-16;
+/// the text edit replaces the typed prefix. An empty list means
+/// "no suggestions" (unknown base, inside strings/comments).
+fn completion_at(docs: &HashMap<String, OpenDoc>, params: &J) -> J {
+    let (uri, line, character) = doc_position(params);
+    let Some(doc) = docs.get(&uri) else {
+        return J::Null;
+    };
+    // Current line text and the cursor's byte index within it.
+    let line_text: &str = doc.text.lines().nth(line as usize).unwrap_or("");
+    let mut col = 0u64;
+    let mut line_off = 0usize;
+    for (i, ch) in line_text.char_indices() {
+        if col >= character {
+            break;
+        }
+        col += ch.len_utf16() as u64;
+        line_off = i + ch.len_utf8();
+    }
+    let before = &line_text[..line_off.min(line_text.len())];
+    // Inside a string literal or comment: no suggestions.
+    if before.matches('"').count() % 2 == 1 || before.contains("//") {
+        return J::Arr(vec![]);
+    }
+    // Identifier prefix immediately before the cursor (ASCII, so
+    // bytes and UTF-16 units coincide).
+    let mut prefix_start = before.len();
+    while prefix_start > 0
+        && (before.as_bytes()[prefix_start - 1].is_ascii_alphanumeric()
+            || before.as_bytes()[prefix_start - 1] == b'_')
+    {
+        prefix_start -= 1;
+    }
+    let prefix = &before[prefix_start..];
+    let prefix_col = character - (before.len() - prefix_start) as u64;
+    // A `base.` immediately before the prefix means member position.
+    let member_base = before[..prefix_start].strip_suffix('.').and_then(|r| {
+        let mut s = r.len();
+        while s > 0 && (r.as_bytes()[s - 1].is_ascii_alphanumeric() || r.as_bytes()[s - 1] == b'_')
+        {
+            s -= 1;
+        }
+        let base = &r[s..];
+        let first = base.as_bytes().first().copied().unwrap_or(b'0');
+        if base.is_empty() || !(first.is_ascii_alphabetic() || first == b'_') {
+            None
+        } else {
+            Some(base.to_string())
+        }
+    });
+    let mut items: Vec<J> = Vec::new();
+    let mut push = |label: &str, kind: i64, detail: &str, sort: &str| {
+        items.push(complete_item(
+            label, kind, detail, sort, line, prefix_col, character,
+        ));
+    };
+    // The working program: the open buffer, or — for a member
+    // position, where a trailing dot never parses — the buffer with
+    // a synthetic placeholder at the cursor (spans before the
+    // cursor are unaffected). Anything else unparseable yields no
+    // items.
+    let program = match parse_buffer(&doc.text) {
+        Some(program) => program,
+        None => {
+            if member_base.is_none() {
+                return J::Arr(vec![]);
+            }
+            let cursor_off = position_to_offset(&doc.text, line, character);
+            let mut synthetic = doc.text.clone();
+            synthetic.insert_str(cursor_off.min(synthetic.len()), "__complete");
+            match parse_buffer(&synthetic) {
+                Some(program) => program,
+                None => return J::Arr(vec![]),
+            }
+        }
+    };
+    if let Some(base) = member_base {
+        // Member position: the base type from its declaration —
+        // an annotated type or a struct-literal initializer.
+        let cursor_off = position_to_offset(&doc.text, line, character);
+        let base_start = cursor_off.saturating_sub(prefix.len() + 1 + base.len());
+        if let Some(struct_name) = base_struct_name(&program, &base, base_start) {
+            // Entry file first (the working program, not the stale
+            // reload snapshot), then the rest of the project.
+            let entry_display = doc_display(doc);
+            let mut others: Vec<toto_compiler::ast::Program> = Vec::new();
+            for (display, src) in &doc.file_srcs {
+                if display == &entry_display {
+                    continue;
+                }
+                if let Some(prog) = parse_buffer(src) {
+                    others.push(prog);
+                }
+            }
+            let mut found: Option<Vec<(String, String)>> = None;
+            'files: for prog in std::iter::once(&program).chain(others.iter()) {
+                for item in &prog.items {
+                    if let ItemKind::Struct(decl) = &item.kind
+                        && decl.name == struct_name
+                    {
+                        found = Some(
+                            decl.fields
+                                .iter()
+                                .map(|f| (f.name.clone(), ty_text(&f.ty)))
+                                .collect(),
+                        );
+                        break 'files;
+                    }
+                }
+            }
+            if let Some(fields) = found {
+                for (name, ty) in fields {
+                    push(&name, 5, &format!("field: {ty}"), &format!("0_{name}"));
+                }
+            }
+        }
+        return J::Arr(items);
+    }
+    // Unqualified position: visible locals first, then globals,
+    // builtins, keywords.
+    let off = position_to_offset(&doc.text, line, character);
+    let mut seen: HashSet<String> = HashSet::new();
+    for (name, _span, is_param) in visible_locals(&program, off) {
+        if seen.insert(name.clone()) {
+            push(
+                &name,
+                6,
+                if is_param { "parameter" } else { "local" },
+                &format!("0_{name}"),
+            );
+        }
+    }
+    let walked = walk_project(doc);
+    let mut globals: Vec<(String, i64, String)> = Vec::new();
+    for (_, _, w) in &walked {
+        for d in &w.decls {
+            let (kind, detail) = match d.kind {
+                DeclKind::Func | DeclKind::MigrateFn => (3, "function".to_string()),
+                DeclKind::Struct => (22, "struct".to_string()),
+                DeclKind::Extern => (3, "extern".to_string()),
+                DeclKind::State => (6, "state".to_string()),
+                DeclKind::StructField => continue,
+            };
+            if seen.insert(d.name.clone()) {
+                globals.push((d.name.clone(), kind, detail));
+            }
+        }
+    }
+    globals.sort();
+    for (name, kind, detail) in globals {
+        push(&name, kind, &detail, &format!("1_{name}"));
+    }
+    for builtin in toto_compiler::builtins::BUILTIN_NAMES {
+        if seen.insert(builtin.to_string()) {
+            let detail = builtin_doc(builtin).unwrap_or("builtin");
+            push(builtin, 3, detail, &format!("2_{builtin}"));
+        }
+    }
+    for keyword in [
+        "fn", "let", "mut", "if", "else", "while", "for", "in", "return", "break", "continue",
+        "struct", "go", "select", "chan", "defer", "close", "unsafe", "extern", "import", "match",
+        "true", "false",
+    ] {
+        if seen.insert(keyword.to_string()) {
+            push(keyword, 14, "keyword", &format!("3_{keyword}"));
+        }
+    }
+    J::Arr(items)
+}
+
+/// One completion item with a prefix-replacing text edit.
+fn complete_item(
+    label: &str,
+    kind: i64,
+    detail: &str,
+    sort: &str,
+    line: u64,
+    start: u64,
+    end: u64,
+) -> J {
+    J::Obj(vec![
+        ("label".to_string(), J::Str(label.to_string())),
+        ("kind".to_string(), J::Num(kind)),
+        ("detail".to_string(), J::Str(detail.to_string())),
+        ("sortText".to_string(), J::Str(sort.to_string())),
+        (
+            "textEdit".to_string(),
+            J::Obj(vec![
+                (
+                    "range".to_string(),
+                    J::Obj(vec![
+                        ("start".to_string(), pos_json(line, start)),
+                        ("end".to_string(), pos_json(line, end)),
+                    ]),
+                ),
+                ("newText".to_string(), J::Str(label.to_string())),
+            ]),
+        ),
+    ])
+}
+
+/// Struct name behind a member-access base: the declaration the
+/// base name resolves to must carry an annotated struct type or a
+/// struct-literal initializer. Anything else (call results, loop
+/// variables, unresolvable names) yields nothing — member
+/// completion without a proven struct would suggest wrong fields.
+fn base_struct_name(
+    program: &toto_compiler::ast::Program,
+    base: &str,
+    base_start: usize,
+) -> Option<String> {
+    let mut walk = RefWalk::default();
+    walk.collect_program(program);
+    let decl = walk.vars.iter().find_map(|u| {
+        if u.name == base && u.span.start as usize == base_start {
+            u.local_decl
+        } else {
+            None
+        }
+    })?;
+    find_decl_struct(program, &decl)
+}
+
+/// Struct name from a declaration site: annotated `Named` type or
+/// struct-literal initializer. Parameters, lets, and closure
+/// params qualify; loop and select bindings carry no type shape.
+fn find_decl_struct(program: &toto_compiler::ast::Program, decl: &Span) -> Option<String> {
+    fn named_ty(ty: &toto_compiler::ast::Type) -> Option<String> {
+        match &ty.kind {
+            toto_compiler::ast::TypeKind::Named { name, .. } => Some(name.clone()),
+            _ => None,
+        }
+    }
+    fn in_block(block: &toto_compiler::ast::Block, decl: &Span) -> Option<Option<String>> {
+        // Some(found) unambiguous; Some(None) means "declared here
+        // but shapeless" — stop searching, the inner binding wins.
+        for stmt in &block.stmts {
+            match &stmt.node {
+                toto_compiler::ast::StmtKind::Let {
+                    name_span,
+                    ty,
+                    value,
+                    ..
+                } => {
+                    if name_span == decl {
+                        let shaped = ty
+                            .as_ref()
+                            .and_then(named_ty)
+                            .or_else(|| match &value.node {
+                                toto_compiler::ast::ExprKind::StructLit { name, .. } => {
+                                    Some(name.clone())
+                                }
+                                _ => None,
+                            });
+                        return Some(shaped);
+                    }
+                    if let Some(found) = in_expr(value, decl) {
+                        return Some(found);
+                    }
+                }
+                toto_compiler::ast::StmtKind::For { body, .. }
+                | toto_compiler::ast::StmtKind::While { body, .. }
+                | toto_compiler::ast::StmtKind::Go { body } => {
+                    if let Some(found) = in_block(body, decl) {
+                        return Some(found);
+                    }
+                }
+                toto_compiler::ast::StmtKind::Select { cases, default } => {
+                    for case in cases {
+                        let body = match case {
+                            toto_compiler::ast::SelectCase::Recv { body, .. }
+                            | toto_compiler::ast::SelectCase::Send { body, .. } => body,
+                        };
+                        if let Some(found) = in_block(body, decl) {
+                            return Some(found);
+                        }
+                    }
+                    if let Some(body) = default
+                        && let Some(found) = in_block(body, decl)
+                    {
+                        return Some(found);
+                    }
+                }
+                toto_compiler::ast::StmtKind::Expr(e)
+                | toto_compiler::ast::StmtKind::Return(e)
+                | toto_compiler::ast::StmtKind::Assign { value: e, .. } => {
+                    if let Some(found) = in_expr(e, decl) {
+                        return Some(found);
+                    }
+                }
+                toto_compiler::ast::StmtKind::Break | toto_compiler::ast::StmtKind::Continue => {}
+            }
+        }
+        if let Some(tail) = &block.tail {
+            return in_expr(tail, decl);
+        }
+        None
+    }
+    fn in_expr(expr: &toto_compiler::ast::Expr, decl: &Span) -> Option<Option<String>> {
+        match &expr.node {
+            toto_compiler::ast::ExprKind::Closure { params, body, .. } => {
+                for p in params {
+                    if &p.name_span == decl {
+                        return Some(named_ty(&p.ty));
+                    }
+                }
+                in_block(body, decl)
+            }
+            toto_compiler::ast::ExprKind::If {
+                cond,
+                then_b,
+                else_b,
+            } => in_expr(cond, decl)
+                .or_else(|| in_block(then_b, decl))
+                .or_else(|| else_b.as_ref().and_then(|b| in_block(b, decl))),
+            _ => expr_children(expr)
+                .into_iter()
+                .find_map(|e| in_expr(e, decl)),
+        }
+    }
+    fn expr_children<'a>(expr: &'a toto_compiler::ast::Expr) -> Vec<&'a toto_compiler::ast::Expr> {
+        use toto_compiler::ast::ExprKind::*;
+        match &expr.node {
+            Call { callee, args } => {
+                let mut out = vec![callee.as_ref()];
+                out.extend(args.iter());
+                out
+            }
+            StructLit { fields, .. } => fields.iter().map(|(_, v, _)| v).collect(),
+            Array(items) => items.iter().collect(),
+            Range(a, b)
+            | Binary {
+                left: a, right: b, ..
+            }
+            | Index { base: a, index: b } => {
+                vec![a.as_ref(), b.as_ref()]
+            }
+            Field { base, .. }
+            | Unary { expr: base, .. }
+            | Question(base)
+            | Recv { chan: base } => {
+                vec![base.as_ref()]
+            }
+            Send { chan, value } => vec![chan.as_ref(), value.as_ref()],
+            ChanNew { cap, .. } => cap.iter().map(|c| c.as_ref()).collect(),
+            If { .. } | Closure { .. } => vec![],
+            Ok(x) | Err(x) | Some(x) => vec![x.as_ref()],
+            Int(_) | Float(_) | Str(_) | Bool(_) | Unit | None | Var(_) => vec![],
+        }
+    }
+    for item in &program.items {
+        let (params, body) = match &item.kind {
+            ItemKind::Fn(decl) => (&decl.params, &decl.body),
+            ItemKind::Migrate(decl) => (&decl.func.params, &decl.func.body),
+            _ => continue,
+        };
+        for p in params {
+            if &p.name_span == decl {
+                return named_ty(&p.ty);
+            }
+        }
+        if let Some(found) = in_block(body, decl) {
+            return found;
+        }
+    }
+    None
+}
+
+/// Local bindings (and parameters) visible at `off`: name, span,
+/// is-parameter. Mirrors `resolve_*` scoping: statements starting
+/// after the cursor are not walked, so later bindings — and
+/// bindings in untaken branches — never leak in.
+fn visible_locals(program: &toto_compiler::ast::Program, off: usize) -> Vec<(String, Span, bool)> {
+    for item in &program.items {
+        if !span_contains(&item.span, off) {
+            continue;
+        }
+        let (params, body) = match &item.kind {
+            ItemKind::Fn(decl) => (&decl.params, &decl.body),
+            ItemKind::Migrate(decl) => (&decl.func.params, &decl.func.body),
+            _ => continue,
+        };
+        let mut out = Vec::new();
+        for p in params {
+            out.push((p.name.clone(), p.name_span, true));
+        }
+        collect_visible_block(body, off, &mut out);
+        // Innermost first, then dedupe by name (shadowing wins).
+        out.reverse();
+        let mut seen = HashSet::new();
+        out.retain(|(name, _, _)| seen.insert(name.clone()));
+        out.reverse();
+        return out;
+    }
+    Vec::new()
+}
+
+#[allow(clippy::too_many_lines)]
+fn collect_visible_block(
+    block: &toto_compiler::ast::Block,
+    off: usize,
+    out: &mut Vec<(String, Span, bool)>,
+) {
+    for stmt in &block.stmts {
+        if stmt.span.start as usize > off {
+            break;
+        }
+        match &stmt.node {
+            toto_compiler::ast::StmtKind::Let {
+                name,
+                name_span,
+                ty: _,
+                is_mut: _,
+                value,
+            } => {
+                collect_visible_expr(value, off, out);
+                if !span_contains(&value.span, off) {
+                    out.push((name.clone(), *name_span, false));
+                }
+            }
+            toto_compiler::ast::StmtKind::Assign { target, value } => {
+                match target {
+                    toto_compiler::ast::AssignTarget::Var(..) => {}
+                    toto_compiler::ast::AssignTarget::Field(base, ..)
+                    | toto_compiler::ast::AssignTarget::Index(base, ..) => {
+                        collect_visible_expr(base, off, out);
+                    }
+                }
+                if let toto_compiler::ast::AssignTarget::Index(_, index, _) = target {
+                    collect_visible_expr(index, off, out);
+                }
+                collect_visible_expr(value, off, out);
+            }
+            toto_compiler::ast::StmtKind::Expr(e) | toto_compiler::ast::StmtKind::Return(e) => {
+                collect_visible_expr(e, off, out)
+            }
+            toto_compiler::ast::StmtKind::Break | toto_compiler::ast::StmtKind::Continue => {}
+            toto_compiler::ast::StmtKind::While { cond, body } => {
+                collect_visible_expr(cond, off, out);
+                if span_contains(&body.span, off) {
+                    collect_visible_block(body, off, out);
+                }
+            }
+            toto_compiler::ast::StmtKind::For {
+                name,
+                name_span,
+                iter,
+                body,
+            } => {
+                collect_visible_expr(iter, off, out);
+                if span_contains(&body.span, off) {
+                    out.push((name.clone(), *name_span, false));
+                    collect_visible_block(body, off, out);
+                }
+            }
+            toto_compiler::ast::StmtKind::Go { body } => {
+                if span_contains(&body.span, off) {
+                    collect_visible_block(body, off, out);
+                }
+            }
+            toto_compiler::ast::StmtKind::Select { cases, default } => {
+                for case in cases {
+                    match case {
+                        toto_compiler::ast::SelectCase::Recv { name, chan, body } => {
+                            collect_visible_expr(chan, off, out);
+                            if span_contains(&body.span, off) {
+                                if let Some((n, s)) = name {
+                                    out.push((n.clone(), *s, false));
+                                }
+                                collect_visible_block(body, off, out);
+                            }
+                        }
+                        toto_compiler::ast::SelectCase::Send { chan, value, body } => {
+                            collect_visible_expr(chan, off, out);
+                            collect_visible_expr(value, off, out);
+                            if span_contains(&body.span, off) {
+                                collect_visible_block(body, off, out);
+                            }
+                        }
+                    }
+                }
+                if let Some(body) = default
+                    && span_contains(&body.span, off)
+                {
+                    collect_visible_block(body, off, out);
+                }
+            }
+        }
+    }
+    if let Some(tail) = &block.tail
+        && span_contains(&tail.span, off)
+    {
+        collect_visible_expr(tail, off, out);
+    }
+}
+
+fn collect_visible_expr(
+    expr: &toto_compiler::ast::Expr,
+    off: usize,
+    out: &mut Vec<(String, Span, bool)>,
+) {
+    if !span_contains(&expr.span, off) {
+        return;
+    }
+    match &expr.node {
+        toto_compiler::ast::ExprKind::Closure { params, body, .. } => {
+            for p in params {
+                out.push((p.name.clone(), p.name_span, true));
+            }
+            collect_visible_block(body, off, out);
+        }
+        toto_compiler::ast::ExprKind::If {
+            cond,
+            then_b,
+            else_b,
+        } => {
+            collect_visible_expr(cond, off, out);
+            if span_contains(&then_b.span, off) {
+                collect_visible_block(then_b, off, out);
+            }
+            if let Some(else_b) = else_b
+                && span_contains(&else_b.span, off)
+            {
+                collect_visible_block(else_b, off, out);
+            }
+        }
+        toto_compiler::ast::ExprKind::StructLit { fields, .. } => {
+            for (_, value, _) in fields {
+                collect_visible_expr(value, off, out);
+            }
+        }
+        toto_compiler::ast::ExprKind::Call { callee, args } => {
+            collect_visible_expr(callee, off, out);
+            for arg in args {
+                collect_visible_expr(arg, off, out);
+            }
+        }
+        toto_compiler::ast::ExprKind::Array(items) => {
+            for item in items {
+                collect_visible_expr(item, off, out);
+            }
+        }
+        toto_compiler::ast::ExprKind::Range(a, b)
+        | toto_compiler::ast::ExprKind::Binary {
+            left: a, right: b, ..
+        }
+        | toto_compiler::ast::ExprKind::Index { base: a, index: b } => {
+            collect_visible_expr(a, off, out);
+            collect_visible_expr(b, off, out);
+        }
+        toto_compiler::ast::ExprKind::Field { base, .. } => collect_visible_expr(base, off, out),
+        toto_compiler::ast::ExprKind::Unary { expr, .. } => collect_visible_expr(expr, off, out),
+        toto_compiler::ast::ExprKind::Question(inner) => collect_visible_expr(inner, off, out),
+        toto_compiler::ast::ExprKind::Recv { chan } => collect_visible_expr(chan, off, out),
+        toto_compiler::ast::ExprKind::ChanNew { cap, .. } => {
+            if let Some(cap) = cap {
+                collect_visible_expr(cap, off, out);
+            }
+        }
+        toto_compiler::ast::ExprKind::Ok(inner)
+        | toto_compiler::ast::ExprKind::Err(inner)
+        | toto_compiler::ast::ExprKind::Some(inner) => collect_visible_expr(inner, off, out),
+        toto_compiler::ast::ExprKind::Send { chan, value } => {
+            collect_visible_expr(chan, off, out);
+            collect_visible_expr(value, off, out);
+        }
+        toto_compiler::ast::ExprKind::Int(_)
+        | toto_compiler::ast::ExprKind::Float(_)
+        | toto_compiler::ast::ExprKind::Str(_)
+        | toto_compiler::ast::ExprKind::Bool(_)
+        | toto_compiler::ast::ExprKind::Unit
+        | toto_compiler::ast::ExprKind::None
+        | toto_compiler::ast::ExprKind::Var(_) => {}
+    }
 }
 
 fn doc_position(params: &J) -> (String, u64, u64) {

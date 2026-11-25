@@ -555,6 +555,134 @@ fn lsp_rename_local_shadowing_capture_refused() {
     assert!(status.success(), "lsp exit: {status:?}");
 }
 
+fn complete_request(uri: &str, line: u64, character: u64) -> String {
+    format!(
+        "{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":{line},\"character\":{character}}}}}"
+    )
+}
+
+#[test]
+fn lsp_completion_capability_advertised() {
+    let mut s = Session::start();
+    let init = s.request("initialize", "{\"capabilities\":{}}");
+    assert!(init.contains("\"completionProvider\""), "caps: {init}");
+    assert!(init.contains("\".\""), "trigger: {init}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
+#[test]
+fn lsp_completion_unqualified() {
+    let src = "fn helper(x: int) -> int {\n    return x;\n}\nfn main() -> int {\n    let m = 1;\n    let n = m + 2;\n    println(n);\n    return 0;\n}\n";
+    let uri = "file:///tmp/toto-lsp-complete-main.gzv";
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(uri, src));
+    for _ in 0..2 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") {
+            break;
+        }
+    }
+    // End of line 5 (`    let n = m + 2;`): visible locals m and n,
+    // globals, builtins, keywords. helper's `x` must not leak in.
+    let res = s.request("textDocument/completion", &complete_request(uri, 5, 18));
+    assert!(res.contains("\"label\":\"m\""), "local: {res}");
+    assert!(res.contains("\"label\":\"n\""), "local: {res}");
+    assert!(res.contains("\"detail\":\"local\""), "detail: {res}");
+    assert!(res.contains("\"label\":\"helper\""), "global: {res}");
+    assert!(res.contains("\"label\":\"main\""), "global: {res}");
+    assert!(res.contains("\"label\":\"println\""), "builtin: {res}");
+    assert!(
+        res.contains("print a value with a trailing newline"),
+        "doc: {res}"
+    );
+    assert!(res.contains("\"label\":\"return\""), "keyword: {res}");
+    assert!(!res.contains("\"label\":\"x\""), "shadow leak: {res}");
+    // The text edit replaces the (empty) typed prefix.
+    assert!(
+        res.contains("\"range\":{\"start\":{\"line\":5,\"character\":18}"),
+        "range: {res}"
+    );
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
+#[test]
+fn lsp_completion_member_from_literal() {
+    let src = "struct Pt { x: int, y: int }\nfn main() -> int {\n    let p = Pt { x: 1, y: 2 };\n    println(p.);\n    return 0;\n}\n";
+    let uri = "file:///tmp/toto-lsp-complete-lit.gzv";
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(uri, src));
+    for _ in 0..2 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") {
+            break;
+        }
+    }
+    // After `p.` (line 3, col 14): the struct's fields with types.
+    let res = s.request("textDocument/completion", &complete_request(uri, 3, 14));
+    assert!(res.contains("\"label\":\"x\""), "field: {res}");
+    assert!(res.contains("\"label\":\"y\""), "field: {res}");
+    assert!(res.contains("\"detail\":\"field: int\""), "type: {res}");
+    assert!(res.contains("\"kind\":5"), "kind: {res}");
+    assert!(
+        res.contains("\"range\":{\"start\":{\"line\":3,\"character\":14},\"end\":{\"line\":3,\"character\":14}}"),
+        "range: {res}"
+    );
+    // Non-member position in the same broken file yields nothing.
+    let res = s.request("textDocument/completion", &complete_request(uri, 2, 4));
+    assert!(res.contains("\"result\":[]"), "broken: {res}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
+#[test]
+fn lsp_completion_member_from_annotation() {
+    let src = "struct Pt { x: int, y: int }\nfn show(q: Pt) -> int {\n    println(q.);\n    return 0;\n}\n";
+    let uri = "file:///tmp/toto-lsp-complete-ann.gzv";
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(uri, src));
+    for _ in 0..2 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") {
+            break;
+        }
+    }
+    // `q` carries an annotated struct type: fields offered.
+    let res = s.request("textDocument/completion", &complete_request(uri, 2, 14));
+    assert!(res.contains("\"label\":\"x\""), "field: {res}");
+    assert!(res.contains("\"label\":\"y\""), "field: {res}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
+#[test]
+fn lsp_completion_member_unknown_empty() {
+    let src = "fn main() -> int {\n    println(q.);\n    return 0;\n}\n";
+    let uri = "file:///tmp/toto-lsp-complete-unknown.gzv";
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(uri, src));
+    for _ in 0..2 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") {
+            break;
+        }
+    }
+    // Unknown base: no suggestions rather than wrong ones.
+    let res = s.request("textDocument/completion", &complete_request(uri, 1, 14));
+    assert!(res.contains("\"result\":[]"), "unknown: {res}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
 #[test]
 fn lsp_positions_are_utf16() {
     // 𝕩 is 1 scalar but 2 UTF-16 units: the `e` use sits at UTF-16

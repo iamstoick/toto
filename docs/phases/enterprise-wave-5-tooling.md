@@ -7,8 +7,8 @@ settled decision.
 
 Status: STAGE 0 VERIFIED (run #118 green on the starting
 tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI);
-STAGE 2 PARTIAL: references + rename + UTF-16 columns
-implemented (completion next).
+STAGE 2 PARTIAL: references + rename + completion + UTF-16
+implemented (code actions next, then the editor proof).
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -285,6 +285,32 @@ Implementation record — rename (completion next):
   fn, field name-span edits, 5 refusal kinds, local→global
   capture); 13/13 `lsp` tests green. Neighbors unchanged
   (same `cli` 13/5); `fmt` clean; zero new warnings.
+
+Implementation record — completion (code actions next):
+- `textDocument/completion` with `triggerCharacters: ["."]`:
+  unqualified names in scope (visible locals + params,
+  project globals, builtins, keywords) with kind, detail,
+  sortText, and prefix-replacing UTF-16 text edits; member
+  position (`base.`) offers the struct's fields with
+  `field: Type` details. Unknown base, strings, and comments
+  yield `[]`, never wrong items.
+- Member types come from declarations, not inference:
+  annotated struct types and struct-literal initializers
+  (both AST-only, so completion works on broken files).
+  A trailing dot never parses, so a synthetic placeholder
+  is inserted at the cursor for parsing only (spans before
+  the cursor are unaffected). Call results, loop variables,
+  and unresolvable bases yield nothing — documented, not
+  guessed.
+- Scope discipline mirrors `resolve_*`: statements starting
+  after the cursor are not walked, so later bindings and
+  untaken-branch bindings never leak in (dedup keeps the
+  innermost binding on shadowing).
+- Tests: 5 new protocol tests (unqualified incl. shadow
+  exclusion, member from literal and from annotation, unknown
+  base empty, capability); 18/18 `lsp` tests green.
+  Neighbors unchanged (same `cli` 13/5); `fmt` clean; zero
+  new warnings.
 
 ## Stage 3 — coverage
 
