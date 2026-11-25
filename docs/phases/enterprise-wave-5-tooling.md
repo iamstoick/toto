@@ -334,6 +334,21 @@ Implementation record — code actions (editor proof next):
   Neighbors unchanged (same `cli` 13/5); `fmt` clean; zero
   new warnings. `codeActionProvider` advertised.
 
+# Dated addendum — CI on the Stage 1 tree (2026-11-25, on main; append-only)
+- Run 45553139355 (#119, head 83952b6): check FAILED on one
+  `cargo fmt --check` hunk in `lint.rs` (the local rustfmt
+  1.87 wrapped a line the CI toolchain keeps joined);
+  everything else in the gate did not run (`set -eu` stops
+  at the first failure). Diagnosis from the CI log (fetched
+  with `gh`, no 403 this time). Fixed in place in commit
+  09bf9db (`Wave 5 Stage 1: match CI rustfmt...`): the exact
+  CI-requested shape, verified byte-identical against the
+  logged diff. Windows probe failed informationally as usual
+  (net-FFI mir_conform, continue-on-error). This commit
+  triggers a fresh run that exercises clippy, the full
+  suite, and the new lint gate for the first time; its
+  outcome belongs in the next record, not here.
+
 ## Stage 3 — coverage
 
 Goal: statement/branch coverage for `.gzv` programs with a
