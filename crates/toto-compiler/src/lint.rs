@@ -803,7 +803,7 @@ mod tests {
                 .unwrap_or(file)
                 .to_string_lossy()
                 .into_owned();
-            if excluded.iter().any(|e| rel == *e) {
+            if excluded.contains(&rel) {
                 continue;
             }
             // Known error-goldens are not style-clean exemplars.

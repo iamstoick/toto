@@ -408,6 +408,14 @@ Implementation record — reference-client proof (2026-11-25):
   `toto-cli` half of the new code has still never been
   through CI clippy (the lib failure gates it); the next
   run is the first full crossing.
+- Same run, second layer (found after pushing the fix):
+  `manual_contains` in a lint unit test
+  (`excluded.iter().any(|e| rel == *e)` → `contains`).
+  toto-cli's new code remains unverified by clippy; the
+  patterns used match pre-existing passing code
+  (`&mut Vec` params, fully-qualified paths, `expect` in
+  tests), and narrowing casts were preempted with a
+  `u32::try_from(...).expect(...)` helper.
 - Second follow-up (same night): that run cleared clippy
   but failed `fmt --check` on two hunks my own reflow had
   introduced (a joined method chain the local 1.87 rustfmt
