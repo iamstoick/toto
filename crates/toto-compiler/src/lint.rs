@@ -66,8 +66,7 @@ fn unreachable_in_block(block: &Block, out: &mut Vec<Diag>) {
     if dead && let Some(tail) = &block.tail {
         out.push(Diag::new(
             "E0501",
-            "unreachable expression: a previous statement in this block always exits"
-                .to_string(),
+            "unreachable expression: a previous statement in this block always exits".to_string(),
             tail.span,
             Some("remove it".to_string()),
         ));
@@ -526,7 +525,9 @@ impl NeedCtx<'_> {
         }
         if self.effect[idx]
             || self.fns[idx].iter().any(|n| self.referenced.contains(n))
-            || self.structs[idx].iter().any(|n| self.referenced.contains(n))
+            || self.structs[idx]
+                .iter()
+                .any(|n| self.referenced.contains(n))
         {
             self.memo.insert(idx, true);
             return true;
