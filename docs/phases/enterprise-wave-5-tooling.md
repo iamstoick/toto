@@ -408,6 +408,15 @@ Implementation record — reference-client proof (2026-11-25):
   `toto-cli` half of the new code has still never been
   through CI clippy (the lib failure gates it); the next
   run is the first full crossing.
+- Second follow-up (same night): that run cleared clippy
+  but failed `fmt --check` on two hunks my own reflow had
+  introduced (a joined method chain the local 1.87 rustfmt
+  keeps split, and a split chain it keeps joined — the two
+  versions disagree on chains around long lines) in commit
+  `a2494e8`, applied byte-identical from the CI diff. The
+  pattern is now clear: local rustfmt 1.87 is advisory
+  only; CI's log is the formatter of record until the
+  toolchain is upgraded.
 
 ## Stage 3 — coverage (DESIGN APPROVED 2026-11-25; no code yet)
 
