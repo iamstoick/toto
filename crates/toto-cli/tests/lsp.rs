@@ -683,6 +683,107 @@ fn lsp_completion_member_unknown_empty() {
     assert!(status.success(), "lsp exit: {status:?}");
 }
 
+fn action_request(uri: &str, sl: u64, sc: u64, el: u64, ec: u64) -> String {
+    format!(
+        "{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"range\":{{\"start\":{{\"line\":{sl},\"character\":{sc}}},\"end\":{{\"line\":{el},\"character\":{ec}}}}},\"context\":{{\"diagnostics\":[]}}}}"
+    )
+}
+
+#[test]
+fn lsp_code_action_fixes_and_severity() {
+    // E0502 `unused` (line 1) + E0501 dead statement (line 4).
+    let src = "fn main() -> int {\n    let unused = 1;\n    println(\"hi\");\n    return 0;\n    println(\"dead\");\n}\n";
+    let uri = "file:///tmp/toto-lsp-actions.gzv";
+    let mut s = Session::start();
+    let init = s.request("initialize", "{\"capabilities\":{}}");
+    assert!(init.contains("\"codeActionProvider\""), "caps: {init}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(uri, src));
+    // Lint findings arrive as severity-2 warnings.
+    let mut saw_e0502 = false;
+    for _ in 0..2 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") && msg.contains(uri) {
+            assert!(msg.contains("\"code\":\"E0502\""), "diag: {msg}");
+            assert!(msg.contains("\"severity\":2"), "severity: {msg}");
+            saw_e0502 = true;
+            break;
+        }
+    }
+    assert!(saw_e0502, "no E0502 diagnostic published");
+    // Unreachable statement: whole-line deletion.
+    let res = s.request("textDocument/codeAction", &action_request(uri, 4, 0, 4, 20));
+    assert!(
+        res.contains("\"title\":\"Remove unreachable code\""),
+        "act: {res}"
+    );
+    assert!(res.contains("\"kind\":\"quickfix\""), "act: {res}");
+    assert!(res.contains("\"newText\":\"\""), "act: {res}");
+    assert!(
+        res.contains("\"start\":{\"line\":4,\"character\":0},\"end\":{\"line\":5,\"character\":0}"),
+        "range: {res}"
+    );
+    // Unused binding: underscore prefix, name-only range.
+    let res = s.request("textDocument/codeAction", &action_request(uri, 1, 0, 1, 20));
+    assert!(res.contains("intentionally unused"), "act: {res}");
+    assert!(res.contains("\"newText\":\"_unused\""), "act: {res}");
+    assert!(
+        res.contains(
+            "\"start\":{\"line\":1,\"character\":8},\"end\":{\"line\":1,\"character\":14}"
+        ),
+        "range: {res}"
+    );
+    // Clean line: no actions.
+    let res = s.request("textDocument/codeAction", &action_request(uri, 2, 0, 2, 20));
+    assert!(res.contains("\"result\":[]"), "empty: {res}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
+#[test]
+fn lsp_code_action_removes_unused_import() {
+    let dir = std::env::temp_dir().join("toto-lsp-actions");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).expect("mkdir");
+    std::fs::write(
+        dir.join("lib").join("lib.gzv"),
+        "fn helper() -> int {\n    return 1;\n}\n",
+    )
+    .expect("write lib");
+    let main =
+        "import \"lib/lib.gzv\";\nfn main() -> int {\n    println(\"hi\");\n    return 0;\n}\n";
+    let uri = format!("file://{}/main.gzv", dir.to_string_lossy());
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(&uri, main));
+    for _ in 0..4 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") && msg.contains(&uri) {
+            assert!(msg.contains("\"code\":\"E0503\""), "diag: {msg}");
+            assert!(msg.contains("\"severity\":2"), "severity: {msg}");
+            break;
+        }
+    }
+    // The whole import line is removed.
+    let res = s.request(
+        "textDocument/codeAction",
+        &action_request(&uri, 0, 0, 0, 19),
+    );
+    assert!(
+        res.contains("\"title\":\"Remove unused import\""),
+        "act: {res}"
+    );
+    assert!(res.contains("\"newText\":\"\""), "act: {res}");
+    assert!(
+        res.contains("\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":1,\"character\":0}"),
+        "range: {res}"
+    );
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn lsp_positions_are_utf16() {
     // 𝕩 is 1 scalar but 2 UTF-16 units: the `e` use sits at UTF-16

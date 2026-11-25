@@ -433,6 +433,7 @@ pub fn serve() -> std::process::ExitCode {
                             J::Arr(vec![J::Str(".".to_string())]),
                         )]),
                     ),
+                    ("codeActionProvider".to_string(), J::Bool(true)),
                     (
                         "textDocumentSync".to_string(),
                         J::Obj(vec![
@@ -558,6 +559,12 @@ pub fn serve() -> std::process::ExitCode {
                     send_message(&mut out, &result_response(&id, result));
                 }
             }
+            "textDocument/codeAction" => {
+                let result = code_actions_at(&docs, &params);
+                if has_id {
+                    send_message(&mut out, &result_response(&id, result));
+                }
+            }
             _ => {
                 if has_id {
                     send_message(&mut out, &error_response(&id, -32601, "method not found"));
@@ -579,6 +586,10 @@ struct OpenDoc {
     checked: Option<toto_compiler::hir::CheckedProgram>,
     /// Per-file sources for cross-file jumps: (display path, text).
     file_srcs: Vec<(String, String)>,
+    /// The open file's own lint findings (entry-file spans, buffer
+    /// coordinates): what `publishDiagnostics` reported and what
+    /// code actions offer to fix.
+    lint: Vec<toto_compiler::diag::Diag>,
 }
 
 fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
@@ -600,6 +611,7 @@ impl OpenDoc {
             project: None,
             checked: None,
             file_srcs: Vec::new(),
+            lint: Vec::new(),
         }
     }
 
@@ -609,6 +621,7 @@ impl OpenDoc {
         self.project = None;
         self.checked = None;
         self.file_srcs.clear();
+        self.lint = Vec::new();
         let text = self.text.clone();
         let open_path = self.path.to_string_lossy().into_owned();
         let parent = self
@@ -619,50 +632,93 @@ impl OpenDoc {
         // The open buffer overrides disk; `gzv.std` resolves
         // embedded; anything else reads from disk (relative to the
         // open file's directory, like the CLI).
-        let loaded = toto_compiler::project::load_and_check(
-            &open_path,
-            &text,
-            &|p| {
-                if same_file(p, &open_path) {
-                    return Some(text.clone());
-                }
-                if let Some(src) = toto_compiler::stdlib::get(p) {
-                    return Some(src.to_string());
-                }
-                std::fs::read_to_string(p)
-                    .ok()
-                    .or_else(|| std::fs::read_to_string(parent.join(p)).ok())
-            },
-            &[],
-        );
+        let read = |p: &str| -> Option<String> {
+            if same_file(p, &open_path) {
+                return Some(text.clone());
+            }
+            if let Some(src) = toto_compiler::stdlib::get(p) {
+                return Some(src.to_string());
+            }
+            std::fs::read_to_string(p)
+                .ok()
+                .or_else(|| std::fs::read_to_string(parent.join(p)).ok())
+        };
+        let loaded = toto_compiler::project::load_and_check(&open_path, &text, &read, &[]);
+        // Stage 1 hygiene in the editor: Tier A runs on the open
+        // buffer whenever it parses; Tier B additionally runs over
+        // a successful load. Libraries (missing `main` only) get
+        // Tier A; anything else broken gets check errors only.
+        let mut lint_by_path: HashMap<String, Vec<toto_compiler::diag::Diag>> = HashMap::new();
+        let lint_here = |lint_by_path: &mut HashMap<String, Vec<toto_compiler::diag::Diag>>,
+                         display: &str| {
+            if let Some(program) = parse_buffer(&text) {
+                lint_by_path
+                    .entry(display.to_string())
+                    .or_default()
+                    .extend(toto_compiler::lint::lint_file(&program));
+            }
+        };
         let mut notes = Vec::new();
         match loaded {
             Ok((project, checked)) => {
                 for f in &project.files {
                     self.file_srcs.push((f.path.clone(), f.src.clone()));
                 }
+                let entry = project.files[project.entry].path.clone();
+                lint_here(&mut lint_by_path, &entry);
+                lint_by_path
+                    .entry(entry.clone())
+                    .or_default()
+                    .extend(toto_compiler::lint::unused_imports(&project, &read, &[]));
                 self.checked = Some(checked);
                 self.project = Some(project);
-                // Clean slate for every known file.
+                // Clean slate for check errors; the entry file
+                // additionally carries its lint warnings.
                 for (path, _) in &self.file_srcs.clone() {
-                    notes.push(self.diagnostics_note(path, &[]));
+                    let empty = Vec::new();
+                    let diags = lint_by_path.get(path).unwrap_or(&empty);
+                    notes.push(self.diagnostics_note(path, diags));
                 }
             }
             Err(failed) => {
                 for f in &failed.files {
                     self.file_srcs.push((f.path.clone(), f.src.clone()));
                 }
+                let entry = failed
+                    .files
+                    .first()
+                    .map(|f| f.path.clone())
+                    .unwrap_or_default();
+                let has_own_main = parse_buffer(&text).map_or(false, |program| {
+                    program.items.iter().any(|item| {
+                        matches!(&item.kind, toto_compiler::ast::ItemKind::Fn(d) if d.name == "main")
+                    })
+                });
+                let only_missing_main = !has_own_main
+                    && failed
+                        .errors
+                        .iter()
+                        .flat_map(|fd| fd.diags.iter())
+                        .all(|d| d.code == "E0312");
+                if only_missing_main {
+                    lint_here(&mut lint_by_path, &entry);
+                }
                 let mut by_file: HashMap<usize, Vec<toto_compiler::diag::Diag>> = HashMap::new();
                 for fd in &failed.errors {
                     by_file.entry(fd.file).or_default().extend(fd.diags.clone());
                 }
                 for (idx, (path, _)) in self.file_srcs.clone().into_iter().enumerate() {
-                    let empty = Vec::new();
-                    let diags = by_file.get(&idx).unwrap_or(&empty);
-                    notes.push(self.diagnostics_note(&path, diags));
+                    let mut diags = by_file.get(&idx).cloned().unwrap_or_default();
+                    if let Some(extra) = lint_by_path.get(&path) {
+                        diags.extend(extra.iter().cloned());
+                    }
+                    notes.push(self.diagnostics_note(&path, &diags));
                 }
             }
         }
+        // What `publishDiagnostics` reported for the open file is
+        // what code actions may fix: same set, no recomputation.
+        self.lint = lint_by_path.into_values().next().unwrap_or_default();
         notes
     }
 
@@ -673,23 +729,7 @@ impl OpenDoc {
             .find(|(p, _)| p == file_path)
             .map(|(_, s)| s.clone())
             .unwrap_or_default();
-        let items: Vec<J> = diags
-            .iter()
-            .map(|d| {
-                J::Obj(vec![
-                    (
-                        "range".to_string(),
-                        range_json(&src, d.span.start, d.span.end),
-                    ),
-                    (
-                        "severity".to_string(),
-                        J::Num(if d.code.starts_with('E') { 1 } else { 2 }),
-                    ),
-                    ("code".to_string(), J::Str(d.code.to_string())),
-                    ("message".to_string(), J::Str(d.message.clone())),
-                ])
-            })
-            .collect();
+        let items: Vec<J> = diags.iter().map(|d| diagnostic_json(&src, d)).collect();
         notification(
             "textDocument/publishDiagnostics",
             J::Obj(vec![
@@ -707,6 +747,27 @@ fn same_file(candidate: &str, open: &str) -> bool {
     let norm = |s: &str| s.replace('\\', "/").trim_start_matches("./").to_string();
     let (a, b) = (norm(candidate), norm(open));
     a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
+}
+
+/// One diagnostic as JSON. Lint findings (`E05xx`) are warnings
+/// (severity 2); every other `E` code is an error (severity 1).
+fn diagnostic_json(src: &str, d: &toto_compiler::diag::Diag) -> J {
+    let severity = if d.code.starts_with("E05") {
+        2
+    } else if d.code.starts_with('E') {
+        1
+    } else {
+        2
+    };
+    J::Obj(vec![
+        (
+            "range".to_string(),
+            range_json(src, d.span.start, d.span.end),
+        ),
+        ("severity".to_string(), J::Num(severity)),
+        ("code".to_string(), J::Str(d.code.to_string())),
+        ("message".to_string(), J::Str(d.message.clone())),
+    ])
 }
 
 /// Display paths are relative when under the working directory;
@@ -2975,6 +3036,182 @@ fn collect_visible_expr(
         | toto_compiler::ast::ExprKind::None
         | toto_compiler::ast::ExprKind::Var(_) => {}
     }
+}
+
+/// `textDocument/codeAction`: quick fixes for the open file's
+/// lint findings overlapping the request range. Every fix is
+/// derived from the exact diagnostic the server published: remove
+/// unreachable code (E0501) and unused imports (E0503) delete the
+/// statement line when it stands alone, otherwise just the span;
+/// unused bindings (E0502) are prefixed with `_`. No finding in
+/// range means no actions.
+fn code_actions_at(docs: &HashMap<String, OpenDoc>, params: &J) -> J {
+    let Some(doc) = params
+        .get("textDocument")
+        .and_then(|d| d.get("uri"))
+        .and_then(J::as_str)
+        .and_then(|u| docs.get(u))
+    else {
+        return J::Null;
+    };
+    let (_, start, end) = code_action_range(doc, params);
+    let mut actions = Vec::new();
+    for diag in &doc.lint {
+        let span = diag.span;
+        if span.end as usize <= start || span.start as usize >= end {
+            continue;
+        }
+        let diag_j = diagnostic_json(&doc.text, diag);
+        let edit_for = |s: u32, e: u32, new_text: &str| {
+            let text_edit = J::Obj(vec![
+                ("range".to_string(), range_json(&doc.text, s, e)),
+                ("newText".to_string(), J::Str(new_text.to_string())),
+            ]);
+            let changes = J::Obj(vec![(doc.uri.clone(), J::Arr(vec![text_edit]))]);
+            J::Obj(vec![("changes".to_string(), changes)])
+        };
+        match diag.code {
+            "E0501" => {
+                let (s, e) = line_aware_delete(&doc.text, span);
+                actions.push(J::Obj(vec![
+                    (
+                        "title".to_string(),
+                        J::Str("Remove unreachable code".to_string()),
+                    ),
+                    ("kind".to_string(), J::Str("quickfix".to_string())),
+                    ("diagnostics".to_string(), J::Arr(vec![diag_j])),
+                    ("edit".to_string(), edit_for(s, e, "")),
+                ]));
+            }
+            "E0502" => {
+                let name = doc
+                    .text
+                    .get(span.start as usize..span.end as usize)
+                    .unwrap_or_default();
+                actions.push(J::Obj(vec![
+                    (
+                        "title".to_string(),
+                        J::Str(format!("Mark `{name}` as intentionally unused")),
+                    ),
+                    ("kind".to_string(), J::Str("quickfix".to_string())),
+                    ("diagnostics".to_string(), J::Arr(vec![diag_j])),
+                    (
+                        "edit".to_string(),
+                        edit_for(span.start, span.end, &format!("_{name}")),
+                    ),
+                ]));
+            }
+            "E0503" => {
+                if let Some(stmt) = import_stmt_span(&doc.text, span) {
+                    let (s, e) = line_aware_delete(&doc.text, stmt);
+                    actions.push(J::Obj(vec![
+                        (
+                            "title".to_string(),
+                            J::Str("Remove unused import".to_string()),
+                        ),
+                        ("kind".to_string(), J::Str("quickfix".to_string())),
+                        ("diagnostics".to_string(), J::Arr(vec![diag_j])),
+                        ("edit".to_string(), edit_for(s, e, "")),
+                    ]));
+                }
+            }
+            _ => {}
+        }
+    }
+    J::Arr(actions)
+}
+
+/// Request range for code actions as byte offsets: `params.range`,
+/// with a point `position` fallback. Multi-line ranges cover
+/// through the end of their first line (no fix spans lines).
+/// Out-of-range positions clamp into the start line.
+fn code_action_range(doc: &OpenDoc, params: &J) -> (String, usize, usize) {
+    let (uri, line, character) = doc_position(params);
+    let range = params.get("range");
+    let at = |key: &str| {
+        range
+            .and_then(|r| r.get(key))
+            .and_then(|p| p.get("character"))
+            .and_then(J::as_u64)
+            .unwrap_or(character)
+    };
+    let line_of = |key: &str| {
+        range
+            .and_then(|r| r.get(key))
+            .and_then(|p| p.get("line"))
+            .and_then(J::as_u64)
+            .unwrap_or(line)
+    };
+    let (line_start, line_end) = line_byte_range(&doc.text, line_of("start"));
+    let mut start = position_to_offset(&doc.text, line_of("start"), at("start"));
+    let mut end = if line_of("end") == line_of("start") {
+        position_to_offset(&doc.text, line_of("end"), at("end"))
+    } else {
+        line_end
+    };
+    start = start.clamp(line_start, line_end);
+    end = end.clamp(line_start, line_end).max(start);
+    (uri, start, end)
+}
+
+/// Byte range of one (0-based) line, excluding the newline.
+fn line_byte_range(text: &str, line: u64) -> (usize, usize) {
+    let mut off = 0usize;
+    for (i, part) in text.split('\n').enumerate() {
+        if i as u64 == line {
+            return (off, off + part.len());
+        }
+        off += part.len() + 1;
+    }
+    let end = text.len();
+    (end, end)
+}
+
+/// Expand a span to whole lines when it stands alone on them:
+/// deletion then removes the line, not just the statement text.
+/// Shared-line statements shrink to the span itself.
+fn line_aware_delete(src: &str, span: Span) -> (u32, u32) {
+    let bytes = src.as_bytes();
+    let mut ls = span.start as usize;
+    while ls > 0 && bytes[ls - 1] != b'\n' {
+        ls -= 1;
+    }
+    let mut le = span.end as usize;
+    while le < bytes.len() && bytes[le] != b'\n' {
+        le += 1;
+    }
+    let before_blank = src
+        .get(ls..span.start as usize)
+        .map_or(true, |s| s.trim().is_empty());
+    let after_blank = src
+        .get(span.end as usize..le)
+        .map_or(true, |s| s.trim().is_empty());
+    if before_blank && after_blank {
+        let end = if le < bytes.len() { le + 1 } else { le };
+        (ls as u32, end as u32)
+    } else {
+        (span.start, span.end)
+    }
+}
+
+/// The `import "...";` statement containing an unused-import path.
+fn import_stmt_span(text: &str, path_span: Span) -> Option<Span> {
+    let (tokens, lex_errors) = toto_compiler::lexer::lex(text);
+    if !lex_errors.is_empty() {
+        return None;
+    }
+    let (program, parse_errors) = toto_compiler::parser::parse(tokens, text);
+    if !parse_errors.is_empty() {
+        return None;
+    }
+    program.items.iter().find_map(|item| match &item.kind {
+        toto_compiler::ast::ItemKind::Import(decl)
+            if decl.path_span.start == path_span.start && decl.path_span.end == path_span.end =>
+        {
+            Some(item.span)
+        }
+        _ => None,
+    })
 }
 
 fn doc_position(params: &J) -> (String, u64, u64) {

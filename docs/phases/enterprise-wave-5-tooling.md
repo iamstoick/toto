@@ -7,8 +7,8 @@ settled decision.
 
 Status: STAGE 0 VERIFIED (run #118 green on the starting
 tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI);
-STAGE 2 PARTIAL: references + rename + completion + UTF-16
-implemented (code actions next, then the editor proof).
+STAGE 2 PARTIAL: references + rename + completion + code
+actions + UTF-16 implemented (real-editor proof next).
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -311,6 +311,28 @@ Implementation record — completion (code actions next):
   base empty, capability); 18/18 `lsp` tests green.
   Neighbors unchanged (same `cli` 13/5); `fmt` clean; zero
   new warnings.
+
+Implementation record — code actions (editor proof next):
+- `textDocument/codeAction` returns quickfixes for the open
+  file's published lint findings overlapping the request
+  range (recomputed nowhere: the actions read the same
+  stored set `publishDiagnostics` reported). E0501 removes
+  the unreachable code, E0502 prefixes the binding with `_`,
+  E0503 removes the unused import; refusals are simply no
+  actions (clean range, unknown target kind). Deletions are
+  line-aware: a statement standing alone on its lines takes
+  the whole lines, a shared-line statement only its span.
+- Lint now surfaces in `publishDiagnostics`: Tier A on the
+  open buffer plus Tier B over a successful load (same
+  library rule as the CLI: missing-`main`-only gets Tier A,
+  other breakage gets check errors only). A shared
+  `diagnostic_json` maps E05xx to severity 2, other `E` codes
+  to 1.
+- Tests: 2 new protocol tests (all three fix kinds with
+  exact ranges/newText, severity-2 diagnostics, clean-range
+  empty, cross-file import removal); 20/20 `lsp` tests green.
+  Neighbors unchanged (same `cli` 13/5); `fmt` clean; zero
+  new warnings. `codeActionProvider` advertised.
 
 ## Stage 3 — coverage
 
