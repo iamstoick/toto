@@ -1880,7 +1880,9 @@ impl RefWalk {
                 match target {
                     toto_compiler::ast::AssignTarget::Var(name, span) => {
                         let resolved = lookup(&self.scopes, name);
-                        if resolved.is_none() && let Some(f) = self.current_fn {
+                        if resolved.is_none()
+                            && let Some(f) = self.current_fn
+                        {
                             self.fn_var_globals[f].insert(name.clone());
                         }
                         self.vars.push(NameUse {
@@ -1962,7 +1964,9 @@ impl RefWalk {
         match &expr.node {
             toto_compiler::ast::ExprKind::Var(name) => {
                 let resolved = lookup(&self.scopes, name);
-                if resolved.is_none() && let Some(f) = self.current_fn {
+                if resolved.is_none()
+                    && let Some(f) = self.current_fn
+                {
                     self.fn_var_globals[f].insert(name.clone());
                 }
                 self.vars.push(NameUse {

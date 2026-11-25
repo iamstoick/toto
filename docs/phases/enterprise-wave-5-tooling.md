@@ -456,6 +456,7 @@ Implementation record — reference-client proof (2026-11-25):
   own clippy demanded exactly that shape, and its rustfmt
   already proved the opposite preference once. If CI's
   rustfmt disagrees, its diff will say so byte-exactly.
+- Resolution: CI's rustfmt did disagree — it wants the two joined chains split across lines (exactly what 1.87 suggested). Applied byte-identical. The tension is now mapped: clippy demands `&&`-joined conditions, rustfmt demands them split across lines, and the split-let-chain form satisfies both at once. Lesson: write that shape first.
 
 ## Stage 3 — coverage (DESIGN APPROVED 2026-11-25; no code yet)
 
