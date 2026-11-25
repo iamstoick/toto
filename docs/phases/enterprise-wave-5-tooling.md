@@ -408,7 +408,13 @@ Implementation record — reference-client proof (2026-11-25):
   four `clippy -D warnings` errors, all in the new
   `lint.rs` (collapsible_if, type_complexity,
   reserve_after_initialization, too_many_arguments on the
-  9-arg need-check). The local toolchain (1.87) cannot run
+  9-arg need-check). The run after that failed on the same
+  two lint families in new code: single_match (an
+  if-let-able `match` in `collect_inventory`) and another
+  manual_checked_ops (a `branches_found == 0` guard in the
+  coverage unit test) — both fixed, the latter by reusing
+  the new `branch_pct()` helper instead of duplicating the
+  guard. The local toolchain (1.87) cannot run
   this clippy at all (edition-2024 let-chains do not
   compile), so these were diagnosed purely from the CI log
   and fixed by restructuring, not suppression

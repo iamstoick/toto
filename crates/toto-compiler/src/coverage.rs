@@ -434,11 +434,7 @@ mod tests {
             summary.line_pct(),
             summary.lines_hit,
             summary.lines_found,
-            if summary.branches_found == 0 {
-                100
-            } else {
-                summary.branches_hit * 100 / summary.branches_found
-            },
+            summary.branch_pct(),
             summary.branches_hit,
             summary.branches_found,
             summary.fns_hit,
