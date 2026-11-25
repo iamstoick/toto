@@ -326,13 +326,13 @@ fn lsp_references_struct_field_and_param_decl() {
         res.contains("\"start\":{\"line\":0,\"character\":7}"),
         "decl: {res}"
     );
-    // Field `x` in `p.x` (line 6, col 14): whole `p.x` span, the
+    // Field `x` in `p.x` (line 6, col 14): the name span, the
     // literal entry (line 5, col 17), and the field declaration
     // (line 0, col 12) when asked. `y` (decl 0:20, entry 5:23)
     // must not appear.
     let res = s.request("textDocument/references", &refs_request(uri, 6, 14, true));
     assert!(
-        res.contains("\"start\":{\"line\":6,\"character\":12}"),
+        res.contains("\"start\":{\"line\":6,\"character\":14}"),
         "use: {res}"
     );
     assert!(
@@ -365,6 +365,192 @@ fn lsp_references_struct_field_and_param_decl() {
     // Builtin references are an empty list, not null.
     let res = s.request("textDocument/references", &refs_request(uri, 6, 5, true));
     assert!(res.contains("\"result\":[]"), "builtin: {res}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
+fn rename_request(uri: &str, line: u64, character: u64, new_name: &str) -> String {
+    format!(
+        "{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":{line},\"character\":{character}}},\"newName\":\"{new_name}\"}}"
+    )
+}
+
+#[test]
+fn lsp_rename_local_edits_decl_and_uses() {
+    let src = "fn helper(x: int) -> int {\n    return x;\n}\nfn main() -> int {\n    let r = helper(1);\n    println(r);\n    return 0;\n}\n";
+    let uri = "file:///tmp/toto-lsp-rename-local.gzv";
+    let mut s = Session::start();
+    let init = s.request("initialize", "{\"capabilities\":{}}");
+    assert!(init.contains("\"renameProvider\":true"), "caps: {init}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(uri, src));
+    for _ in 0..2 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") {
+            break;
+        }
+    }
+    // Rename local `r` (use at line 5, col 12) to `total`.
+    let res = s.request("textDocument/rename", &rename_request(uri, 5, 12, "total"));
+    assert!(res.contains("\"newText\":\"total\""), "edits: {res}");
+    assert!(
+        res.contains("\"start\":{\"line\":4,\"character\":8}"),
+        "decl: {res}"
+    );
+    assert!(
+        res.contains("\"start\":{\"line\":5,\"character\":12}"),
+        "use: {res}"
+    );
+    assert_eq!(res.matches("\"newText\"").count(), 2, "edits: {res}");
+    // Same-name rename succeeds with empty changes.
+    let res = s.request("textDocument/rename", &rename_request(uri, 5, 12, "r"));
+    assert!(res.contains("\"changes\":{}"), "noop: {res}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
+#[test]
+fn lsp_rename_function_cross_file() {
+    let dir = std::env::temp_dir().join("toto-lsp-rename");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).expect("mkdir");
+    std::fs::write(
+        dir.join("lib").join("math.gzv"),
+        "fn helper(x: int) -> int {\n    return x + 1;\n}\n",
+    )
+    .expect("write lib");
+    let main = "import \"lib/math.gzv\";\nfn main() -> int {\n    println(helper(41));\n    return helper(1);\n}\n";
+    let uri = format!("file://{}/main.gzv", dir.to_string_lossy());
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(&uri, main));
+    for _ in 0..4 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") && msg.contains(&uri) {
+            break;
+        }
+    }
+    // Rename `helper` (call at line 2, col 14) to `assist`.
+    let res = s.request(
+        "textDocument/rename",
+        &rename_request(&uri, 2, 14, "assist"),
+    );
+    assert!(res.contains("\"newText\":\"assist\""), "edits: {res}");
+    assert_eq!(res.matches("\"newText\"").count(), 3, "edits: {res}");
+    assert!(res.contains("lib/math.gzv"), "lib edit: {res}");
+    assert!(
+        res.contains("\"start\":{\"line\":0,\"character\":3}"),
+        "decl: {res}"
+    );
+    assert!(
+        res.contains("\"start\":{\"line\":2,\"character\":12}"),
+        "call 1: {res}"
+    );
+    assert!(
+        res.contains("\"start\":{\"line\":3,\"character\":11}"),
+        "call 2: {res}"
+    );
+    assert!(
+        !res.contains("\"start\":{\"line\":3,\"character\":12}"),
+        "off by one: {res}"
+    );
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lsp_rename_field_uses_name_spans() {
+    let src = "struct Pt { x: int, y: int }\nfn main() -> int {\n    let p = Pt { x: 1, y: 2 };\n    println(p.x);\n    return 0;\n}\n";
+    let uri = "file:///tmp/toto-lsp-rename-field.gzv";
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(uri, src));
+    for _ in 0..2 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") {
+            break;
+        }
+    }
+    // Rename field `x` (use at line 3, col 14) to `ex`: the use edit
+    // covers exactly the name, not the whole `p.x`.
+    let res = s.request("textDocument/rename", &rename_request(uri, 3, 14, "ex"));
+    assert!(
+        res.contains(
+            "\"start\":{\"line\":3,\"character\":14},\"end\":{\"line\":3,\"character\":15}"
+        ),
+        "use: {res}"
+    );
+    assert!(
+        res.contains(
+            "\"start\":{\"line\":2,\"character\":17},\"end\":{\"line\":2,\"character\":18}"
+        ),
+        "lit entry: {res}"
+    );
+    assert!(
+        res.contains(
+            "\"start\":{\"line\":0,\"character\":12},\"end\":{\"line\":0,\"character\":13}"
+        ),
+        "decl: {res}"
+    );
+    assert_eq!(res.matches("\"newText\":\"ex\"").count(), 3, "edits: {res}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
+#[test]
+fn lsp_rename_refusals() {
+    let src = "fn helper() -> int {\n    return 1;\n}\nfn main() -> int {\n    let assist = 2;\n    println(helper());\n    return assist;\n}\n";
+    let uri = "file:///tmp/toto-lsp-rename-refuse.gzv";
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(uri, src));
+    for _ in 0..2 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") {
+            break;
+        }
+    }
+    // Builtin target (`println` call, line 5).
+    let res = s.request("textDocument/rename", &rename_request(uri, 5, 5, "out"));
+    assert!(res.contains("\"code\":-32803"), "builtin: {res}");
+    // Duplicate top-level name (`helper` call, line 5).
+    let res = s.request("textDocument/rename", &rename_request(uri, 5, 14, "main"));
+    assert!(res.contains("\"code\":-32803"), "dup: {res}");
+    assert!(res.contains("already declared"), "dup: {res}");
+    // Capture: `assist` is bound as a local in the edited file.
+    let res = s.request("textDocument/rename", &rename_request(uri, 5, 14, "assist"));
+    assert!(res.contains("\"code\":-32803"), "capture: {res}");
+    // Invalid identifier and keyword.
+    let res = s.request("textDocument/rename", &rename_request(uri, 5, 14, "123abc"));
+    assert!(res.contains("\"code\":-32602"), "invalid: {res}");
+    let res = s.request("textDocument/rename", &rename_request(uri, 5, 14, "fn"));
+    assert!(res.contains("\"code\":-32602"), "keyword: {res}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
+
+#[test]
+fn lsp_rename_local_shadowing_capture_refused() {
+    // Renaming `x` to `g` would capture the global use in `println`.
+    let src = "fn g() -> int {\n    return 1;\n}\nfn main() -> int {\n    let x = 1;\n    println(g());\n    return x;\n}\n";
+    let uri = "file:///tmp/toto-lsp-rename-capture.gzv";
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(uri, src));
+    for _ in 0..2 {
+        let msg = s.recv();
+        if msg.contains("publishDiagnostics") {
+            break;
+        }
+    }
+    let res = s.request("textDocument/rename", &rename_request(uri, 4, 8, "g"));
+    assert!(res.contains("\"code\":-32803"), "capture: {res}");
+    assert!(res.contains("used as a global"), "capture: {res}");
     let status = s.shutdown();
     assert!(status.success(), "lsp exit: {status:?}");
 }

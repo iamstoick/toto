@@ -13,7 +13,7 @@
 //! Verification is headless/protocol-only (no real editor run); the
 //! CLI test suite drives the binary over piped stdio.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 
 use toto_compiler::hir::Ty;
@@ -425,6 +425,7 @@ pub fn serve() -> std::process::ExitCode {
                     ("hoverProvider".to_string(), J::Bool(true)),
                     ("definitionProvider".to_string(), J::Bool(true)),
                     ("referencesProvider".to_string(), J::Bool(true)),
+                    ("renameProvider".to_string(), J::Bool(true)),
                     (
                         "textDocumentSync".to_string(),
                         J::Obj(vec![
@@ -532,6 +533,16 @@ pub fn serve() -> std::process::ExitCode {
                 let result = references_at(&docs, &params);
                 if has_id {
                     send_message(&mut out, &result_response(&id, result));
+                }
+            }
+            "textDocument/rename" => {
+                if has_id {
+                    match rename_at(&docs, &params) {
+                        Ok(edits) => send_message(&mut out, &result_response(&id, edits)),
+                        Err((code, message)) => {
+                            send_message(&mut out, &error_response(&id, code, &message));
+                        }
+                    }
                 }
             }
             _ => {
@@ -1626,16 +1637,39 @@ struct RefWalk {
     field_uses: Vec<(String, Span)>,
     lit_fields: Vec<(String, String, Span)>,
     decls: Vec<DeclSite>,
+    /// Local names per function index, plus declaration span to
+    /// function index: rename's capture check needs function-level
+    /// precision (a colliding local in another function is harmless).
+    fn_locals: Vec<HashSet<String>>,
+    current_fn: Option<usize>,
+    decl_fn: HashMap<(u32, u32), usize>,
+    /// Value names used as globals per function index (no visible
+    /// local): renaming a local to one of these would capture the
+    /// use. Struct/type/field positions are syntax-determined and
+    /// cannot be captured by locals, so only `Var` occurrences count.
+    fn_var_globals: Vec<HashSet<String>>,
 }
 
 fn name_span_at(start: u32, name: &str) -> Span {
     Span::new(start, start + name.len() as u32)
 }
 
+/// Field-name span inside a `base.name` occurrence: the parser merges
+/// the whole expression span through the name token, so the name is
+/// exactly the trailing span. (Identifiers are ASCII, and span math
+/// is byte-based either way.)
+fn field_name_span(span: Span, name: &str) -> Span {
+    Span::new(span.end.saturating_sub(name.len() as u32), span.end)
+}
+
 impl RefWalk {
     fn declare(&mut self, name: &str, span: Span) {
         if let Some(frame) = self.scopes.last_mut() {
             frame.entry(name.to_string()).or_insert(span);
+        }
+        if let Some(f) = self.current_fn {
+            self.fn_locals[f].insert(name.to_string());
+            self.decl_fn.insert((span.start, span.end), f);
         }
     }
 
@@ -1649,6 +1683,10 @@ impl RefWalk {
                         span: decl.name_span,
                         struct_name: None,
                     });
+                    let f = self.fn_locals.len();
+                    self.fn_locals.push(HashSet::new());
+                    self.fn_var_globals.push(HashSet::new());
+                    self.current_fn = Some(f);
                     self.scopes.push(HashMap::new());
                     for p in &decl.params {
                         self.declare(&p.name, p.name_span);
@@ -1657,6 +1695,7 @@ impl RefWalk {
                     self.collect_ty(&decl.ret);
                     self.collect_block(&decl.body);
                     self.scopes.pop();
+                    self.current_fn = None;
                 }
                 ItemKind::Struct(decl) => {
                     self.decls.push(DeclSite {
@@ -1712,6 +1751,10 @@ impl RefWalk {
                         span: decl.func.name_span,
                         struct_name: None,
                     });
+                    let f = self.fn_locals.len();
+                    self.fn_locals.push(HashSet::new());
+                    self.fn_var_globals.push(HashSet::new());
+                    self.current_fn = Some(f);
                     self.scopes.push(HashMap::new());
                     for p in &decl.func.params {
                         self.declare(&p.name, p.name_span);
@@ -1720,6 +1763,7 @@ impl RefWalk {
                     self.collect_ty(&decl.func.ret);
                     self.collect_block(&decl.func.body);
                     self.scopes.pop();
+                    self.current_fn = None;
                 }
                 ItemKind::Import(_) => {}
             }
@@ -1755,15 +1799,22 @@ impl RefWalk {
             toto_compiler::ast::StmtKind::Assign { target, value } => {
                 match target {
                     toto_compiler::ast::AssignTarget::Var(name, span) => {
+                        let resolved = lookup(&self.scopes, name);
+                        if resolved.is_none() {
+                            if let Some(f) = self.current_fn {
+                                self.fn_var_globals[f].insert(name.clone());
+                            }
+                        }
                         self.vars.push(NameUse {
                             name: name.clone(),
                             span: *span,
-                            local_decl: lookup(&self.scopes, name),
+                            local_decl: resolved,
                         });
                     }
                     toto_compiler::ast::AssignTarget::Field(base, name, span) => {
                         self.collect_expr(base);
-                        self.field_uses.push((name.clone(), *span));
+                        self.field_uses
+                            .push((name.clone(), field_name_span(*span, name)));
                     }
                     toto_compiler::ast::AssignTarget::Index(base, index, _) => {
                         self.collect_expr(base);
@@ -1832,10 +1883,16 @@ impl RefWalk {
     fn collect_expr(&mut self, expr: &toto_compiler::ast::Expr) {
         match &expr.node {
             toto_compiler::ast::ExprKind::Var(name) => {
+                let resolved = lookup(&self.scopes, name);
+                if resolved.is_none() {
+                    if let Some(f) = self.current_fn {
+                        self.fn_var_globals[f].insert(name.clone());
+                    }
+                }
                 self.vars.push(NameUse {
                     name: name.clone(),
                     span: expr.span,
-                    local_decl: lookup(&self.scopes, name),
+                    local_decl: resolved,
                 });
             }
             toto_compiler::ast::ExprKind::Call { callee, args } => {
@@ -1846,9 +1903,11 @@ impl RefWalk {
             }
             toto_compiler::ast::ExprKind::Field { base, name } => {
                 self.collect_expr(base);
-                // No dedicated name span in the AST: the whole
-                // `base.name` occurrence (rename refines this).
-                self.field_uses.push((name.clone(), expr.span));
+                // No dedicated name span in the AST, but the parser
+                // merges the expression span through the name token,
+                // so the name is exactly the trailing span.
+                self.field_uses
+                    .push((name.clone(), field_name_span(expr.span, name)));
             }
             toto_compiler::ast::ExprKind::StructLit { name, fields } => {
                 self.struct_lits
@@ -1939,17 +1998,9 @@ impl RefWalk {
     }
 }
 
-/// All use sites of `target` across the open file's project, in file
-/// then span order, as (uri, file text, span) triples. Locals never
-/// cross files; globals are matched by name only where no visible
-/// local shadows them. Field uses match by name only when exactly
-/// one struct declares the field — otherwise the request yields
-/// nothing rather than a wrong set (rename safety).
-fn find_references(
-    doc: &OpenDoc,
-    target: &Target,
-    include_decl: bool,
-) -> Vec<(String, String, Span)> {
+/// Parse every project file and collect occurrences once; shared by
+/// references and rename so both see the same program view.
+fn walk_project(doc: &OpenDoc) -> Vec<(String, String, RefWalk)> {
     let mut per_file: Vec<(String, String, RefWalk)> = Vec::new();
     for (display, src) in &doc.file_srcs {
         let Some(program) = parse_buffer(src) else {
@@ -1966,19 +2017,70 @@ fn find_references(
             per_file.push((doc_display(doc), doc.text.clone(), walk));
         }
     }
-    let src_of = |display: &str| {
-        per_file
-            .iter()
-            .find(|(d, _, _)| d == display)
-            .map(|(_, s, _)| s.clone())
-    };
-    // The target's own name, sliced from its declaration site.
-    let target_name = |display: &str, span: Span| -> Option<String> {
-        src_of(display).and_then(|src| {
-            src.get(span.start as usize..span.end as usize)
-                .map(str::to_string)
+    per_file
+}
+
+/// A target's own name, sliced from its declaration site.
+fn target_name_in(
+    per_file: &[(String, String, RefWalk)],
+    display: &str,
+    span: Span,
+) -> Option<String> {
+    per_file
+        .iter()
+        .find(|(d, _, _)| d == display)
+        .and_then(|(_, src, _)| src.get(span.start as usize..span.end as usize))
+        .map(str::to_string)
+}
+
+/// The struct declaring a field plus whether the field name is
+/// unique program-wide (bare `x.f` attribution needs uniqueness).
+/// Returns `None` when the declaration site cannot be found.
+fn field_owner_in(
+    per_file: &[(String, String, RefWalk)],
+    display: &str,
+    span: Span,
+    field: &str,
+) -> Option<(String, bool)> {
+    let owner = per_file.iter().find_map(|(d, src, _)| {
+        if d != display {
+            return None;
+        }
+        let program = parse_buffer(src)?;
+        program.items.iter().find_map(|item| match &item.kind {
+            ItemKind::Struct(decl) if decl.fields.iter().any(|f| f.span == span) => {
+                Some(decl.name.clone())
+            }
+            _ => None,
         })
-    };
+    })?;
+    let mut declarers = 0;
+    for (_, _, walk) in per_file {
+        if walk
+            .decls
+            .iter()
+            .any(|d| d.kind == DeclKind::StructField && d.name == field)
+        {
+            declarers += 1;
+        }
+    }
+    Some((owner, declarers == 1))
+}
+
+/// All use sites of `target` across the open file's project, in file
+/// then span order, as (uri, file text, span) triples. Locals never
+/// cross files; globals are matched by name only where no visible
+/// local shadows them. Field uses match by name only when exactly
+/// one struct declares the field — otherwise the request yields
+/// nothing rather than a wrong set (rename safety).
+fn find_references(
+    doc: &OpenDoc,
+    target: &Target,
+    include_decl: bool,
+) -> Vec<(String, String, Span)> {
+    let per_file = walk_project(doc);
+    let target_name =
+        |display: &str, span: Span| -> Option<String> { target_name_in(&per_file, display, span) };
     let mut hits: Vec<(usize, Span)> = Vec::new();
     let push_var_uses =
         |hits: &mut Vec<(usize, Span)>, per_file: &[(String, String, RefWalk)], name: &str| {
@@ -2052,35 +2154,11 @@ fn find_references(
             let Some(name) = target_name(path, *span) else {
                 return vec![];
             };
-            let owner = per_file.iter().find_map(|(display, src, _walk)| {
-                if display != path {
-                    return None;
-                }
-                let program = parse_buffer(src)?;
-                program.items.iter().find_map(|item| match &item.kind {
-                    ItemKind::Struct(decl) if decl.fields.iter().any(|f| f.span == *span) => {
-                        Some(decl.name.clone())
-                    }
-                    _ => None,
-                })
-            });
-            let Some(owner) = owner else {
+            // Yield nothing when the declaration cannot be found or
+            // the field name is ambiguous program-wide.
+            let Some((owner, true)) = field_owner_in(&per_file, path, *span, &name) else {
                 return vec![];
             };
-            // Unique field name program-wide? Otherwise a bare
-            // `x.f` cannot be attributed — yield nothing.
-            let mut declarers = 0;
-            for (_, _, walk) in &per_file {
-                for d in &walk.decls {
-                    if d.kind == DeclKind::StructField && d.name == name {
-                        declarers += 1;
-                        break;
-                    }
-                }
-            }
-            if declarers != 1 {
-                return vec![];
-            }
             for (i, (_, _, walk)) in per_file.iter().enumerate() {
                 for (n, s) in &walk.field_uses {
                     if n == &name {
@@ -2112,6 +2190,199 @@ fn find_references(
             (file_uri(&doc.path, display), src.clone(), span)
         })
         .collect()
+}
+
+/// `textDocument/rename`: rewrite every use of the symbol at the
+/// cursor to `newName`, returning a `WorkspaceEdit`. Refusals are
+/// errors, never partial edits: unknown target, builtin, invalid or
+/// keyword name, duplicate top-level or field name, and capture
+/// (the new name would resolve differently after the rewrite).
+/// A rename to the current name succeeds with empty changes.
+fn rename_at(docs: &HashMap<String, OpenDoc>, params: &J) -> Result<J, (i64, String)> {
+    let invalid = |m: String| (-32602i64, m);
+    let failed = |m: String| (-32803i64, m);
+    let (uri, line, character) = doc_position(params);
+    let new_name = match params.get("newName").and_then(J::as_str) {
+        Some(n) => n.to_string(),
+        None => return Err(invalid("rename needs a newName string".to_string())),
+    };
+    let Some(doc) = docs.get(&uri) else {
+        return Err(failed("no such open document".to_string()));
+    };
+    let Some(target) = resolve_at(doc, line, character).and_then(|r| r.target) else {
+        return Err(failed("nothing renameable here".to_string()));
+    };
+    if matches!(target, Target::Builtin) {
+        return Err(failed("cannot rename a builtin".to_string()));
+    }
+    let is_field = matches!(target, Target::Field(..));
+    if !valid_rename_name(&new_name) {
+        return Err(invalid(format!("`{new_name}` is not a valid name")));
+    }
+    if toto_compiler::token::keyword(&new_name).is_some() {
+        return Err(invalid(format!("`{new_name}` is a keyword")));
+    }
+    // Builtins live in the value namespace: a value rename to one
+    // would rebind every use. (Field names live in their struct and
+    // may reuse builtin spellings.)
+    if !is_field && toto_compiler::builtins::is_builtin(&new_name) {
+        return Err(failed(format!("`{new_name}` is a builtin")));
+    }
+    let walked = walk_project(doc);
+    let entry_display = doc_display(doc);
+    let old_name = match &target {
+        Target::Local(span) => doc
+            .text
+            .get(span.start as usize..span.end as usize)
+            .map(str::to_string),
+        Target::Func(path, span)
+        | Target::Extern(path, span)
+        | Target::State(path, span)
+        | Target::Struct(path, span)
+        | Target::Field(path, span) => target_name_in(&walked, path, *span),
+        Target::Builtin => None,
+    };
+    let Some(old_name) = old_name else {
+        return Err(failed("cannot read the target name".to_string()));
+    };
+    if old_name == new_name {
+        return Ok(J::Obj(vec![("changes".to_string(), J::Obj(vec![]))]));
+    }
+    // Program-wide top-level names and per-file locals for the
+    // duplicate/capture checks.
+    let mut top_names: HashSet<String> = HashSet::new();
+    for (_, _, walk) in &walked {
+        for d in &walk.decls {
+            match d.kind {
+                DeclKind::Func
+                | DeclKind::Struct
+                | DeclKind::Extern
+                | DeclKind::State
+                | DeclKind::MigrateFn => {
+                    top_names.insert(d.name.clone());
+                }
+                DeclKind::StructField => {}
+            }
+        }
+    }
+    match &target {
+        Target::Builtin => {}
+        Target::Local(decl) => {
+            let Some(entry) = walked.iter().find(|(d, _, _)| d == &entry_display) else {
+                return Err(failed("stale program view".to_string()));
+            };
+            match entry.2.decl_fn.get(&(decl.start, decl.end)) {
+                Some(f) if entry.2.fn_locals[*f].contains(&new_name) => {
+                    return Err(failed(format!(
+                        "`{new_name}` is already bound in this function"
+                    )));
+                }
+                Some(f) if entry.2.fn_var_globals[*f].contains(&new_name) => {
+                    return Err(failed(format!(
+                        "`{new_name}` is used as a global in this function"
+                    )));
+                }
+                Some(_) => {}
+                None => return Err(failed("stale program view".to_string())),
+            }
+        }
+        Target::Func(..) | Target::Extern(..) | Target::State(..) => {
+            if top_names.contains(&new_name) {
+                return Err(failed(format!("`{new_name}` is already declared")));
+            }
+        }
+        Target::Struct(..) => {
+            if top_names.contains(&new_name) {
+                return Err(failed(format!("`{new_name}` is already declared")));
+            }
+        }
+        Target::Field(path, span) => {
+            let Some(name) = target_name_in(&walked, path, *span) else {
+                return Err(failed("cannot read the target name".to_string()));
+            };
+            let Some((owner, unique)) = field_owner_in(&walked, path, *span, &name) else {
+                return Err(failed("cannot read the field declaration".to_string()));
+            };
+            if !unique {
+                return Err(failed(
+                    "cannot rename an ambiguous field (declared by several structs)".to_string(),
+                ));
+            }
+            let clash = walked.iter().any(|(_, _, walk)| {
+                walk.decls.iter().any(|d| {
+                    d.kind == DeclKind::StructField
+                        && d.name == new_name
+                        && d.struct_name.as_deref() == Some(owner.as_str())
+                })
+            });
+            if clash {
+                return Err(failed(format!(
+                    "`{owner}` already has a field `{new_name}`"
+                )));
+            }
+        }
+    }
+    let hits = find_references(doc, &target, true);
+    if hits.is_empty() {
+        return Err(failed("nothing to rename".to_string()));
+    }
+    // Capture check for value globals: the new name must not be
+    // bound as a local in any edited file (a use there would stop
+    // resolving to the renamed target).
+    if matches!(
+        target,
+        Target::Func(..) | Target::Extern(..) | Target::State(..)
+    ) {
+        let edited_uris: HashSet<&str> = hits.iter().map(|(u, _, _)| u.as_str()).collect();
+        for (display, _, walk) in &walked {
+            let uri = file_uri(&doc.path, display);
+            if !edited_uris.contains(uri.as_str()) {
+                continue;
+            }
+            if walk
+                .fn_locals
+                .iter()
+                .any(|locals| locals.contains(&new_name))
+            {
+                return Err(failed(format!(
+                    "`{new_name}` is bound as a local in {display}"
+                )));
+            }
+        }
+    }
+    // Group consecutive same-uri edits, preserving file then span order.
+    let mut changes: Vec<(String, Vec<J>)> = Vec::new();
+    for (uri, src, span) in hits {
+        let edit = J::Obj(vec![
+            ("range".to_string(), range_json(&src, span.start, span.end)),
+            ("newText".to_string(), J::Str(new_name.clone())),
+        ]);
+        match changes.last_mut() {
+            Some((u, list)) if u == &uri => list.push(edit),
+            _ => changes.push((uri, vec![edit])),
+        }
+    }
+    Ok(J::Obj(vec![(
+        "changes".to_string(),
+        J::Obj(
+            changes
+                .into_iter()
+                .map(|(u, list)| (u, J::Arr(list)))
+                .collect(),
+        ),
+    )]))
+}
+
+/// Renameable identifiers: ASCII word characters, never starting
+/// with a digit (the lexer rule). Keywords and builtins are checked
+/// separately so the diagnostics can name the reason.
+fn valid_rename_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn doc_position(params: &J) -> (String, u64, u64) {

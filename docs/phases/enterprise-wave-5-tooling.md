@@ -7,8 +7,8 @@ settled decision.
 
 Status: STAGE 0 VERIFIED (run #118 green on the starting
 tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI);
-STAGE 2 PARTIAL: references + UTF-16 columns implemented
-(rename next).
+STAGE 2 PARTIAL: references + rename + UTF-16 columns
+implemented (completion next).
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -255,6 +255,36 @@ Implementation record — references + UTF-16 (rename next):
   build/dist network failures); `fmt` clean; zero new
   compiler warnings. Clippy rides on CI (no local component:
   static.rust-lang.org unresolvable on this machine).
+
+Implementation record — rename (completion next):
+- `textDocument/rename` returns a `WorkspaceEdit`
+  (`renameProvider: true`); refusals are protocol errors,
+  never partial edits: unknown target and builtins (-32803),
+  invalid identifier or keyword new name (-32602), duplicate
+  top-level or field name, and capture (-32803). Same-name
+  rename succeeds with empty changes. No `prepareRename`
+  (clients fall back to word range; documented).
+- Exact spans everywhere: field uses now carry name spans
+  (the parser merges the whole `base.name` span through the
+  name token, so the name is exactly the trailing span —
+  verified against the parser, not assumed). The references
+  finder shares the representation (field locations tightened
+  accordingly).
+- Soundness rules, each tested: a local rename is refused
+  when the new name is bound in the same function or used
+  as a global there (shadowing + capture, function-level
+  precision so other functions' locals do not block it); a
+  global rename is refused on top-level duplicate and when
+  the new name is bound as a local in any edited file; a
+  struct rename needs only top-level uniqueness (type and
+  literal positions are syntax-determined); a field rename
+  needs field-name uniqueness (else refused) plus no clash
+  in the owning struct. New names must be valid identifiers,
+  non-keywords, and (outside fields) non-builtins.
+- Tests: 5 new protocol tests (local incl. no-op, cross-file
+  fn, field name-span edits, 5 refusal kinds, local→global
+  capture); 13/13 `lsp` tests green. Neighbors unchanged
+  (same `cli` 13/5); `fmt` clean; zero new warnings.
 
 ## Stage 3 — coverage
 
