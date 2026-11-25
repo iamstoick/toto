@@ -8,8 +8,8 @@ settled decision.
 Status: STAGE 0 VERIFIED (run #118 green on the starting
 tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI);
 STAGE 2 CAPABILITIES IMPLEMENTED + proven against an
-independent client stack (GUI editor session outstanding —
-see proof record).
+independent client stack (GUI editor session outstanding);
+STAGE 3 DESIGN APPROVED, IMPLEMENTATION PENDING.
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -380,17 +380,48 @@ Implementation record — reference-client proof (2026-11-25):
   suite, and the new lint gate for the first time; its
   outcome belongs in the next record, not here.
 
-## Stage 3 — coverage
+## Stage 3 — coverage (DESIGN APPROVED 2026-11-25; no code yet)
 
 Goal: statement/branch coverage for `.gzv` programs with a
 machine-readable report plus a gate integration.
 
-Acceptance: self-measurement demonstrated on a corpus program;
-report format fixed and golden-tested; overhead budget stated
-and met on the bench corpus; the gate can fail a run below a
-configured threshold. Non-goals: branch-level precision beyond
-what the interpreter/JIT can attribute honestly (limits
-disclosed, not silently smoothed).
+Design decisions (user-approved 2026-11-25):
+
+- Units: statements + branches. Every statement plus `if` /
+  `while` / `select` arm outcomes, attributed exactly in the
+  tree-walking interpreter (`exec_stmt` and branch paths are
+  the hook points — AST spans, no mapping loss). Function
+  totals fall out as free aggregation over the same data.
+- Executor scope: sequential interpreter only (`toto run`
+  path). Concurrent programs execute lowered MIR on the M:N
+  scheduler, where source-line mapping is approximate and
+  counts vary run to run — the runtime-executor follow-up
+  is named here, not silently dropped. `toto coverage`
+  refuses concurrent programs loudly (same honesty rule as
+  the JIT probe's single-file limit), documents why, and
+  exits non-zero; it never reports smoothed numbers.
+- Report + CLI: `toto coverage [--fail-under PCT]
+  <file.gzv>...`, mirroring `toto lint` (hand-rolled
+  dispatch, per-file program roots, broken files refused
+  exit 2 like `fmt`). Writes standard LCOV
+  (`SF:`/`DA:`/`BRDA:` records, `end_of_record`) plus a
+  one-line human summary; line-based text needs no new
+  dependencies and works with coveralls/codecov tooling.
+  `--fail-under` exits 1 below the threshold; the gate
+  demonstration runs it against a corpus program.
+- Overhead: measured on the bench corpus (compute/gc/stdlib
+  workloads) and recorded here at implementation; budget met
+  or the stage does not close. Self-measurement: the corpus
+  program's own LCOV is golden-tested (counts pinned).
+
+Acceptance: seed implementation with the units above;
+LCOV fixed and golden-tested; self-measurement demonstrated
+on a corpus program; overhead budget stated and met on the
+bench corpus; `--fail-under` demonstrated failing below
+threshold and passing at it. Non-goals: concurrent-program
+coverage (named follow-up), branch precision beyond honest
+attribution (disclosed, not smoothed), HTML reports
+(LCOV consumers already exist).
 
 ## Stage 4 — doc generator
 
