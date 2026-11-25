@@ -457,6 +457,7 @@ Implementation record — reference-client proof (2026-11-25):
   already proved the opposite preference once. If CI's
   rustfmt disagrees, its diff will say so byte-exactly.
 - Resolution: CI's rustfmt did disagree — it wants the two joined chains split across lines (exactly what 1.87 suggested). Applied byte-identical. The tension is now mapped: clippy demands `&&`-joined conditions, rustfmt demands them split across lines, and the split-let-chain form satisfies both at once. Lesson: write that shape first.
+- Validation closed (same night): run 45632741818 (head 2223720) is GREEN — check (fmt + clippy + full suite incl. the lint gate), bench, release-gates, macOS/Linux ARM probes all pass; Windows informational as usual. Every line of Wave 5 code written so far is now CI-confirmed: the linter, all four LSP capabilities, and coverage. The fmt-vs-clippy tension is settled doctrine, not an open question.
 
 ## Stage 3 — coverage (DESIGN APPROVED 2026-11-25; no code yet)
 
