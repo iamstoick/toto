@@ -364,6 +364,17 @@ Implementation record — reference-client proof (2026-11-25):
   record depends on it: every server behavior it could
   observe is already pinned by the 20 repo tests plus the
   31 reference-stack checks.
+- GUI package staged (2026-11-25, uncommitted tooling under
+  `/tmp/toto-lsp-proof/`): a one-command extension
+  (`extension/`, `vscode-languageclient` 11.0.1 bundled, no
+  build step) plus fixture workspace and `RUN.md`. The user
+  opens it via `code --extensionDevelopmentPath=...` and
+  runs "Toto: Run Wave 5 Proof"; the command drives hover,
+  definition, references, rename, completion (incl. member),
+  and code actions through the live editor and writes a
+  timestamped `PROOF-LOG.md` (25 checks) into the workspace.
+  A 5-item manual fallback is in `RUN.md` if the command
+  path fails. Transcribe the log's verdict here when run.
 
 # Dated addendum — CI on the Stage 1 tree (2026-11-25, on main; append-only)
 - Run 45553139355 (#119, head 83952b6): check FAILED on one
