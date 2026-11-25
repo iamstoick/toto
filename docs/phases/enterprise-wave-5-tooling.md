@@ -7,9 +7,8 @@ settled decision.
 
 Status: STAGE 0 VERIFIED (run #118 green on the starting
 tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI);
-STAGE 2 CAPABILITIES IMPLEMENTED + proven against an
-independent client stack (GUI editor session outstanding);
-STAGE 3 IMPLEMENTED (awaiting CI);
+STAGE 2 COMPLETE (reference-client + real-editor proof
+green); STAGE 3 IMPLEMENTED (awaiting CI);
 STAGE 4 DESIGN APPROVED, IMPLEMENTATION PENDING.
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
@@ -375,7 +374,21 @@ Implementation record — reference-client proof (2026-11-25):
   and code actions through the live editor and writes a
   timestamped `PROOF-LOG.md` (25 checks) into the workspace.
   A 5-item manual fallback is in `RUN.md` if the command
-  path fails. Transcribe the log's verdict here when run.
+  path fails. Transcribe the log's verdict here — DONE 2026-11-25:
+  `ALL PROOF CHECKS PASSED` (VS Code 1.147.0, toto 0.1.0),
+  all 25 green on the first clean run after two harness-side
+  fixes (a `codeActionProvider` argument-order bug, and a
+  hover assertion that JSON-stringified API objects instead
+  of reading `.value`; the server was exonerated in both
+  cases by raw-protocol checks). The log's hover line reads
+  the signature verbatim (`fn double(n: int) -> int`), and
+  every capability — definition, references with declaration,
+  cross-file rename to `doubled`, unqualified and member
+  completion, all three quickfixes, UTF-16 positions —
+  behaved identically through the real editor and the
+  independent client stack. Stage 2's acceptance gate is
+  closed: no open items remain on references, rename,
+  completion, code actions, or UTF-16 columns.
 
 # Dated addendum — CI on the Stage 1 tree (2026-11-25, on main; append-only)
 - Run 45553139355 (#119, head 83952b6): check FAILED on one
