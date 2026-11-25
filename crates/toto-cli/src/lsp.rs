@@ -689,7 +689,7 @@ impl OpenDoc {
                     .first()
                     .map(|f| f.path.clone())
                     .unwrap_or_default();
-                let has_own_main = parse_buffer(&text).map_or(false, |program| {
+                let has_own_main = parse_buffer(&text).is_some_and(|program| {
                     program.items.iter().any(|item| {
                         matches!(&item.kind, toto_compiler::ast::ItemKind::Fn(d) if d.name == "main")
                     })
@@ -1880,10 +1880,8 @@ impl RefWalk {
                 match target {
                     toto_compiler::ast::AssignTarget::Var(name, span) => {
                         let resolved = lookup(&self.scopes, name);
-                        if resolved.is_none() {
-                            if let Some(f) = self.current_fn {
-                                self.fn_var_globals[f].insert(name.clone());
-                            }
+                        if resolved.is_none() && let Some(f) = self.current_fn {
+                            self.fn_var_globals[f].insert(name.clone());
                         }
                         self.vars.push(NameUse {
                             name: name.clone(),
@@ -1964,10 +1962,8 @@ impl RefWalk {
         match &expr.node {
             toto_compiler::ast::ExprKind::Var(name) => {
                 let resolved = lookup(&self.scopes, name);
-                if resolved.is_none() {
-                    if let Some(f) = self.current_fn {
-                        self.fn_var_globals[f].insert(name.clone());
-                    }
+                if resolved.is_none() && let Some(f) = self.current_fn {
+                    self.fn_var_globals[f].insert(name.clone());
                 }
                 self.vars.push(NameUse {
                     name: name.clone(),
@@ -2090,12 +2086,12 @@ fn walk_project(doc: &OpenDoc) -> Vec<(String, String, RefWalk)> {
         walk.collect_program(&program);
         per_file.push((display.clone(), src.clone(), walk));
     }
-    if !per_file.iter().any(|(d, _, _)| d == &doc_display(doc)) {
-        if let Some(program) = parse_buffer(&doc.text) {
-            let mut walk = RefWalk::default();
-            walk.collect_program(&program);
-            per_file.push((doc_display(doc), doc.text.clone(), walk));
-        }
+    if !per_file.iter().any(|(d, _, _)| d == &doc_display(doc))
+        && let Some(program) = parse_buffer(&doc.text)
+    {
+        let mut walk = RefWalk::default();
+        walk.collect_program(&program);
+        per_file.push((doc_display(doc), doc.text.clone(), walk));
     }
     per_file
 }
@@ -2788,7 +2784,7 @@ fn find_decl_struct(program: &toto_compiler::ast::Program, decl: &Span) -> Optio
                 .find_map(|e| in_expr(e, decl)),
         }
     }
-    fn expr_children<'a>(expr: &'a toto_compiler::ast::Expr) -> Vec<&'a toto_compiler::ast::Expr> {
+    fn expr_children(expr: &toto_compiler::ast::Expr) -> Vec<&toto_compiler::ast::Expr> {
         use toto_compiler::ast::ExprKind::*;
         match &expr.node {
             Call { callee, args } => {
@@ -3188,10 +3184,10 @@ fn line_aware_delete(src: &str, span: Span) -> (u32, u32) {
     }
     let before_blank = src
         .get(ls..span.start as usize)
-        .map_or(true, |s| s.trim().is_empty());
+        .is_none_or(|s| s.trim().is_empty());
     let after_blank = src
         .get(span.end as usize..le)
-        .map_or(true, |s| s.trim().is_empty());
+        .is_none_or(|s| s.trim().is_empty());
     if before_blank && after_blank {
         let end = if le < bytes.len() { le + 1 } else { le };
         (ls as u32, end as u32)

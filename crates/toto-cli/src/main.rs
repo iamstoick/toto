@@ -553,14 +553,14 @@ fn coverage_files(files: &[String], fail_under: Option<u32>) -> ExitCode {
                 any_failed = true;
             }
         }
-        if let Some(pct) = fail_under {
-            if summary.line_pct() < u64::from(pct) {
-                eprintln!(
-                    "toto: coverage {}% below --fail-under {pct}",
-                    summary.line_pct()
-                );
-                any_failed = true;
-            }
+        if let Some(pct) = fail_under
+            && summary.line_pct() < u64::from(pct)
+        {
+            eprintln!(
+                "toto: coverage {}% below --fail-under {pct}",
+                summary.line_pct()
+            );
+            any_failed = true;
         }
     }
     if any_failed {

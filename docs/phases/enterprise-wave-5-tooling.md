@@ -445,6 +445,17 @@ Implementation record — reference-client proof (2026-11-25):
   pattern is now clear: local rustfmt 1.87 is advisory
   only; CI's log is the formatter of record until the
   toolchain is upgraded.
+- Third layer (same night): with the lib clean, CI's clippy
+  reached Stage 2 `toto-cli` code for the first time and
+  found eight more, all fixed as suggested: three
+  `unnecessary_map_or` (`map_or(false/true, …)` →
+  `is_some_and`/`is_none_or`), three `collapsible_if`
+  (nested ifs joined with `&&`), `needless_lifetimes` on a
+  local helper. Deliberately kept the joined let-chains even
+  though local rustfmt 1.87 wants two of them re-split: CI's
+  own clippy demanded exactly that shape, and its rustfmt
+  already proved the opposite preference once. If CI's
+  rustfmt disagrees, its diff will say so byte-exactly.
 
 ## Stage 3 — coverage (DESIGN APPROVED 2026-11-25; no code yet)
 
