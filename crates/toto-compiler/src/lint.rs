@@ -777,9 +777,8 @@ mod tests {
     #[test]
     fn corpus_tier_a_clean() {
         let root = workspace_root();
-        let exceptions_src =
-            std::fs::read_to_string(root.join("tests/lint-exceptions.txt"))
-                .expect("lint exceptions readable");
+        let exceptions_src = std::fs::read_to_string(root.join("tests/lint-exceptions.txt"))
+            .expect("lint exceptions readable");
         let excluded: Vec<String> = exceptions_src
             .lines()
             .map(str::trim)
