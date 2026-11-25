@@ -1724,8 +1724,14 @@ struct RefWalk {
     fn_var_globals: Vec<HashSet<String>>,
 }
 
+/// Byte length as u32: identifier spans always fit (the parser
+/// itself stores them as u32).
+fn u32_len(text: &str) -> u32 {
+    u32::try_from(text.len()).expect("span fits in u32")
+}
+
 fn name_span_at(start: u32, name: &str) -> Span {
-    Span::new(start, start + name.len() as u32)
+    Span::new(start, start + u32_len(name))
 }
 
 /// Field-name span inside a `base.name` occurrence: the parser merges
@@ -1733,7 +1739,7 @@ fn name_span_at(start: u32, name: &str) -> Span {
 /// exactly the trailing span. (Identifiers are ASCII, and span math
 /// is byte-based either way.)
 fn field_name_span(span: Span, name: &str) -> Span {
-    Span::new(span.end.saturating_sub(name.len() as u32), span.end)
+    Span::new(span.end.saturating_sub(u32_len(name)), span.end)
 }
 
 impl RefWalk {

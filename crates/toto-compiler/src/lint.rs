@@ -63,16 +63,14 @@ fn unreachable_in_block(block: &Block, out: &mut Vec<Diag>) {
             dead = true;
         }
     }
-    if dead {
-        if let Some(tail) = &block.tail {
-            out.push(Diag::new(
-                "E0501",
-                "unreachable expression: a previous statement in this block always exits"
-                    .to_string(),
-                tail.span,
-                Some("remove it".to_string()),
-            ));
-        }
+    if dead && let Some(tail) = &block.tail {
+        out.push(Diag::new(
+            "E0501",
+            "unreachable expression: a previous statement in this block always exits"
+                .to_string(),
+            tail.span,
+            Some("remove it".to_string()),
+        ));
     }
 }
 
@@ -135,12 +133,17 @@ fn unreachable_in_expr(expr: &Expr, out: &mut Vec<Diag>) {
     }
 }
 
+/// One declared binding: span, whether it was read, whether an
+/// unread binding is reported (parameters and loop variables are
+/// tracked for shadowing but never flagged).
+type DeclEntry = (crate::span::Span, bool, bool);
+
 /// Lexical-scope use tracker: one frame per block, innermost first.
 /// Shadowing is legal (spec §5.6), so each name maps to a stack: a use
 /// marks the innermost live declaration.
 #[derive(Default)]
 struct UseScopes {
-    frames: Vec<HashMap<String, Vec<(crate::span::Span, bool, bool)>>>,
+    frames: Vec<HashMap<String, Vec<DeclEntry>>>,
 }
 
 impl UseScopes {
@@ -382,8 +385,7 @@ pub fn unused_imports(
     // Every file parsed clean or the load would have failed; a file
     // that cannot be re-parsed here keeps its imports unknown, which
     // marks it needed below (conservative: fewer findings).
-    let mut direct: Vec<Vec<String>> = Vec::new();
-    direct.reserve(project.files.len());
+    let mut direct: Vec<Vec<String>> = Vec::with_capacity(project.files.len());
     let mut unparseable = HashSet::new();
     for (i, file) in project.files.iter().enumerate() {
         let (tokens, lex_errors) = crate::lexer::lex(&file.src);
@@ -458,7 +460,15 @@ pub fn unused_imports(
             }
         }
     }
-    let mut memo: HashMap<usize, bool> = HashMap::new();
+    let mut need = NeedCtx {
+        fns: &fns,
+        structs: &structs,
+        effect: &effect,
+        children: &children,
+        referenced: &referenced,
+        unresolved: &unresolved,
+        memo: HashMap::new(),
+    };
     // Entry imports from the entry source with their spans.
     let entry_src = &project.files[project.entry].src;
     let (tokens, _) = crate::lexer::lex(entry_src);
@@ -470,19 +480,7 @@ pub fn unused_imports(
                 resolve_import_display(&project.files[project.entry].path, &decl.path, read, deps);
             let idx = disp.and_then(|d| index_of.get(d.as_str()).copied());
             match idx {
-                Some(idx)
-                    if !file_needed(
-                        idx,
-                        &fns,
-                        &structs,
-                        &effect,
-                        &children,
-                        &referenced,
-                        &unresolved,
-                        &mut memo,
-                        &mut Vec::new(),
-                    ) =>
-                {
+                Some(idx) if !need.needed(idx, &mut Vec::new()) => {
                     out.push(Diag::new(
                         "E0503",
                         format!(
@@ -501,49 +499,50 @@ pub fn unused_imports(
     out
 }
 
-fn file_needed(
-    idx: usize,
-    fns: &[HashSet<String>],
-    structs: &[HashSet<String>],
-    effect: &[bool],
-    children: &[Vec<usize>],
-    referenced: &HashSet<String>,
-    unresolved: &HashSet<usize>,
-    memo: &mut HashMap<usize, bool>,
-    visiting: &mut Vec<usize>,
-) -> bool {
-    if let Some(known) = memo.get(&idx) {
-        return *known;
-    }
-    if visiting.contains(&idx) {
-        return true;
-    }
-    // Conservative: an unresolvable edge or a file whose own imports
-    // are unknown keeps the file.
-    if unresolved.contains(&idx) {
-        memo.insert(idx, true);
-        return true;
-    }
-    if effect[idx]
-        || fns[idx].iter().any(|n| referenced.contains(n))
-        || structs[idx].iter().any(|n| referenced.contains(n))
-    {
-        memo.insert(idx, true);
-        return true;
-    }
-    visiting.push(idx);
-    let mut keep = false;
-    for child in &children[idx] {
-        if file_needed(
-            *child, fns, structs, effect, children, referenced, unresolved, memo, visiting,
-        ) {
-            keep = true;
-            break;
+/// Program-wide reachability facts for the need computation.
+struct NeedCtx<'a> {
+    fns: &'a [HashSet<String>],
+    structs: &'a [HashSet<String>],
+    effect: &'a [bool],
+    children: &'a [Vec<usize>],
+    referenced: &'a HashSet<String>,
+    unresolved: &'a HashSet<usize>,
+    memo: HashMap<usize, bool>,
+}
+
+impl NeedCtx<'_> {
+    fn needed(&mut self, idx: usize, visiting: &mut Vec<usize>) -> bool {
+        if let Some(known) = self.memo.get(&idx) {
+            return *known;
         }
+        if visiting.contains(&idx) {
+            return true;
+        }
+        // Conservative: an unresolvable edge or a file whose own
+        // imports are unknown keeps the file.
+        if self.unresolved.contains(&idx) {
+            self.memo.insert(idx, true);
+            return true;
+        }
+        if self.effect[idx]
+            || self.fns[idx].iter().any(|n| self.referenced.contains(n))
+            || self.structs[idx].iter().any(|n| self.referenced.contains(n))
+        {
+            self.memo.insert(idx, true);
+            return true;
+        }
+        visiting.push(idx);
+        let mut keep = false;
+        for child in &self.children[idx] {
+            if self.needed(*child, visiting) {
+                keep = true;
+                break;
+            }
+        }
+        visiting.pop();
+        self.memo.insert(idx, keep);
+        keep
     }
-    visiting.pop();
-    memo.insert(idx, keep);
-    keep
 }
 
 fn collect_refs_item(item: &crate::ast::Item, referenced: &mut HashSet<String>) {
