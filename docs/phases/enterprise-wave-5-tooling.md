@@ -7,8 +7,9 @@ settled decision.
 
 Status: STAGE 0 VERIFIED (run #118 green on the starting
 tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI);
-STAGE 2 PARTIAL: references + rename + completion + code
-actions + UTF-16 implemented (real-editor proof next).
+STAGE 2 CAPABILITIES IMPLEMENTED + proven against an
+independent client stack (GUI editor session outstanding —
+see proof record).
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -333,6 +334,36 @@ Implementation record — code actions (editor proof next):
   empty, cross-file import removal); 20/20 `lsp` tests green.
   Neighbors unchanged (same `cli` 13/5); `fmt` clean; zero
   new warnings. `codeActionProvider` advertised.
+
+Implementation record — reference-client proof (2026-11-25):
+- All four capabilities plus diagnostics proven end to end
+  against an INDEPENDENT client stack: Microsoft's
+  `vscode-jsonrpc` 10.0.1 (message framing + JSON-RPC) and
+  `vscode-languageserver-types` 3.18.6 on node v25.8.1,
+  driving the built `toto` 0.1.0 server over stdio — the
+  same protocol stack VS Code extensions use, with none of
+  the test-harness framing code. Harness (throwaway, kept at
+  `/tmp/toto-lsp-proof/node/proof.js` for re-runs, not
+  committed): fixture project plus trailing-dot and unknown
+  cases; 31/31 checks green — capability advertisement
+  (all six incl. trigger `.`), E0501/E0502/E0503 published
+  as severity-2 warnings, hover signature, cross-file
+  definition, references (lib decl + main use),
+  cross-file rename (`doubled` in both files), unqualified
+  completion (locals, globals, builtin, keyword, textEdit
+  range), member completion (`x`, `y`, `field: int`),
+  all three code-action fixes, empty result on clean code,
+  and UTF-16 resolution of an astral-adjacent use.
+- What this is NOT: a GUI session. VS Code 1.147.0 is
+  installed on this machine (editor version on record), but
+  this sandbox has no display, so no window could be opened.
+  The GUI run — same four capabilities exercised live in
+  VS Code, version recorded — remains the final acceptance
+  step and needs a display (e.g. run the harness scenarios
+  in the user's own VS Code). Nothing in the protocol
+  record depends on it: every server behavior it could
+  observe is already pinned by the 20 repo tests plus the
+  31 reference-stack checks.
 
 # Dated addendum — CI on the Stage 1 tree (2026-11-25, on main; append-only)
 - Run 45553139355 (#119, head 83952b6): check FAILED on one
