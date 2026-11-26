@@ -86,3 +86,12 @@ demand and the five decisions above get asked in one round.
 Completion-item doc prose (marginal polish on a complete
 feature); trailing-note attachment (by design, see Wave 5
 brief); anything that reopens a closed wave.
+
+## Validation (CI green 2026-11-26, run 45804775707)
+
+Run 45804775707 on the backlog head (06dce97) concluded
+SUCCESS: check + release-gates + bench + macOS/Linux-ARM
+probes green (Windows probe the known informational
+failure). This green covers the refusal-message pointer and
+confirms the tree state the spike was verified against. No
+open items remain on this note.
