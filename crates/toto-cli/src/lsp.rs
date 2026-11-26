@@ -824,6 +824,17 @@ struct Resolved {
     target: Option<Target>,
 }
 
+/// Append item doc prose to a hover body. Undocumented items
+/// render exactly as before; documented ones gain the verbatim
+/// lines after a blank line (the caller fences Markdown).
+fn with_doc(body: String, doc: &[String]) -> String {
+    if doc.is_empty() {
+        body
+    } else {
+        format!("{body}\n\n{}", doc.join("\n"))
+    }
+}
+
 /// Entry: resolve the name at `(line, character)` in the open
 /// document. Positions outside any known name return `None`.
 /// Resolution context: the open document plus the enclosing
@@ -851,7 +862,7 @@ fn resolve_at(doc: &OpenDoc, line: u64, character: u64) -> Option<Resolved> {
             if span_contains(&fn_name_span(decl), off) {
                 let sig = fn_sig_text(&decl.name, &decl.params, &decl.ret);
                 return Some(Resolved {
-                    hover: sig,
+                    hover: with_doc(sig, &item.doc),
                     target: Some(Target::Func(doc_display(doc), fn_name_span(decl))),
                 });
             }
@@ -875,7 +886,7 @@ fn resolve_at(doc: &OpenDoc, line: u64, character: u64) -> Option<Resolved> {
         ItemKind::Struct(decl) => {
             if span_contains(&decl.name_span, off) {
                 return Some(Resolved {
-                    hover: struct_sig_text(cx.doc, &decl.name),
+                    hover: with_doc(struct_sig_text(cx.doc, &decl.name), &item.doc),
                     target: Some(Target::Struct(doc_display(cx.doc), decl.name_span)),
                 });
             }
@@ -902,7 +913,7 @@ fn resolve_at(doc: &OpenDoc, line: u64, character: u64) -> Option<Resolved> {
                         ty_text(&d.ret)
                     );
                     return Some(Resolved {
-                        hover: format!("unsafe extern (C)\n{sig}"),
+                        hover: with_doc(format!("unsafe extern (C)\n{sig}"), &item.doc),
                         target: Some(Target::Extern(doc_display(cx.doc), d.name_span)),
                     });
                 }
@@ -913,7 +924,7 @@ fn resolve_at(doc: &OpenDoc, line: u64, character: u64) -> Option<Resolved> {
             for b in &decl.bindings {
                 if span_contains(&b.name_span, off) {
                     return Some(Resolved {
-                        hover: format!("state {}: {}", b.name, ty_text(&b.ty)),
+                        hover: with_doc(format!("state {}: {}", b.name, ty_text(&b.ty)), &item.doc),
                         target: Some(Target::State(doc_display(cx.doc), b.name_span)),
                     });
                 }
@@ -923,7 +934,7 @@ fn resolve_at(doc: &OpenDoc, line: u64, character: u64) -> Option<Resolved> {
             if span_contains(&decl.func.name_span, off) {
                 let sig = fn_sig_text(&decl.func.name, &decl.func.params, &decl.func.ret);
                 return Some(Resolved {
-                    hover: format!("migrate {sig}"),
+                    hover: with_doc(format!("migrate {sig}"), &item.doc),
                     target: Some(Target::Func(doc_display(cx.doc), fn_name_span(&decl.func))),
                 });
             }
@@ -1264,13 +1275,13 @@ fn resolve_global(program: &Program, name: &str, cx: &Cx) -> Option<Resolved> {
         match &item.kind {
             ItemKind::Fn(d) if d.name == name => {
                 return Some(Resolved {
-                    hover: fn_sig_text(&d.name, &d.params, &d.ret),
+                    hover: with_doc(fn_sig_text(&d.name, &d.params, &d.ret), &item.doc),
                     target: Some(Target::Func(doc_display(cx.doc), fn_name_span(d))),
                 });
             }
             ItemKind::Struct(d) if d.name == name => {
                 return Some(Resolved {
-                    hover: struct_sig_text(cx.doc, &d.name),
+                    hover: with_doc(struct_sig_text(cx.doc, &d.name), &item.doc),
                     target: Some(Target::Struct(doc_display(cx.doc), d.name_span)),
                 });
             }
@@ -1288,7 +1299,7 @@ fn resolve_global(program: &Program, name: &str, cx: &Cx) -> Option<Resolved> {
                             ty_text(&d.ret)
                         );
                         return Some(Resolved {
-                            hover: format!("unsafe extern (C)\n{sig}"),
+                            hover: with_doc(format!("unsafe extern (C)\n{sig}"), &item.doc),
                             target: Some(Target::Extern(doc_display(cx.doc), d.name_span)),
                         });
                     }
@@ -1298,7 +1309,10 @@ fn resolve_global(program: &Program, name: &str, cx: &Cx) -> Option<Resolved> {
                 for b in &decl.bindings {
                     if b.name == name {
                         return Some(Resolved {
-                            hover: format!("state {}: {}", b.name, ty_text(&b.ty)),
+                            hover: with_doc(
+                                format!("state {}: {}", b.name, ty_text(&b.ty)),
+                                &item.doc,
+                            ),
                             target: Some(Target::State(doc_display(cx.doc), b.name_span)),
                         });
                     }
@@ -1307,7 +1321,7 @@ fn resolve_global(program: &Program, name: &str, cx: &Cx) -> Option<Resolved> {
             ItemKind::Migrate(decl) if decl.func.name == name => {
                 let sig = fn_sig_text(&decl.func.name, &decl.func.params, &decl.func.ret);
                 return Some(Resolved {
-                    hover: format!("migrate {sig}"),
+                    hover: with_doc(format!("migrate {sig}"), &item.doc),
                     target: Some(Target::Func(doc_display(cx.doc), fn_name_span(&decl.func))),
                 });
             }
@@ -1324,13 +1338,13 @@ fn resolve_global(program: &Program, name: &str, cx: &Cx) -> Option<Resolved> {
             match &item.kind {
                 ItemKind::Fn(d) if d.name == name => {
                     return Some(Resolved {
-                        hover: fn_sig_text(&d.name, &d.params, &d.ret),
+                        hover: with_doc(fn_sig_text(&d.name, &d.params, &d.ret), &item.doc),
                         target: Some(Target::Func(path.clone(), fn_name_span(d))),
                     });
                 }
                 ItemKind::Struct(d) if d.name == name => {
                     return Some(Resolved {
-                        hover: format!("struct {}", d.name),
+                        hover: with_doc(format!("struct {}", d.name), &item.doc),
                         target: Some(Target::Struct(path.clone(), d.name_span)),
                     });
                 }
@@ -1338,7 +1352,10 @@ fn resolve_global(program: &Program, name: &str, cx: &Cx) -> Option<Resolved> {
                     for b in &decl.bindings {
                         if b.name == name {
                             return Some(Resolved {
-                                hover: format!("state {}: {}", b.name, ty_text(&b.ty)),
+                                hover: with_doc(
+                                    format!("state {}: {}", b.name, ty_text(&b.ty)),
+                                    &item.doc,
+                                ),
                                 target: Some(Target::State(path.clone(), b.name_span)),
                             });
                         }
@@ -1347,7 +1364,7 @@ fn resolve_global(program: &Program, name: &str, cx: &Cx) -> Option<Resolved> {
                 ItemKind::Migrate(decl) if decl.func.name == name => {
                     let sig = fn_sig_text(&decl.func.name, &decl.func.params, &decl.func.ret);
                     return Some(Resolved {
-                        hover: format!("migrate {sig}"),
+                        hover: with_doc(format!("migrate {sig}"), &item.doc),
                         target: Some(Target::Func(path.clone(), fn_name_span(&decl.func))),
                     });
                 }

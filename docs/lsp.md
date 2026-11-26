@@ -14,7 +14,8 @@ crate. One open document plus project-aware imports.
 
 Hover shows the checked type (`x: int`), the declaration form
 (`let x`), or a signature (`fn double(n: int) -> int`, builtins
-included). Definition jumps to the local declaration or into the
+included) — documented items append their `///` prose below
+the signature fence. Definition jumps to the local declaration or into the
 imported file; builtins resolve to null. A broken file keeps its
 last good data out: hover answers null and diagnostics carry the
 error codes. A malformed frame is skipped, never fatal — only stdin
@@ -35,7 +36,8 @@ overrides disk and `gzv.std` is embedded for import-aware answers.
 ## Limits (accepted)
 
 - Comments vanish nowhere (the server reads source, it does not
-  format), but hover/definition have no notion of comments.
+  format); hover surfaces `///` item prose, and definition
+  jumps land on documented declarations unchanged.
 - No completion, references, rename, or code actions (Enterprise
   Wave 5 reserves richer LSP work).
 - `file://` URIs only; `untitled:` buffers are refused.

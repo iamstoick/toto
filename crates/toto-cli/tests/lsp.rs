@@ -918,3 +918,62 @@ fn lsp_malformed_frame_is_skipped() {
     let status = s.shutdown();
     assert!(status.success(), "lsp exit: {status:?}");
 }
+
+#[test]
+fn lsp_hover_shows_item_docs() {
+    // Documented items gain prose after the fenced signature;
+    // undocumented items render byte-identically to before.
+    let dir = std::env::temp_dir().join("toto-lsp-hoverdoc");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).expect("mkdir");
+    std::fs::write(
+        dir.join("lib").join("math.gzv"),
+        "/// Doubles its input.\n/// Second line.\nfn double(n: int) -> int {\n    return n + n;\n}\n\n/// A point.\nstruct Pt { x: int, y: int }\n",
+    )
+    .expect("write lib");
+    let main = "import \"lib/math.gzv\";\n/// Local entry point.\nfn main() -> int {\n    let m = double(21);\n    let p = Pt { x: 1, y: 2 };\n    return m + p.x;\n}\n\n/// Helper with docs.\nfn helped() -> int {\n    return 1;\n}\n\nfn plain() -> int {\n    return 2;\n}\n";
+    let uri = format!("file://{}/main.gzv", dir.to_string_lossy());
+
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(&uri, main));
+
+    // Cross-file use hover carries the lib prose.
+    let hover = s.request(
+        "textDocument/hover",
+        &format!("{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":3,\"character\":13}}}}"),
+    );
+    assert!(hover.contains("fn double(n: int) -> int"), "hover: {hover}");
+    assert!(hover.contains("Doubles its input."), "hover: {hover}");
+    assert!(hover.contains("Second line."), "hover: {hover}");
+
+    // Cross-file struct use hover carries its prose.
+    let hover = s.request(
+        "textDocument/hover",
+        &format!("{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":4,\"character\":12}}}}"),
+    );
+    assert!(hover.contains("struct Pt"), "hover: {hover}");
+    assert!(hover.contains("A point."), "hover: {hover}");
+
+    // Local documented declaration hover carries its prose.
+    let hover = s.request(
+        "textDocument/hover",
+        &format!("{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":9,\"character\":4}}}}"),
+    );
+    assert!(hover.contains("Helper with docs."), "hover: {hover}");
+
+    // Undocumented hover is byte-identical: fence, no trailing prose.
+    let hover = s.request(
+        "textDocument/hover",
+        &format!("{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":13,\"character\":4}}}}"),
+    );
+    assert!(
+        hover.contains("```toto\\nfn plain() -> int\\n```"),
+        "hover: {hover}"
+    );
+    assert!(!hover.contains("Helper with docs."), "hover: {hover}");
+    assert!(!hover.contains("Doubles its input."), "hover: {hover}");
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}
