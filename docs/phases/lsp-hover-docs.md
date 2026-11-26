@@ -96,3 +96,13 @@ its demands on untouched baseline drift. Re-verified after
 the fix: 1.87 fully clean on both crates' trees plus every
 touched test file, 21/21 protocol tests green.
 Fixed in this commit; re-validation run pending.
+
+## Closed (CI green 2026-11-26, run 45769609177)
+
+Run 45769609177 on head efaa486 concluded SUCCESS: check +
+release-gates + bench + macOS/Linux-ARM probes green (Windows
+probe the known informational failure). The hover-docs code is
+CI-green. Remaining, both non-blocking: this record commit's
+own validation run (lag-by-one formality), and the real-editor
+proof — the user's part (hover a documented stdlib item in
+VS Code and paste the result).
