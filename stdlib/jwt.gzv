@@ -21,105 +21,17 @@
 import "gzv.std/crypto.gzv";
 import "gzv.std/json.gzv";
 import "gzv.std/strings.gzv";
-
-fn b64url_alpha() -> string {
-    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-}
-
-/// 6-bit value of a base64url char, or -1.
-fn b64url_val(c: string) -> int {
-    let alpha: string = b64url_alpha();
-    let n: int = len(alpha);
-    let mut i: int = 0;
-    while i < n {
-        if char_at(alpha, i) == c {
-            return i;
-        } else {
-        }
-        i = i + 1;
-    }
-    return -1;
-}
+import "gzv.std/bytes.gzv";
 
 /// Bytes to unpadded base64url (JWT style — never emits `=`).
 pub fn jwt_b64_encode(data: Array<int>) -> string {
-    let alpha: string = b64url_alpha();
-    let mut out: string = "";
-    let mut i: int = 0;
-    while i + 3 <= len(data) {
-        let b0: int = data[i];
-        let b1: int = data[i + 1];
-        let b2: int = data[i + 2];
-        let s0: int = b0 / 4;
-        let r0: int = b0 - s0 * 4;
-        let s1: int = r0 * 16 + b1 / 16;
-        let r1: int = b1 - (b1 / 16) * 16;
-        let s2: int = r1 * 4 + b2 / 64;
-        let s3: int = b2 - (b2 / 64) * 64;
-        out = out + char_at(alpha, s0) + char_at(alpha, s1) + char_at(alpha, s2) + char_at(alpha, s3);
-        i = i + 3;
-    }
-    let rem: int = len(data) - i;
-    if rem == 1 {
-        let b0: int = data[i];
-        let s0: int = b0 / 4;
-        let r0: int = b0 - s0 * 4;
-        out = out + char_at(alpha, s0) + char_at(alpha, r0 * 16);
-    } else if rem == 2 {
-        let b0: int = data[i];
-        let b1: int = data[i + 1];
-        let s0: int = b0 / 4;
-        let r0: int = b0 - s0 * 4;
-        let s1: int = r0 * 16 + b1 / 16;
-        let r1: int = b1 - (b1 / 16) * 16;
-        out = out + char_at(alpha, s0) + char_at(alpha, s1) + char_at(alpha, r1 * 4);
-    } else {
-    }
-    return out;
+    return bytes_b64url_encode(data);
 }
 
 /// Unpadded base64url to bytes. Padding `=` is rejected (JWT
 /// style — loud Err, never silently accepted).
 pub fn jwt_b64_decode(s: string) -> Result<Array<int>, string> {
-    let mut vals: Array<int> = [];
-    for c in split(s, "") {
-        if c == "=" {
-            return Err("bad base64url (padding rejected)");
-        }
-        let v: int = b64url_val(c);
-        if v < 0 {
-            return Err("bad base64url (bad char)");
-        }
-        push(vals, v);
-    }
-    let mut out: Array<int> = [];
-    let mut i: int = 0;
-    while i + 4 <= len(vals) {
-        let s0: int = vals[i];
-        let s1: int = vals[i + 1];
-        let s2: int = vals[i + 2];
-        let s3: int = vals[i + 3];
-        push(out, s0 * 4 + s1 / 16);
-        push(out, (s1 - (s1 / 16) * 16) * 16 + s2 / 4);
-        push(out, (s2 - (s2 / 4) * 4) * 64 + s3);
-        i = i + 4;
-    }
-    let rem: int = len(vals) - i;
-    if rem == 1 {
-        return Err("bad base64url (bad length)");
-    } else if rem == 2 {
-        let s0: int = vals[i];
-        let s1: int = vals[i + 1];
-        push(out, s0 * 4 + s1 / 16);
-    } else if rem == 3 {
-        let s0: int = vals[i];
-        let s1: int = vals[i + 1];
-        let s2: int = vals[i + 2];
-        push(out, s0 * 4 + s1 / 16);
-        push(out, (s1 - (s1 / 16) * 16) * 16 + s2 / 4);
-    } else {
-    }
-    return Ok(out);
+    return bytes_b64url_decode(s);
 }
 
 /// ASCII string to bytes (JWT signs ASCII `header.payload`).

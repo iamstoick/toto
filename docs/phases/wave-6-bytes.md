@@ -72,7 +72,28 @@ immediately in-wave). Does NOT change D1–D8, ADR, module
 model, spec, the 27-builtin catalog, or any existing stdlib
 API surface (wrappers keep names + semantics).
 
-## Phase A record (2026-11-26; CI pending)
+## Phase A record (2026-11-26; CI run 45817063343 pending at
+Phase B commit time — see below)
+
+Phase B record (2026-11-26; CI pending): dedup wrappers as
+designed — `jwt_b64_*` → `bytes_b64url_*`, `saml_b64_decode`
+→ `bytes_b64_decode`, `pw_hex_*` → `bytes_hex_*`,
+`trace_hex` → `bytes_hex_encode`; dead private tables
+removed (verified zero remaining references, tests use only
+public names). One judgment recorded here: `pw_hex_decode`
+widens to both-case input (canonical rule; no in-tree
+uppercase producers/consumers/tests, documented on the
+wrapper). `http_hex_val` and `trace_hexval` untouched
+(different shapes: pct-decoder internals, validation
+predicates). `trace.gzv` E0502 (`kind_ok`) is a pre-existing
+documented gate exclusion — left alone, not introduced here.
+Verification: stdlib suite 26/26 (incl. RFC/JWT/pbkdf2
+vectors through the wrappers), lint gate clean (exclusions
+unchanged), doc gate clean, fmt clean, clippy clean under
+`-D warnings` except the two pre-existing netsys lints CI
+already accepts, compiler front + CLI + corpus suites green,
+wordfreq green. The `stdlib_table_is_complete` count pin
+30→31 (new module registered).
 
 Built as designed, no deviations: `stdlib/bytes.gzv`
 (17 pub + 5 private fns, `//!` + `///` from birth),

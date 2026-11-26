@@ -22,6 +22,7 @@ import "gzv.std/crypto.gzv";
 import "gzv.std/http.gzv";
 import "gzv.std/json.gzv";
 import "gzv.std/strings.gzv";
+import "gzv.std/bytes.gzv";
 import "gzv.std/time.gzv";
 
 /// OTel SpanKind numbers (stable): internal=1, server=2,
@@ -50,22 +51,10 @@ fn trace_kind_num(kind: string) -> Result<int, string> {
     return Err("trace: bad kind (want internal|server|client|producer|consumer)");
 }
 
-/// One hex digit (lowercase output alphabet).
-fn trace_hexdig(v: int) -> string {
-    let digits: string = "0123456789abcdef";
-    return substring(digits, v, v + 1);
-}
-
 /// Lowercase hex of arbitrary bytes (same shape as the Wave-3
 /// password codec, local so tracing stays dependency-free).
 pub fn trace_hex(bytes: Array<int>) -> string {
-    let mut out: string = "";
-    for b in bytes {
-        let hi: int = b / 16;
-        let lo: int = b - hi * 16;
-        out = out + trace_hexdig(hi) + trace_hexdig(lo);
-    }
-    return out;
+    return bytes_hex_encode(bytes);
 }
 
 /// Numeric value of one hex char, or -1 when not hex.

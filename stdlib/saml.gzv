@@ -18,6 +18,7 @@
 //! math is needed and tests stay deterministic). Skew is not
 //! applied in v1 (documented).
 import "gzv.std/strings.gzv";
+import "gzv.std/bytes.gzv";
 
 pub struct SamlAttr {
     name: string,
@@ -271,78 +272,8 @@ pub fn saml_parse_response(b64: string) -> Result<SamlAssertion, string> {
 /// not rejected; anything else outside the alphabet is a loud
 /// Err. `=` terminates the payload (padding must be 1-2 chars
 /// at the very end — anything after it is an Err).
-fn saml_b64_decode(s: string) -> Result<Array<int>, string> {
-    let alpha: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    // Padding is 1-2 `=` at the very end (whitespace around it
-    // is still skipped); anything else after the first `=` —
-    // including a third `=` — is an Err.
-    let mut vals: Array<int> = [];
-    let mut pads: int = 0;
-    for c in split(s, "") {
-        if pads > 0 {
-            if c == "=" && pads < 2 {
-                pads = pads + 1;
-            } else if c == " " || c == "\n" || c == "\r" || c == "\t" {
-            } else {
-                return Err("bad base64 (trailing data after padding)");
-            }
-        } else if c == " " || c == "\n" || c == "\r" || c == "\t" {
-        } else if c == "=" {
-            pads = 1;
-        } else {
-            let v: int = saml_b64_val(alpha, c);
-            if v < 0 {
-                return Err("bad base64 (bad char)");
-            } else {
-            }
-            push(vals, v);
-        }
-    }
-    // A length-1 tail can never align (mirrors the JWT rule).
-    if len(vals) % 4 == 1 {
-        return Err("bad base64 (bad length)");
-    }
-    let mut out: Array<int> = [];
-    let mut i: int = 0;
-    while i + 4 <= len(vals) {
-        let s0: int = vals[i];
-        let s1: int = vals[i + 1];
-        let s2: int = vals[i + 2];
-        let s3: int = vals[i + 3];
-        push(out, s0 * 4 + s1 / 16);
-        push(out, (s1 - (s1 / 16) * 16) * 16 + s2 / 4);
-        push(out, (s2 - (s2 / 4) * 4) * 64 + s3);
-        i = i + 4;
-    }
-    // Trailing quantum: `=` chars were already consumed as the
-    // terminator, so the remainder decodes by count (2 chars ->
-    // 1 byte, 3 chars -> 2 bytes).
-    let rem: int = len(vals) - i;
-    if rem == 2 {
-        push(out, vals[i] * 4 + vals[i + 1] / 16);
-    } else if rem == 3 {
-        let s0: int = vals[i];
-        let s1: int = vals[i + 1];
-        let s2: int = vals[i + 2];
-        push(out, s0 * 4 + s1 / 16);
-        push(out, (s1 - (s1 / 16) * 16) * 16 + s2 / 4);
-    } else {
-    }
-    return Ok(out);
-}
-
-/// Base64 value with an explicit alphabet (the JWT codec bakes
-/// its own in; SAML's differs in two characters).
-fn saml_b64_val(alpha: string, c: string) -> int {
-    let mut i: int = 0;
-    while i < len(alpha) {
-        if char_at(alpha, i) == c {
-            return i;
-        } else {
-        }
-        i = i + 1;
-    }
-    return -1;
+pub fn saml_b64_decode(b64: string) -> Result<Array<int>, string> {
+    return bytes_b64_decode(b64);
 }
 
 /// ASCII bytes to string (shared shape with the JWT segment
