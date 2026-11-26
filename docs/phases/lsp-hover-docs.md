@@ -107,6 +107,15 @@ own validation run (lag-by-one formality), and the real-editor
 proof — the user's part (hover a documented stdlib item in
 VS Code and paste the result).
 
+## Toolchain correction (2026-11-26, recorded here)
+
+The no-local-oracle premise above is superseded: `rustup
+component add rustfmt clippy` succeeded — rustfmt
+1.11.0-stable + clippy 0.1.100 now run locally. The advisory
+rule ("trust 1.87 on touched lines") is retired; verify new
+work with the real `cargo fmt --check` and `cargo clippy`
+before pushing. CI (`@stable`, possibly newer) stays final.
+
 ## Real-editor proof (2026-11-26, user-verified)
 
 Confirmed by user screenshot in the Extension Development

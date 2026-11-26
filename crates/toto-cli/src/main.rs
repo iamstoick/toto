@@ -547,7 +547,8 @@ fn coverage_files(files: &[String], fail_under: Option<u32>) -> ExitCode {
             eprintln!(
                 "toto: `{path}` uses concurrency: coverage runs sequential programs only \
                 (the runtime executor lowers to MIR, which this tool cannot attribute); \
-                refusing instead of reporting smoothed numbers"
+                refusing instead of reporting smoothed numbers \
+                (tracked: docs/phases/post-wave5-backlog.md)"
             );
             return ExitCode::from(2);
         }
