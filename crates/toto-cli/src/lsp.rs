@@ -1714,6 +1714,10 @@ struct DeclSite {
     name: String,
     span: Span,
     struct_name: Option<String>,
+    /// Item doc lines (empty when undocumented). Extern decls
+    /// and state bindings carry their item's doc, mirroring
+    /// hover and `toto doc`.
+    doc: Vec<String>,
 }
 
 /// Scope-aware occurrence collector: one walk per file gathers every
@@ -1779,6 +1783,7 @@ impl RefWalk {
                         name: decl.name.clone(),
                         span: decl.name_span,
                         struct_name: None,
+                        doc: item.doc.clone(),
                     });
                     let f = self.fn_locals.len();
                     self.fn_locals.push(HashSet::new());
@@ -1800,6 +1805,7 @@ impl RefWalk {
                         name: decl.name.clone(),
                         span: decl.name_span,
                         struct_name: None,
+                        doc: item.doc.clone(),
                     });
                     for f in &decl.fields {
                         self.decls.push(DeclSite {
@@ -1807,6 +1813,7 @@ impl RefWalk {
                             name: f.name.clone(),
                             span: f.span,
                             struct_name: Some(decl.name.clone()),
+                            doc: Vec::new(),
                         });
                         self.collect_ty(&f.ty);
                     }
@@ -1818,6 +1825,7 @@ impl RefWalk {
                             name: d.name.clone(),
                             span: d.name_span,
                             struct_name: None,
+                            doc: item.doc.clone(),
                         });
                         for p in &d.params {
                             self.collect_ty(&p.ty);
@@ -1832,6 +1840,7 @@ impl RefWalk {
                             name: b.name.clone(),
                             span: b.name_span,
                             struct_name: None,
+                            doc: item.doc.clone(),
                         });
                         self.collect_ty(&b.ty);
                         if let Some(init) = &b.init {
@@ -1847,6 +1856,7 @@ impl RefWalk {
                         name: decl.func.name.clone(),
                         span: decl.func.name_span,
                         struct_name: None,
+                        doc: item.doc.clone(),
                     });
                     let f = self.fn_locals.len();
                     self.fn_locals.push(HashSet::new());
@@ -2536,9 +2546,9 @@ fn completion_at(docs: &HashMap<String, OpenDoc>, params: &J) -> J {
         }
     });
     let mut items: Vec<J> = Vec::new();
-    let mut push = |label: &str, kind: i64, detail: &str, sort: &str| {
+    let mut push = |label: &str, kind: i64, detail: &str, sort: &str, doc: Option<&str>| {
         items.push(complete_item(
-            label, kind, detail, sort, line, prefix_col, character,
+            label, kind, detail, sort, doc, line, prefix_col, character,
         ));
     };
     // The working program: the open buffer, or — for a member
@@ -2597,7 +2607,13 @@ fn completion_at(docs: &HashMap<String, OpenDoc>, params: &J) -> J {
             }
             if let Some(fields) = found {
                 for (name, ty) in fields {
-                    push(&name, 5, &format!("field: {ty}"), &format!("0_{name}"));
+                    push(
+                        &name,
+                        5,
+                        &format!("field: {ty}"),
+                        &format!("0_{name}"),
+                        None,
+                    );
                 }
             }
         }
@@ -2614,11 +2630,12 @@ fn completion_at(docs: &HashMap<String, OpenDoc>, params: &J) -> J {
                 6,
                 if is_param { "parameter" } else { "local" },
                 &format!("0_{name}"),
+                None,
             );
         }
     }
     let walked = walk_project(doc);
-    let mut globals: Vec<(String, i64, String)> = Vec::new();
+    let mut globals: Vec<(String, i64, String, String)> = Vec::new();
     for (_, _, w) in &walked {
         for d in &w.decls {
             let (kind, detail) = match d.kind {
@@ -2629,18 +2646,23 @@ fn completion_at(docs: &HashMap<String, OpenDoc>, params: &J) -> J {
                 DeclKind::StructField => continue,
             };
             if seen.insert(d.name.clone()) {
-                globals.push((d.name.clone(), kind, detail));
+                globals.push((d.name.clone(), kind, detail, d.doc.join("\n")));
             }
         }
     }
     globals.sort();
-    for (name, kind, detail) in globals {
-        push(&name, kind, &detail, &format!("1_{name}"));
+    for (name, kind, detail, doc) in &globals {
+        let doc = if doc.is_empty() {
+            None
+        } else {
+            Some(doc.as_str())
+        };
+        push(name, *kind, detail, &format!("1_{name}"), doc);
     }
     for builtin in toto_compiler::builtins::BUILTIN_NAMES {
         if seen.insert(builtin.to_string()) {
             let detail = builtin_doc(builtin).unwrap_or("builtin");
-            push(builtin, 3, detail, &format!("2_{builtin}"));
+            push(builtin, 3, detail, &format!("2_{builtin}"), None);
         }
     }
     for keyword in [
@@ -2649,41 +2671,55 @@ fn completion_at(docs: &HashMap<String, OpenDoc>, params: &J) -> J {
         "true", "false",
     ] {
         if seen.insert(keyword.to_string()) {
-            push(keyword, 14, "keyword", &format!("3_{keyword}"));
+            push(keyword, 14, "keyword", &format!("3_{keyword}"), None);
         }
     }
     J::Arr(items)
 }
 
 /// One completion item with a prefix-replacing text edit.
+/// Documented globals also carry their `///` prose as Markdown
+/// documentation (same verbatim text as hover); everything
+/// else omits the field exactly as before.
 fn complete_item(
     label: &str,
     kind: i64,
     detail: &str,
     sort: &str,
+    doc: Option<&str>,
     line: u64,
     start: u64,
     end: u64,
 ) -> J {
-    J::Obj(vec![
+    let mut obj = vec![
         ("label".to_string(), J::Str(label.to_string())),
         ("kind".to_string(), J::Num(kind)),
         ("detail".to_string(), J::Str(detail.to_string())),
         ("sortText".to_string(), J::Str(sort.to_string())),
-        (
-            "textEdit".to_string(),
+    ];
+    if let Some(text) = doc {
+        obj.push((
+            "documentation".to_string(),
             J::Obj(vec![
-                (
-                    "range".to_string(),
-                    J::Obj(vec![
-                        ("start".to_string(), pos_json(line, start)),
-                        ("end".to_string(), pos_json(line, end)),
-                    ]),
-                ),
-                ("newText".to_string(), J::Str(label.to_string())),
+                ("kind".to_string(), J::Str("markdown".to_string())),
+                ("value".to_string(), J::Str(text.to_string())),
             ]),
-        ),
-    ])
+        ));
+    }
+    obj.push((
+        "textEdit".to_string(),
+        J::Obj(vec![
+            (
+                "range".to_string(),
+                J::Obj(vec![
+                    ("start".to_string(), pos_json(line, start)),
+                    ("end".to_string(), pos_json(line, end)),
+                ]),
+            ),
+            ("newText".to_string(), J::Str(label.to_string())),
+        ]),
+    ));
+    J::Obj(obj)
 }
 
 /// Struct name behind a member-access base: the declaration the

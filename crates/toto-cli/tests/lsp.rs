@@ -979,3 +979,46 @@ fn lsp_hover_shows_item_docs() {
     let status = s.shutdown();
     assert!(status.success(), "lsp exit: {status:?}");
 }
+
+#[test]
+fn lsp_completion_shows_item_docs() {
+    // Documented globals carry Markdown documentation; everything
+    // else omits the field exactly as before.
+    let dir = std::env::temp_dir().join("toto-lsp-compdoc");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).expect("mkdir");
+    std::fs::write(
+        dir.join("lib").join("math.gzv"),
+        "/// Doubles its input.\nfn double(n: int) -> int {\n    return n + n;\n}\n",
+    )
+    .expect("write lib");
+    let main =
+        "import \"lib/math.gzv\";\nfn main() -> int {\n    let d = double(0);\n    return d;\n}\n";
+    let uri = format!("file://{}/main.gzv", dir.to_string_lossy());
+
+    let mut s = Session::start();
+    let _ = s.request("initialize", "{\"capabilities\":{}}");
+    s.notify("initialized", "{}");
+    s.notify("textDocument/didOpen", &did_open(&uri, main));
+
+    // Complete inside `double` on line 2 (the server returns the
+    // full list; the client filters by prefix).
+    let comp = s.request(
+        "textDocument/completion",
+        &format!("{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":2,\"character\":13}}}}"),
+    );
+    assert!(comp.contains("\"label\":\"double\""), "completion: {comp}");
+    assert!(
+        comp.contains("\"documentation\":{\"kind\":\"markdown\",\"value\":\"Doubles its input.\"}"),
+        "completion docs: {comp}"
+    );
+    // Exactly one documented item in this fixture (`main` itself is
+    // undocumented, as are locals, builtins, and keywords).
+    assert_eq!(
+        comp.matches("\"documentation\"").count(),
+        1,
+        "completion: {comp}"
+    );
+    let status = s.shutdown();
+    assert!(status.success(), "lsp exit: {status:?}");
+}

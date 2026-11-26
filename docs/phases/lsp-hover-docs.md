@@ -128,3 +128,17 @@ Stage-2 pattern) is met: 21/21 protocol tests green, CI green
 on run 45769609177, editor proof green here. Follow-up
 COMPLETE. Remaining: only the lag-by-one validation run on a
 record commit, a future note.
+
+## Follow-on: completion-item docs (2026-11-26; awaiting CI)
+
+Small consistency completion, same convention: documented
+globals now carry their `///` prose as Markdown
+`documentation` on completion items (`DeclSite.doc`
+threaded from `item.doc`; members/locals/builtins/keywords
+unchanged, undocumented items omit the field
+byte-identically). Protocol test
+`lsp_completion_shows_item_docs` (documented global carries
+prose; exactly one `documentation` in the response).
+Verified locally with the real oracle: 22/22 LSP tests,
+`cargo fmt --check` clean, `cargo clippy` zero errors.
+This extends but does not reopen the closed verdict above.
