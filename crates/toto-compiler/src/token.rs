@@ -53,7 +53,10 @@ pub enum TokenKind {
     /// false for `//!` (module doc, valid at file top only). One
     /// optional leading space stripped; trailing `\r` from CRLF
     /// endings trimmed.
-    DocComment { outer: bool, text: String },
+    DocComment {
+        outer: bool,
+        text: String,
+    },
     True,
     False,
     Fn,
@@ -143,7 +146,7 @@ impl TokenKind {
             TokenKind::Float(_) => "float",
             TokenKind::Str(_) => "string",
             TokenKind::Ident(_) => "identifier",
-        TokenKind::DocComment { .. } => "doc comment",
+            TokenKind::DocComment { .. } => "doc comment",
             TokenKind::True => "`true`",
             TokenKind::False => "`false`",
             TokenKind::Eof => "end of file",

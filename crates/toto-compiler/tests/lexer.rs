@@ -76,7 +76,9 @@ fn doc_comments_become_tokens() {
         .collect();
     // `///` is outer (item doc); `//!` is inner (module doc).
     assert_eq!(
-        docs.iter().map(|(o, s)| (*o, s.as_str())).collect::<Vec<_>>(),
+        docs.iter()
+            .map(|(o, s)| (*o, s.as_str()))
+            .collect::<Vec<_>>(),
         vec![(true, "hello"), (false, "module"), (true, "nospace")]
     );
     // Empty `///` yields an empty doc token, not nothing.
@@ -84,9 +86,11 @@ fn doc_comments_become_tokens() {
     assert!(matches!(&toks[0].kind, TokenKind::DocComment { text, .. } if text.is_empty()));
     // `////` is a plain comment: no doc token.
     let (toks, _) = lex("//// not doc\nfn f() {}\n");
-    assert!(!toks
-        .iter()
-        .any(|t| matches!(t.kind, TokenKind::DocComment { .. })));
+    assert!(
+        !toks
+            .iter()
+            .any(|t| matches!(t.kind, TokenKind::DocComment { .. }))
+    );
     // CRLF: the trailing `\r` is trimmed from the doc text.
     let (toks, _) = lex("/// hi\r\nfn f() {}\n");
     assert!(matches!(&toks[0].kind, TokenKind::DocComment { text, .. } if text == "hi"));

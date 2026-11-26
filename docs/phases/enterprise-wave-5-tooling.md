@@ -731,6 +731,39 @@ new builtins, no D1–D8/ADR/spec change). NOT done: CI green
 on the final tree — this commit triggers that run, whose
 outcome belongs in a future record.
 
+## Stage 4 — CI failure + fix (2026-11-26; re-validation pending)
+
+Run 45745499962 on head 4e24315: check FAILED in ~97 s at
+`cargo fmt --all -- --check` (the first gate in check.sh), so
+clippy and the test suite never ran on that tree. The log named
+exactly four hunks, all on new Stage 4 lines (file:line from
+the run's failed-step log):
+
+- `crates/toto-compiler/src/token.rs:53`: expand the
+  `DocComment { outer: bool, text: String }` variant multi-line.
+- `crates/toto-compiler/src/token.rs:143`: 12-space indent on
+  the `DocComment { .. }` match arm.
+- `crates/toto-compiler/tests/lexer.rs:76`: split the
+  `docs.iter().map(...).collect()` chain.
+- `crates/toto-compiler/tests/lexer.rs:84`: wrap the
+  `assert!(!toks.iter().any(...))` in `assert!(...)`.
+
+Correction to the advisory judgments in the implementation
+record above (recorded here): CI's rustfmt agreed with 1.87 on
+all four, so the "ignore" calls were wrong. Fixed in place by
+applying CI's four hunks byte-identical (this commit); 1.87
+advisory is now fully clean on the crate, and the affected
+suites re-pass locally (lexer 8/8, parser 10/10, fmt 3/3,
+compiler doc 3/3, CLI doc 3/3).
+
+Everything else on run 45745499962 was green: release-gates,
+bench, Linux-ARM + macOS probes; the Windows probe failure is
+the known informational one under continue-on-error. The
+clippy `&Vec` suspicion from the implementation record was
+never reached and stays unconfirmed — the re-validation run on
+this commit exercises clippy and the full suite for the first
+time, and its outcome belongs in a future record.
+
 ## Wave gates (no merge until all green)
 
 - Each stage: design recorded before implementation; code +
