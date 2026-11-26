@@ -1,5 +1,5 @@
-// stdlib smoke: imports every module so `toto run`/`toto build` prove
-// the whole library loads, merges, and checks as one program.
+//! stdlib smoke: imports every module so `toto run`/`toto build` prove
+//! the whole library loads, merges, and checks as one program.
 import "gzv.std/io.gzv";
 import "gzv.std/fs.gzv";
 import "gzv.std/strings.gzv";

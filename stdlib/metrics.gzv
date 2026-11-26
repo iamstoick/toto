@@ -1,84 +1,84 @@
-// `gzv.std/metrics` — Prometheus metrics (Enterprise Wave 2, Stage 4).
-//
-// Counters, gauges, and histograms with Prometheus text-exposition
-// rendering (format version 0.0.4) plus a scrape responder for the
-// `gzv.std/http` framework. Pure Toto: no new builtins, no new FFI,
-// no spec change — the registry is ordinary structs and arrays over
-// the frozen surface, served through `http_serve` like any handler.
-//
-// Constraints honored: D1–D8 frozen; 27 builtins frozen (the ASCII
-// checks below are comparisons, not a codec builtin); Phase 5
-// module model (path imports, flat namespace — every name here is
-// `metrics_*`/`Metrics*`, `gzv.std/` prefix); ADR-009 + spec §17
-// APPROVED-as-written (loopback only — the scrape endpoint binds
-// through `http_serve`, so the loopback rule rides along; no
-// timeout parameters — `keepalive_ms` stays advisory in the
-// framework); static linking only (no new FFI — this module calls
-// back into `gzv.std/http` only); no Toto-owned TLS/crypto; no
-// Waves 3–5 work; Windows gets check-time `E0301` via the net/tls
-// surface this module rides on.
-//
-// State types (FIXED — one choice each, golden-pinned): a
-// `MetricsRegistry` holds `counters`, `gauges`, and `histograms`
-// (each a registration-ordered array of definitions). Every
-// definition carries `name`, `help`, and `label_names`; every
-// observation is a sample under one label-value set
-// (first-observation order). Counters hold monotonic `int` totals
-// (`metrics_inc` rejects negative deltas loudly); gauges hold
-// `int` values set or added to (`metrics_gauge_set/add` — the
-// delta may be negative); histograms hold cumulative per-bucket
-// `counts` over `int` upper bounds plus `sum` and `count`.
-// Values are ints (request counts, millisecond latencies) — float
-// observations are a follow-up with the full bytes story.
-//
-// Registration (FIXED): every metric must be registered before
-// use; the name must match `[a-zA-Z_:][a-zA-Z0-9_:]*`; the name
-// must be unique across ALL kinds (a counter and a gauge may never
-// share a name — Prometheus forbids it); label names follow the
-// same grammar, must be unique within the metric, must not start
-// with `__` (reserved), and `le` is reserved on histograms (the
-// renderer owns it); histogram bounds must be non-empty and
-// strictly increasing. Unknown-metric observations, wrong-arity
-// label sets, and unrepresentable help/label text are all `Err`
-// (fixed strings, never silent defaults). `help` and label values
-// must be HTTP text (printable ASCII plus HT/LF/CR — the same
-// acceptance as `http_text_to_bytes`, which performs the final
-// encode at serve time).
-//
-// Format version (FIXED): `metrics_exposition_version()` returns
-// `"0.0.4"`, and `metrics_content_type()` returns the scrape
-// media type `text/plain; version=0.0.4; charset=utf-8`. Render
-// order is registration order (counters, then gauges, then
-// histograms; samples in first-observation order) with label
-// names in declaration order (`le` first on bucket lines, as the
-// reference clients emit). HELP docstrings escape `\` and LF;
-// label values escape `\`, `"`, and LF — exactly the reference
-// escaping; anything else passes through verbatim. A registered
-// metric with no observations still emits its HELP/TYPE pair.
-// No timestamps, no `# EOF` (that marker is OpenMetrics, not
-// the 0.0.4 text format).
-//
-// Concurrency: arrays and structs are shared by reference, so a
-// handler closure capturing the registry observes the same state
-// the main task mutates (the `mwlog` pattern from `proj16`) —
-// one connection task per scrape, values exact under the
-// executor. No locks in v1: increments are single green-thread
-// steps, and scrapes interleave at suspension points exactly like
-// any other handler read.
+//! `gzv.std/metrics` — Prometheus metrics (Enterprise Wave 2, Stage 4).
+//!
+//! Counters, gauges, and histograms with Prometheus text-exposition
+//! rendering (format version 0.0.4) plus a scrape responder for the
+//! `gzv.std/http` framework. Pure Toto: no new builtins, no new FFI,
+//! no spec change — the registry is ordinary structs and arrays over
+//! the frozen surface, served through `http_serve` like any handler.
+//!
+//! Constraints honored: D1–D8 frozen; 27 builtins frozen (the ASCII
+//! checks below are comparisons, not a codec builtin); Phase 5
+//! module model (path imports, flat namespace — every name here is
+//! `metrics_*`/`Metrics*`, `gzv.std/` prefix); ADR-009 + spec §17
+//! APPROVED-as-written (loopback only — the scrape endpoint binds
+//! through `http_serve`, so the loopback rule rides along; no
+//! timeout parameters — `keepalive_ms` stays advisory in the
+//! framework); static linking only (no new FFI — this module calls
+//! back into `gzv.std/http` only); no Toto-owned TLS/crypto; no
+//! Waves 3–5 work; Windows gets check-time `E0301` via the net/tls
+//! surface this module rides on.
+//!
+//! State types (FIXED — one choice each, golden-pinned): a
+//! `MetricsRegistry` holds `counters`, `gauges`, and `histograms`
+//! (each a registration-ordered array of definitions). Every
+//! definition carries `name`, `help`, and `label_names`; every
+//! observation is a sample under one label-value set
+//! (first-observation order). Counters hold monotonic `int` totals
+//! (`metrics_inc` rejects negative deltas loudly); gauges hold
+//! `int` values set or added to (`metrics_gauge_set/add` — the
+//! delta may be negative); histograms hold cumulative per-bucket
+//! `counts` over `int` upper bounds plus `sum` and `count`.
+//! Values are ints (request counts, millisecond latencies) — float
+//! observations are a follow-up with the full bytes story.
+//!
+//! Registration (FIXED): every metric must be registered before
+//! use; the name must match `[a-zA-Z_:][a-zA-Z0-9_:]*`; the name
+//! must be unique across ALL kinds (a counter and a gauge may never
+//! share a name — Prometheus forbids it); label names follow the
+//! same grammar, must be unique within the metric, must not start
+//! with `__` (reserved), and `le` is reserved on histograms (the
+//! renderer owns it); histogram bounds must be non-empty and
+//! strictly increasing. Unknown-metric observations, wrong-arity
+//! label sets, and unrepresentable help/label text are all `Err`
+//! (fixed strings, never silent defaults). `help` and label values
+//! must be HTTP text (printable ASCII plus HT/LF/CR — the same
+//! acceptance as `http_text_to_bytes`, which performs the final
+//! encode at serve time).
+//!
+//! Format version (FIXED): `metrics_exposition_version()` returns
+//! `"0.0.4"`, and `metrics_content_type()` returns the scrape
+//! media type `text/plain; version=0.0.4; charset=utf-8`. Render
+//! order is registration order (counters, then gauges, then
+//! histograms; samples in first-observation order) with label
+//! names in declaration order (`le` first on bucket lines, as the
+//! reference clients emit). HELP docstrings escape `\` and LF;
+//! label values escape `\`, `"`, and LF — exactly the reference
+//! escaping; anything else passes through verbatim. A registered
+//! metric with no observations still emits its HELP/TYPE pair.
+//! No timestamps, no `# EOF` (that marker is OpenMetrics, not
+//! the 0.0.4 text format).
+//!
+//! Concurrency: arrays and structs are shared by reference, so a
+//! handler closure capturing the registry observes the same state
+//! the main task mutates (the `mwlog` pattern from `proj16`) —
+//! one connection task per scrape, values exact under the
+//! executor. No locks in v1: increments are single green-thread
+//! steps, and scrapes interleave at suspension points exactly like
+//! any other handler read.
 import "gzv.std/http.gzv";
 import "gzv.std/strings.gzv";
 
 // --- State types ---
 
-// One counter/gauge series: the label values (parallel to the
-// definition's `label_names`) plus the current total.
+/// One counter/gauge series: the label values (parallel to the
+/// definition's `label_names`) plus the current total.
 pub struct MetricsSample {
     labels: Array<string>,
     value: int,
 }
 
-// One histogram series: cumulative per-bucket counts (parallel to
-// the definition's `buckets`), plus the running sum and count.
+/// One histogram series: cumulative per-bucket counts (parallel to
+/// the definition's `buckets`), plus the running sum and count.
 pub struct MetricsHistoSample {
     labels: Array<string>,
     counts: Array<int>,
@@ -86,7 +86,7 @@ pub struct MetricsHistoSample {
     count: int,
 }
 
-// A registered counter definition plus its series.
+/// A registered counter definition plus its series.
 pub struct MetricsCounter {
     name: string,
     help: string,
@@ -94,7 +94,7 @@ pub struct MetricsCounter {
     samples: Array<MetricsSample>,
 }
 
-// A registered gauge definition plus its series.
+/// A registered gauge definition plus its series.
 pub struct MetricsGauge {
     name: string,
     help: string,
@@ -102,7 +102,7 @@ pub struct MetricsGauge {
     samples: Array<MetricsSample>,
 }
 
-// A registered histogram definition plus its series.
+/// A registered histogram definition plus its series.
 pub struct MetricsHistogram {
     name: string,
     help: string,
@@ -111,16 +111,16 @@ pub struct MetricsHistogram {
     samples: Array<MetricsHistoSample>,
 }
 
-// The registry: every definition ever registered, in
-// registration order per kind. Mutated in place through the
-// shared arrays (the `route_add` pattern).
+/// The registry: every definition ever registered, in
+/// registration order per kind. Mutated in place through the
+/// shared arrays (the `route_add` pattern).
 pub struct MetricsRegistry {
     counters: Array<MetricsCounter>,
     gauges: Array<MetricsGauge>,
     histograms: Array<MetricsHistogram>,
 }
 
-// An empty registry: no metrics of any kind.
+/// An empty registry: no metrics of any kind.
 pub fn metrics_registry() -> MetricsRegistry {
     let c: Array<MetricsCounter> = [];
     let g: Array<MetricsGauge> = [];
@@ -130,12 +130,12 @@ pub fn metrics_registry() -> MetricsRegistry {
 
 // --- Format version ---
 
-// The Prometheus text-exposition format this module renders.
+/// The Prometheus text-exposition format this module renders.
 pub fn metrics_exposition_version() -> string {
     return "0.0.4";
 }
 
-// The scrape media type: version pinned, UTF-8 declared.
+/// The scrape media type: version pinned, UTF-8 declared.
 pub fn metrics_content_type() -> string {
     return "text/plain; version=0.0.4; charset=utf-8";
 }
@@ -170,7 +170,7 @@ fn metrics_is_name_char(c: string) -> bool {
     return false;
 }
 
-// Prometheus metric/label grammar: `[a-zA-Z_:][a-zA-Z0-9_:]*`.
+/// Prometheus metric/label grammar: `[a-zA-Z_:][a-zA-Z0-9_:]*`.
 fn metrics_valid_name(s: string) -> bool {
     if len(s) == 0 {
         return false;
@@ -190,9 +190,9 @@ fn metrics_valid_name(s: string) -> bool {
     return true;
 }
 
-// HTTP-text acceptance: printable ASCII plus HT/LF/CR — the same
-// rule `http_text_to_bytes` enforces at encode time, checked here
-// so the responsible call fails instead of a later scrape.
+/// HTTP-text acceptance: printable ASCII plus HT/LF/CR — the same
+/// rule `http_text_to_bytes` enforces at encode time, checked here
+/// so the responsible call fails instead of a later scrape.
 fn metrics_require_text(s: string, err: string) -> Result<unit, string> {
     let chars: Array<string> = split(s, "");
     for c in chars {
@@ -209,8 +209,8 @@ fn metrics_require_text(s: string, err: string) -> Result<unit, string> {
     return Ok(());
 }
 
-// Label-name rules shared by all three kinds (`le` reserved only
-// on histograms, where the renderer owns it).
+/// Label-name rules shared by all three kinds (`le` reserved only
+/// on histograms, where the renderer owns it).
 fn metrics_check_label_names(label_names: Array<string>, for_histogram: bool) -> Result<unit, string> {
     for i in 0..len(label_names) {
         let nm = label_names[i];
@@ -236,7 +236,7 @@ fn metrics_check_label_names(label_names: Array<string>, for_histogram: bool) ->
     return Ok(());
 }
 
-// Histogram bounds: non-empty, strictly increasing.
+/// Histogram bounds: non-empty, strictly increasing.
 fn metrics_check_buckets(buckets: Array<int>) -> Result<unit, string> {
     if len(buckets) == 0 {
         return Err("metrics: buckets must be non-empty and strictly increasing");
@@ -253,7 +253,7 @@ fn metrics_check_buckets(buckets: Array<int>) -> Result<unit, string> {
 
 // --- Lookup (private) ---
 
-// True when any kind already carries `name`.
+/// True when any kind already carries `name`.
 fn metrics_known(reg: MetricsRegistry, name: string) -> bool {
     for i in 0..len(reg.counters) {
         if reg.counters[i].name == name {
@@ -340,8 +340,8 @@ fn metrics_histo_at(samples: Array<MetricsHistoSample>, labels: Array<string>) -
     return -1;
 }
 
-// Label values must match the declaration arity and be HTTP text
-// (fixed errors, never echoing the value).
+/// Label values must match the declaration arity and be HTTP text
+/// (fixed errors, never echoing the value).
 fn metrics_require_labels(label_names: Array<string>, labels: Array<string>) -> Result<unit, string> {
     if len(labels) != len(label_names) {
         return Err("metrics: want " + to_string(len(label_names)) + " label values (got " + to_string(len(labels)) + ")");
@@ -355,8 +355,8 @@ fn metrics_require_labels(label_names: Array<string>, labels: Array<string>) -> 
 
 // --- Copies (private) ---
 
-// Copies (arrays are shared by reference — stored state must not
-// alias caller arrays).
+/// Copies (arrays are shared by reference — stored state must not
+/// alias caller arrays).
 fn metrics_copy_strings(xs: Array<string>) -> Array<string> {
     let out: Array<string> = [];
     for x in xs {
@@ -375,7 +375,7 @@ fn metrics_copy_ints(xs: Array<int>) -> Array<int> {
 
 // --- Exposition (private escaping + public render) ---
 
-// Label values escape `\`, `"`, and LF — exactly the reference.
+/// Label values escape `\`, `"`, and LF — exactly the reference.
 fn metrics_escape_label(s: string) -> string {
     let mut out: string = "";
     let chars: Array<string> = split(s, "");
@@ -397,7 +397,7 @@ fn metrics_escape_label(s: string) -> string {
     return out;
 }
 
-// HELP docstrings escape `\` and LF only (0.0.4).
+/// HELP docstrings escape `\` and LF only (0.0.4).
 fn metrics_escape_help(s: string) -> string {
     let mut out: string = "";
     let chars: Array<string> = split(s, "");
@@ -415,7 +415,7 @@ fn metrics_escape_help(s: string) -> string {
     return out;
 }
 
-// `{name="value",...}` (declaration order) or "" when unlabelled.
+/// `{name="value",...}` (declaration order) or "" when unlabelled.
 fn metrics_label_suffix(label_names: Array<string>, labels: Array<string>) -> string {
     if len(label_names) == 0 {
         return "";
@@ -432,7 +432,7 @@ fn metrics_label_suffix(label_names: Array<string>, labels: Array<string>) -> st
     return out + "}";
 }
 
-// Bucket lines carry `le` first, then the series labels.
+/// Bucket lines carry `le` first, then the series labels.
 fn metrics_bucket_suffix(label_names: Array<string>, labels: Array<string>, le: string) -> string {
     let mut out: string = "{le=\"" + le + "\"";
     for i in 0..len(label_names) {
@@ -441,9 +441,9 @@ fn metrics_bucket_suffix(label_names: Array<string>, labels: Array<string>, le: 
     return out + "}";
 }
 
-// The full 0.0.4 exposition: HELP/TYPE per metric in registration
-// order (counters, gauges, histograms), then every sample line.
-// Each line ends with `\n`, including the last.
+/// The full 0.0.4 exposition: HELP/TYPE per metric in registration
+/// order (counters, gauges, histograms), then every sample line.
+/// Each line ends with `\n`, including the last.
 pub fn metrics_render(reg: MetricsRegistry) -> Result<string, string> {
     let mut out: string = "";
     for i in 0..len(reg.counters) {
@@ -483,9 +483,9 @@ pub fn metrics_render(reg: MetricsRegistry) -> Result<string, string> {
 
 // --- Scrape endpoint via the framework ---
 
-// A 200 response carrying the current exposition with the pinned
-// media type. Handlers close over the registry (shared arrays, so
-// the scrape sees every observation to date).
+/// A 200 response carrying the current exposition with the pinned
+/// media type. Handlers close over the registry (shared arrays, so
+/// the scrape sees every observation to date).
 pub fn metrics_respond(reg: MetricsRegistry) -> Result<HttpResponse, string> {
     let text = metrics_render(reg)?;
     let body = http_text_to_bytes(text)?;
@@ -493,8 +493,8 @@ pub fn metrics_respond(reg: MetricsRegistry) -> Result<HttpResponse, string> {
     return Ok(http_response(200, "OK", hs, body));
 }
 
-// A `GET`-ready handler value for `route_add(router, "GET",
-// "/metrics", metrics_handler(reg))`.
+/// A `GET`-ready handler value for `route_add(router, "GET",
+/// "/metrics", metrics_handler(reg))`.
 pub fn metrics_handler(reg: MetricsRegistry) -> fn(HttpRequest) -> Result<HttpResponse, string> {
     return fn(req: HttpRequest) -> Result<HttpResponse, string> {
         return metrics_respond(reg);
@@ -503,8 +503,8 @@ pub fn metrics_handler(reg: MetricsRegistry) -> fn(HttpRequest) -> Result<HttpRe
 
 // --- Registration ---
 
-// Register a counter. `label_names` declares the series key;
-// observations carry the values positionally.
+/// Register a counter. `label_names` declares the series key;
+/// observations carry the values positionally.
 pub fn metrics_register_counter(reg: MetricsRegistry, name: string, help: string, label_names: Array<string>) -> Result<unit, string> {
     if !(metrics_valid_name(name)) {
         return Err("metrics: bad metric name \"" + name + "\" (want [a-zA-Z_:][a-zA-Z0-9_:]*)");
@@ -521,7 +521,7 @@ pub fn metrics_register_counter(reg: MetricsRegistry, name: string, help: string
     return Ok(());
 }
 
-// Register a gauge (same rules as a counter).
+/// Register a gauge (same rules as a counter).
 pub fn metrics_register_gauge(reg: MetricsRegistry, name: string, help: string, label_names: Array<string>) -> Result<unit, string> {
     if !(metrics_valid_name(name)) {
         return Err("metrics: bad metric name \"" + name + "\" (want [a-zA-Z_:][a-zA-Z0-9_:]*)");
@@ -538,8 +538,8 @@ pub fn metrics_register_gauge(reg: MetricsRegistry, name: string, help: string, 
     return Ok(());
 }
 
-// Register a histogram with `int` upper bounds (cumulative
-// `le` series plus `_sum`/`_count`, all in observation units).
+/// Register a histogram with `int` upper bounds (cumulative
+/// `le` series plus `_sum`/`_count`, all in observation units).
 pub fn metrics_register_histogram(reg: MetricsRegistry, name: string, help: string, label_names: Array<string>, buckets: Array<int>) -> Result<unit, string> {
     if !(metrics_valid_name(name)) {
         return Err("metrics: bad metric name \"" + name + "\" (want [a-zA-Z_:][a-zA-Z0-9_:]*)");
@@ -559,8 +559,8 @@ pub fn metrics_register_histogram(reg: MetricsRegistry, name: string, help: stri
 
 // --- Observation ---
 
-// Add `delta` to a counter series (must be >= 0 — counters never
-// go down). First observation for a label set creates the series.
+/// Add `delta` to a counter series (must be >= 0 — counters never
+/// go down). First observation for a label set creates the series.
 pub fn metrics_inc(reg: MetricsRegistry, name: string, labels: Array<string>, delta: int) -> Result<unit, string> {
     let ci = metrics_counter_at(reg, name);
     if ci < 0 {
@@ -582,7 +582,7 @@ pub fn metrics_inc(reg: MetricsRegistry, name: string, labels: Array<string>, de
     return Ok(());
 }
 
-// Set a gauge series to an absolute value.
+/// Set a gauge series to an absolute value.
 pub fn metrics_gauge_set(reg: MetricsRegistry, name: string, labels: Array<string>, value: int) -> Result<unit, string> {
     let gi = metrics_gauge_at(reg, name);
     if gi < 0 {
@@ -600,7 +600,7 @@ pub fn metrics_gauge_set(reg: MetricsRegistry, name: string, labels: Array<strin
     return Ok(());
 }
 
-// Add a (signed) delta to a gauge series.
+/// Add a (signed) delta to a gauge series.
 pub fn metrics_gauge_add(reg: MetricsRegistry, name: string, labels: Array<string>, delta: int) -> Result<unit, string> {
     let gi = metrics_gauge_at(reg, name);
     if gi < 0 {
@@ -618,8 +618,8 @@ pub fn metrics_gauge_add(reg: MetricsRegistry, name: string, labels: Array<strin
     return Ok(());
 }
 
-// Observe one histogram value: every bound >= the value counts
-// one more (cumulative), and `sum`/`count` grow by the value/one.
+/// Observe one histogram value: every bound >= the value counts
+/// one more (cumulative), and `sum`/`count` grow by the value/one.
 pub fn metrics_observe(reg: MetricsRegistry, name: string, labels: Array<string>, value: int) -> Result<unit, string> {
     let hi = metrics_histogram_at(reg, name);
     if hi < 0 {

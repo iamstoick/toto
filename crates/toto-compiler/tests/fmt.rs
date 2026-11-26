@@ -263,3 +263,20 @@ fn fmt_drops_pub_without_changing_meaning() {
         "formatted pub-using project no longer checks"
     );
 }
+
+#[test]
+fn fmt_preserves_doc_comments_verbatim() {
+    // Canonical form round-trips byte-identically: `//!` module
+    // block (bare `//!` line included), `///` item docs, blank line
+    // between module doc and items and between items.
+    let src = "//! Math helpers.\n//!\n\n/// Adds one.\nfn inc(x: int) -> int {\n    return x + 1;\n}\n\n/// A point.\nstruct Pt { x: int }\n";
+    let program = parse(src).expect("doc source parses");
+    assert_eq!(program.doc, vec!["Math helpers.", ""]);
+    assert_eq!(program.items[0].doc, vec!["Adds one."]);
+    let once = toto_compiler::fmt::format_program(&program);
+    assert_eq!(once, src);
+    // Idempotent: formatting formatted output changes nothing.
+    let reparsed = parse(&once).expect("formatted parses");
+    let twice = toto_compiler::fmt::format_program(&reparsed);
+    assert_eq!(twice, once);
+}

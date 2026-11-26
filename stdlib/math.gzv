@@ -1,9 +1,9 @@
-// gzv.std/math — integer math helpers beyond the frozen builtins.
-//
-// The builtins already cover abs/min/max/sqrt/floor/ceil. This module
-// adds exact integer operations. All arithmetic is checked: overflow
-// panics per the ratified rule, so `pow_int`/`factorial` panic rather
-// than wrap.
+//! gzv.std/math — integer math helpers beyond the frozen builtins.
+//!
+//! The builtins already cover abs/min/max/sqrt/floor/ceil. This module
+//! adds exact integer operations. All arithmetic is checked: overflow
+//! panics per the ratified rule, so `pow_int`/`factorial` panic rather
+//! than wrap.
 
 pub fn clamp_int(v: int, lo: int, hi: int) -> int {
     if v < lo {

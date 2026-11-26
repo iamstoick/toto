@@ -1,17 +1,17 @@
-// gzv.std/proto — protobuf wire codec, varint/length-delimited
-// subset (Enterprise Wave 1).
-//
-// Schema-driven encode/decode over explicit field descriptors —
-// no `.proto` compiler, no codegen (binding generation stays
-// deferred per the FFI rules). Wire scope (stated subset):
-// field numbers 1..2^29-1, wire types 0 (varint, non-negative
-// only) and 2 (length-delimited bytes). NOT covered (clear
-// errors): groups, fixed32/fixed64/sfixed/float/double, negative
-// ints (no 10-byte sign extension), unknown wire types.
-// Unknown FIELDS (known wire type, unlisted number) are SKIPPED
-// per protobuf rules. Strings cross as bytes — the caller maps
-// text (ASCII decimal literals in tests); there is no text
-// format in v1.
+//! gzv.std/proto — protobuf wire codec, varint/length-delimited
+//! subset (Enterprise Wave 1).
+//!
+//! Schema-driven encode/decode over explicit field descriptors —
+//! no `.proto` compiler, no codegen (binding generation stays
+//! deferred per the FFI rules). Wire scope (stated subset):
+//! field numbers 1..2^29-1, wire types 0 (varint, non-negative
+//! only) and 2 (length-delimited bytes). NOT covered (clear
+//! errors): groups, fixed32/fixed64/sfixed/float/double, negative
+//! ints (no 10-byte sign extension), unknown wire types.
+//! Unknown FIELDS (known wire type, unlisted number) are SKIPPED
+//! per protobuf rules. Strings cross as bytes — the caller maps
+//! text (ASCII decimal literals in tests); there is no text
+//! format in v1.
 
 pub struct PbField {
     num: int,
@@ -40,7 +40,7 @@ fn pb_check_num(num: int) -> Result<int, string> {
     return Ok(num);
 }
 
-// Unsigned varint encode (non-negative only).
+/// Unsigned varint encode (non-negative only).
 fn pb_encode_varint(v: int) -> Result<Array<int>, string> {
     if v < 0 {
         return Err("negative varints are not supported: " + to_string(v));
@@ -64,7 +64,7 @@ fn pb_encode_varint(v: int) -> Result<Array<int>, string> {
     return Ok(out);
 }
 
-// Unsigned varint decode: (value, next index).
+/// Unsigned varint decode: (value, next index).
 struct PbVarint {
     value: int,
     next: int,
@@ -193,8 +193,8 @@ pub fn pb_decode(data: Array<int>, schema: Array<PbSchema>) -> Result<Array<PbFi
     return Ok(out);
 }
 
-// Decode and project onto the schema (unknown fields dropped —
-// callers that need them use `pb_decode` directly).
+/// Decode and project onto the schema (unknown fields dropped —
+/// callers that need them use `pb_decode` directly).
 pub fn pb_decode_known(data: Array<int>, schema: Array<PbSchema>) -> Result<Array<PbField>, string> {
     let all = pb_decode(data, schema)?;
     let mut out: Array<PbField> = [];

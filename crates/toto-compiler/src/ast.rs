@@ -21,6 +21,9 @@ pub type Stmt = Sp<StmtKind>;
 #[derive(Clone, Debug)]
 pub struct Program {
     pub items: Vec<Item>,
+    /// Module doc: the file-header doc-comment block (leading `//!`
+    /// lines by convention), drained before the first item.
+    pub doc: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +34,9 @@ pub struct Item {
     /// parsing (single-file parses leave it `None`; rendering and
     /// checking fall back to the caller-supplied filename).
     pub file: Option<String>,
+    /// Item doc: the `///` lines immediately preceding the item
+    /// (drained by the parser; empty when undocumented).
+    pub doc: Vec<String>,
 }
 
 #[derive(Clone, Debug)]

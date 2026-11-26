@@ -1,19 +1,19 @@
-// `gzv.std/oidc` — OAuth2 / OpenID Connect client over the Wave 2
-// HTTP framework (Enterprise Wave 3, Stage 3).
-//
-// Discovery (`GET .well-known/openid-configuration`), auth-URL
-// builder (state/nonce/PKCE-S256), code exchange and password
-// grants (POST form), ID-token validation (JWT RS256/HS256/ES256
-// via `gzv.std/jwt` + JWKS `kid` selection), and userinfo fetch.
-// No browser is automated: the auth-code leg runs as scripted
-// form posts (same HTTP client, manual cookies); the password
-// grant is the automation seam for tests and services.
-//
-// Reference IdP: Keycloak (HS256 client setting or default
-// RS256 — both validate; the §6 demo uses RS256+JWKS, the
-// enterprise default). Test-only credentials travel in code
-// (never committed fixtures/goldens with real secrets — CI
-// injects its own; see Stage 4).
+//! `gzv.std/oidc` — OAuth2 / OpenID Connect client over the Wave 2
+//! HTTP framework (Enterprise Wave 3, Stage 3).
+//!
+//! Discovery (`GET .well-known/openid-configuration`), auth-URL
+//! builder (state/nonce/PKCE-S256), code exchange and password
+//! grants (POST form), ID-token validation (JWT RS256/HS256/ES256
+//! via `gzv.std/jwt` + JWKS `kid` selection), and userinfo fetch.
+//! No browser is automated: the auth-code leg runs as scripted
+//! form posts (same HTTP client, manual cookies); the password
+//! grant is the automation seam for tests and services.
+//!
+//! Reference IdP: Keycloak (HS256 client setting or default
+//! RS256 — both validate; the §6 demo uses RS256+JWKS, the
+//! enterprise default). Test-only credentials travel in code
+//! (never committed fixtures/goldens with real secrets — CI
+//! injects its own; see Stage 4).
 import "gzv.std/http.gzv";
 import "gzv.std/json.gzv";
 import "gzv.std/jwt.gzv";
@@ -34,10 +34,10 @@ pub struct OidcTokens {
     token_type: string,
 }
 
-// Percent-encode for query/form bodies (unreserved set passes
-// through; everything else is %XX uppercase over the UTF-8
-// bytes — multibyte text encodes correctly, never an Err for
-// valid strings).
+/// Percent-encode for query/form bodies (unreserved set passes
+/// through; everything else is %XX uppercase over the UTF-8
+/// bytes — multibyte text encodes correctly, never an Err for
+/// valid strings).
 pub fn oidc_pct_encode(s: string) -> Result<string, string> {
     let digits: string = "0123456789ABCDEF";
     let mut out: string = "";
@@ -56,7 +56,7 @@ pub fn oidc_pct_encode(s: string) -> Result<string, string> {
     return Ok(out);
 }
 
-// Fetch + parse one JSON document over plain HTTP(S).
+/// Fetch + parse one JSON document over plain HTTP(S).
 fn oidc_get_json(url: string, ca: string) -> Result<JsonVal, string> {
     let opts = HttpClientOpts { max_body: 1048576, redirects: 3, host_allow: [] };
     let req = HttpClientReq { method: "GET", url: url, headers: [], body: [], ca_pem: ca };
@@ -67,7 +67,7 @@ fn oidc_get_json(url: string, ca: string) -> Result<JsonVal, string> {
     return json_parse(http_bytes_to_text(resp.body)?);
 }
 
-// OIDC discovery (RFC 8414 / OIDC Discovery 1.0).
+/// OIDC discovery (RFC 8414 / OIDC Discovery 1.0).
 pub fn oidc_discover(issuer: string, ca: string) -> Result<OidcConfig, string> {
     let doc = oidc_get_json(issuer + "/.well-known/openid-configuration", ca)?;
     let iss = json_as_string(json_object_get(doc, "issuer")?)?;
@@ -80,8 +80,8 @@ pub fn oidc_discover(issuer: string, ca: string) -> Result<OidcConfig, string> {
     });
 }
 
-// Authorization URL (auth-code leg): state + nonce required;
-// pass a PKCE challenge to opt into S256 (empty = plain).
+/// Authorization URL (auth-code leg): state + nonce required;
+/// pass a PKCE challenge to opt into S256 (empty = plain).
 pub fn oidc_auth_url(cfg: OidcConfig, client_id: string, redirect_uri: string, scope: string, state: string, nonce: string, pkce_challenge: string) -> Result<string, string> {
     let mut q: string = "?response_type=code&client_id=" + oidc_pct_encode(client_id)? + "&redirect_uri=" + oidc_pct_encode(redirect_uri)? + "&scope=" + oidc_pct_encode(scope)? + "&state=" + oidc_pct_encode(state)? + "&nonce=" + oidc_pct_encode(nonce)?;
     if pkce_challenge != "" {
@@ -90,8 +90,8 @@ pub fn oidc_auth_url(cfg: OidcConfig, client_id: string, redirect_uri: string, s
     return Ok(cfg.auth_endpoint + q);
 }
 
-// PKCE S256 pair: 32 random bytes, verifier = unpadded
-// base64url, challenge = base64url(sha256(verifier)).
+/// PKCE S256 pair: 32 random bytes, verifier = unpadded
+/// base64url, challenge = base64url(sha256(verifier)).
 pub fn oidc_pkce() -> Result<Array<string>, string> {
     let raw = crypto_random(32)?;
     let verifier = jwt_b64_encode(raw);
@@ -99,7 +99,7 @@ pub fn oidc_pkce() -> Result<Array<string>, string> {
     return Ok([verifier, jwt_b64_encode(digest)]);
 }
 
-// POST a form and parse the JSON answer (token/userinfo style).
+/// POST a form and parse the JSON answer (token/userinfo style).
 fn oidc_post_form(url: string, fields: Array<string>, ca: string) -> Result<JsonVal, string> {
     let mut body: string = "";
     let mut i: int = 0;
@@ -121,10 +121,10 @@ fn oidc_post_form(url: string, fields: Array<string>, ca: string) -> Result<Json
     return json_parse(http_bytes_to_text(resp.body)?);
 }
 
-// Auth-code exchange (confidential client).
-// Auth-code exchange (confidential client). `code_verifier`
-// carries the PKCE verifier when the auth URL used a challenge
-// (empty string = plain flow, field omitted).
+/// Auth-code exchange (confidential client).
+/// Auth-code exchange (confidential client). `code_verifier`
+/// carries the PKCE verifier when the auth URL used a challenge
+/// (empty string = plain flow, field omitted).
 pub fn oidc_exchange_code(cfg: OidcConfig, client_id: string, client_secret: string, code: string, redirect_uri: string, code_verifier: string, ca: string) -> Result<OidcTokens, string> {
     let mut fields: Array<string> = ["grant_type=authorization_code", "code=" + oidc_pct_encode(code)?, "redirect_uri=" + oidc_pct_encode(redirect_uri)?, "client_id=" + oidc_pct_encode(client_id)?, "client_secret=" + oidc_pct_encode(client_secret)?];
     if code_verifier != "" {
@@ -135,8 +135,8 @@ pub fn oidc_exchange_code(cfg: OidcConfig, client_id: string, client_secret: str
     return oidc_tokens_of(doc);
 }
 
-// Password grant (automation seam: tests, services, CLIs —
-// never a browser substitute in the report).
+/// Password grant (automation seam: tests, services, CLIs —
+/// never a browser substitute in the report).
 pub fn oidc_password_grant(cfg: OidcConfig, client_id: string, client_secret: string, username: string, password: string) -> Result<OidcTokens, string> {
     let doc = oidc_post_form(cfg.token_endpoint, ["grant_type=password", "username=" + oidc_pct_encode(username)?, "password=" + oidc_pct_encode(password)?, "client_id=" + oidc_pct_encode(client_id)?, "client_secret=" + oidc_pct_encode(client_secret)?, "scope=" + oidc_pct_encode("openid")?], "")?;
     return oidc_tokens_of(doc);
@@ -153,7 +153,7 @@ fn oidc_tokens_of(doc: JsonVal) -> Result<OidcTokens, string> {
     return Ok(OidcTokens { access_token: at, id_token: it, refresh_token: rt, token_type: json_as_string(json_object_get(doc, "token_type")?)? });
 }
 
-// Does this parsed JSON object carry `key`?
+/// Does this parsed JSON object carry `key`?
 fn json_has(v: JsonVal, key: string) -> bool {
     for k in v.keys {
         if k == key {
@@ -164,13 +164,13 @@ fn json_has(v: JsonVal, key: string) -> bool {
     return false;
 }
 
-// Fetch the provider JWKS (public document, no auth).
+/// Fetch the provider JWKS (public document, no auth).
 pub fn oidc_fetch_jwks(cfg: OidcConfig, ca: string) -> Result<JsonVal, string> {
     return oidc_get_json(cfg.jwks_uri, ca);
 }
 
-// Userinfo (Bearer access token). Returns the raw JSON string
-// (caller parses with `gzv.std/json`).
+/// Userinfo (Bearer access token). Returns the raw JSON string
+/// (caller parses with `gzv.std/json`).
 pub fn oidc_userinfo(cfg: OidcConfig, access_token: string, ca: string) -> Result<string, string> {
     let opts = HttpClientOpts { max_body: 1048576, redirects: 0, host_allow: [] };
     let req = HttpClientReq { method: "GET", url: cfg.userinfo_endpoint, headers: [HttpHeader { name: "Authorization", value: "Bearer " + access_token }], body: [], ca_pem: ca };
@@ -181,13 +181,13 @@ pub fn oidc_userinfo(cfg: OidcConfig, access_token: string, ca: string) -> Resul
     return Ok(http_bytes_to_text(resp.body)?);
 }
 
-// Validate an ID token against a JWKS document: the token
-// header names `alg` + `kid`; the key must be a published RSA
-// key with a matching `kid` (rejects `none` and unknown algs
-// before any crypto, then enforces iss/aud/expiry). `now` is
-// unix seconds; `skew` the leeway. HS256/ES256 tokens verify
-// through `jwt_verify` with caller-held keys instead (their
-// keys are never published).
+/// Validate an ID token against a JWKS document: the token
+/// header names `alg` + `kid`; the key must be a published RSA
+/// key with a matching `kid` (rejects `none` and unknown algs
+/// before any crypto, then enforces iss/aud/expiry). `now` is
+/// unix seconds; `skew` the leeway. HS256/ES256 tokens verify
+/// through `jwt_verify` with caller-held keys instead (their
+/// keys are never published).
 pub fn oidc_verify_id_token(jwks: JsonVal, token: string, now: int, skew: int, want_iss: string, want_aud: string) -> Result<string, string> {
     let parts: Array<string> = split(token, ".");
     if len(parts) != 3 {

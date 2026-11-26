@@ -63,6 +63,36 @@ fn int_overflow_is_a_lexer_error_not_a_panic() {
 }
 
 #[test]
+fn doc_comments_become_tokens() {
+    // `///` strips one optional leading space; `//!` too; plain `//` stays skipped.
+    let (toks, errors) = lex("/// hello\n// plain\n//! module\n///nospace\n");
+    assert!(errors.is_empty());
+    let docs: Vec<(bool, &String)> = toks
+        .iter()
+        .filter_map(|t| match &t.kind {
+            TokenKind::DocComment { outer, text } => Some((*outer, text)),
+            _ => None,
+        })
+        .collect();
+    // `///` is outer (item doc); `//!` is inner (module doc).
+    assert_eq!(
+        docs.iter().map(|(o, s)| (*o, s.as_str())).collect::<Vec<_>>(),
+        vec![(true, "hello"), (false, "module"), (true, "nospace")]
+    );
+    // Empty `///` yields an empty doc token, not nothing.
+    let (toks, _) = lex("///\nfn f() {}\n");
+    assert!(matches!(&toks[0].kind, TokenKind::DocComment { text, .. } if text.is_empty()));
+    // `////` is a plain comment: no doc token.
+    let (toks, _) = lex("//// not doc\nfn f() {}\n");
+    assert!(!toks
+        .iter()
+        .any(|t| matches!(t.kind, TokenKind::DocComment { .. })));
+    // CRLF: the trailing `\r` is trimmed from the doc text.
+    let (toks, _) = lex("/// hi\r\nfn f() {}\n");
+    assert!(matches!(&toks[0].kind, TokenKind::DocComment { text, .. } if text == "hi"));
+}
+
+#[test]
 fn string_escapes_and_errors() {
     let (toks, errors) = lex(r#""a\nb\x""#);
     assert_eq!(errors.len(), 1);

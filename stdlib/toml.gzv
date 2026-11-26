@@ -1,5 +1,5 @@
-// gzv.std/toml — TOML parse + serialize, config-shaped subset
-// (Enterprise Wave 1).
+//! gzv.std/toml — TOML parse + serialize, config-shaped subset
+//! (Enterprise Wave 1).
 
 import "gzv.std/strings.gzv";
 //
@@ -134,8 +134,8 @@ fn toml_is_float_literal(s: string) -> bool {
     return digits && i == len(chars);
 }
 
-// Classify a scalar literal: kind + decoded content. Strings keep
-// their UNESCAPED content in `raw`.
+/// Classify a scalar literal: kind + decoded content. Strings keep
+/// their UNESCAPED content in `raw`.
 fn toml_classify(lit: string) -> Result<TomlVal, string> {
     let chars: Array<string> = split(lit, "");
     if len(chars) >= 2 && chars[0] == "\"" {
@@ -216,7 +216,7 @@ fn toml_trim(s: string) -> string {
     return out;
 }
 
-// Strip a `#` comment (outside quotes).
+/// Strip a `#` comment (outside quotes).
 fn toml_strip_comment(line: string) -> string {
     let chars: Array<string> = split(line, "");
     let mut quote: string = "";
@@ -428,10 +428,10 @@ fn toml_has_newline(s: string) -> bool {
     return false;
 }
 
-// Build a table TomlVal for `prefix` from flat entries: immediate
-// children become scalar entries; deeper paths group into
-// multi-line source fragments (re-parsed with their absolute
-// prefix on access).
+/// Build a table TomlVal for `prefix` from flat entries: immediate
+/// children become scalar entries; deeper paths group into
+/// multi-line source fragments (re-parsed with their absolute
+/// prefix on access).
 fn toml_build(entries: Array<TomlEntry>, prefix: string) -> Result<TomlVal, string> {
     let mut keys: Array<string> = [];
     let mut vals: Array<string> = [];
@@ -565,8 +565,8 @@ pub fn toml_parse(text: string) -> Result<TomlVal, string> {
     return toml_build(doc.entries, "");
 }
 
-// Array inner elements (top-level commas only; nested arrays and
-// tables are rejected — config-shaped scope).
+/// Array inner elements (top-level commas only; nested arrays and
+/// tables are rejected — config-shaped scope).
 fn toml_array_inner(lit: string) -> Result<Array<string>, string> {
     let chars: Array<string> = split(lit, "");
     let mut inner: string = "";
@@ -735,8 +735,8 @@ fn toml_parse_float(s: string) -> Result<float, string> {
     return Ok(value);
 }
 
-// Arrays surface through table access: a scalar entry whose
-// literal is `[...]` materializes as an `arr` TomlVal.
+/// Arrays surface through table access: a scalar entry whose
+/// literal is `[...]` materializes as an `arr` TomlVal.
 pub fn toml_table_get_array(v: TomlVal, key: string) -> Result<TomlVal, string> {
     if v.kind != "table" {
         return Err("expected table, got " + v.kind);

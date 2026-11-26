@@ -49,6 +49,23 @@ done
 ./target/debug/toto coverage crates/toto-cli/tests/fixtures/coverage/branches.gzv 2>/dev/null | sed 's|^SF:.*/\(.*\)|SF:\1|' > /tmp/toto-cov-demo.lcov
 cmp /tmp/toto-cov-demo.lcov crates/toto-cli/tests/fixtures/coverage/branches.gzv.lcov
 ./target/debug/toto coverage --fail-under 100 crates/toto-cli/tests/fixtures/coverage/branches.gzv >/dev/null
+# Stage 4 doc gate (Wave 5): `toto doc` renders every stdlib module
+# (parse refusal would fail here), and every `pub` fn/struct has a
+# `###` signature heading in its module file (surface completeness,
+# self-maintaining: no hardcoded counts).
+rm -rf /tmp/toto-doc-gate
+./target/debug/toto doc --out /tmp/toto-doc-gate stdlib/*.gzv
+: > /tmp/toto-doc-missing.txt
+for f in stdlib/*.gzv; do
+    name=$(basename "$f" .gzv)
+    grep -hoE '^pub (unsafe )?fn [A-Za-z0-9_]+|^pub struct [A-Za-z0-9_]+' "$f" | sed -E 's/^pub (unsafe )?fn //;s/^pub struct //' | while read -r item; do
+        grep -qxF "### $item" /tmp/toto-doc-gate/"$name.md" || echo "$name.md: missing ### $item" >> /tmp/toto-doc-missing.txt
+    done
+done
+if [ -s /tmp/toto-doc-missing.txt ]; then
+    cat /tmp/toto-doc-missing.txt
+    exit 1
+fi
 (cd stdlib && ../target/debug/toto test)
 # wordfreq sample app (Phase 5, Stage 5): project tests green, and
 # the built executable matches the interpreter byte-for-byte.

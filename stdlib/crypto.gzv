@@ -1,26 +1,26 @@
-// `gzv.std/crypto` — cryptographic bindings (Enterprise Wave 1).
-//
-// Toto wrappers over the runtime `toto_rt_crypto_*` foreign
-// functions (unix-only; see `docs/ffi.md` for the per-binding
-// contract). The primitives themselves live in the linked system
-// libcrypto (OpenSSL/LibreSSL) — this module binds, never
-// implements. Bytes cross as `Array<int>` (0–255; out-of-range is
-// E0308 at the boundary). Every fallible function returns
-// `Result<_, string>` with the library message (`strerror`
-// discipline via the call-duration error slot); malformed inputs
-// (wrong key/nonce lengths, unparseable PEM/DER) are runtime `Err`
-// strings, never panics, never silent.
-//
-// Layouts (fixed, documented here and in spec §18):
-// - digests: SHA-256 (32 bytes), SHA-512 (64 bytes).
-// - HMAC: HMAC-SHA-256/512 (key any length, output 32/64 bytes).
-// - AEAD: AES-256-GCM; key 32 bytes, nonce 12 bytes, encrypt output
-//   is `ciphertext || tag(16)`; decrypt authenticates or `Err`s.
-// - Signatures: ECDSA P-256 over SHA-256; secret 32 bytes, public
-//   64 bytes (`x || y`, no `0x04` prefix), signatures DER.
-// - CSPRNG: `RAND_bytes`, 1–65536 bytes per call.
-// - X.509: `verify(leaf_pem, ca_pem)` is 1 iff the leaf chains to
-//   the trust root (0 = bad chain; `Err` = unparseable PEM).
+//! `gzv.std/crypto` — cryptographic bindings (Enterprise Wave 1).
+//!
+//! Toto wrappers over the runtime `toto_rt_crypto_*` foreign
+//! functions (unix-only; see `docs/ffi.md` for the per-binding
+//! contract). The primitives themselves live in the linked system
+//! libcrypto (OpenSSL/LibreSSL) — this module binds, never
+//! implements. Bytes cross as `Array<int>` (0–255; out-of-range is
+//! E0308 at the boundary). Every fallible function returns
+//! `Result<_, string>` with the library message (`strerror`
+//! discipline via the call-duration error slot); malformed inputs
+//! (wrong key/nonce lengths, unparseable PEM/DER) are runtime `Err`
+//! strings, never panics, never silent.
+//!
+//! Layouts (fixed, documented here and in spec §18):
+//! - digests: SHA-256 (32 bytes), SHA-512 (64 bytes).
+//! - HMAC: HMAC-SHA-256/512 (key any length, output 32/64 bytes).
+//! - AEAD: AES-256-GCM; key 32 bytes, nonce 12 bytes, encrypt output
+//!   is `ciphertext || tag(16)`; decrypt authenticates or `Err`s.
+//! - Signatures: ECDSA P-256 over SHA-256; secret 32 bytes, public
+//!   64 bytes (`x || y`, no `0x04` prefix), signatures DER.
+//! - CSPRNG: `RAND_bytes`, 1–65536 bytes per call.
+//! - X.509: `verify(leaf_pem, ca_pem)` is 1 iff the leaf chains to
+//!   the trust root (0 = bad chain; `Err` = unparseable PEM).
 
 pub struct SignKeyPair {
     secret: Array<int>,
@@ -130,9 +130,9 @@ pub fn crypto_random(n: int) -> Result<Array<int>, string> {
     return ok_or_empty(toto_rt_crypto_random(n));
 }
 
-// PBKDF2-HMAC-SHA256, 32-byte key (Wave 3 password hashing).
-// Iterations must be positive (callers pass the OWASP count);
-// the KDF itself runs in the linked libcrypto, never in Toto.
+/// PBKDF2-HMAC-SHA256, 32-byte key (Wave 3 password hashing).
+/// Iterations must be positive (callers pass the OWASP count);
+/// the KDF itself runs in the linked libcrypto, never in Toto.
 pub fn crypto_pbkdf2(password: string, salt: Array<int>, iterations: int) -> Result<Array<int>, string> {
     if iterations < 1 {
         return Err("pbkdf2: need positive iterations, got " + to_string(iterations));
@@ -140,8 +140,8 @@ pub fn crypto_pbkdf2(password: string, salt: Array<int>, iterations: int) -> Res
     return ok_or_empty(toto_rt_crypto_pbkdf2(password, salt, iterations));
 }
 
-// Constant-time 32-byte comparison: 1 equal, 0 different, Err
-// on bad lengths (never a silent false).
+/// Constant-time 32-byte comparison: 1 equal, 0 different, Err
+/// on bad lengths (never a silent false).
 pub fn crypto_pbkdf2_verify(expected: Array<int>, got: Array<int>) -> Result<int, string> {
     if len(expected) != 32 || len(got) != 32 {
         return Err("pbkdf2 verify: need 32-byte keys");
@@ -153,10 +153,10 @@ pub fn crypto_pbkdf2_verify(expected: Array<int>, got: Array<int>) -> Result<int
     return Ok(v);
 }
 
-// RSA PKCS#1 v1.5 verification with SHA-256 (Wave 3 RS256
-// JWTs): 1 valid, 0 invalid, Err on bad inputs (never silent).
-// `n`/`e` are big-endian JWK bytes, `digest` is 32 bytes of
-// SHA-256, `sig` the raw signature.
+/// RSA PKCS#1 v1.5 verification with SHA-256 (Wave 3 RS256
+/// JWTs): 1 valid, 0 invalid, Err on bad inputs (never silent).
+/// `n`/`e` are big-endian JWK bytes, `digest` is 32 bytes of
+/// SHA-256, `sig` the raw signature.
 pub fn crypto_rsa_verify(n: Array<int>, e: Array<int>, digest: Array<int>, sig: Array<int>) -> Result<int, string> {
     if len(digest) != 32 {
         return Err("rsa verify: need a 32-byte digest");

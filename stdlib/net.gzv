@@ -1,18 +1,18 @@
-// `gzv.std/net` — networking substrate (Enterprise Wave 1).
-//
-// Toto wrappers over the runtime `toto_rt_net_*` foreign functions
-// (unix-only; see `docs/ffi.md` for the per-binding contract).
-// Bytes cross as `Array<int>` (0–255; out-of-range is E0308 at the
-// boundary). Sockets are opaque `int` handles — never printed
-// (fd numbers are process-unstable). All failures are `Result` `Err`
-// strings (`strerror` discipline via the call-duration error slot);
-// closing twice or using a closed socket is an `Err`, never a
-// panic, never silent.
-//
-// Blocking semantics: connect/accept/send/receive park the task on
-// the M:N poller (network waits never occupy workers); `net_resolve`
-// parks on the dedicated blocking pool (`getaddrinfo` cannot be
-// made nonblocking). See spec §17.
+//! `gzv.std/net` — networking substrate (Enterprise Wave 1).
+//!
+//! Toto wrappers over the runtime `toto_rt_net_*` foreign functions
+//! (unix-only; see `docs/ffi.md` for the per-binding contract).
+//! Bytes cross as `Array<int>` (0–255; out-of-range is E0308 at the
+//! boundary). Sockets are opaque `int` handles — never printed
+//! (fd numbers are process-unstable). All failures are `Result` `Err`
+//! strings (`strerror` discipline via the call-duration error slot);
+//! closing twice or using a closed socket is an `Err`, never a
+//! panic, never silent.
+//!
+//! Blocking semantics: connect/accept/send/receive park the task on
+//! the M:N poller (network waits never occupy workers); `net_resolve`
+//! parks on the dedicated blocking pool (`getaddrinfo` cannot be
+//! made nonblocking). See spec §17.
 
 pub struct UdpPacket {
     data: Array<int>,
@@ -46,9 +46,9 @@ fn last_error() -> string {
     return toto_rt_net_last_error();
 }
 
-// Resolve `host` (blocking-pool DNS), then connect to the first
-// address (poller-parked handshake). Loopback and LAN names work,
-// as do public names where DNS answers.
+/// Resolve `host` (blocking-pool DNS), then connect to the first
+/// address (poller-parked handshake). Loopback and LAN names work,
+/// as do public names where DNS answers.
 pub fn net_tcp_connect(host: string, port: int) -> Result<int, string> {
     if !valid_port(port) {
         return Err("invalid port (want 1-65535)");
@@ -70,8 +70,8 @@ pub fn net_tcp_connect(host: string, port: int) -> Result<int, string> {
     return Err(err);
 }
 
-// Bind loopback (`127.0.0.1`) + listen. No all-interfaces bind in
-// v1 (spec §17.4).
+/// Bind loopback (`127.0.0.1`) + listen. No all-interfaces bind in
+/// v1 (spec §17.4).
 pub fn net_tcp_listen(port: int) -> Result<int, string> {
     if !valid_port(port) {
         return Err("invalid port (want 1-65535)");
@@ -91,7 +91,7 @@ pub fn net_accept(listener: int) -> Result<int, string> {
     return Ok(fd);
 }
 
-// One `send` syscall; may short-send. Returns bytes written.
+/// One `send` syscall; may short-send. Returns bytes written.
 pub fn net_send(conn: int, data: Array<int>) -> Result<int, string> {
     let n = toto_rt_net_send(conn, data);
     if n < 0 {
@@ -100,7 +100,7 @@ pub fn net_send(conn: int, data: Array<int>) -> Result<int, string> {
     return Ok(n);
 }
 
-// Loop to full delivery (`send` may short-write per call).
+/// Loop to full delivery (`send` may short-write per call).
 pub fn net_send_all(conn: int, data: Array<int>) -> Result<int, string> {
     let mut off = 0;
     while off < len(data) {
@@ -119,7 +119,7 @@ pub fn net_send_all(conn: int, data: Array<int>) -> Result<int, string> {
     return Ok(len(data));
 }
 
-// Up to `max` bytes; an empty array is orderly shutdown, NOT an error.
+/// Up to `max` bytes; an empty array is orderly shutdown, NOT an error.
 pub fn net_recv(conn: int, max: int) -> Result<Array<int>, string> {
     if max < 1 {
         return Err("invalid max (want >= 1)");

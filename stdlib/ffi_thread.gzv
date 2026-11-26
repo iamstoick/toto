@@ -1,18 +1,18 @@
-// `gzv.std/ffi_thread` — foreign-thread FFI (Phase 5, Stage 3).
-//
-// `c_thread_spawn` hands a callback to `pthread_create`, and only
-// generated code's drain cannot run it: any program importing this
-// module runs under `toto run` / `toto test` ONLY. `toto build`
-// refuses the callback call site at compile time (exit 3, with the
-// run/test workaround in the message). Import `gzv.std/ffi` alone
-// for the buildable C surface — unused callback *declarations*
-// never poison a build, only called callback sites refuse.
+//! `gzv.std/ffi_thread` — foreign-thread FFI (Phase 5, Stage 3).
+//!
+//! `c_thread_spawn` hands a callback to `pthread_create`, and only
+//! generated code's drain cannot run it: any program importing this
+//! module runs under `toto run` / `toto test` ONLY. `toto build`
+//! refuses the callback call site at compile time (exit 3, with the
+//! run/test workaround in the message). Import `gzv.std/ffi` alone
+//! for the buildable C surface — unused callback *declarations*
+//! never poison a build, only called callback sites refuse.
 import "gzv.std/ffi.gzv";
 
-// Spawn a foreign thread running `f(data)`. The 8-byte thread-id
-// slot is an implementation detail (Linux x86_64 `pthread_t`);
-// success is `Ok(id)` for `c_thread_join`, failure is `Err(message)`
-// with the pthread error number's text.
+/// Spawn a foreign thread running `f(data)`. The 8-byte thread-id
+/// slot is an implementation detail (Linux x86_64 `pthread_t`);
+/// success is `Ok(id)` for `c_thread_join`, failure is `Err(message)`
+/// with the pthread error number's text.
 fn c_thread_spawn(f: fn(*c_void) -> *c_void, data: *c_void) -> Result<int, string> {
     let slot: *c_void = malloc(8);
     let rc: int = pthread_create(slot, None, f, data);
@@ -25,9 +25,9 @@ fn c_thread_spawn(f: fn(*c_void) -> *c_void, data: *c_void) -> Result<int, strin
     return Ok(id);
 }
 
-// Join by id (blocks until the thread exits, then drains its
-// callback on this worker). The callback's effects are visible
-// after this returns.
+/// Join by id (blocks until the thread exits, then drains its
+/// callback on this worker). The callback's effects are visible
+/// after this returns.
 fn c_thread_join(id: int) -> Result<int, string> {
     let rc: int = pthread_join(id, None);
     if rc != 0 {

@@ -1,23 +1,23 @@
-// `gzv.std/ffi` — C ABI surface (Phase 5, Stage 3).
-//
-// Safe Toto wrappers over the 18 linked foreign symbols (real libc /
-// libm plus the `toto_rt_*` runtime helpers; see `docs/ffi.md` for the
-// per-binding contract). Every wrapper documents who owns what:
-//
-// - Strings cross as fresh NUL-copies, rooted for exactly the call.
-//   The C side never retains them; the copy dies on return.
-// - Pointers are opaque `*T` addresses (never printed: ASLR-unstable).
-//   Memory from `c_malloc` is yours: every allocation needs its
-//   `c_free`, including on error paths.
-// - Callbacks run on the worker that drains them (after the foreign
-//   call completes, or after `pthread_join`); they must not touch
-//   scheduler/GC state — only plain memory through the pointer arg.
-// - File descriptors from `c_open` are yours: close them... except
-//   `close(2)` cannot be named in an `unsafe extern` block (`close`
-//   is the channel builtin), so this module cannot offer `c_close`
-//   (see `docs/ffi.md`). Prefer short-lived opens you can leave to
-//   process exit in examples, and real lifecycle management once the
-//   naming restriction is lifted.
+//! `gzv.std/ffi` — C ABI surface (Phase 5, Stage 3).
+//!
+//! Safe Toto wrappers over the 18 linked foreign symbols (real libc /
+//! libm plus the `toto_rt_*` runtime helpers; see `docs/ffi.md` for the
+//! per-binding contract). Every wrapper documents who owns what:
+//!
+//! - Strings cross as fresh NUL-copies, rooted for exactly the call.
+//!   The C side never retains them; the copy dies on return.
+//! - Pointers are opaque `*T` addresses (never printed: ASLR-unstable).
+//!   Memory from `c_malloc` is yours: every allocation needs its
+//!   `c_free`, including on error paths.
+//! - Callbacks run on the worker that drains them (after the foreign
+//!   call completes, or after `pthread_join`); they must not touch
+//!   scheduler/GC state — only plain memory through the pointer arg.
+//! - File descriptors from `c_open` are yours: close them... except
+//!   `close(2)` cannot be named in an `unsafe extern` block (`close`
+//!   is the channel builtin), so this module cannot offer `c_close`
+//!   (see `docs/ffi.md`). Prefer short-lived opens you can leave to
+//!   process exit in examples, and real lifecycle management once the
+//!   naming restriction is lifted.
 
 unsafe extern "C" {
     fn strlen(s: *c_char) -> c_long;
@@ -42,20 +42,20 @@ unsafe extern "C" {
     fn read(fd: c_int, buf: *c_void, n: c_long) -> c_long;
 }
 
-// Byte length of the NUL-copy (== the string length; interior NUL
-// bytes fail with E0210 rather than truncating).
+/// Byte length of the NUL-copy (== the string length; interior NUL
+/// bytes fail with E0210 rather than truncating).
 fn c_strlen(s: string) -> int {
     return strlen(s);
 }
 
-// Negative/zero/positive like C: sign only, not distance.
+/// Negative/zero/positive like C: sign only, not distance.
 fn c_strcmp(a: string, b: string) -> int {
     return strcmp(a, b);
 }
 
-// Parse with `strtod`; the end pointer is dropped (`None`), so
-// trailing garbage is ignored — check the span yourself when that
-// matters.
+/// Parse with `strtod`; the end pointer is dropped (`None`), so
+/// trailing garbage is ignored — check the span yourself when that
+/// matters.
 fn c_strtod(s: string) -> float {
     return strtod(s, None);
 }
@@ -68,21 +68,21 @@ fn c_sleep(secs: int) -> int {
     return sleep(secs);
 }
 
-// Current `errno` as an int (0 when the last call succeeded).
+/// Current `errno` as an int (0 when the last call succeeded).
 fn errno_value() -> int {
     return toto_rt_read_i32(__errno_location());
 }
 
-// `strerror` message for an error number. The `-> string` return
-// copies the C message into a Toto string on return (invalid UTF-8
-// is E0210, NULL is E0308); nothing is retained.
+/// `strerror` message for an error number. The `-> string` return
+/// copies the C message into a Toto string on return (invalid UTF-8
+/// is E0210, NULL is E0308); nothing is retained.
 fn errno_message(e: int) -> string {
     return strerror(e);
 }
 
-// Open for reading (`O_RDONLY`). Success is `Ok(fd)` — the fd is
-// yours (see the `c_close` note above). Failure is `Err(message)`
-// with the `errno` text, never a bare -1.
+/// Open for reading (`O_RDONLY`). Success is `Ok(fd)` — the fd is
+/// yours (see the `c_close` note above). Failure is `Err(message)`
+/// with the `errno` text, never a bare -1.
 fn c_open_read(path: string) -> Result<int, string> {
     // `open` reports failure in-band as `-errno` (never bare -1):
     // `errno` is thread-local and FFI runs on a thread pool, so a
@@ -97,8 +97,8 @@ fn c_open_read(path: string) -> Result<int, string> {
     return Ok(fd);
 }
 
-// Allocate `n` bytes (uninitialized, like C). Pair every success
-// with `c_free`, including on early returns.
+/// Allocate `n` bytes (uninitialized, like C). Pair every success
+/// with `c_free`, including on early returns.
 fn c_malloc(n: int) -> *c_void {
     return malloc(n);
 }
@@ -108,12 +108,12 @@ fn c_free(p: *c_void) -> unit {
     return ();
 }
 
-// Fill `n` bytes with zero. Returns the pointer for chaining.
+/// Fill `n` bytes with zero. Returns the pointer for chaining.
 fn c_memzero(p: *c_void, n: int) -> *c_void {
     return memset(p, 0, n);
 }
 
-// Compare `n` bytes. Returns 0 when equal (sign only otherwise).
+/// Compare `n` bytes. Returns 0 when equal (sign only otherwise).
 fn c_memcmp(a: *c_void, b: *c_void, n: int) -> int {
     return memcmp(a, b, n);
 }
@@ -133,15 +133,15 @@ fn c_write_i64(p: *c_void, v: int) -> unit {
 // buildable: unused callback *declarations* never poison a build,
 // only called callback sites refuse at compile time.
 
-// Raw `read(2)`: byte count (0 is EOF) or `-errno` in-band, like
-// `open`. The buffer must hold at least `n` bytes.
+/// Raw `read(2)`: byte count (0 is EOF) or `-errno` in-band, like
+/// `open`. The buffer must hold at least `n` bytes.
 fn c_read(fd: int, buf: *c_void, n: int) -> int {
     return read(fd, buf, n);
 }
 
-// Close an `open` fd. `close(2)` cannot be named in an `unsafe
-// extern` block (`close` is the reserved channel builtin), so this
-// alias is the sanctioned spelling. Success is `Ok(0)`.
+/// Close an `open` fd. `close(2)` cannot be named in an `unsafe
+/// extern` block (`close` is the reserved channel builtin), so this
+/// alias is the sanctioned spelling. Success is `Ok(0)`.
 fn c_close(fd: int) -> Result<int, string> {
     let rc = toto_rt_close(fd);
     if rc < 0 {
@@ -150,15 +150,15 @@ fn c_close(fd: int) -> Result<int, string> {
     return Ok(0);
 }
 
-// Copy `n` foreign bytes into a Toto string (UTF-8 validated:
-// misuse panics E0210, NULL panics E0308).
+/// Copy `n` foreign bytes into a Toto string (UTF-8 validated:
+/// misuse panics E0210, NULL panics E0308).
 fn c_read_str(p: *c_void, n: int) -> string {
     return toto_rt_read_str(p, n);
 }
 
-// Whole-file read through FFI only: open, chunked `read`, close.
-// Missing/unreadable paths and mid-read I/O errors are `Err` with
-// the `errno` text; the fd and buffer release on every path.
+/// Whole-file read through FFI only: open, chunked `read`, close.
+/// Missing/unreadable paths and mid-read I/O errors are `Err` with
+/// the `errno` text; the fd and buffer release on every path.
 fn c_read_file(path: string) -> Result<string, string> {
     let fd = open(path, 0);
     if fd < 0 {

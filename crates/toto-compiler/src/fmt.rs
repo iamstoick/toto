@@ -62,11 +62,21 @@ fn bin_text(op: BinOp) -> &'static str {
 }
 
 /// Format a whole program (one file; imports are not resolved).
+/// Module docs render as `//!` lines up top, item docs as `///`
+/// lines above their item (canonical one-space form; the lexer
+/// strips exactly one optional space, so canonical sources
+/// round-trip byte-identically).
 pub fn format_program(prog: &Program) -> String {
     let mut f = F {
         out: String::new(),
         indent: 0,
     };
+    for line in &prog.doc {
+        f.emit_doc_line("//!", line);
+    }
+    if !prog.doc.is_empty() && !prog.items.is_empty() {
+        f.out.push('\n');
+    }
     for (i, item) in prog.items.iter().enumerate() {
         if i > 0 {
             f.out.push('\n');
@@ -94,7 +104,18 @@ impl F {
         self.out.push('\n');
     }
 
+    fn emit_doc_line(&mut self, marker: &str, text: &str) {
+        if text.is_empty() {
+            self.line(marker);
+        } else {
+            self.line(&format!("{marker} {text}"));
+        }
+    }
+
     fn emit_item(&mut self, item: &Item) {
+        for line in &item.doc {
+            self.emit_doc_line("///", line);
+        }
         match &item.kind {
             ItemKind::Fn(d) => self.emit_fn(d),
             ItemKind::Struct(d) => self.emit_struct(d),
@@ -182,38 +203,14 @@ impl F {
 
     fn emit_fn(&mut self, d: &FnDecl) {
         self.emit_annotations(&d.annotations);
-        let mut head = String::from("fn ");
-        head.push_str(&d.name);
-        head.push('(');
-        for (i, p) in d.params.iter().enumerate() {
-            if i > 0 {
-                head.push_str(", ");
-            }
-            head.push_str(&emit_param(p));
-        }
-        head.push_str(") -> ");
-        head.push_str(&emit_ty(&d.ret));
-        head.push_str(" {");
-        self.line(&head);
+        self.line(&format!("{} {{", fn_signature(d)));
         self.emit_block_body(&d.body);
         self.line("}");
     }
 
     fn emit_struct(&mut self, d: &StructDecl) {
         self.emit_annotations(&d.annotations);
-        let mut head = String::from("struct ");
-        head.push_str(&d.name);
-        head.push_str(" { ");
-        for (i, f) in d.fields.iter().enumerate() {
-            if i > 0 {
-                head.push_str(", ");
-            }
-            head.push_str(&f.name);
-            head.push_str(": ");
-            head.push_str(&emit_ty(&f.ty));
-        }
-        head.push_str(" }");
-        self.line(&head);
+        self.line(&struct_signature(d));
     }
 
     fn emit_extern(&mut self, b: &ExternBlock) {
@@ -693,6 +690,52 @@ fn emit_param(p: &Param) -> String {
         p.name,
         emit_ty(&p.ty)
     )
+}
+
+/// One-line `fn` signature for API rendering (`toto doc`): no
+/// body, no annotations. Shared with `emit_fn` so formatted code
+/// and docs can never disagree on a signature.
+pub fn fn_signature(d: &FnDecl) -> String {
+    fn_head(&d.name, &d.params, &d.ret)
+}
+
+/// One-line `struct` shape for API rendering (`toto doc`), shared
+/// with `emit_struct`.
+pub fn struct_signature(d: &StructDecl) -> String {
+    let mut head = String::from("struct ");
+    head.push_str(&d.name);
+    head.push_str(" { ");
+    for (i, f) in d.fields.iter().enumerate() {
+        if i > 0 {
+            head.push_str(", ");
+        }
+        head.push_str(&f.name);
+        head.push_str(": ");
+        head.push_str(&emit_ty(&f.ty));
+    }
+    head.push_str(" }");
+    head
+}
+
+/// One-line foreign signature for API rendering (`toto doc`):
+/// same shape as [`fn_signature`], no body by construction.
+pub fn extern_signature(d: &ExternFn) -> String {
+    fn_head(&d.name, &d.params, &d.ret)
+}
+
+fn fn_head(name: &str, params: &[Param], ret: &Type) -> String {
+    let mut head = String::from("fn ");
+    head.push_str(name);
+    head.push('(');
+    for (i, p) in params.iter().enumerate() {
+        if i > 0 {
+            head.push_str(", ");
+        }
+        head.push_str(&emit_param(p));
+    }
+    head.push_str(") -> ");
+    head.push_str(&emit_ty(ret));
+    head
 }
 
 /// One annotation argument: re-quote only when the text would not

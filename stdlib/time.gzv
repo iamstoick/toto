@@ -1,32 +1,32 @@
-// gzv.std/time — pure durations and timestamps (Phase 5, Stage 2),
-// plus the Wave 2 monotonic clock (Stage 3).
-//
-// A duration is an int count of milliseconds; a timestamp is an int
-// count of milliseconds since an application-chosen epoch. The
-// frozen builtins expose no clock, so the clock arrives as a linked
-// foreign function (`toto_rt_clock_monotonic_ms`, unix-only — see
-// `docs/ffi.md`), not a builtin: the catalog stays frozen.
-//
-// The clock is MONOTONIC milliseconds since process start
-// (ADR-009): absolute values compose across fan-out, durations do
-// not. There is still no wall clock in v1 — timestamps are
-// process-relative. Values are small ints early in the run but
-// nondeterministic by construction (time passes between scheduling
-// points), so they are never pinned in goldens. Durations and the
-// pure timestamp arithmetic below stay exact and deterministic.
+//! gzv.std/time — pure durations and timestamps (Phase 5, Stage 2),
+//! plus the Wave 2 monotonic clock (Stage 3).
+//!
+//! A duration is an int count of milliseconds; a timestamp is an int
+//! count of milliseconds since an application-chosen epoch. The
+//! frozen builtins expose no clock, so the clock arrives as a linked
+//! foreign function (`toto_rt_clock_monotonic_ms`, unix-only — see
+//! `docs/ffi.md`), not a builtin: the catalog stays frozen.
+//!
+//! The clock is MONOTONIC milliseconds since process start
+//! (ADR-009): absolute values compose across fan-out, durations do
+//! not. There is still no wall clock in v1 — timestamps are
+//! process-relative. Values are small ints early in the run but
+//! nondeterministic by construction (time passes between scheduling
+//! points), so they are never pinned in goldens. Durations and the
+//! pure timestamp arithmetic below stay exact and deterministic.
 
 unsafe extern "C" {
     fn toto_rt_clock_monotonic_ms() -> c_long;
 }
 
-// Monotonic ms since process start. Never equal-pinned; compare
-// differences (elapsed) or inequalities only.
+/// Monotonic ms since process start. Never equal-pinned; compare
+/// differences (elapsed) or inequalities only.
 pub fn clock_monotonic_ms() -> int {
     return toto_rt_clock_monotonic_ms();
 }
 
-// Milliseconds elapsed since `t0` (a `clock_monotonic_ms()` read).
-// Non-negative on both engines (the clock never runs backward).
+/// Milliseconds elapsed since `t0` (a `clock_monotonic_ms()` read).
+/// Non-negative on both engines (the clock never runs backward).
 pub fn clock_elapsed_since(t0: int) -> int {
     return clock_monotonic_ms() - t0;
 }
@@ -79,7 +79,7 @@ pub fn duration_sub(a: int, b: int) -> int {
     return a - b;
 }
 
-// -1 when a < b, 0 when equal, 1 when a > b.
+/// -1 when a < b, 0 when equal, 1 when a > b.
 pub fn duration_compare(a: int, b: int) -> int {
     if a < b {
         return -1;
@@ -90,8 +90,8 @@ pub fn duration_compare(a: int, b: int) -> int {
     return 0;
 }
 
-// Shortest exact rendering: "500ms", "90s", "2m 5s", "3h 4m", "2d 1h".
-// Negative durations render with a leading "-".
+/// Shortest exact rendering: "500ms", "90s", "2m 5s", "3h 4m", "2d 1h".
+/// Negative durations render with a leading "-".
 pub fn format_duration(ms: int) -> string {
     if ms < 0 {
         return "-" + format_duration(0 - ms);
@@ -127,8 +127,8 @@ pub fn format_duration(ms: int) -> string {
     return to_string(d) + "d " + to_string(h) + "h";
 }
 
-// Timestamp arithmetic: timestamps are plain ints, so these read as
-// documentation of intent rather than doing anything clever.
+/// Timestamp arithmetic: timestamps are plain ints, so these read as
+/// documentation of intent rather than doing anything clever.
 pub fn timestamp_add(ts: int, d: int) -> int {
     return ts + d;
 }

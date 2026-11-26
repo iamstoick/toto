@@ -1,12 +1,12 @@
-// gzv.std/collections — array helpers on the frozen builtins.
-//
-// Toto v1 has no user generics, so helpers come in per-type variants.
-// `int` and `string` are covered; the pattern extends on demand. All
-// functions build fresh arrays except `sort_ints`/`reverse_*`, which
-// sort in place (arrays are shared by reference) and return the same
-// array for chaining.
+//! gzv.std/collections — array helpers on the frozen builtins.
+//!
+//! Toto v1 has no user generics, so helpers come in per-type variants.
+//! `int` and `string` are covered; the pattern extends on demand. All
+//! functions build fresh arrays except `sort_ints`/`reverse_*`, which
+//! sort in place (arrays are shared by reference) and return the same
+//! array for chaining.
 
-// --- ints ---
+//! --- ints ---
 
 pub fn map_ints(a: Array<int>, f: fn(int) -> int) -> Array<int> {
     let mut out: Array<int> = [];
@@ -61,7 +61,7 @@ pub fn all_int(a: Array<int>, pred: fn(int) -> bool) -> bool {
     return true;
 }
 
-// Character index of the first element satisfying `pred`, or None.
+/// Character index of the first element satisfying `pred`, or None.
 pub fn find_index_int(a: Array<int>, pred: fn(int) -> bool) -> Option<int> {
     let mut i: int = 0;
     for v in a {
@@ -83,7 +83,7 @@ pub fn contains_int(a: Array<int>, v: int) -> bool {
     return false;
 }
 
-// Insertion sort in place; returns the same array for chaining.
+/// Insertion sort in place; returns the same array for chaining.
 pub fn sort_ints(a: Array<int>) -> Array<int> {
     for i in 1..len(a) {
         let key: int = a[i];

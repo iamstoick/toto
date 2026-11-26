@@ -1,23 +1,23 @@
-// `gzv.std/jwt` — JSON Web Tokens, HS256 + ES256 + RS256 verify
-// (Enterprise Wave 3, Stage 3).
-//
-// Pure Toto over the crypto bindings (HMAC/ECDSA on the Wave-1
-// bindings; RSA PKCS#1 v1.5 verify via a linked-libcrypto
-// binding — public-ops only, no home-grown crypto). `none` is
-// always rejected, and each verify entry point pins exactly
-// one `alg` (no algorithm confusion: an HS256 token never
-// verifies as RS256 and vice versa).
-//
-// Wire shape (RFC 7519/7515): `base64url(header) +
-// "." + base64url(payload) + "." + base64url(sig)`; the
-// signature covers the ASCII `header_b64.payload_b64` bytes.
-// Verification enforces `alg` exact, the signature, and
-// `exp`/`nbf`/`iat` against a caller-supplied `now` (seconds)
-// plus a skew window, and optional `iss`/`aud` expects —
-// mismatches are `Err`, never silent acceptance.
-// Non-ASCII payload text is a loud `Err` (no `ord` builtin);
-// non-finite floats cannot appear (JSON payloads are
-// caller-built; integers for times).
+//! `gzv.std/jwt` — JSON Web Tokens, HS256 + ES256 + RS256 verify
+//! (Enterprise Wave 3, Stage 3).
+//!
+//! Pure Toto over the crypto bindings (HMAC/ECDSA on the Wave-1
+//! bindings; RSA PKCS#1 v1.5 verify via a linked-libcrypto
+//! binding — public-ops only, no home-grown crypto). `none` is
+//! always rejected, and each verify entry point pins exactly
+//! one `alg` (no algorithm confusion: an HS256 token never
+//! verifies as RS256 and vice versa).
+//!
+//! Wire shape (RFC 7519/7515): `base64url(header) +
+//! "." + base64url(payload) + "." + base64url(sig)`; the
+//! signature covers the ASCII `header_b64.payload_b64` bytes.
+//! Verification enforces `alg` exact, the signature, and
+//! `exp`/`nbf`/`iat` against a caller-supplied `now` (seconds)
+//! plus a skew window, and optional `iss`/`aud` expects —
+//! mismatches are `Err`, never silent acceptance.
+//! Non-ASCII payload text is a loud `Err` (no `ord` builtin);
+//! non-finite floats cannot appear (JSON payloads are
+//! caller-built; integers for times).
 import "gzv.std/crypto.gzv";
 import "gzv.std/json.gzv";
 import "gzv.std/strings.gzv";
@@ -26,7 +26,7 @@ fn b64url_alpha() -> string {
     return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 }
 
-// 6-bit value of a base64url char, or -1.
+/// 6-bit value of a base64url char, or -1.
 fn b64url_val(c: string) -> int {
     let alpha: string = b64url_alpha();
     let n: int = len(alpha);
@@ -41,7 +41,7 @@ fn b64url_val(c: string) -> int {
     return -1;
 }
 
-// Bytes to unpadded base64url (JWT style — never emits `=`).
+/// Bytes to unpadded base64url (JWT style — never emits `=`).
 pub fn jwt_b64_encode(data: Array<int>) -> string {
     let alpha: string = b64url_alpha();
     let mut out: string = "";
@@ -78,8 +78,8 @@ pub fn jwt_b64_encode(data: Array<int>) -> string {
     return out;
 }
 
-// Unpadded base64url to bytes. Padding `=` is rejected (JWT
-// style — loud Err, never silently accepted).
+/// Unpadded base64url to bytes. Padding `=` is rejected (JWT
+/// style — loud Err, never silently accepted).
 pub fn jwt_b64_decode(s: string) -> Result<Array<int>, string> {
     let mut vals: Array<int> = [];
     for c in split(s, "") {
@@ -122,11 +122,11 @@ pub fn jwt_b64_decode(s: string) -> Result<Array<int>, string> {
     return Ok(out);
 }
 
-// ASCII string to bytes (JWT signs ASCII `header.payload`).
-// Non-ASCII payload text is a loud `Err` on both paths (no
-// `ord` builtin exists to UTF-8-encode it in pure Toto —
-// documented limitation; OIDC claim strings are ASCII in
-// practice and multibyte names fail loudly, never silently).
+/// ASCII string to bytes (JWT signs ASCII `header.payload`).
+/// Non-ASCII payload text is a loud `Err` on both paths (no
+/// `ord` builtin exists to UTF-8-encode it in pure Toto —
+/// documented limitation; OIDC claim strings are ASCII in
+/// practice and multibyte names fail loudly, never silently).
 fn jwt_ascii_bytes(s: string) -> Result<Array<int>, string> {
     let mut out: Array<int> = [];
     for c in split(s, "") {
@@ -148,9 +148,9 @@ fn jwt_ascii_bytes(s: string) -> Result<Array<int>, string> {
     return Ok(out);
 }
 
-// ASCII code of a single ASCII char (exact for the JWT signing
-// alphabet and JSON punctuation; never called on multibyte
-// text — the caller gates on it).
+/// ASCII code of a single ASCII char (exact for the JWT signing
+/// alphabet and JSON punctuation; never called on multibyte
+/// text — the caller gates on it).
 fn char_code_ascii(c: string) -> int {
     let alpha: string = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
     let mut i: int = 0;
@@ -164,11 +164,11 @@ fn char_code_ascii(c: string) -> int {
     return -1;
 }
 
-// Bytes to an ASCII string (inverse of the path above; used
-// for header/payload JSON after base64url decode). Horizontal
-// tab, LF, and CR ride along (insignificant JSON whitespace —
-// the RFC vectors contain CRLF); anything else outside
-// printable ASCII is a loud Err.
+/// Bytes to an ASCII string (inverse of the path above; used
+/// for header/payload JSON after base64url decode). Horizontal
+/// tab, LF, and CR ride along (insignificant JSON whitespace —
+/// the RFC vectors contain CRLF); anything else outside
+/// printable ASCII is a loud Err.
 fn jwt_ascii_string(data: Array<int>) -> Result<string, string> {
     let alpha: string = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
     let mut out: string = "";
@@ -188,7 +188,7 @@ fn jwt_ascii_string(data: Array<int>) -> Result<string, string> {
     return Ok(out);
 }
 
-// Sign `payload_json` (already-stringified JSON) with HMAC key.
+/// Sign `payload_json` (already-stringified JSON) with HMAC key.
 pub fn jwt_sign_hs256(payload_json: string, key: Array<int>) -> Result<string, string> {
     let header: string = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
     let h = jwt_ascii_bytes(header)?;
@@ -198,7 +198,7 @@ pub fn jwt_sign_hs256(payload_json: string, key: Array<int>) -> Result<string, s
     return Ok(signing + "." + jwt_b64_encode(sig));
 }
 
-// Sign with an ECDSA P-256 private scalar (32 bytes).
+/// Sign with an ECDSA P-256 private scalar (32 bytes).
 pub fn jwt_sign_es256(payload_json: string, secret: Array<int>) -> Result<string, string> {
     if len(secret) != 32 {
         return Err("jwt es256 needs a 32-byte private scalar");
@@ -212,9 +212,9 @@ pub fn jwt_sign_es256(payload_json: string, secret: Array<int>) -> Result<string
     return Ok(signing + "." + jwt_b64_encode(sig));
 }
 
-// Verify either family. `now` is unix seconds, `skew` the leeway;
-// `want_iss`/`want_aud` empty means "do not check". Returns the
-// payload JSON on success.
+/// Verify either family. `now` is unix seconds, `skew` the leeway;
+/// `want_iss`/`want_aud` empty means "do not check". Returns the
+/// payload JSON on success.
 pub fn jwt_verify(token: string, key_hmac: Array<int>, key_ecdsa: Array<int>, now: int, skew: int, want_iss: string, want_aud: string) -> Result<string, string> {
     let parts: Array<string> = split(token, ".");
     if len(parts) != 3 {
@@ -254,13 +254,13 @@ pub fn jwt_verify(token: string, key_hmac: Array<int>, key_ecdsa: Array<int>, no
     return jwt_check_claims(payload, payload_json, now, skew, want_iss, want_aud);
 }
 
-// RS256 verification (Wave 3, enterprise IdP default):
-// `n`/`e` are the JWK big-endian bytes (from the provider's
-// JWKS, selected by `kid`). The SHA-256 digest runs over the
-// ASCII signing input via the Wave-1 SHA-256 binding; the RSA
-// step is the linked libcrypto (public ops only — no
-// signing/keygen anywhere). Only RS256 verifies here (`none`
-// and algorithm confusion are rejected exactly like above).
+/// RS256 verification (Wave 3, enterprise IdP default):
+/// `n`/`e` are the JWK big-endian bytes (from the provider's
+/// JWKS, selected by `kid`). The SHA-256 digest runs over the
+/// ASCII signing input via the Wave-1 SHA-256 binding; the RSA
+/// step is the linked libcrypto (public ops only — no
+/// signing/keygen anywhere). Only RS256 verifies here (`none`
+/// and algorithm confusion are rejected exactly like above).
 pub fn jwt_verify_rs256(token: string, n: Array<int>, e: Array<int>, now: int, skew: int, want_iss: string, want_aud: string) -> Result<string, string> {
     let parts: Array<string> = split(token, ".");
     if len(parts) != 3 {
@@ -285,7 +285,7 @@ pub fn jwt_verify_rs256(token: string, n: Array<int>, e: Array<int>, now: int, s
     return jwt_check_claims(payload, payload_json, now, skew, want_iss, want_aud);
 }
 
-// `exp`/`nbf`/`iat` + optional `iss`/`aud` enforcement.
+/// `exp`/`nbf`/`iat` + optional `iss`/`aud` enforcement.
 fn jwt_check_claims(payload: JsonVal, payload_json: string, now: int, skew: int, want_iss: string, want_aud: string) -> Result<string, string> {
     let exp = jwt_opt_int(payload, "exp")?;
     if exp >= 0 && now > exp + skew {
@@ -316,10 +316,10 @@ fn jwt_check_claims(payload: JsonVal, payload_json: string, now: int, skew: int,
     return Ok(payload_json);
 }
 
-// Optional int claim: -1 when absent (never an error).
-// Presence is probed on the struct's key list (there is no
-// try/catch in Toto, and absent keys are an `Err` from the
-// accessor — so the check happens first).
+/// Optional int claim: -1 when absent (never an error).
+/// Presence is probed on the struct's key list (there is no
+/// try/catch in Toto, and absent keys are an `Err` from the
+/// accessor — so the check happens first).
 fn jwt_has(payload: JsonVal, name: string) -> bool {
     for k in payload.keys {
         if k == name {
@@ -343,9 +343,9 @@ fn jwt_opt_int(payload: JsonVal, name: string) -> Result<int, string> {
     return Ok(-1);
 }
 
-// Constant-time byte equality via the crypto verifier shape:
-// 1 equal, 0 different (lengths must match — the caller sizes
-// both from the same decode).
+/// Constant-time byte equality via the crypto verifier shape:
+/// 1 equal, 0 different (lengths must match — the caller sizes
+/// both from the same decode).
 fn crypto_memcmp(a: Array<int>, b: Array<int>) -> Result<int, string> {
     if len(a) != len(b) {
         return Ok(0);

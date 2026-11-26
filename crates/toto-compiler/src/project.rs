@@ -127,7 +127,13 @@ pub fn load_and_check(
             items.push(item);
         }
     }
-    let merged = Program { items };
+    // Merged programs have no single module doc (each file keeps
+    // its own `Program.doc` in `self.programs`); per-module tools
+    // like `toto doc` read files individually.
+    let merged = Program {
+        items,
+        doc: Vec::new(),
+    };
     let (checked, pairs) = check_with_files(&merged);
     if !pairs.is_empty() {
         let by_display: HashMap<&str, usize> = loader
@@ -357,7 +363,10 @@ impl<'a> Loader<'a> {
     fn push_file(&mut self, path: String, src: String) {
         self.files.push(ProjectFile { path, src });
         // Placeholder; replaced by `parse_current`.
-        self.programs.push(Program { items: Vec::new() });
+        self.programs.push(Program {
+            items: Vec::new(),
+            doc: Vec::new(),
+        });
         self.diags.push(Vec::new());
     }
 

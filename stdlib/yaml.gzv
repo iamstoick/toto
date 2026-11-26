@@ -1,20 +1,20 @@
-// gzv.std/yaml — YAML parse + serialize, config-shaped subset
-// (Enterprise Wave 1).
-//
-// Values are `YamlVal` structs, mirroring the `JsonVal` strata
-// design: nested mappings/sequences store as DEDENTED source
-// blocks (re-parsed with the same block parser on access —
-// recursion is re-parse, never a recursive type, which Toto v1
-// rejects). Scalars keep their literal; `yaml_stringify` emits
-// canonical 2-space-indent YAML.
-//
-// Scope (stated subset): block mappings and sequences, nesting
-// by spaces-only indentation, plain/single/double-quoted scalars,
-// int/bool/null/float scalars, `#` comments, inline `- k: v`
-// mappings. NOT covered (clear errors, recorded follow-ups):
-// anchors, tags, flow styles (`{}`, `[]`), multi-document streams,
-// tabs for indentation, `\u` escapes (no codepoint builtin — same
-// rule as `json`).
+//! gzv.std/yaml — YAML parse + serialize, config-shaped subset
+//! (Enterprise Wave 1).
+//!
+//! Values are `YamlVal` structs, mirroring the `JsonVal` strata
+//! design: nested mappings/sequences store as DEDENTED source
+//! blocks (re-parsed with the same block parser on access —
+//! recursion is re-parse, never a recursive type, which Toto v1
+//! rejects). Scalars keep their literal; `yaml_stringify` emits
+//! canonical 2-space-indent YAML.
+//!
+//! Scope (stated subset): block mappings and sequences, nesting
+//! by spaces-only indentation, plain/single/double-quoted scalars,
+//! int/bool/null/float scalars, `#` comments, inline `- k: v`
+//! mappings. NOT covered (clear errors, recorded follow-ups):
+//! anchors, tags, flow styles (`{}`, `[]`), multi-document streams,
+//! tabs for indentation, `\u` escapes (no codepoint builtin — same
+//! rule as `json`).
 
 import "gzv.std/strings.gzv";
 
@@ -53,7 +53,7 @@ fn yaml_count_indent(line: string) -> Result<int, string> {
     return Ok(n);
 }
 
-// Strip a `#` comment (outside single/double quotes).
+/// Strip a `#` comment (outside single/double quotes).
 fn yaml_strip_comment(line: string) -> string {
     let chars: Array<string> = split(line, "");
     let mut quote: string = "";
@@ -157,7 +157,7 @@ fn yaml_unquote(s: string) -> Result<string, string> {
     return Ok(s);
 }
 
-// Classify a scalar: kind + decoded content in `raw`.
+/// Classify a scalar: kind + decoded content in `raw`.
 fn yaml_classify(lit: string) -> Result<YamlVal, string> {
     let t = yaml_trim(lit);
     if t == "" || t == "~" || t == "null" || t == "Null" || t == "NULL" {
@@ -267,8 +267,8 @@ fn yaml_has_exp(s: string) -> bool {
     return false;
 }
 
-// Prepared lines: (indent, content) with blanks/comments dropped,
-// plus the original line number for errors.
+/// Prepared lines: (indent, content) with blanks/comments dropped,
+/// plus the original line number for errors.
 struct YamlLine {
     indent: int,
     text: string,
@@ -303,9 +303,9 @@ struct YamlParseOut {
     next: int,
 }
 
-// Original line text (indentation intact) for fragments: the
-// parsed `.text` drops leading spaces, but nested blocks need
-// their relative indentation until dedented.
+/// Original line text (indentation intact) for fragments: the
+/// parsed `.text` drops leading spaces, but nested blocks need
+/// their relative indentation until dedented.
 fn yaml_pad(n: int) -> string {
     let mut out: string = "";
     for i in 0..n {
@@ -318,7 +318,7 @@ fn yaml_raw_line(l: YamlLine) -> string {
     return yaml_pad(l.indent) + l.text;
 }
 
-// Parse one block (mapping, sequence, or scalar) at lines[i:].
+/// Parse one block (mapping, sequence, or scalar) at lines[i:].
 fn yaml_parse_block(lines: Array<YamlLine>, i: int) -> Result<YamlParseOut, string> {
     if i >= len(lines) {
         return Err("unexpected end of input");
@@ -447,8 +447,8 @@ fn yaml_parse_block(lines: Array<YamlLine>, i: int) -> Result<YamlParseOut, stri
     return Ok(YamlParseOut { value: YamlVal { kind: "obj", raw: "", items: none2, keys: keys, vals: vals }, next: j });
 }
 
-// Column of the `:` ending a mapping key (outside quotes; must be
-// followed by space/end) or -1.
+/// Column of the `:` ending a mapping key (outside quotes; must be
+/// followed by space/end) or -1.
 fn yaml_find_mapping_colon(t: string) -> int {
     let tc: Array<string> = split(t, "");
     let mut quote: string = "";
@@ -473,9 +473,9 @@ fn yaml_find_mapping_colon(t: string) -> int {
     return -1;
 }
 
-// Dedent a fragment to base 0: `inner` is the indentation of
-// its nested lines (0 when there are none); an inline head
-// (`has_head`) is already at base 0 and passes through.
+/// Dedent a fragment to base 0: `inner` is the indentation of
+/// its nested lines (0 when there are none); an inline head
+/// (`has_head`) is already at base 0 and passes through.
 fn yaml_dedent_frag(frag: Array<string>, inner: int, has_head: bool) -> Result<string, string> {
     if len(frag) == 0 {
         return Err("empty block");

@@ -9,7 +9,8 @@ Status: STAGE 0 VERIFIED (run #118 green on the starting
 tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI);
 STAGE 2 COMPLETE (reference-client + real-editor proof
 green); STAGE 3 IMPLEMENTED (awaiting CI);
-STAGE 4 DESIGN APPROVED, IMPLEMENTATION PENDING.
+STAGE 4 IMPLEMENTED 2026-11-26 (awaiting CI; see Stage 4
+implementation record).
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -552,7 +553,7 @@ evidence-driven refinements (no silent drift):
   shape from its log); `lsp` 20/20 untouched. Clippy rides
   on CI.
 
-## Stage 4 — doc generator (DESIGN APPROVED 2026-11-25; no code yet)
+## Stage 4 — doc generator (DESIGN APPROVED 2026-11-25; IMPLEMENTED 2026-11-26, awaiting CI)
 
 Goal: `toto doc` rendering API docs for `.gzv` sources
 (stdlib first), from a documented doc-comment convention.
@@ -597,6 +598,138 @@ full `gzv.std` surface including migrated prose;
 per-module Markdown golden-tested; the convention recorded
 here. Non-goals: a hosted site, versioned publishing
 (registry work is Phase 7).
+
+## Stage 4 — implementation record (2026-11-26; awaiting CI)
+
+What was built (code, all in the named files only):
+
+- Lexer (`crates/toto-compiler/src/lexer.rs`, `token.rs`):
+  `///` and `//!` emit `TokenKind::DocComment { outer, text }`
+  (`outer` = `///` item doc; `!outer` = `//!` module doc). Marker
+  stripped, one optional leading space stripped, trailing `\r`
+  trimmed. `////` and `//` stay skipped, exactly as before.
+- AST (`ast.rs`): `Item.doc: Vec<String>` on every item kind and
+  `Program.doc: Vec<String>` for the file header. One `Vec`
+  entry per doc line, markers gone (fmt re-emits them by
+  position: `//!` for the module block, `///` for items).
+- Parser (`parser.rs`): `take_item_doc_lines` drains `///`
+  before an item (interleaved with `@...`/`pub` in any order);
+  `take_module_doc_lines` drains leading `//!` for
+  `Program.doc`; `skip_doc_lines` drops both markers at block
+  level (docs are not statements). A `//!` past the file top is
+  E0101 naming `///` as the fix; a trailing `///` at EOF is
+  E0101 like any other missing item. `//` inside struct bodies
+  and mid-expression is unchanged behavior (skipped / error as
+  before — zero `///` lines existed, so no regression surface).
+- Merged multi-file programs carry `doc: Vec::new()` (recorded
+  here, fixed in place as the documented rule): a merged program
+  has no single module doc; each file keeps its own in
+  `Loader.programs`, and `toto doc` reads files individually.
+- fmt (`fmt.rs`): module doc renders as `//!` lines up top
+  (+ blank line before the first item), item docs as `///`
+  lines above their item, canonical one-space form. Bare
+  markers re-emit without trailing space. `fn_signature` /
+  `struct_signature` / `extern_signature` are shared with
+  `emit_fn` / `emit_struct`, so formatted code and docs cannot
+  disagree on a signature.
+- Renderer (`crates/toto-compiler/src/doc.rs`, new): `render_module`
+  (`#` name, module prose, `## Functions` / `## Structs` with
+  `###` name + `toto` signature fence + verbatim prose; `Fn`,
+  `extern` decls, and `Struct` render; `Import`/`State`/`Migrate`
+  are not API surface and are skipped; undocumented items still
+  list their signature) and `render_index` (link target injected:
+  `math.md` for files mode, `#math` anchors for stdout mode).
+- CLI (`crates/toto-cli/src/main.rs`): `toto doc [--out DIR]
+  <file.gzv>...` — parse-only, one file per module named by
+  file stem (imports not resolved, like `fmt`). Stdout mode
+  prints index + modules as one document; `--out` writes
+  `<module>.md` + `index.md`. Exit 3 unreadable/usage, exit 2
+  broken source with rendered diagnostics, exit 0 success.
+
+Design correction, recorded here (caught by the new tests
+before commit, fixed in place): the first implementation used
+a position rule (leading block = module doc regardless of
+marker), which swallowed a first item's `///` docs into the
+module. The failing test pinned it; the rule was corrected to
+the approved marker semantics (`///` = item, `//!` = module)
+by carrying an `outer` flag on the token. The parenthetical in
+the design ("file-header blocks become the module doc") is
+satisfied by position-independent marker handling plus the
+`//!`-above-import header rule used in migration.
+
+fmt advisory, recorded here: no local rustfmt newer than the
+language and no local clippy component exist (Homebrew 1.87
+rustfmt only; `rustup component add` has no network route), so
+CI is the oracle for both, as in earlier stages. 1.87 was run
+advisory over the crate: baseline already differs on
+`main.rs`/`lib.rs` (version drift, untouched). Applied only
+version-independent joins (two `while matches!`, one 79-char
+chain, one 99-char borderline restructured into two short
+lines); ignored 1.87's split-what-fits chains
+(`token.rs:53/143`, two lexer-test chains ~78/89 chars —
+house precedent keeps single-line struct variants and joined
+chains, matching CI's known preference). All long test
+sources use `concat!` short lines, safe under every version.
+
+Stdlib migration (mechanical, comment-only; one-shot script,
+one `/` or `!` inserted per line, rest byte-identical):
+
+- Rules: col-0 `//` run directly above a top-level item start
+  becomes `///` (except above `import`, which is file header);
+  any other col-0 `//` run before the first item becomes `//!`;
+  everything else (indented, blank-separated, dividers,
+  markers) stays `//`. Refuse-and-report guards for
+  divider-styled runs, TODO/FIXME/etc markers, and
+  commented-out code.
+- Result: 601 header lines + 265 item runs converted, 0
+  refusals (one false positive during dry-run — `BUG\b`
+  matched inside "debug" — fixed with a leading boundary and
+  re-verified at 0, recorded here). Actual counts for the
+  record: 261 `pub fn`, 49 structs (37 pub + 12 private),
+  619 top-level items; `db.gzv` has zero comments at all
+  (unchanged, renders with empty module doc); the 130-line
+  detached `ffi` notes and the trailing `secrets` note stay
+  `//` by design (attachment is to the following item only).
+  Zero hand fixes; item-name lists before/after are identical.
+- Behavior-neutrality: stdlib suite 25/25 green on migrated
+  files; `toto fmt` on migrated files shows no new drift
+  categories (pre-existing `pub`-drop + expression
+  normalization only) and now preserves docs it used to delete.
+
+Verification (all executed this turn, recorded here):
+
+- `cargo test -p toto-compiler` targets lexer (8/8), parser
+  (10/10), fmt (3/3 incl. new round-trip golden), doc (3/3 new
+  goldens), lib (6/6), interp/project/mir/differential/mir_conform
+  green. Service-backed targets (db_*, tls_*) need services
+  unavailable locally; CI covers them.
+- `cargo test -p toto-cli`: doc (3/3: stdout golden, `--out`
+  files golden, refusals), lint, coverage, corpus (28 s),
+  lsp (20/20), http_interop, drain_shutdown, profile_signal,
+  threaddump_signal green.
+- check.sh blocks run verbatim: lint gate over 144 files
+  `--deny-warnings` clean; coverage golden + `--fail-under 100`
+  clean; new doc gate clean (`toto doc --out` over all 31
+  stdlib files; all 298 `pub` names have `###` headings;
+  647 items, 265 with prose = exactly the 265 converted runs).
+  stdlib `toto test` 25/25; wordfreq `toto test` green.
+- Pre-existing environmental failures, proved not mine: the 5
+  `build_*`/`dist_*` cli tests fail identically on a clean
+  HEAD worktree (broken AOT/cargo pipeline in this sandbox);
+  `packages` failures are the same pipeline (`build failed`
+  exit 3); `cargo fmt`/`clippy` components are not installed
+  locally. Full `check.sh` (fmt → clippy → workspace tests)
+  and the fmt/clippy verdicts belong to CI on this commit.
+
+Acceptance state: `///`/`//!` lexed, attached, fmt-preserved
+(golden round-trip) — done; `toto doc` renders the full
+`gzv.std` surface incl. migrated prose (647 items, 298 pub
+names, 265 prose blocks) — done; per-module Markdown
+golden-tested — done; convention recorded here — done.
+Non-goals kept (no hosted site, no versioned publishing, no
+new builtins, no D1–D8/ADR/spec change). NOT done: CI green
+on the final tree — this commit triggers that run, whose
+outcome belongs in a future record.
 
 ## Wave gates (no merge until all green)
 

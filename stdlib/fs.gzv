@@ -1,8 +1,8 @@
-// gzv.std/fs — path helpers plus the file builtins' home.
-//
-// read_file/write_file/file_exists stay builtins (this module does not
-// wrap them 1:1); what lives here is pure path surgery shared by every
-// project that touches the filesystem.
+//! gzv.std/fs — path helpers plus the file builtins' home.
+//!
+//! read_file/write_file/file_exists stay builtins (this module does not
+//! wrap them 1:1); what lives here is pure path surgery shared by every
+//! project that touches the filesystem.
 
 import "gzv.std/strings.gzv";
 

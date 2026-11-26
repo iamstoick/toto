@@ -14,6 +14,7 @@ pub mod ctxlog;
 #[cfg(unix)]
 pub mod dblib;
 pub mod diag;
+pub mod doc;
 pub mod ffi;
 pub mod fmt;
 pub mod hir;

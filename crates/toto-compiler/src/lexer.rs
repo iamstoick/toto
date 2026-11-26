@@ -73,12 +73,40 @@ impl<'a> Lexer<'a> {
             match b {
                 b' ' | b'\t' | b'\r' | b'\n' => self.bump(),
                 b'/' if self.peek2() == Some(b'/') => {
+                    // `///` (but not `////`) and `//!` open doc comments,
+                    // which become tokens; plain `//` is skipped.
+                    let third = self.bytes.get(self.pos + 2).copied();
+                    let fourth = self.bytes.get(self.pos + 3).copied();
+                    // `//!` is a module doc; `///` (but not `////`)
+                    // is an item doc; anything else is a plain comment.
+                    let outer = third == Some(b'/') && fourth != Some(b'/');
+                    if third != Some(b'!') && !outer {
+                        while let Some(c) = self.peek() {
+                            if c == b'\n' {
+                                break;
+                            }
+                            self.bump();
+                        }
+                        continue;
+                    }
+                    self.bump();
+                    self.bump();
+                    self.bump();
+                    let text_start = self.pos;
                     while let Some(c) = self.peek() {
                         if c == b'\n' {
                             break;
                         }
                         self.bump();
                     }
+                    let mut text = self.src[text_start..self.pos].to_string();
+                    if let Some(stripped) = text.strip_prefix(' ') {
+                        text = stripped.to_string();
+                    }
+                    if text.ends_with('\r') {
+                        text.pop();
+                    }
+                    self.emit(start, TokenKind::DocComment { outer, text });
                 }
                 b'(' => {
                     self.bump();

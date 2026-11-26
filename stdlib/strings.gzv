@@ -1,10 +1,10 @@
-// gzv.std/strings — string helpers on the frozen builtins.
-//
-// `split(s, "")` is the sanctioned character-access path: the builtin
-// splits into one-element strings (Unicode scalar values), so indexing
-// the result walks the string character by character. `len(s)` counts
-// the same scalar values, so `char_at`/`substring` indices agree with
-// `len`. Concatenation is `+`.
+//! gzv.std/strings — string helpers on the frozen builtins.
+//!
+//! `split(s, "")` is the sanctioned character-access path: the builtin
+//! splits into one-element strings (Unicode scalar values), so indexing
+//! the result walks the string character by character. `len(s)` counts
+//! the same scalar values, so `char_at`/`substring` indices agree with
+//! `len`. Concatenation is `+`.
 
 pub fn is_empty(s: string) -> bool {
     return len(s) == 0;
@@ -68,8 +68,8 @@ pub fn substring(s: string, start: int, end: int) -> string {
     return out;
 }
 
-// Byte-free first occurrence of `needle` in `s`, or -1 when absent.
-// Scans with `starts_with` so the result is a character index.
+/// Byte-free first occurrence of `needle` in `s`, or -1 when absent.
+/// Scans with `starts_with` so the result is a character index.
 pub fn index_of(s: string, needle: string) -> int {
     if len(needle) == 0 {
         return 0;

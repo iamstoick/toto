@@ -197,6 +197,9 @@ fn close_name(kind: &TokenKind) -> &'static str {
 /// Parse a token stream into a program, collecting all diagnostics.
 pub fn parse(toks: Vec<Token>, src: &str) -> (Program, Vec<Diag>) {
     let mut p = Parser::new(toks, src);
+    // Leading `//!` lines become the module doc; a leading `///`
+    // block stays for the first item (`parse_item` drains it).
+    let module_doc = p.take_module_doc_lines();
     let mut items = Vec::new();
     while !p.at_eof() {
         match p.parse_item() {
@@ -204,19 +207,80 @@ pub fn parse(toks: Vec<Token>, src: &str) -> (Program, Vec<Diag>) {
             Err(()) => p.sync_item(),
         }
     }
-    (Program { items }, p.errors)
+    (
+        Program {
+            items,
+            doc: module_doc,
+        },
+        p.errors,
+    )
 }
 
 impl Parser<'_> {
+    /// Drain leading `///` (item-doc) lines, returning their texts
+    /// in order. Stops at a `//!` line, which never belongs to an
+    /// item (file-top `//!` is the module doc; elsewhere it errors
+    /// in `parse_item`).
+    fn take_item_doc_lines(&mut self) -> Vec<String> {
+        let mut docs = Vec::new();
+        while matches!(self.peek().kind, TokenKind::DocComment { outer: true, .. }) {
+            if let TokenKind::DocComment { text, .. } = self.bump().kind {
+                docs.push(text);
+            }
+        }
+        docs
+    }
+
+    /// Drain leading `//!` (module-doc) lines for `Program.doc`.
+    /// Stops at the first `///` line, which belongs to the first
+    /// item rather than the module.
+    fn take_module_doc_lines(&mut self) -> Vec<String> {
+        let mut docs = Vec::new();
+        while matches!(self.peek().kind, TokenKind::DocComment { outer: false, .. }) {
+            if let TokenKind::DocComment { text, .. } = self.bump().kind {
+                docs.push(text);
+            }
+        }
+        docs
+    }
+
+    /// Drop all leading doc-comment lines regardless of marker.
+    /// Block bodies attach docs to nothing (docs are not
+    /// statements), so stray lines — including a trailing note
+    /// before `}` — are skipped here, never reaching `parse_stmt`.
+    fn skip_doc_lines(&mut self) {
+        while matches!(self.peek().kind, TokenKind::DocComment { .. }) {
+            self.bump();
+        }
+    }
+
     fn parse_item(&mut self) -> PResult<Item> {
         let start = self.peek().span;
         let mut annotations = Vec::new();
+        let mut docs = Vec::new();
         loop {
             match self.peek().kind {
                 TokenKind::At => annotations.push(self.parse_annotation()?),
                 // `pub` is accepted on top-level items and has no effect (flat namespace).
                 TokenKind::Pub => {
                     self.bump();
+                }
+                // Doc lines attach to the following item; they
+                // interleave with annotations in any order.
+                // `///` attaches to the following item; `//!`
+                // documents the module and is file-top-only.
+                TokenKind::DocComment { outer: true, .. } => {
+                    docs.extend(self.take_item_doc_lines())
+                }
+                TokenKind::DocComment { outer: false, .. } => {
+                    let span = self.peek().span;
+                    self.error(
+                        "E0101",
+                        "found `//!` here; `//!` documents the whole module and is only valid at the top of the file".to_string(),
+                        span,
+                        Some("use `///` to document the following item".to_string()),
+                    );
+                    return Err(());
                 }
                 _ => break,
             }
@@ -229,10 +293,10 @@ impl Parser<'_> {
         if let TokenKind::Ident(name) = self.peek().kind.clone() {
             let next = self.toks.get(self.pos + 1).map(|t| t.kind.clone());
             if name == "state" && matches!(next, Some(TokenKind::LBrace)) {
-                return self.parse_state_item(start, annotations);
+                return self.parse_state_item(start, annotations, docs);
             }
             if name == "migrate" && matches!(next, Some(TokenKind::Fn)) {
-                return self.parse_migrate_item(start, annotations);
+                return self.parse_migrate_item(start, annotations, docs);
             }
         }
         match self.peek().kind.clone() {
@@ -262,6 +326,7 @@ impl Parser<'_> {
                     kind: ItemKind::Import(ImportDecl { path, path_span }),
                     span,
                     file: None,
+                    doc: docs,
                 })
             }
             TokenKind::Mod | TokenKind::Use => {
@@ -286,6 +351,7 @@ impl Parser<'_> {
                     kind: ItemKind::Fn(decl),
                     span,
                     file: None,
+                    doc: docs,
                 })
             }
             TokenKind::Struct => {
@@ -296,6 +362,7 @@ impl Parser<'_> {
                     kind: ItemKind::Struct(decl),
                     span,
                     file: None,
+                    doc: docs,
                 })
             }
             TokenKind::Unsafe => {
@@ -307,6 +374,7 @@ impl Parser<'_> {
                             kind: ItemKind::Extern(block),
                             span,
                             file: None,
+                            doc: docs,
                         })
                     }
                     Err(()) => {
@@ -708,7 +776,12 @@ impl Parser<'_> {
     /// (channel, bare). Shapes are not distinguished here — the
     /// checker enforces data-requires-init and chan-forbids-init
     /// (`E0317`/`E0318`), so both parse uniformly.
-    fn parse_state_item(&mut self, start: Span, annotations: Vec<Annotation>) -> PResult<Item> {
+    fn parse_state_item(
+        &mut self,
+        start: Span,
+        annotations: Vec<Annotation>,
+        docs: Vec<String>,
+    ) -> PResult<Item> {
         self.bump(); // state
         let open = self.expect(|k| matches!(k, TokenKind::LBrace), "`{`")?.span;
         let mut bindings = Vec::new();
@@ -752,13 +825,19 @@ impl Parser<'_> {
             }),
             span,
             file: None,
+            doc: docs,
         })
     }
 
     /// Parse a top-level `migrate fn ...` item after the `migrate`
     /// identifier. The migration target comes from the parameter
     /// type (checked later); the name rides along for diagnostics.
-    fn parse_migrate_item(&mut self, start: Span, annotations: Vec<Annotation>) -> PResult<Item> {
+    fn parse_migrate_item(
+        &mut self,
+        start: Span,
+        annotations: Vec<Annotation>,
+        docs: Vec<String>,
+    ) -> PResult<Item> {
         self.bump(); // migrate
         let mut func = self.parse_fn()?;
         func.annotations = annotations;
@@ -771,6 +850,7 @@ impl Parser<'_> {
             }),
             span,
             file: None,
+            doc: docs,
         })
     }
 
@@ -884,6 +964,7 @@ impl Parser<'_> {
         let open = self.expect(|k| matches!(k, TokenKind::LBrace), "`{`")?.span;
         let mut stmts = Vec::new();
         loop {
+            self.skip_doc_lines();
             if self.at_eof() {
                 let (line, col) = open.line_col(self.src);
                 self.error(

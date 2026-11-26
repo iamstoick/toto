@@ -1,21 +1,21 @@
-// gzv.std/trace — distributed tracing (Enterprise Wave 4, Stage 1).
-//
-// OpenTelemetry-compatible spans over the Wave-1 context ADR
-// (ADR-009): trace/span IDs ride as ordinary context values with
-// spawn inheritance; cross-service propagation uses W3C
-// `traceparent` headers; export is OTLP/HTTP+JSON to a real
-// collector (proven against Jaeger, never asserted from local
-// output alone).
-//
-// Design record: docs/phases/enterprise-wave-4-operations.md §1.
-// No new builtins, no D1-D8 change, no spec change — stdlib only.
-// Error strings are fixed producer text (never library wording)
-// so goldens hold on every platform.
-//
-// Identifiers: trace ids are 16 random bytes rendered as 32
-// lowercase hex chars; span ids are 8 random bytes as 16 hex.
-// Timestamps are monotonic milliseconds rendered as nanos
-// (`ms * 1000000`) — millisecond precision is a stated v1 limit.
+//! gzv.std/trace — distributed tracing (Enterprise Wave 4, Stage 1).
+//!
+//! OpenTelemetry-compatible spans over the Wave-1 context ADR
+//! (ADR-009): trace/span IDs ride as ordinary context values with
+//! spawn inheritance; cross-service propagation uses W3C
+//! `traceparent` headers; export is OTLP/HTTP+JSON to a real
+//! collector (proven against Jaeger, never asserted from local
+//! output alone).
+//!
+//! Design record: docs/phases/enterprise-wave-4-operations.md §1.
+//! No new builtins, no D1-D8 change, no spec change — stdlib only.
+//! Error strings are fixed producer text (never library wording)
+//! so goldens hold on every platform.
+//!
+//! Identifiers: trace ids are 16 random bytes rendered as 32
+//! lowercase hex chars; span ids are 8 random bytes as 16 hex.
+//! Timestamps are monotonic milliseconds rendered as nanos
+//! (`ms * 1000000`) — millisecond precision is a stated v1 limit.
 
 import "gzv.std/context.gzv";
 import "gzv.std/crypto.gzv";
@@ -24,8 +24,8 @@ import "gzv.std/json.gzv";
 import "gzv.std/strings.gzv";
 import "gzv.std/time.gzv";
 
-// OTel SpanKind numbers (stable): internal=1, server=2,
-// client=3, producer=4, consumer=5.
+/// OTel SpanKind numbers (stable): internal=1, server=2,
+/// client=3, producer=4, consumer=5.
 fn trace_kind_num(kind: string) -> Result<int, string> {
     if kind == "internal" {
         return Ok(1);
@@ -50,14 +50,14 @@ fn trace_kind_num(kind: string) -> Result<int, string> {
     return Err("trace: bad kind (want internal|server|client|producer|consumer)");
 }
 
-// One hex digit (lowercase output alphabet).
+/// One hex digit (lowercase output alphabet).
 fn trace_hexdig(v: int) -> string {
     let digits: string = "0123456789abcdef";
     return substring(digits, v, v + 1);
 }
 
-// Lowercase hex of arbitrary bytes (same shape as the Wave-3
-// password codec, local so tracing stays dependency-free).
+/// Lowercase hex of arbitrary bytes (same shape as the Wave-3
+/// password codec, local so tracing stays dependency-free).
 pub fn trace_hex(bytes: Array<int>) -> string {
     let mut out: string = "";
     for b in bytes {
@@ -68,7 +68,7 @@ pub fn trace_hex(bytes: Array<int>) -> string {
     return out;
 }
 
-// Numeric value of one hex char, or -1 when not hex.
+/// Numeric value of one hex char, or -1 when not hex.
 fn trace_hexval(c: string) -> int {
     let digits: string = "0123456789abcdefABCDEF";
     let mut i: int = 0;
@@ -86,7 +86,7 @@ fn trace_hexval(c: string) -> int {
     return -1;
 }
 
-// True when every char is hex.
+/// True when every char is hex.
 fn trace_is_hex(s: string) -> bool {
     if len(s) == 0 {
         return false;
@@ -103,7 +103,7 @@ fn trace_is_hex(s: string) -> bool {
     return true;
 }
 
-// Context keys (dotted to avoid collisions).
+/// Context keys (dotted to avoid collisions).
 fn trace_key_tid() -> string {
     return "trace.trace_id";
 }
@@ -116,8 +116,8 @@ fn trace_key_sampled() -> string {
     return "trace.sampled";
 }
 
-// One recorded span (attributes grow in place; the finished
-// record is appended on trace_end).
+/// One recorded span (attributes grow in place; the finished
+/// record is appended on trace_end).
 pub struct TraceAttr {
     key: string,
     is_int: bool,
@@ -137,7 +137,7 @@ pub struct TraceSpan {
     sampled: bool
 }
 
-// A finished span: the span plus end verdict.
+/// A finished span: the span plus end verdict.
 pub struct TraceRecord {
     span: TraceSpan,
     end_ms: int,
@@ -145,23 +145,23 @@ pub struct TraceRecord {
     status_msg: string
 }
 
-// The finished-span table plus sampling policy. Exported spans
-// are never removed (v1 exports once per test/run; rotation is
-// a named follow-up, not silent loss).
+/// The finished-span table plus sampling policy. Exported spans
+/// are never removed (v1 exports once per test/run; rotation is
+/// a named follow-up, not silent loss).
 pub struct Tracer {
     spans: Array<TraceRecord>,
     num: int,
     den: int
 }
 
-// A tracer that always samples.
+/// A tracer that always samples.
 pub fn trace_tracer() -> Tracer {
     let spans: Array<TraceRecord> = [];
     return Tracer { spans: spans, num: 1, den: 1 };
 }
 
-// A tracer with head-based ratio sampling (num/den, e.g. 1/100
-// for production; tests use 1/1).
+/// A tracer with head-based ratio sampling (num/den, e.g. 1/100
+/// for production; tests use 1/1).
 pub fn trace_tracer_ratio(num: int, den: int) -> Result<Tracer, string> {
     if num < 0 || den < 1 || num > den {
         return Err("trace: bad ratio (want 0 <= num <= den, den >= 1)");
@@ -171,7 +171,7 @@ pub fn trace_tracer_ratio(num: int, den: int) -> Result<Tracer, string> {
     return Ok(Tracer { spans: spans, num: num, den: den });
 }
 
-// Value of the last 8 hex chars as an int (for head sampling).
+/// Value of the last 8 hex chars as an int (for head sampling).
 fn trace_tail_value(tid: string) -> int {
     let tail: string = substring(tid, len(tid) - 8, len(tid));
     let mut v: int = 0;
@@ -183,7 +183,7 @@ fn trace_tail_value(tid: string) -> int {
     return v;
 }
 
-// A begun span plus its derived context.
+/// A begun span plus its derived context.
 pub struct Begun {
     trace_id: string,
     span_id: string,
@@ -191,9 +191,9 @@ pub struct Begun {
     span: TraceSpan
 }
 
-// Start a span: child of the context's span when the context
-// carries (trace_id, span_id), else a new root. Sampling is
-// parent-based when present, head-based otherwise.
+/// Start a span: child of the context's span when the context
+/// carries (trace_id, span_id), else a new root. Sampling is
+/// parent-based when present, head-based otherwise.
 pub fn trace_begin(tracer: Tracer, ctx: Context, name: string, kind: string, service: string) -> Result<Begun, string> {
     let kind_ok = trace_kind_num(kind)?;
     let has_tid: bool = ctx_has(ctx, trace_key_tid());
@@ -227,9 +227,9 @@ pub fn trace_begin(tracer: Tracer, ctx: Context, name: string, kind: string, ser
     return Ok(Begun { trace_id: tid, span_id: sid, sampled: sampled, span: span });
 }
 
-// Derive the child context for a begun span (the spawner's
-// context plus this span's identity). Separate function because
-// a foreign struct (`Context`) cannot sit in a struct field.
+/// Derive the child context for a begun span (the spawner's
+/// context plus this span's identity). Separate function because
+/// a foreign struct (`Context`) cannot sit in a struct field.
 pub fn trace_ctx(ctx: Context, b: Begun) -> Context {
     let c1 = ctx_with_value(ctx, trace_key_tid(), b.trace_id);
     let c2 = ctx_with_value(c1, trace_key_sid(), b.span_id);
@@ -240,7 +240,7 @@ pub fn trace_ctx(ctx: Context, b: Begun) -> Context {
     return ctx_with_value(c2, trace_key_sampled(), "0");
 }
 
-// Record a string attribute on an open span.
+/// Record a string attribute on an open span.
 pub fn trace_attr(span: TraceSpan, key: string, val: string) -> Result<unit, string> {
     if key == "" {
         return Err("trace: empty attribute key");
@@ -251,7 +251,7 @@ pub fn trace_attr(span: TraceSpan, key: string, val: string) -> Result<unit, str
     return Ok(());
 }
 
-// Record an int attribute on an open span.
+/// Record an int attribute on an open span.
 pub fn trace_attr_int(span: TraceSpan, key: string, val: int) -> Result<unit, string> {
     if key == "" {
         return Err("trace: empty attribute key");
@@ -262,9 +262,9 @@ pub fn trace_attr_int(span: TraceSpan, key: string, val: int) -> Result<unit, st
     return Ok(());
 }
 
-// Close a span: stamp end time + status and append the finished
-// record. Status codes follow OTel (0 unset, 1 ok, 2 error);
-// anything else is a loud error.
+/// Close a span: stamp end time + status and append the finished
+/// record. Status codes follow OTel (0 unset, 1 ok, 2 error);
+/// anything else is a loud error.
 pub fn trace_end(tracer: Tracer, span: TraceSpan, status_code: int, status_msg: string) -> Result<unit, string> {
     if status_code < 0 || status_code > 2 {
         return Err("trace: bad status (want 0 unset, 1 ok, 2 error)");
@@ -280,9 +280,9 @@ pub fn trace_end(tracer: Tracer, span: TraceSpan, status_code: int, status_msg: 
     return Ok(());
 }
 
-// W3C traceparent for the span in this context:
-// `00-<trace-id>-<span-id>-<flags>`. Loud when the context
-// carries no span (call trace_begin first).
+/// W3C traceparent for the span in this context:
+/// `00-<trace-id>-<span-id>-<flags>`. Loud when the context
+/// carries no span (call trace_begin first).
 pub fn trace_inject(ctx: Context) -> Result<Array<HttpHeader>, string> {
     if !ctx_has(ctx, trace_key_tid()) {
         return Err("trace: no active span to inject");
@@ -307,11 +307,11 @@ pub fn trace_inject(ctx: Context) -> Result<Array<HttpHeader>, string> {
     return Ok(h);
 }
 
-// Extract an incoming traceparent. Always succeeds: absent or
-// malformed headers yield the input context unchanged (a
-// tracing defect must never fail a request). The derived context
-// carries the remote span as parent; trace_begin turns it into
-// a child span. `Result` only so `?` works inside.
+/// Extract an incoming traceparent. Always succeeds: absent or
+/// malformed headers yield the input context unchanged (a
+/// tracing defect must never fail a request). The derived context
+/// carries the remote span as parent; trace_begin turns it into
+/// a child span. `Result` only so `?` works inside.
 pub fn trace_extract(ctx: Context, headers: Array<HttpHeader>) -> Result<Context, string> {
     let want: Result<string, string> = http_header_or(headers, "traceparent", "");
     let empty: Result<string, string> = Ok("");
@@ -355,7 +355,7 @@ pub fn trace_extract(ctx: Context, headers: Array<HttpHeader>) -> Result<Context
 
 // --- OTLP/HTTP+JSON export (validated against a real collector) ---
 
-// One attribute as an OTLP KeyValue.
+/// One attribute as an OTLP KeyValue.
 fn trace_attr_json(a: TraceAttr) -> Result<JsonVal, string> {
     // OTLP AnyValue wrapper: {"stringValue": ...} or
     // {"intValue": ...} — never a bare value.
@@ -370,10 +370,10 @@ fn trace_attr_json(a: TraceAttr) -> Result<JsonVal, string> {
     return json_object(ks, vs);
 }
 
-// One finished span as OTLP JSON. Timestamps render as strings
-// (OTLP uint64); the parent field is omitted for roots. Public
-// so tests pin the exact wire mapping (the collector proof then
-// covers acceptance, not just shape).
+/// One finished span as OTLP JSON. Timestamps render as strings
+/// (OTLP uint64); the parent field is omitted for roots. Public
+/// so tests pin the exact wire mapping (the collector proof then
+/// covers acceptance, not just shape).
 pub fn trace_span_json(s: TraceSpan, end_ms: int, status_code: int, status_msg: string) -> Result<JsonVal, string> {
     let kind: int = trace_kind_num(s.kind)?;
     let attrs: Array<JsonVal> = [];
@@ -411,9 +411,9 @@ pub fn trace_span_json(s: TraceSpan, end_ms: int, status_code: int, status_msg: 
     return Ok(out);
 }
 
-// Export all sampled finished spans to an OTLP/HTTP collector:
-// POST {endpoint}/v1/traces, 2xx expected. Unsampled spans stay
-// local (never exported). Loud on any failure.
+/// Export all sampled finished spans to an OTLP/HTTP collector:
+/// POST {endpoint}/v1/traces, 2xx expected. Unsampled spans stay
+/// local (never exported). Loud on any failure.
 pub fn trace_export(tracer: Tracer, endpoint: string) -> Result<string, string> {
     if endpoint == "" {
         return Err("trace: empty export endpoint");
@@ -478,10 +478,10 @@ pub fn trace_export(tracer: Tracer, endpoint: string) -> Result<string, string> 
     return Ok("exported");
 }
 
-// Deterministic finished-span report for goldens: one line per
-// span sorted by name (no IDs, no timestamps — both vary run to
-// run), parent resolved to a name (`-` for roots), plus a
-// same-trace check and a count.
+/// Deterministic finished-span report for goldens: one line per
+/// span sorted by name (no IDs, no timestamps — both vary run to
+/// run), parent resolved to a name (`-` for roots), plus a
+/// same-trace check and a count.
 fn trace_parent_name(spans: Array<TraceRecord>, parent: string) -> string {
     if parent == "" {
         return "-";

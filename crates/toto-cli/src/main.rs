@@ -37,6 +37,8 @@ const HELP: &str = "toto — a new programming language (.gzv)\n\
                     \x20                                      hygiene lints (E05xx warnings)\n\
                     \x20   toto coverage [--fail-under PCT] <file.gzv>...\n\
                     \x20                                      LCOV report on stdout (sequential programs only)\n\
+                    \x20   toto doc [--out DIR] <file.gzv>...  API docs as Markdown\n\
+                    \x20                                      (stdout, or per-module files + index with --out)\n\
                     \x20   toto lsp                          basic LSP server on stdio\n\
                     (hover, go-to-definition, diagnostics)\n\
                     \x20   toto --help                        show this help\n\
@@ -290,6 +292,29 @@ fn main() -> ExitCode {
                 return ExitCode::from(3);
             }
             lint_files(&files, deny_warnings)
+        }
+        Some("doc") => {
+            let mut out: Option<String> = None;
+            let mut files = Vec::new();
+            let mut rest = args.iter().skip(2);
+            while let Some(a) = rest.next() {
+                if *a == "--out" {
+                    match rest.next() {
+                        Some(d) => out = Some((*d).to_string()),
+                        None => {
+                            eprintln!("toto: `--out` needs a directory");
+                            return ExitCode::from(3);
+                        }
+                    }
+                } else {
+                    files.push((*a).to_string());
+                }
+            }
+            if files.is_empty() {
+                eprintln!("toto: `doc` needs a file: toto doc [--out DIR] <file.gzv>...");
+                return ExitCode::from(3);
+            }
+            doc_files(&files, out.as_deref())
         }
         Some("lsp") => lsp::serve(),
         Some(other) => {
@@ -567,6 +592,86 @@ fn coverage_files(files: &[String], fail_under: Option<u32>) -> ExitCode {
         ExitCode::from(1)
     } else {
         ExitCode::from(0)
+    }
+}
+
+/// Render API docs as Markdown (Stage 4): parse only, one file at a
+/// time like `fmt` (imports are not resolved — each listed file is
+/// one module named by its file stem). Stdout mode prints the index
+/// plus every module as a single document; `--out DIR` writes
+/// `<module>.md` per file plus `index.md`. Broken files are refused
+/// with their diagnostics (exit 2); unreadable files are exit 3.
+fn doc_files(files: &[String], out: Option<&str>) -> ExitCode {
+    let mut modules: Vec<(String, String, String)> = Vec::new();
+    for path in files {
+        let src = match std::fs::read_to_string(path) {
+            Ok(src) => src,
+            Err(e) => {
+                eprintln!("toto: couldn't read `{path}`: {e}");
+                return ExitCode::from(3);
+            }
+        };
+        let (tokens, lex_errors) = toto_compiler::lexer::lex(&src);
+        if !lex_errors.is_empty() {
+            let diags: Vec<toto_compiler::diag::Diag> = lex_errors
+                .into_iter()
+                .map(|e| toto_compiler::diag::Diag::new(e.code, e.message, e.span, e.help))
+                .collect();
+            eprint!("{}", toto_compiler::render_errors(&diags, &src, path));
+            return ExitCode::from(2);
+        }
+        let (program, parse_errors) = toto_compiler::parser::parse(tokens, &src);
+        if !parse_errors.is_empty() {
+            eprint!(
+                "{}",
+                toto_compiler::render_errors(&parse_errors, &src, path)
+            );
+            return ExitCode::from(2);
+        }
+        let name = std::path::Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| path.to_string());
+        let summary = program.doc.first().cloned().unwrap_or_default();
+        let md = toto_compiler::doc::render_module(&name, &program);
+        modules.push((name, summary, md));
+    }
+    let entries: Vec<(&str, &str)> = modules
+        .iter()
+        .map(|(n, s, _)| (n.as_str(), s.as_str()))
+        .collect();
+    match out {
+        None => {
+            print!(
+                "{}",
+                toto_compiler::doc::render_index(&entries, &|n| format!("#{n}"))
+            );
+            for (_, _, md) in &modules {
+                println!();
+                print!("{md}");
+            }
+            ExitCode::from(0)
+        }
+        Some(dir) => {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!("toto: couldn't create `{dir}`: {e}");
+                return ExitCode::from(3);
+            }
+            let root = std::path::Path::new(dir);
+            let index = toto_compiler::doc::render_index(&entries, &|n| format!("{n}.md"));
+            if let Err(e) = std::fs::write(root.join("index.md"), index) {
+                eprintln!("toto: couldn't write `{dir}/index.md`: {e}");
+                return ExitCode::from(3);
+            }
+            for (name, _, md) in &modules {
+                if let Err(e) = std::fs::write(root.join(format!("{name}.md")), md) {
+                    eprintln!("toto: couldn't write `{dir}/{name}.md`: {e}");
+                    return ExitCode::from(3);
+                }
+            }
+            ExitCode::from(0)
+        }
     }
 }
 

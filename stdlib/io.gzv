@@ -1,9 +1,9 @@
-// gzv.std/io — line-oriented console and text conveniences.
-//
-// print/println/read_file/write_file/file_exists are frozen builtins;
-// this module adds the line-splitting layer. `write_lines` overwrites
-// (there is no append builtin); `append_line` documents its
-// read-modify-write nature and non-atomicity.
+//! gzv.std/io — line-oriented console and text conveniences.
+//!
+//! print/println/read_file/write_file/file_exists are frozen builtins;
+//! this module adds the line-splitting layer. `write_lines` overwrites
+//! (there is no append builtin); `append_line` documents its
+//! read-modify-write nature and non-atomicity.
 import "gzv.std/strings.gzv";
 
 pub fn read_lines(path: string) -> Array<string> {
@@ -25,9 +25,9 @@ pub fn write_lines(path: string, lines: Array<string>) -> unit {
     write_file(path, join(lines, "\n"));
 }
 
-// Read-modify-write append: NOT atomic under concurrency. Writers
-// that race each other can lose lines; use a channel to serialize
-// appends from green threads instead.
+/// Read-modify-write append: NOT atomic under concurrency. Writers
+/// that race each other can lose lines; use a channel to serialize
+/// appends from green threads instead.
 pub fn append_line(path: string, line: string) -> unit {
     if file_exists(path) {
         let cur: string = read_file(path);

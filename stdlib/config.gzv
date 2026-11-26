@@ -1,18 +1,18 @@
-// `gzv.std/config` — configuration: files, environment,
-// defaults (Enterprise Wave 3, Stage 4).
-//
-// One value model: a `JsonVal` object mapping dotted paths to
-// STRINGS. TOML/YAML trees flatten on load (arrays as `a.0`
-// segments, null as the literal `"null"`); typed getters parse
-// with loud `Err`s. Merging is per dotted key (later wins),
-// so `config_merge` needs no schema knowledge — flatness
-// makes layered config trivially correct. Precedence:
-// env > file > defaults — always explicit: file loading
-// names its files, env overlay names every `ENV=config.path`
-// mapping, defaults are built by the caller. No network, no
-// includes, no interpolation in v1 (documented limits).
-// Empty-vs-unset env distinguishes via `config_env_has`
-// (`getenv` returns "" for both; `has` asks presence).
+//! `gzv.std/config` — configuration: files, environment,
+//! defaults (Enterprise Wave 3, Stage 4).
+//!
+//! One value model: a `JsonVal` object mapping dotted paths to
+//! STRINGS. TOML/YAML trees flatten on load (arrays as `a.0`
+//! segments, null as the literal `"null"`); typed getters parse
+//! with loud `Err`s. Merging is per dotted key (later wins),
+//! so `config_merge` needs no schema knowledge — flatness
+//! makes layered config trivially correct. Precedence:
+//! env > file > defaults — always explicit: file loading
+//! names its files, env overlay names every `ENV=config.path`
+//! mapping, defaults are built by the caller. No network, no
+//! includes, no interpolation in v1 (documented limits).
+//! Empty-vs-unset env distinguishes via `config_env_has`
+//! (`getenv` returns "" for both; `has` asks presence).
 import "gzv.std/json.gzv";
 import "gzv.std/strings.gzv";
 import "gzv.std/toml.gzv";
@@ -23,13 +23,13 @@ unsafe extern "C" {
     fn toto_rt_env_has(name: *c_char) -> c_int;
 }
 
-// An empty config object (defaults start here).
+/// An empty config object (defaults start here).
 pub fn config_empty() -> Result<JsonVal, string> {
     return json_parse("{}");
 }
 
-// Raw environment access (the overlay below is the usual
-// entry point; these two are public for tests/REPL use).
+/// Raw environment access (the overlay below is the usual
+/// entry point; these two are public for tests/REPL use).
 pub fn config_env_get(name: string) -> string {
     return toto_rt_env_get(name);
 }
@@ -42,18 +42,18 @@ pub fn config_env_has(name: string) -> bool {
     return false;
 }
 
-// Required lookup: missing keys Err as `missing key: <path>`
-// (the json layer's error — named here so callers can rely
-// on the exact text).
+/// Required lookup: missing keys Err as `missing key: <path>`
+/// (the json layer's error — named here so callers can rely
+/// on the exact text).
 pub fn config_require(cfg: JsonVal, path: string) -> Result<string, string> {
     let v = json_object_get(cfg, path)?;
     return Ok(json_as_string(v)?);
 }
 
-// Lookup with a default (missing key only — a present key is
-// never replaced, not even when empty). Loud Err only when a
-// present value is somehow not a string (breaks the config
-// invariant — cannot happen through the loaders above).
+/// Lookup with a default (missing key only — a present key is
+/// never replaced, not even when empty). Loud Err only when a
+/// present value is somehow not a string (breaks the config
+/// invariant — cannot happen through the loaders above).
 pub fn config_get(cfg: JsonVal, path: string, dflt: string) -> Result<string, string> {
     if !config_has_key(cfg, path) {
         return Ok(dflt);
@@ -62,8 +62,8 @@ pub fn config_get(cfg: JsonVal, path: string, dflt: string) -> Result<string, st
     return Ok(json_as_string(json_object_get(cfg, path)?)?);
 }
 
-// Typed getters (loud Err on malformed values — a bad port
-// number aborts loudly instead of binding somewhere weird).
+/// Typed getters (loud Err on malformed values — a bad port
+/// number aborts loudly instead of binding somewhere weird).
 pub fn config_get_int(cfg: JsonVal, path: string, dflt: int) -> Result<int, string> {
     let raw = config_get_raw(cfg, path)?;
     if raw == "" {
@@ -111,12 +111,12 @@ fn config_has_key(cfg: JsonVal, path: string) -> bool {
     return false;
 }
 
-// All dotted keys (enumeration for merges/dumps/tests).
+/// All dotted keys (enumeration for merges/dumps/tests).
 pub fn config_keys(cfg: JsonVal) -> Array<string> {
     return cfg.keys;
 }
 
-// Overlay `over` onto `base`: every key in `over` wins.
+/// Overlay `over` onto `base`: every key in `over` wins.
 pub fn config_merge(base: JsonVal, over: JsonVal) -> Result<JsonVal, string> {
     let mut keys: Array<string> = [];
     let mut vals: Array<JsonVal> = [];
@@ -159,9 +159,9 @@ fn config_index_of(keys: Array<string>, want: string) -> int {
     return -1;
 }
 
-// Env overlay: each mapping is `"ENV_VAR=config.path"` — set
-// variables win over `cfg`, unset ones are skipped (never
-// overwrite with ""). Returns the merged config.
+/// Env overlay: each mapping is `"ENV_VAR=config.path"` — set
+/// variables win over `cfg`, unset ones are skipped (never
+/// overwrite with ""). Returns the merged config.
 pub fn config_apply_env(cfg: JsonVal, mappings: Array<string>) -> Result<JsonVal, string> {
     let mut keys: Array<string> = [];
     let mut vals: Array<string> = [];
@@ -194,8 +194,8 @@ fn json_strings(ss: Array<string>) -> Array<JsonVal> {
     return out;
 }
 
-// TOML/YAML file loading (flattened to the dotted string
-// map; arrays indexed, null as `"null"`).
+/// TOML/YAML file loading (flattened to the dotted string
+/// map; arrays indexed, null as `"null"`).
 pub fn config_from_toml_file(path: string) -> Result<JsonVal, string> {
     return config_flatten_toml(toml_parse(read_file(path))?, "", config_empty()?);
 }
@@ -366,8 +366,8 @@ fn yaml_scalar_text(v: YamlVal) -> Result<string, string> {
     return Err("bad yaml scalar");
 }
 
-// Strict int/float parsing with loud errors (parse_int aborts
-// the program on bad input — validate first, return Err).
+/// Strict int/float parsing with loud errors (parse_int aborts
+/// the program on bad input — validate first, return Err).
 pub fn config_parse_int(s: string) -> Result<int, string> {
     let mut t: string = s;
     if len(t) > 0 && char_at(t, 0) == "-" {

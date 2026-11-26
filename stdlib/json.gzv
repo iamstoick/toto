@@ -1,21 +1,21 @@
-// gzv.std/json — JSON parse + serialize (Phase 5, Stage 2).
-//
-// Values are `JsonVal` structs. Nested values store as COMPACT JSON
-// strings (`items`/`vals`), parsed on access: Toto v1 rejects
-// recursive types (E0302), so a directly nested DOM is inexpressible
-// and this strata design is the honest encoding. Consequences:
-// - `json_array_get`/`json_object_get` re-parse the nested slice on
-//   every access (O(depth) per descent, no caching).
-// - Numbers keep their RAW literal: `json_as_int` rejects non-integers
-//   and `parse_int` panics E0210 past i64 range (inherited, not wrapped).
-// - Floats parse via float arithmetic (exact decimal semantics is NOT
-//   guaranteed); serialize via `to_string` (Rust Debug, valid JSON).
-// - `\uXXXX` escapes are REJECTED with a clear error: there is no
-//   codepoint-to-char builtin (frozen catalog), so they cannot be
-//   represented. Other C0 controls pass through raw on output.
-// - Depth is bounded by interpreter/JIT stack limits, not by this
-//   module; pathologically nested input can trap. Keep nesting
-//   shallow or pre-validate length.
+//! gzv.std/json — JSON parse + serialize (Phase 5, Stage 2).
+//!
+//! Values are `JsonVal` structs. Nested values store as COMPACT JSON
+//! strings (`items`/`vals`), parsed on access: Toto v1 rejects
+//! recursive types (E0302), so a directly nested DOM is inexpressible
+//! and this strata design is the honest encoding. Consequences:
+//! - `json_array_get`/`json_object_get` re-parse the nested slice on
+//!   every access (O(depth) per descent, no caching).
+//! - Numbers keep their RAW literal: `json_as_int` rejects non-integers
+//!   and `parse_int` panics E0210 past i64 range (inherited, not wrapped).
+//! - Floats parse via float arithmetic (exact decimal semantics is NOT
+//!   guaranteed); serialize via `to_string` (Rust Debug, valid JSON).
+//! - `\uXXXX` escapes are REJECTED with a clear error: there is no
+//!   codepoint-to-char builtin (frozen catalog), so they cannot be
+//!   represented. Other C0 controls pass through raw on output.
+//! - Depth is bounded by interpreter/JIT stack limits, not by this
+//!   module; pathologically nested input can trap. Keep nesting
+//!   shallow or pre-validate length.
 
 import "gzv.std/strings.gzv";
 
@@ -266,8 +266,8 @@ fn json_is_int_literal(s: string) -> bool {
     return true;
 }
 
-// Float from a validated JSON number literal: int + frac/10^digits,
-// then the binary exponent. Precision follows float arithmetic.
+/// Float from a validated JSON number literal: int + frac/10^digits,
+/// then the binary exponent. Precision follows float arithmetic.
 fn json_parse_number_float(s: string) -> Result<float, string> {
     let chars: Array<string> = split(s, "");
     let mut i: int = 0;
@@ -430,7 +430,7 @@ fn json_parse_number(chars: Array<string>, pos: int) -> Result<JsonParseOut, str
     return Ok(JsonParseOut { value: json_make("num", raw), next: i });
 }
 
-// Strict JSON number shape: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+/// Strict JSON number shape: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
 fn json_is_canonical_number(raw: string) -> bool {
     let chars: Array<string> = split(raw, "");
     let mut i: int = 0;
