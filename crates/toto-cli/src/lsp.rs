@@ -2681,6 +2681,7 @@ fn completion_at(docs: &HashMap<String, OpenDoc>, params: &J) -> J {
 /// Documented globals also carry their `///` prose as Markdown
 /// documentation (same verbatim text as hover); everything
 /// else omits the field exactly as before.
+#[allow(clippy::too_many_arguments)]
 fn complete_item(
     label: &str,
     kind: i64,

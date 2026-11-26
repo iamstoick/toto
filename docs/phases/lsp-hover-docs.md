@@ -142,3 +142,19 @@ prose; exactly one `documentation` in the response).
 Verified locally with the real oracle: 22/22 LSP tests,
 `cargo fmt --check` clean, `cargo clippy` zero errors.
 This extends but does not reopen the closed verdict above.
+
+## Follow-on CI round (2026-11-26; fix committed, re-validation pending)
+
+Run 45835686539 on head 2c4a302: check FAILED on one new
+lint — `clippy::too_many_arguments` on the 8-parameter
+`complete_item`. Diagnostic corrected here: local plain
+`cargo clippy` showed it only as a warning (filtered out of
+my grep), and local `-D warnings` never reached `toto-cli`
+because the pre-existing macOS-only netsys lints fail the
+compiler crate first — CI (Linux) compiles netsys clean and
+trips on exactly this one. Fixed in place with the house
+`#[allow]` (same as `visit_source`); the two netsys warnings
+are version/platform drift, explicitly not mine, and CI was
+green with them twice. Re-verified: 22/22 LSP tests,
+fmt clean, no new clippy warnings. This commit's run is the
+re-validation; outcome in a future note.
