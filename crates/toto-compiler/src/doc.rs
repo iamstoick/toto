@@ -71,9 +71,7 @@ fn item_name(sig: &str) -> &str {
         .strip_prefix("fn ")
         .or_else(|| sig.strip_prefix("struct "))
         .unwrap_or(sig);
-    s.split(|c| c == '(' || c == ' ' || c == '{')
-        .next()
-        .unwrap_or(s)
+    s.split(['(', ' ', '{']).next().unwrap_or(s)
 }
 
 /// Render the module index: `# Index` plus one bullet per module,

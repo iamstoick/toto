@@ -764,6 +764,30 @@ never reached and stays unconfirmed — the re-validation run on
 this commit exercises clippy and the full suite for the first
 time, and its outcome belongs in a future record.
 
+## Stage 4 — CI failure round 2 + fix (2026-11-26; re-validation pending)
+
+Run 45747624576 on head a6a13da: fmt now passes (the four-hunk
+fix held), and check FAILED next at `cargo clippy --workspace
+--all-targets -- -D warnings` with exactly one lint, all other
+jobs green (release-gates, bench, Linux-ARM + macOS probes;
+Windows probe the known informational failure):
+
+- `clippy::manual_pattern_char_comparison` at
+  `crates/toto-compiler/src/doc.rs:74` — the `item_name`
+  closure `|c| c == '(' || c == ' ' || c == '{'`; clippy's
+  suggestion applied verbatim (`s.split(['(', ' ', '{'])`).
+  Notably NOT the suspected `&Vec` (ptr_arg never fired, on
+  nested positions or otherwise — suspicion retired, recorded
+  here).
+
+Fixed in place (this commit); 1.87 advisory clean on the file
+and compiler doc goldens re-pass (3/3). A sibling sweep for
+the same lint class across the Stage 4 diff found nothing
+else (remaining `||` chains are pre-existing method-based
+guards CI already accepts). The re-validation run on this
+commit is the first to reach the test suite; its outcome
+belongs in a future record.
+
 ## Wave gates (no merge until all green)
 
 - Each stage: design recorded before implementation; code +
