@@ -278,6 +278,13 @@ pub enum MInstr {
     Safepoint {
         kind: SpKind,
     },
+    /// Coverage marker: the AST statement at `span` started
+    /// executing (Wave 8, emitted only by
+    /// `lower_for_coverage`). The runtime executor records one
+    /// hit; every other consumer treats it as a nop.
+    Cover {
+        span: Span,
+    },
     /// Read declared-state slot `slot` (spec amendment, Phase 6).
     /// Slots are declaration order across the program's one state
     /// block; every executor owns a same-ordered cell vector.
@@ -311,6 +318,26 @@ pub enum MSelectCase {
     },
 }
 
+/// Coverage rerouting for one `Branch` (Wave 8): `Some` only in
+/// `lower_for_coverage` output, `None` everywhere else (production
+/// lowering never sets this, so production MIR is byte-identical
+/// with or without the coverage flag). `None` credits the verbatim
+/// `(span, arm)` — right when the lowering already stamped the
+/// inventory point's span, and harmlessly dropped by the renderer
+/// when no point claims it (short-circuit and match internals).
+/// `Some` credits `point` with the mapped arm (`None` swallows the
+/// edge): `for`-range bottom checks credit completion as arm 1 and
+/// swallow the continue edge; select case-dispatch polls swallow
+/// both edges because the `Select` instruction already records the
+/// winning case. The mapping mirrors the tree-walker's
+/// statement-level attribution exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BranchCover {
+    pub point: Span,
+    pub then_arm: Option<u8>,
+    pub else_arm: Option<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MTerm {
     Return(Option<Local>),
@@ -326,6 +353,8 @@ pub enum MTerm {
         span: Span,
         /// `while` conditions panic with the `while` message (`E0207`).
         while_cond: bool,
+        /// Coverage rerouting (see `BranchCover`).
+        cover: Option<BranchCover>,
     },
 }
 
@@ -369,7 +398,15 @@ pub enum MConst {
 /// resolution, types, and arities hold; the builder still never panics —
 /// any violated invariant becomes a well-formed `FallOff` in dead code.
 pub fn lower(checked: &CheckedProgram) -> MProgram {
-    lower_with_init(checked, true)
+    lower_with_init(checked, true, false)
+}
+
+/// Lower with per-AST-statement `Cover` markers for coverage
+/// (Wave 8, concurrent programs only). Production lowering
+/// never sets this: JIT/AOT/mir_conform see byte-identical
+/// MIR with or without the flag.
+pub fn lower_for_coverage(checked: &CheckedProgram) -> MProgram {
+    lower_with_init(checked, true, true)
 }
 
 /// Lower without the state-init prepend in `main` (Phase 6,
@@ -377,10 +414,10 @@ pub fn lower(checked: &CheckedProgram) -> MProgram {
 /// carried values instead of running initializers. Everything else
 /// (safepoints, checks, migrates) lowers identically.
 pub fn lower_without_init(checked: &CheckedProgram) -> MProgram {
-    lower_with_init(checked, false)
+    lower_with_init(checked, false, false)
 }
 
-fn lower_with_init(checked: &CheckedProgram, with_init: bool) -> MProgram {
+fn lower_with_init(checked: &CheckedProgram, with_init: bool, cover: bool) -> MProgram {
     let mut fns = Vec::new();
     let mut fn_index = HashMap::new();
     let mut main_span = Span::new(0, 0);
@@ -400,7 +437,7 @@ fn lower_with_init(checked: &CheckedProgram, with_init: bool) -> MProgram {
             main_span = hfn.span;
             saw_main = true;
         }
-        fns.push(lower_fn_inner(checked, hfn, with_init));
+        fns.push(lower_fn_inner(checked, hfn, with_init, cover));
     }
     // State without `main` lowers nothing: `main` is mandatory
     // (E0312), so a checked program with state always has it.
@@ -418,6 +455,7 @@ fn lower_with_init(checked: &CheckedProgram, with_init: bool) -> MProgram {
                 span: m.span,
             },
             with_init,
+            cover,
         ));
     }
     MProgram {
@@ -433,8 +471,8 @@ fn lower_with_init(checked: &CheckedProgram, with_init: bool) -> MProgram {
 /// Stage 3): the preserving-reload compile uses `false` for `main`,
 /// since carried values seed every slot and re-running initializers
 /// would clobber them (and repeat IO side effects).
-fn lower_fn_inner(checked: &CheckedProgram, hfn: &HFn, with_init: bool) -> MFn {
-    let mut b = FnBuilder::new(checked);
+fn lower_fn_inner(checked: &CheckedProgram, hfn: &HFn, with_init: bool, cover: bool) -> MFn {
+    let mut b = FnBuilder::new(checked, cover);
     for (name, ty, _) in &hfn.params {
         let l = b.fresh(format!("{name} (param)"), ty.clone());
         b.scopes
@@ -489,10 +527,13 @@ struct FnBuilder<'a> {
     /// Declared-state name → slot (declaration order). Slots are the
     /// cross-executor contract; every lowering and executor agrees.
     state_slots: HashMap<String, u32>,
+    /// Emit a `Cover` marker per AST statement (coverage builds
+    /// only; production lowering leaves this false).
+    cover: bool,
 }
 
 impl<'a> FnBuilder<'a> {
-    fn new(checked: &'a CheckedProgram) -> Self {
+    fn new(checked: &'a CheckedProgram, cover: bool) -> Self {
         let mut state_slots = HashMap::new();
         for (slot, s) in checked.state.iter().enumerate() {
             state_slots.insert(s.name.clone(), slot as u32);
@@ -508,6 +549,7 @@ impl<'a> FnBuilder<'a> {
             scopes: vec![HashMap::new()],
             loop_stack: Vec::new(),
             state_slots,
+            cover,
         }
     }
 
@@ -643,6 +685,11 @@ impl<'a> FnBuilder<'a> {
     }
 
     fn lower_stmt(&mut self, stmt: &crate::hir::HStmt, ret: &Ty) {
+        // Coverage marker first: one hit per AST statement
+        // execution, whatever control flow follows (Wave 8).
+        if self.cover {
+            self.emit(MInstr::Cover { span: stmt.span });
+        }
         match &stmt.kind {
             HStmtKind::Let {
                 name, ty, value, ..
@@ -734,7 +781,7 @@ impl<'a> FnBuilder<'a> {
                     None => self.close(MTerm::FallOff { span }),
                 }
             }
-            HStmtKind::While { cond, body } => self.lower_while(cond, body, ret),
+            HStmtKind::While { cond, body } => self.lower_while(cond, body, ret, stmt.span),
             HStmtKind::For {
                 name, iter, body, ..
             } => {
@@ -756,7 +803,7 @@ impl<'a> FnBuilder<'a> {
         for (name, _) in captured {
             srcs.push(self.resolve(name));
         }
-        let mut sub = FnBuilder::new(self.checked);
+        let mut sub = FnBuilder::new(self.checked, self.cover);
         for (name, ty) in captured {
             let l = sub.fresh(format!("{name} (capture)"), ty.clone());
             sub.scopes
@@ -882,6 +929,18 @@ impl<'a> FnBuilder<'a> {
                 else_b: next_id,
                 span,
                 while_cond: false,
+                // Case-dispatch polls: the `Select` instruction
+                // already records the winning case, so both poll
+                // edges are unattributed in cover mode (Wave 8).
+                cover: if self.cover {
+                    Some(BranchCover {
+                        point: span,
+                        then_arm: None,
+                        else_arm: None,
+                    })
+                } else {
+                    None
+                },
             });
             self.open(body_id);
             // The recv-bind local (created with the guards) is visible
@@ -939,7 +998,7 @@ impl<'a> FnBuilder<'a> {
             .expect("checked program resolves every name")
     }
 
-    fn lower_while(&mut self, cond: &HExpr, body: &HBlock, ret: &Ty) {
+    fn lower_while(&mut self, cond: &HExpr, body: &HBlock, ret: &Ty, stmt_span: Span) {
         let cond_id = self.fresh_block();
         let body_id = self.fresh_block();
         let join_id = self.fresh_block();
@@ -952,8 +1011,12 @@ impl<'a> FnBuilder<'a> {
             cond: c,
             then_b: body_id,
             else_b: join_id,
-            span: cspan,
+            // Cover mode credits the statement span the
+            // inventory lists (Wave 8); production keeps the
+            // condition span (byte-identical MIR).
+            span: if self.cover { stmt_span } else { cspan },
             while_cond: true,
+            cover: None,
         });
         self.open(body_id);
         self.loop_stack.push((join_id, cond_id));
@@ -981,7 +1044,7 @@ impl<'a> FnBuilder<'a> {
             if let HExprKind::Range(lo_expr, hi_expr) = &iter.kind {
                 let lo = self.lower_expr(lo_expr, ret);
                 let hi = self.lower_expr(hi_expr, ret);
-                self.lower_for_range(name, lo, hi, body, ret);
+                self.lower_for_range(name, lo, hi, body, ret, span);
                 return;
             }
             let it = self.lower_expr(iter, ret);
@@ -993,7 +1056,7 @@ impl<'a> FnBuilder<'a> {
                 range: it,
                 span,
             });
-            self.lower_for_range(name, lo, hi, body, ret);
+            self.lower_for_range(name, lo, hi, body, ret, span);
         } else {
             self.lower_for_array(name, iter, body, ret, span);
         }
@@ -1001,7 +1064,15 @@ impl<'a> FnBuilder<'a> {
 
     /// Mirror the interpreter exactly: `while i < end`, saturating
     /// increment, explicit `i == end` break (spec §5.5).
-    fn lower_for_range(&mut self, name: &str, lo: Local, hi: Local, body: &HBlock, ret: &Ty) {
+    fn lower_for_range(
+        &mut self,
+        name: &str,
+        lo: Local,
+        hi: Local,
+        body: &HBlock,
+        ret: &Ty,
+        span: Span,
+    ) {
         let i = self.fresh(format!("{name} i"), Ty::Int);
         self.emit(MInstr::Copy { dst: i, src: lo });
         let cond_id = self.fresh_block();
@@ -1023,8 +1094,12 @@ impl<'a> FnBuilder<'a> {
             cond: c,
             then_b: body_id,
             else_b: join_id,
-            span: body.span,
+            // Cover mode credits the statement span the
+            // inventory lists (Wave 8); production keeps the
+            // body span (byte-identical MIR).
+            span: if self.cover { span } else { body.span },
             while_cond: false,
+            cover: None,
         });
         self.open(body_id);
         self.loop_stack.push((join_id, incr_id));
@@ -1065,6 +1140,20 @@ impl<'a> FnBuilder<'a> {
             else_b: cond_id,
             span: body.span,
             while_cond: false,
+            // Bottom check (range loops only): completion takes
+            // the `then` edge, so in cover mode it credits the
+            // statement's arm 1 and the continue edge is
+            // unattributed — mirroring the tree-walker's exit
+            // attribution exactly (Wave 8). Production: `None`.
+            cover: if self.cover {
+                Some(BranchCover {
+                    point: span,
+                    then_arm: Some(1),
+                    else_arm: None,
+                })
+            } else {
+                None
+            },
         });
         self.open(join_id);
     }
@@ -1116,8 +1205,12 @@ impl<'a> FnBuilder<'a> {
             cond: c,
             then_b: body_id,
             else_b: join_id,
-            span: body.span,
+            // Cover mode credits the statement span the
+            // inventory lists (Wave 8); production keeps the
+            // body span (byte-identical MIR).
+            span: if self.cover { span } else { body.span },
             while_cond: false,
+            cover: None,
         });
         self.open(body_id);
         self.loop_stack.push((join_id, incr_id));
@@ -1200,7 +1293,7 @@ impl<'a> FnBuilder<'a> {
                 cond,
                 then_b,
                 else_b,
-            } => self.lower_if(cond, then_b, else_b, &expr.ty, ret),
+            } => self.lower_if(cond, then_b, else_b, &expr.ty, ret, expr.span),
             HExprKind::Closure {
                 params,
                 ret: cret,
@@ -1476,6 +1569,9 @@ impl<'a> FnBuilder<'a> {
                     else_b: false_id,
                     span,
                     while_cond: false,
+                    // Short-circuit internals carry no inventory
+                    // point: verbatim hits are dropped (Wave 8).
+                    cover: None,
                 });
                 self.open(rhs_id);
                 let r = self.lower_expr(right, ret);
@@ -1500,6 +1596,9 @@ impl<'a> FnBuilder<'a> {
                     else_b: rhs_id,
                     span,
                     while_cond: false,
+                    // Short-circuit internals carry no inventory
+                    // point: verbatim hits are dropped (Wave 8).
+                    cover: None,
                 });
                 self.open(rhs_id);
                 let r = self.lower_expr(right, ret);
@@ -1573,6 +1672,7 @@ impl<'a> FnBuilder<'a> {
         else_b: &Option<Box<HBlock>>,
         ty: &Ty,
         ret: &Ty,
+        expr_span: Span,
     ) -> Local {
         let c = self.lower_expr(cond, ret);
         let cspan = cond.span;
@@ -1583,8 +1683,12 @@ impl<'a> FnBuilder<'a> {
             cond: c,
             then_b: then_id,
             else_b: else_id,
-            span: cspan,
+            // Cover mode credits the `if`-expression span the
+            // inventory lists (Wave 8); production keeps the
+            // condition span (byte-identical MIR).
+            span: if self.cover { expr_span } else { cspan },
             while_cond: false,
+            cover: None,
         });
         let join = self.fresh("if".to_string(), ty.clone());
         self.open(then_id);
@@ -1647,7 +1751,7 @@ impl<'a> FnBuilder<'a> {
         for (name, _) in captured {
             srcs.push(self.resolve(name));
         }
-        let mut sub = FnBuilder::new(self.checked);
+        let mut sub = FnBuilder::new(self.checked, self.cover);
         for (name, ty, _) in params {
             let l = sub.fresh(format!("{name} (param)"), ty.clone());
             sub.scopes
@@ -2004,6 +2108,7 @@ impl fmt::Display for MInstr {
                 Ok(())
             }
             MInstr::Safepoint { kind } => write!(f, "safepoint {kind}"),
+            MInstr::Cover { span } => write!(f, "cover {}..{}", span.start, span.end),
         }
     }
 }

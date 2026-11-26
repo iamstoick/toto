@@ -487,14 +487,16 @@ fn lint_files(files: &[String], deny_warnings: bool) -> ExitCode {
     }
 }
 
-/// Measure statement + branch coverage (Wave 5 Stage 3).
-/// Each listed file runs as a program root through
-/// the checked tree-walking interpreter; LCOV goes to stdout, the
-/// human summary to stderr, and the covered program's own stdout is
-/// suppressed (inspect it with `toto run`). Unreadable files exit 3;
-/// broken (lex/parse/check) or concurrent programs are refused with
-/// exit 2 — concurrent programs execute lowered MIR on the runtime
-/// executor, which this tool cannot attribute honestly.
+/// Measure statement + branch coverage (Wave 5 Stage 3, concurrent
+/// programs Wave 8). Each listed file runs as a program root:
+/// sequential programs through the checked tree-walking
+/// interpreter, concurrent programs on the runtime executor under a
+/// single worker (deterministic FIFO schedule, fixed seed) with
+/// `Cover` markers attributed exactly like the sequential path.
+/// LCOV goes to stdout, the human summary to stderr, and the
+/// covered program's own stdout is suppressed (inspect it with
+/// `toto run`). Unreadable files exit 3; broken (lex/parse/check)
+/// programs are refused with exit 2.
 fn coverage_files(files: &[String], fail_under: Option<u32>) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dep_entries = match build_cmd::run_deps(&cwd) {
@@ -545,22 +547,57 @@ fn coverage_files(files: &[String], fail_under: Option<u32>) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        if checked.uses_concurrency {
-            eprintln!(
-                "toto: `{path}` uses concurrency: coverage runs sequential programs only \
-                (the runtime executor lowers to MIR, which this tool cannot attribute); \
-                refusing instead of reporting smoothed numbers \
-                (tracked: docs/phases/post-wave5-backlog.md)"
+        // Concurrent programs run on the runtime executor under a
+        // single worker: `Cover` markers record into a shared sink
+        // the CLI clones after the run (Wave 8). Multi-worker runs
+        // stay outside coverage — thread timing would make arm hits
+        // nondeterministic — so this path hardcodes workers = 1.
+        let hits = if checked.uses_concurrency {
+            let sink = std::sync::Arc::new(std::sync::Mutex::new(
+                toto_compiler::coverage::CovHits::default(),
+            ));
+            let rt = toto_runtime::run_checked(
+                &project.program,
+                &checked,
+                toto_runtime::RuntimeConfig {
+                    workers: 1,
+                    coverage: Some(sink.clone()),
+                    ..toto_runtime::RuntimeConfig::default()
+                },
             );
-            return ExitCode::from(2);
-        }
-        let (outcome, hits) = toto_compiler::run_program_cov(&project.program, &checked.externs);
+            match rt.result {
+                Ok(_) => {}
+                Err((diag, trace)) => {
+                    eprintln!(
+                        "{}",
+                        toto_compiler::render_panic_multi(&diag, &trace, &project)
+                    );
+                    any_failed = true;
+                }
+            }
+            sink.lock().expect("coverage sink readable").clone()
+        } else {
+            let (outcome, run_hits) =
+                toto_compiler::run_program_cov(&project.program, &checked.externs);
+            match outcome {
+                (Ok(_), _) => {}
+                (Err((diag, _trace)), _) => {
+                    eprintln!("{}", toto_compiler::render_errors(&[diag], &src, path));
+                    any_failed = true;
+                }
+            }
+            run_hits
+        };
         let files_for_report: Vec<(String, String)> = project
             .files
             .iter()
             .map(|f| (f.path.clone(), f.src.clone()))
             .collect();
-        let inv = toto_compiler::coverage::collect_inventory(&project.program);
+        let inv = if checked.uses_concurrency {
+            toto_compiler::coverage::collect_inventory_concurrent(&project.program)
+        } else {
+            toto_compiler::coverage::collect_inventory(&project.program)
+        };
         let (lcov, summary) = toto_compiler::coverage::render_lcov(&files_for_report, &inv, &hits);
         print!("{lcov}");
         eprintln!(
@@ -574,13 +611,6 @@ fn coverage_files(files: &[String], fail_under: Option<u32>) -> ExitCode {
             summary.fns_hit,
             summary.fns_found,
         );
-        match outcome {
-            (Ok(_), _) => {}
-            (Err((diag, _trace)), _) => {
-                eprintln!("{}", toto_compiler::render_errors(&[diag], &src, path));
-                any_failed = true;
-            }
-        }
         if let Some(pct) = fail_under
             && summary.line_pct() < u64::from(pct)
         {

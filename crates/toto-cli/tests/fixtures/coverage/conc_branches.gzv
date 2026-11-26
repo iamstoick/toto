@@ -1,0 +1,29 @@
+fn sign(n: int) -> int {
+    if n > 0 {
+        return 1;
+    } else {
+        return 0 - 1;
+    }
+}
+fn main() -> int {
+    let a = sign(5);
+    let b = sign(0 - 3);
+    let ch = chan<int>(1);
+    go {
+        let mut total = 0;
+        for i in 0..3 {
+            total = total + i;
+        }
+        ch <- total;
+    }
+    let mut w = 3;
+    while w > 0 {
+        w = w - 1;
+    }
+    for i in 0..0 {
+        println(i);
+    }
+    let got = <-ch;
+    println(a + b + got + w);
+    return 0;
+}

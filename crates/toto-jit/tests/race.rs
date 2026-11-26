@@ -103,11 +103,18 @@ fn sweep(
                 collect_at_every_safepoint_for_test: true,
                 workers,
                 blocking_pool_threads: 2,
+                // No coverage sink on race paths (Wave 8).
+                coverage: None,
             };
             // Twice per schedule: catches run-to-run flips under the
             // same seed at M:N (the race manifesting as timing).
             for _ in 0..2 {
-                classes.insert(class_of(&run_jit(program, checked, config, &session)));
+                classes.insert(class_of(&run_jit(
+                    program,
+                    checked,
+                    config.clone(),
+                    &session,
+                )));
             }
         }
     }
@@ -235,10 +242,12 @@ fn seed_determinism_single_worker() {
             collect_at_every_safepoint_for_test: true,
             workers: 1,
             blocking_pool_threads: 2,
+            // No coverage sink on race paths (Wave 8).
+            coverage: None,
         };
-        let first = class_of(&run_jit(&program, &checked, config, &session));
+        let first = class_of(&run_jit(&program, &checked, config.clone(), &session));
         for _ in 0..9 {
-            let again = class_of(&run_jit(&program, &checked, config, &session));
+            let again = class_of(&run_jit(&program, &checked, config.clone(), &session));
             assert_eq!(again, first, "seed {seed}: same fiber schedule diverged");
         }
     }

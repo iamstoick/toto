@@ -337,6 +337,10 @@ impl<'a> MirInterp<'a> {
                     else_b,
                     span,
                     while_cond,
+                    // Coverage is recorded by the runtime executor
+                    // only; the sequential interpreter never runs
+                    // cover-mode MIR (Wave 8).
+                    cover: _,
                 } => match &slots[*cond] {
                     Value::Bool(true) => current = *then_b,
                     Value::Bool(false) => current = *else_b,
@@ -698,6 +702,13 @@ impl<'a> MirInterp<'a> {
             MInstr::Safepoint { .. } => {
                 // No-op in the MIR interpreter: single-threaded, no GC in
                 // Phase 2. Phase 3 codegen uses these markers.
+            }
+            MInstr::Cover { .. } => {
+                // No-op here: differential tests lower without the
+                // coverage flag, so this arm is unreachable in
+                // practice; the runtime executor (toto run/coverage)
+                // is what records hits. Nop keeps the interpreter's
+                // contract (no observably new behavior) intact.
             }
             // Routing tripwire: the sequential MIR interpreter cannot
             // execute channels. Concurrent programs run on the runtime

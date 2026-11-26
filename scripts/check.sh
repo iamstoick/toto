@@ -49,6 +49,17 @@ done
 ./target/debug/toto coverage crates/toto-cli/tests/fixtures/coverage/branches.gzv 2>/dev/null | sed 's|^SF:.*/\(.*\)|SF:\1|' > /tmp/toto-cov-demo.lcov
 cmp /tmp/toto-cov-demo.lcov crates/toto-cli/tests/fixtures/coverage/branches.gzv.lcov
 ./target/debug/toto coverage --fail-under 100 crates/toto-cli/tests/fixtures/coverage/branches.gzv >/dev/null
+# Wave 8 concurrent coverage gate: each concurrent fixture's LCOV
+# must match its golden, and two back-to-back runs must agree byte
+# for byte (workers = 1, fixed seed — the determinism contract).
+for conc in conc conc_select conc_branches; do
+    fix="crates/toto-cli/tests/fixtures/coverage/$conc.gzv"
+    ./target/debug/toto coverage "$fix" 2>/dev/null | sed 's|^SF:.*/\(.*\)|SF:\1|' > /tmp/toto-cov-conc.lcov
+    cmp /tmp/toto-cov-conc.lcov "$fix.lcov"
+    ./target/debug/toto coverage "$fix" 2>/dev/null > /tmp/toto-cov-conc-a.lcov
+    ./target/debug/toto coverage "$fix" 2>/dev/null > /tmp/toto-cov-conc-b.lcov
+    cmp /tmp/toto-cov-conc-a.lcov /tmp/toto-cov-conc-b.lcov
+done
 # Stage 4 doc gate (Wave 5): `toto doc` renders every stdlib module
 # (parse refusal would fail here), and every `pub` fn/struct has a
 # `###` signature heading in its module file (surface completeness,

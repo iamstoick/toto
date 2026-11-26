@@ -988,7 +988,11 @@ impl<R: RestartPolicy> DevDriver<R> {
         number: u64,
         seed: Option<PreservingSeed>,
     ) -> RebuildOutcome {
-        match next.spawn(self.config, heap, self.module_table.clone(), seed) {
+        // `RuntimeConfig` stopped being `Copy` in Wave 8 (the
+        // coverage sink is an `Arc`): cloning here shares the sink
+        // rather than moving it, which is exactly the semantics a
+        // coverage run needs across generations.
+        match next.spawn(self.config.clone(), heap, self.module_table.clone(), seed) {
             Ok((run, shared)) => {
                 self.current_shared = Some(shared);
                 self.current = Some(ActiveGeneration {
@@ -1176,6 +1180,8 @@ mod retain_proofs {
             collect_at_every_safepoint_for_test: false,
             workers: 1,
             blocking_pool_threads: 2,
+            // No coverage sink on dev-driver test paths (Wave 8).
+            coverage: None,
         }
     }
 

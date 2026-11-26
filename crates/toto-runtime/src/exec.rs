@@ -28,7 +28,9 @@ use toto_compiler::builtins;
 use toto_compiler::diag::Diag;
 use toto_compiler::hir::Ty;
 use toto_compiler::interp::TraceFrame;
-use toto_compiler::mir::{BlockId, MBinOp, MBlock, MConst, MInstr, MSelectCase, MTerm};
+use toto_compiler::mir::{
+    BlockId, BranchCover, MBinOp, MBlock, MConst, MInstr, MSelectCase, MTerm,
+};
 use toto_compiler::ops::{self, FnRetKind};
 use toto_compiler::span::Span;
 
@@ -235,6 +237,11 @@ impl<'a> Executor<'a> {
         body_span: Span,
         return_dst: Option<usize>,
     ) {
+        // Function entry (Wave 8): every frame funnels through
+        // here — `main`, direct calls, closures, and `go` bodies
+        // (whose synthetic names never match an inventory entry
+        // and are harmlessly dropped by the renderer).
+        self.cover_fn(&name);
         let mut by_id = HashMap::with_capacity(blocks.len());
         for (i, b) in blocks.iter().enumerate() {
             by_id.insert(b.id, i);
@@ -262,6 +269,50 @@ impl<'a> Executor<'a> {
 
     fn err(&self, code: &'static str, message: String, span: Span) -> ExecErr {
         ExecErr::Toto(Diag::new(code, message, span, None))
+    }
+
+    /// Coverage: record one executed statement (Wave 8). No-op
+    /// unless the run was started with coverage enabled; the
+    /// lock is held only for the hit itself, never across
+    /// yields, so cooperative tasks cannot interleave inside it.
+    fn cover_stmt(&self, span: Span) {
+        if let Some(hits) = &self.shared.coverage {
+            hits.lock().expect("coverage lock").hit_stmt(span);
+        }
+    }
+
+    /// Coverage: record one taken branch arm (Wave 8). Arm
+    /// convention matches the tree-walker exactly: 0 means the
+    /// then/body side ran, 1 means else taken, loop skipped or
+    /// exited. Select cases use their case index (default arm =
+    /// number of cases).
+    fn cover_branch(&self, span: Span, arm: u8) {
+        if let Some(hits) = &self.shared.coverage {
+            hits.lock().expect("coverage lock").hit_branch(span, arm);
+        }
+    }
+
+    /// Coverage: credit one taken `Branch` edge (Wave 8). Plain
+    /// branches credit the verbatim `(span, arm)`; `cover`-stamped
+    /// branches reroute per the lowering's map (`None` arm swallows
+    /// the edge), mirroring the tree-walker's statement-level
+    /// attribution exactly.
+    fn cover_edge(&self, span: Span, cover: Option<BranchCover>, arm: u8) {
+        if let Some(c) = cover {
+            let mapped = if arm == 0 { c.then_arm } else { c.else_arm };
+            if let Some(a) = mapped {
+                self.cover_branch(c.point, a);
+            }
+        } else {
+            self.cover_branch(span, arm);
+        }
+    }
+
+    /// Coverage: record one named-function entry (Wave 8).
+    fn cover_fn(&self, name: &str) {
+        if let Some(hits) = &self.shared.coverage {
+            hits.lock().expect("coverage lock").hit_fn(name);
+        }
     }
 
     fn internal(&self, what: &str, span: Span) -> ExecErr {
@@ -456,14 +507,17 @@ impl<'a> Executor<'a> {
                     else_b,
                     span,
                     while_cond,
+                    cover,
                 } => {
                     let c = self.frames[top].locals[cond].clone();
                     match c {
                         RtVal::Bool(true) => {
+                            self.cover_edge(span, cover, 0);
                             self.frames[top].block = then_b;
                             self.frames[top].ip = 0;
                         }
                         RtVal::Bool(false) => {
+                            self.cover_edge(span, cover, 1);
                             self.frames[top].block = else_b;
                             self.frames[top].ip = 0;
                         }
@@ -1214,6 +1268,9 @@ impl<'a> Executor<'a> {
             MInstr::Safepoint { .. } => {
                 self.maybe_collect();
             }
+            MInstr::Cover { span } => {
+                self.cover_stmt(span);
+            }
             MInstr::StateGet { dst, slot, span } => {
                 // Declared-state read (spec amendment, Phase 6): the
                 // cell vector lives in shared state (one per run, all
@@ -1391,6 +1448,11 @@ impl<'a> Executor<'a> {
             "select",
         )? {
             ToTask::Selected { index, value } => {
+                // Select arm = winning case index, default =
+                // cases.len() (Wave 8: mirrors the MIR doc on
+                // `MInstr::Select` exactly).
+                let arm = index.min(u8::MAX as usize) as u8;
+                self.cover_branch(span, arm);
                 if index < cases.len()
                     && let (Some(v), MSelectCase::Recv { bind: Some(b), .. }) =
                         (value, &cases[index])

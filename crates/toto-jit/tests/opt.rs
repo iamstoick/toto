@@ -136,6 +136,8 @@ fn pressure_config() -> RuntimeConfig {
         collect_at_every_safepoint_for_test: true,
         workers: 1,
         blocking_pool_threads: 2,
+        // No coverage sink on opt test paths (Wave 8).
+        coverage: None,
     }
 }
 
@@ -304,14 +306,14 @@ fn opt_concurrent_equivalent() {
                     rng_seed: seed,
                     ..config
                 };
-                let base = class_of(&run_jit(&program, &checked, config, &sessions[0].2));
+                let base = class_of(&run_jit(&program, &checked, config.clone(), &sessions[0].2));
                 if racy && !legal_racy(name, &base) {
                     failures.push(format!(
                         "{name}@off seed={seed} workers={workers}: illegal class"
                     ));
                 }
                 for (level, _, session) in sessions.iter().skip(1) {
-                    let got = class_of(&run_jit(&program, &checked, config, session));
+                    let got = class_of(&run_jit(&program, &checked, config.clone(), session));
                     if racy {
                         if !legal_racy(name, &got) {
                             failures.push(format!(

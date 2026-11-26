@@ -25,6 +25,8 @@ fn test_config(workers: usize) -> RuntimeConfig {
         collect_at_every_safepoint_for_test: true,
         workers,
         blocking_pool_threads: 2,
+        // No coverage sink on dev-driver test paths (Wave 8).
+        coverage: None,
     }
 }
 

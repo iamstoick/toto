@@ -33,6 +33,8 @@ fn pressure_config() -> RuntimeConfig {
         // Deterministic single-worker mode: exact goldens.
         workers: 1,
         blocking_pool_threads: 2,
+        // No coverage sink on pressure paths (Wave 8).
+        coverage: None,
     }
 }
 

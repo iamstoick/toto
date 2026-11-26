@@ -31,7 +31,7 @@ use sched::{ExecCode, RunStats, SchedOutcome, Scheduler, fresh_closure_modules};
 
 /// Runtime configuration. Defaults are documented in the Phase 3
 /// report; tests use tiny thresholds to force frequent collections.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     /// Collect when `bytes_since_gc` reaches this at a safepoint.
     pub gc_threshold_bytes: u64,
@@ -53,6 +53,15 @@ pub struct RuntimeConfig {
     /// Dedicated blocking-pool threads for file-system builtins
     /// (Stage 2 policy: no worker ever stalls on IO).
     pub blocking_pool_threads: usize,
+    /// Coverage hit sink (Wave 8): when `Some`, the runtime
+    /// executor records every executed MIR statement/branch
+    /// into it.
+    /// `None` (production runs) changes nothing — not even a
+    /// branch, since `Cover` markers are never emitted without
+    /// `lower_for_coverage`. Shared by `Arc` because the config
+    /// is cloned across workers; the `Mutex` is uncontended in
+    /// the only supported mode (workers = 1).
+    pub coverage: Option<std::sync::Arc<std::sync::Mutex<toto_compiler::coverage::CovHits>>>,
 }
 
 impl Default for RuntimeConfig {
@@ -64,6 +73,7 @@ impl Default for RuntimeConfig {
             collect_at_every_safepoint_for_test: false,
             workers: 1,
             blocking_pool_threads: 2,
+            coverage: None,
         }
     }
 }
@@ -85,7 +95,13 @@ pub fn run_checked(
     checked: &CheckedProgram,
     config: RuntimeConfig,
 ) -> RtOutcome {
-    let prog = toto_compiler::mir::lower(checked);
+    // Cover markers only exist when the caller supplied a hit sink:
+    // production runs lower identically with or without the flag.
+    let prog = if config.coverage.is_some() {
+        toto_compiler::mir::lower_for_coverage(checked)
+    } else {
+        toto_compiler::mir::lower(checked)
+    };
     let mut structs: HashMap<String, HStructDecl> = HashMap::new();
     for (name, decl) in &checked.structs {
         structs.insert(name.clone(), decl.clone());

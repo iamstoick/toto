@@ -31,6 +31,8 @@ fn pressure_config() -> RuntimeConfig {
         collect_at_every_safepoint_for_test: true,
         workers: 1,
         blocking_pool_threads: 2,
+        // No coverage sink on pressure paths (Wave 8).
+        coverage: None,
     }
 }
 

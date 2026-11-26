@@ -1,0 +1,46 @@
+fn main() -> int {
+    let a = chan<int>(1);
+    let b = chan<int>(1);
+    a <- 10;
+    select {
+        let x = <-a {
+            println(x)
+        }
+        let y = <-b {
+            println(0 - y)
+        }
+    }
+    b <- 20;
+    select {
+        let x = <-a {
+            println(x)
+        }
+        let y = <-b {
+            println(y)
+        }
+    }
+    select {
+        let x = <-a {
+            println(x)
+        }
+        let y = <-b {
+            println(y)
+        }
+        default {
+            println(0 - 1)
+        }
+    }
+    // Tie-break: both ready — the fixed-seed RNG decides, so the
+    // winner is deterministic (pinned by the golden + double-run).
+    a <- 30;
+    b <- 40;
+    select {
+        let x = <-a {
+            println(x)
+        }
+        let y = <-b {
+            println(y)
+        }
+    }
+    return 0;
+}

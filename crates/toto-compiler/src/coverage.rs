@@ -54,11 +54,14 @@ pub struct CoverPoint {
     pub span: Span,
 }
 
-/// A branch point: both arms are always reported (0 if never
-/// taken), so uncovered arms are visible, not absent.
+/// A branch point: every arm is always reported (0 if never
+/// taken), so uncovered arms are visible, not absent. Two arms
+/// for if/while/for (then/body vs else/exit); one per select case
+/// plus one for `default` when present.
 pub struct BranchPoint {
     pub file: String,
     pub span: Span,
+    pub arms: u8,
 }
 
 /// A named function and where it is declared.
@@ -76,12 +79,26 @@ pub struct Inventory {
 
 /// Static inventory of everything v1 can cover: every `Stmt`,
 /// every if/while/for branch point, every named function. Runs
-/// over the merged program; files come from item tags.
+/// over the merged program; files come from item tags. Sequential
+/// `select` never executes, so it contributes no point here —
+/// concurrent runs use [`collect_inventory_concurrent`].
 pub fn collect_inventory(program: &crate::ast::Program) -> Inventory {
+    collect_inventory_inner(program, false)
+}
+
+/// Concurrent inventory: as above, plus one branch point per
+/// `select` (one arm per case, `default` last). Only the runtime
+/// executor records select arms (workers = 1, deterministic).
+pub fn collect_inventory_concurrent(program: &crate::ast::Program) -> Inventory {
+    collect_inventory_inner(program, true)
+}
+
+fn collect_inventory_inner(program: &crate::ast::Program, with_select: bool) -> Inventory {
     struct Walk<'a> {
         out_stmts: &'a mut Vec<CoverPoint>,
         out_branches: &'a mut Vec<BranchPoint>,
         file: String,
+        with_select: bool,
     }
     impl Walk<'_> {
         fn block(&mut self, block: &Block) {
@@ -125,6 +142,7 @@ pub fn collect_inventory(program: &crate::ast::Program) -> Inventory {
                     self.out_branches.push(BranchPoint {
                         file: self.file.clone(),
                         span,
+                        arms: 2,
                     });
                     self.block(body);
                 }
@@ -133,15 +151,29 @@ pub fn collect_inventory(program: &crate::ast::Program) -> Inventory {
                     self.out_branches.push(BranchPoint {
                         file: self.file.clone(),
                         span,
+                        arms: 2,
                     });
                     self.block(body);
                 }
-                // `go`/`select` never execute in this interpreter
-                // (E0215 tripwire): their bodies stay listed at zero.
-                // Bodies are still walked so nested statements are
-                // attributed, not silently dropped.
+                // `go` bodies never execute in the sequential
+                // interpreter (E0215 tripwire) but DO run under the
+                // runtime executor: they are walked so nested
+                // statements are attributed, not silently dropped.
+                // (Hits land only in concurrent runs; sequential
+                // reports list them at zero, as before.)
                 StmtKind::Go { body } => self.block(body),
                 StmtKind::Select { cases, default } => {
+                    // Sequential `select` never executes (E0215), so
+                    // the point exists only in the concurrent
+                    // inventory: same arms the executor records (case
+                    // indices, `default` last when present).
+                    if self.with_select {
+                        self.out_branches.push(BranchPoint {
+                            file: self.file.clone(),
+                            span,
+                            arms: cases.len() as u8 + u8::from(default.is_some()),
+                        });
+                    }
                     for case in cases {
                         match case {
                             SelectCase::Recv { chan, body, .. } => {
@@ -175,6 +207,7 @@ pub fn collect_inventory(program: &crate::ast::Program) -> Inventory {
                     self.out_branches.push(BranchPoint {
                         file,
                         span: expr.span,
+                        arms: 2,
                     });
                     self.block(then_b);
                     if let Some(else_b) = else_b {
@@ -250,6 +283,7 @@ pub fn collect_inventory(program: &crate::ast::Program) -> Inventory {
                 out_stmts: &mut stmts,
                 out_branches: &mut branches,
                 file,
+                with_select,
             };
             walk.block(&decl.body);
         }
@@ -370,7 +404,7 @@ pub fn render_lcov(
             } else {
                 block += 1;
             }
-            for arm in [0u8, 1u8] {
+            for arm in 0..bp.arms {
                 let h = hits
                     .branches
                     .get(&(bp.span.start, bp.span.end, arm))

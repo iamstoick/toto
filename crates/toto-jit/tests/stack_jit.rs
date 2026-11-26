@@ -24,6 +24,8 @@ fn base_config() -> RuntimeConfig {
         collect_at_every_safepoint_for_test: false,
         workers: 1,
         blocking_pool_threads: 2,
+        // No coverage sink on stack test paths (Wave 8).
+        coverage: None,
     }
 }
 
@@ -35,6 +37,8 @@ fn pressure_config() -> RuntimeConfig {
         collect_at_every_safepoint_for_test: true,
         workers: 1,
         blocking_pool_threads: 2,
+        // No coverage sink on stack test paths (Wave 8).
+        coverage: None,
     }
 }
 

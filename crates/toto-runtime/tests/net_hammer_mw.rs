@@ -38,6 +38,8 @@ fn run_cell(workers: usize, seed: u64) -> RtOutcome {
         collect_at_every_safepoint_for_test: false,
         workers,
         blocking_pool_threads: 2,
+        // No coverage sink on hammer paths (Wave 8).
+        coverage: None,
     };
     // The watchdog: a lost wakeup parks every worker forever, so an
     // unbounded join would hang the suite. Timeout converts the

@@ -1065,7 +1065,8 @@ impl<'a> FnCx<'a> {
             | MInstr::StoreField { .. }
             | MInstr::StoreIndex { .. }
             | MInstr::StateSet { .. }
-            | MInstr::Safepoint { .. } => Vec::new(),
+            | MInstr::Safepoint { .. }
+            | MInstr::Cover { .. } => Vec::new(),
         }
     }
 
@@ -1123,7 +1124,8 @@ impl<'a> FnCx<'a> {
             MInstr::Const { .. }
             | MInstr::FuncRef { .. }
             | MInstr::StateGet { .. }
-            | MInstr::Safepoint { .. } => Vec::new(),
+            | MInstr::Safepoint { .. }
+            | MInstr::Cover { .. } => Vec::new(),
         }
     }
 
@@ -2736,6 +2738,10 @@ impl<'a> FnCx<'a> {
                 )?;
                 self.check_silent(sess, b, *span)?;
             }
+            // Coverage markers vanish under JIT/AOT (Wave 8): they
+            // exist only in `lower_for_coverage` output, which the
+            // JIT never sees — this arm is belt and braces.
+            MInstr::Cover { .. } => {}
             MInstr::Safepoint { kind } => {
                 use toto_compiler::mir::SpKind as K;
                 self.publish_all(sess, b)?;

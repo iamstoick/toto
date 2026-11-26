@@ -33,6 +33,8 @@ fn mn_config() -> RuntimeConfig {
         collect_at_every_safepoint_for_test: true,
         workers: 4,
         blocking_pool_threads: 2,
+        // No coverage sink on multi-worker paths (Wave 8).
+        coverage: None,
     }
 }
 

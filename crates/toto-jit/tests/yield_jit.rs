@@ -36,6 +36,8 @@ fn yield_from_live_jit_frames() {
         collect_at_every_safepoint_for_test: true,
         workers: 1,
         blocking_pool_threads: 2,
+        // No coverage sink on yield test paths (Wave 8).
+        coverage: None,
     };
     let outcome = run_jit(&program, &checked, config, &session);
     // `5` crosses the channel to the spawned task; `60` proves main's

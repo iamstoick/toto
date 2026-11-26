@@ -661,6 +661,12 @@ pub struct Shared {
     pub rng: Mutex<Rng>,
     /// TEST-ONLY: mirror of `RuntimeConfig::collect_at_every_safepoint_for_test`.
     pub force_collect_for_test: bool,
+    /// Coverage hit sink (Wave 8): `Some` only when the run was
+    /// started with `RuntimeConfig::coverage`. Cloned (not
+    /// re-created) per `Shared` so every worker records into the
+    /// same table; `None` keeps the executor hot path free of even
+    /// a branch on production runs.
+    pub coverage: Option<std::sync::Arc<std::sync::Mutex<toto_compiler::coverage::CovHits>>>,
     /// Scheduler state (slots, queues, outcomes). Workers take this
     /// lock only for short scheduling decisions, never while running
     /// task code or holding any other lock.
@@ -1329,6 +1335,7 @@ impl Scheduler {
             threshold,
             rng: Mutex::new(Rng::new(seed)),
             force_collect_for_test,
+            coverage: config.coverage.clone(),
             sched: Mutex::new(SchedState {
                 slots: Vec::new(),
                 queues: (0..workers).map(|_| VecDeque::new()).collect(),

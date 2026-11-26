@@ -17,7 +17,20 @@ stays final. This supersedes the no-oracle advisory written
 into `docs/phases/lsp-hover-docs.md` (true when written;
 kept as history).
 
-## 2. Concurrent coverage — SPIKED, verdict: wave-scale, NOT started
+## 2. Concurrent coverage — SHIPPED (Wave 8)
+
+Shipped: `toto coverage` now measures concurrent programs on
+the runtime executor under a single worker (see
+`docs/phases/wave-8-concurrent-coverage.md` for the design and
+the verification record). The spike's open points resolved as:
+statement boundaries are explicit `Cover` markers emitted only
+by `lower_for_coverage` (no MIR-count inflation — `DA` counts
+AST statements exactly like the tree-walker); branch
+attribution is span-rerouted at lowering (`BranchCover`) to
+mirror the tree-walker; workers=1 determinism is proven by the
+double-run byte-equality gate in `scripts/check.sh` plus the
+`coverage_concurrent_deterministic` test. What follows is the
+original spike record, kept as history.
 
 Why `toto coverage` refuses (recap, verified in tree): the
 tree-walking `Interp` explicitly rejects `go`/`select`
