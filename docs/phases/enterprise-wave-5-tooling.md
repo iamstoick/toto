@@ -9,8 +9,8 @@ Status: STAGE 0 VERIFIED (run #118 green on the starting
 tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI);
 STAGE 2 COMPLETE (reference-client + real-editor proof
 green); STAGE 3 IMPLEMENTED (awaiting CI);
-STAGE 4 IMPLEMENTED 2026-11-26 (awaiting CI; see Stage 4
-implementation record).
+STAGE 4 COMPLETE (CI green run 45752777119 — see Stage 4
+closing record).
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -787,6 +787,20 @@ else (remaining `||` chains are pre-existing method-based
 guards CI already accepts). The re-validation run on this
 commit is the first to reach the test suite; its outcome
 belongs in a future record.
+
+## Stage 4 — CLOSED (CI green 2026-11-26, run 45752777119)
+
+Run 45752777119 on head cb158dc concluded SUCCESS: check +
+release-gates + bench + macOS/Linux ARM64 probes green, Windows
+probe the known informational failure under continue-on-error.
+This is the first tree to clear the full gate with Stage 4
+aboard (fmt → clippy → workspace tests → lint gate → coverage
+golden → doc gate → stdlib/wordfreq suites), closing the two
+failure rounds above (fmt 4-hunk, clippy 1-lint). Stage 4 meets
+its acceptance (lexed, attached, fmt-preserved, full-surface
+`toto doc` golden-tested, convention recorded here) and is
+CLOSED on this run. NOT done here: the Wave 5 verdict and any
+merge — those need the user's explicit approval with a date.
 
 ## Wave gates (no merge until all green)
 
