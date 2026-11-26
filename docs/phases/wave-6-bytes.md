@@ -75,7 +75,25 @@ API surface (wrappers keep names + semantics).
 ## Phase A record (2026-11-26; CI run 45817063343 pending at
 Phase B commit time — see below)
 
-Phase B record (2026-11-26; CI pending): dedup wrappers as
+Phase A CI outcome (run 45817063343, recorded here): check
+FAILED — missed count pin. My Phase A verification ran the
+stdlib suite, both gates, fmt/clippy, and the front suites
+but NOT `cargo test --test project`; the new module made
+`MODULES.len()` 31 against the test's hardcoded 30. Caught
+by CI instead of locally — process gap, owned. The fix
+(count 30→31) is already in the Phase B commit, verified
+locally 15/15; confirmation awaits the failed-step log
+(bench still running when observed) plus the Phase B run.
+
+Phase B CI outcome (run 45819168935, recorded here):
+concluded SUCCESS — check + release-gates + bench +
+macOS/Linux-ARM green (Windows: the known informational
+failure). This green covers both phases' code (Phase B tree
+is a superset of Phase A), closing the count-pin miss above:
+the full gate, including `cargo test --workspace` with the
+31-module table, passes on the final tree. Wave 6 COMPLETE.
+
+Phase B record (2026-11-26; CI green — see above): dedup wrappers as
 designed — `jwt_b64_*` → `bytes_b64url_*`, `saml_b64_decode`
 → `bytes_b64_decode`, `pw_hex_*` → `bytes_hex_*`,
 `trace_hex` → `bytes_hex_encode`; dead private tables
