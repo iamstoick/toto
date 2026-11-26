@@ -106,3 +106,16 @@ CI-green. Remaining, both non-blocking: this record commit's
 own validation run (lag-by-one formality), and the real-editor
 proof — the user's part (hover a documented stdlib item in
 VS Code and paste the result).
+
+## Real-editor proof (2026-11-26, user-verified)
+
+Confirmed by user screenshot in the Extension Development
+Host: hovering `CtxPair` in `stdlib/context.gzv` shows the
+signature plus the migrated prose ("One map entry. Keys need
+not be unique in the array ... matching the runtime slot."),
+rendered inside the fenced block per the implemented shape.
+The follow-up's proof standard (protocol tests + real editor,
+Stage-2 pattern) is met: 21/21 protocol tests green, CI green
+on run 45769609177, editor proof green here. Follow-up
+COMPLETE. Remaining: only the lag-by-one validation run on a
+record commit, a future note.
