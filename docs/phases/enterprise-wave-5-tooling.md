@@ -5,12 +5,11 @@ in order — Stage 1 linter, Stage 2 richer LSP, Stage 3 coverage,
 Stage 4 doc generator. Each stage gated; no stage re-opens a
 settled decision.
 
-Status: STAGE 0 VERIFIED (run #118 green on the starting
-tree — see Stage 0); STAGE 1 IMPLEMENTED (awaiting CI);
-STAGE 2 COMPLETE (reference-client + real-editor proof
-green); STAGE 3 IMPLEMENTED (awaiting CI);
-STAGE 4 COMPLETE (CI green run 45752777119 — see Stage 4
-closing record).
+Status: WAVE 5 COMPLETE (verdict 2026-11-26, user-approved —
+see Wave 5 verdict). STAGE 0 VERIFIED (run #118); STAGE 1
+COMPLETE, STAGE 2 COMPLETE, STAGE 3 COMPLETE, STAGE 4
+COMPLETE — all aboard the cumulative tree that went green
+on run 45752777119 (see per-stage records).
 
 Branch: `enterprise/wave-5-tooling`, from `main` at `2c7a456`.
 Never force-push; stage named files only (`git add`, never `-A`).
@@ -553,7 +552,7 @@ evidence-driven refinements (no silent drift):
   shape from its log); `lsp` 20/20 untouched. Clippy rides
   on CI.
 
-## Stage 4 — doc generator (DESIGN APPROVED 2026-11-25; IMPLEMENTED 2026-11-26, awaiting CI)
+## Stage 4 — doc generator (DESIGN APPROVED 2026-11-25; IMPLEMENTED + CLOSED 2026-11-26)
 
 Goal: `toto doc` rendering API docs for `.gzv` sources
 (stdlib first), from a documented doc-comment convention.
@@ -599,7 +598,7 @@ per-module Markdown golden-tested; the convention recorded
 here. Non-goals: a hosted site, versioned publishing
 (registry work is Phase 7).
 
-## Stage 4 — implementation record (2026-11-26; awaiting CI)
+## Stage 4 — implementation record (2026-11-26; closed same day)
 
 What was built (code, all in the named files only):
 
@@ -801,6 +800,52 @@ its acceptance (lexed, attached, fmt-preserved, full-surface
 `toto doc` golden-tested, convention recorded here) and is
 CLOSED on this run. NOT done here: the Wave 5 verdict and any
 merge — those need the user's explicit approval with a date.
+
+## Wave 5 — VERDICT (2026-11-26, user-approved)
+
+Wave 5 (developer tooling: linter → richer LSP → coverage →
+doc generator) is COMPLETE. Architect's check behind this
+verdict, all verified this turn against the tree and the
+record (not from memory):
+
+- Stage 1 linter: acceptance met (E0501–E0503, corpus-clean
+  proof 146 silent + 9 reasoned exclusions + 108
+  error-goldens, in-process sweep 0.11 s) and gated in
+  `check.sh`.
+- Stage 2 LSP: acceptance met (references, rename,
+  completion, code actions, UTF-16; 20/20 protocol tests;
+  31/31 reference-client proof; 25/25 in real VS Code
+  1.147.0 by the user).
+- Stage 3 coverage: acceptance met (LCOV to stdout, corpus
+  self-measurement 83% lines / 66% branches, overhead budget
+  <1.35x, `--fail-under` golden-gated).
+- Stage 4 doc generator: acceptance met and closed on run
+  45752777119 (see Stage 4 records).
+- Cumulative proof (load-bearing): the final code tree
+  (head cb158dc, all four stages aboard) cleared the FULL
+  gate on run 45752777119 — fmt → clippy → workspace tests
+  → lint gate → coverage golden → doc gate → stdlib/wordfreq
+  suites, plus release-gates, bench, macOS/Linux-ARM probes
+  (Windows probe the known informational failure). This
+  supersedes the per-stage "awaiting CI" labels: every
+  stage's code is in that green tree.
+- Wave gates hold: every stage designed before implementation;
+  zero new builtins; no D1–D8, ADR, module-model, or spec
+  change (verified: `git diff 2c7a456..HEAD --name-only`
+  shows no spec/ADR/builtin touches); report hygiene
+  append-only throughout.
+- Non-goals kept: no hosted site, no versioned publishing, no
+  debug protocol, no concurrent coverage, no untitled buffers.
+
+Merge: moot — no `enterprise/wave-5-tooling` branch was ever
+created; all wave work landed directly on `main`, so there is
+nothing to merge.
+
+Pending formality (not verdict-blocking): the record-only
+commit carrying this verdict triggers its own CI run per the
+lag-by-one pattern; its outcome belongs in a future note. The
+verdict itself rests on run 45752777119 over the code tree,
+which is green and final.
 
 ## Wave gates (no merge until all green)
 
