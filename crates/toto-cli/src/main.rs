@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use toto_compiler::render_errors;
 
 mod build_cmd;
+mod index;
 mod lsp;
 mod manifest;
 mod packages;
@@ -26,7 +27,8 @@ const HELP: &str = "toto — a new programming language (.gzv)\n\
                     \x20                                      (--offline: no network; fails loudly on a cold cargo cache)\n\
                     \x20   toto dist [--release] [--offline]   self-contained dist (bin + bundled lib closure)\n\
                     \x20                                      under target/dist/<name>/ (runs with empty env)\n\
-                    \x20   toto add <name> --path DIR | --git URL [--rev R | --tag T]\n\
+                    \x20   toto add <name> [--version REQ] [--path DIR | --git URL [--rev R | --tag T]]\n\
+                    \x20                                      bare names resolve through toto-index.toml\n\
                     \x20                                      add a dependency (writes toto.toml + toto.lock)\n\
                     \x20   toto update [pkg...]              re-resolve dependencies, rewrite toto.lock\n\
                     \x20   toto publish                      pack <name>-<version>.gzv-pkg (local only)\n\

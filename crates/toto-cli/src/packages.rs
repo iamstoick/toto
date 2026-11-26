@@ -22,6 +22,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use super::index::Indexes;
 use super::manifest::{DepReq, DepSource, Manifest};
 use super::semver::{Req, Version};
 
@@ -581,6 +582,9 @@ fn resolve_inner(
     let mut reqs: BTreeMap<String, Vec<Requirement>> = BTreeMap::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = Vec::new();
+    // Package index (./toto-index.toml, then ~/.toto/index.toml),
+    // consulted for bare requirements only.
+    let index = Indexes::load(root)?;
     // Seed with the root requirements (sorted by name: BTreeMap).
     let mut seed: Vec<(String, DepReq)> = manifest
         .dependencies
@@ -593,6 +597,7 @@ fn resolve_inner(
             root,
             &manifest.name,
             cache,
+            &index,
             fetch,
             &name,
             &dep,
@@ -692,6 +697,176 @@ fn source_display(s: &CandidateSource) -> String {
     }
 }
 
+/// List `(tag, commit)` for a git URL (Wave 7: index resolution).
+/// With `fetch`, `git ls-remote --tags` (no clone needed);
+/// otherwise the union of tags across warm cached checkouts.
+/// Peeled `^{}` lines win (annotated tags resolve to commits).
+fn enumerate_git_tags(
+    url: &str,
+    cache: &Cache,
+    fetch: bool,
+    requirer: &str,
+) -> Result<Vec<(String, String)>, PkgError> {
+    if fetch {
+        let mut cmd = git_cmd()?;
+        let out = cmd
+            .arg("ls-remote")
+            .arg("--tags")
+            .arg(url)
+            .output()
+            .map_err(|e| {
+                PkgError::new(
+                    "E0608",
+                    format!("cannot list tags of `{url}` (required by {requirer}): {e}"),
+                )
+            })?;
+        if !out.status.success() {
+            return Err(PkgError::new(
+                "E0608",
+                format!(
+                    "cannot list tags of `{url}` (required by {requirer}): {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            ));
+        }
+        let mut tags: BTreeMap<String, String> = BTreeMap::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(hash), Some(rref)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let Some(name) = rref.strip_prefix("refs/tags/") else {
+                continue;
+            };
+            if let Some(peeled) = name.strip_suffix("^{}") {
+                tags.insert(peeled.to_string(), hash.to_string());
+            } else {
+                tags.entry(name.to_string())
+                    .or_insert_with(|| hash.to_string());
+            }
+        }
+        return Ok(tags.into_iter().collect());
+    }
+    // Offline: union of tags across warm cached checkouts.
+    let prefix = format!("git-{:016x}-", fnv1a64(url.as_bytes()));
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(cache.dir()) {
+        let mut found: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok().map(|x| x.path()))
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+            })
+            .collect();
+        found.sort();
+        dirs.append(&mut found);
+    }
+    if dirs.is_empty() {
+        return Err(PkgError::new(
+            "E0604",
+            format!(
+                "git source `{url}` (required by {requirer}) is not in the local package cache; run `toto update` with network access"
+            ),
+        ));
+    }
+    let mut tags: BTreeMap<String, String> = BTreeMap::new();
+    for dir in &dirs {
+        let mut cmd = git_cmd()?;
+        let out = match cmd.arg("-C").arg(dir).arg("tag").arg("--list").output() {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+        for name in String::from_utf8_lossy(&out.stdout).lines() {
+            if tags.contains_key(name) {
+                continue;
+            }
+            let mut rc = git_cmd()?;
+            let ro = rc
+                .arg("-C")
+                .arg(dir)
+                .arg("rev-list")
+                .arg("-n")
+                .arg("1")
+                .arg(name)
+                .output();
+            if let Ok(ro) = ro
+                && ro.status.success()
+            {
+                let hash = String::from_utf8_lossy(&ro.stdout).trim().to_string();
+                if !hash.is_empty() {
+                    tags.insert(name.to_string(), hash);
+                }
+            }
+        }
+    }
+    Ok(tags.into_iter().collect())
+}
+
+/// Strip one leading `v`/`V` and parse strict MAJOR.MINOR.PATCH.
+/// Anything else is not a release tag (documented convention:
+/// release tags look like versions, e.g. `v1.2.0`).
+fn tag_version(tag: &str) -> Option<Version> {
+    let stripped = tag
+        .strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .unwrap_or(tag);
+    Version::parse(stripped).ok()
+}
+
+/// Check out every version-shaped tag and collect one candidate
+/// per tag with a readable package manifest. Tags without a
+/// `toto.toml` are skipped (not releases); a semver tag whose
+/// manifest cannot be read is a loud error (broken release).
+/// Zero usable tags is E0602: the requirement genuinely has
+/// no candidates.
+#[allow(clippy::too_many_arguments)]
+fn collect_tagged_checkouts(
+    url: &str,
+    cache: &Cache,
+    fetch: bool,
+    name: &str,
+    requirer: &str,
+    visited: &mut HashSet<String>,
+    checkouts: &mut Vec<(PathBuf, CandidateSource)>,
+) -> Result<(), PkgError> {
+    let tags = enumerate_git_tags(url, cache, fetch, requirer)?;
+    let mut skipped_manifest = 0usize;
+    let mut skipped_name = 0usize;
+    for (tag, _rev) in tags {
+        if tag_version(&tag).is_none() {
+            skipped_name += 1;
+            continue;
+        }
+        let key = format!("git:{url}#{tag}");
+        if !visited.insert(key) {
+            continue;
+        }
+        let no_rev: Option<String> = None;
+        let only_tag = Some(tag);
+        let (dir, _resolved) = materialize_git(cache, url, &no_rev, &only_tag, fetch, requirer)?;
+        if !dir.join("toto.toml").is_file() {
+            skipped_manifest += 1;
+            continue;
+        }
+        checkouts.push((
+            dir,
+            CandidateSource::Git {
+                url: url.to_string(),
+                rev: _resolved,
+            },
+        ));
+    }
+    if checkouts.is_empty() {
+        return Err(PkgError::new(
+            "E0602",
+            format!(
+                "no usable release tags of `{url}` for `{name}` (required by {requirer}): skipped {skipped_name} non-version tags and {skipped_manifest} tags without a package manifest; tag releases like `v1.2.3`"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Visit one source: materialize it, record its version as a
 /// candidate, file its requirement with provenance, recurse into
 /// its own dependencies (Amendment 2a).
@@ -700,6 +875,7 @@ fn visit_source(
     root: &Path,
     root_name: &str,
     cache: &Cache,
+    index: &Indexes,
     fetch: bool,
     name: &str,
     dep: &DepReq,
@@ -746,38 +922,49 @@ fn visit_source(
         text: req_text,
         req: dep.version,
     });
-    // Materialize the source (each source visited once).
-    let source_id = match &dep.source {
-        DepSource::Bare => {
-            return Err(PkgError::new(
-                "E0606",
-                format!(
-                    "requirement `{name} = \"{}\"` names no source (required by {requirer}): use `{{ path = … }}` or `{{ git = …, rev|tag = … }}`, or `toto add --path/--git`",
-                    dep.version.map(|q| q.to_string()).unwrap_or_default()
-                ),
-            ));
-        }
-        DepSource::Path(p) => format!("path:{p}"),
-        DepSource::Git { url, rev, tag } => format!(
-            "git:{url}:{}",
-            rev.clone().or(tag.clone()).unwrap_or_default()
-        ),
-    };
-    if !visited.insert(source_id.clone()) {
-        return Ok(());
-    }
-    let (dir, candsource): (PathBuf, CandidateSource) = match &dep.source {
-        DepSource::Bare => unreachable!("rejected above"),
+    // Materialize the source into checkouts. Single-checkout
+    // sources (path, pinned git) keep the existing
+    // once-per-source visit; an index-mapped name or an
+    // unpinned git URL with a version requirement enumerates
+    // release tags into one checkout per tag instead.
+    let mut checkouts: Vec<(PathBuf, CandidateSource)> = Vec::new();
+    match &dep.source {
+        DepSource::Bare => match index.lookup(name) {
+            Some(url) => {
+                collect_tagged_checkouts(
+                    url,
+                    cache,
+                    fetch,
+                    name,
+                    requirer,
+                    visited,
+                    &mut checkouts,
+                )?;
+            }
+            None => {
+                return Err(PkgError::new(
+                    "E0606",
+                    format!(
+                        "requirement `{name} = \"{}\"` names no source (required by {requirer}): use `{{ path = … }}` or `{{ git = …, rev|tag = … }}`, or map the name to a git URL in ./toto-index.toml or ~/.toto/index.toml",
+                        dep.version.map(|q| q.to_string()).unwrap_or_default()
+                    ),
+                ));
+            }
+        },
         DepSource::Path(p) => {
+            let source_id = format!("path:{p}");
+            if !visited.insert(source_id) {
+                return Ok(());
+            }
             if p.ends_with(".gzv-pkg") {
                 let (dir, hash) = materialize_pkg(cache, root, p, requirer)?;
-                (
+                checkouts.push((
                     dir,
                     CandidateSource::Pkg {
                         file: p.clone(),
                         hash,
                     },
-                )
+                ));
             } else {
                 let dir = root.join(p);
                 if !dir.join("toto.toml").is_file() {
@@ -788,47 +975,65 @@ fn visit_source(
                         ),
                     ));
                 }
-                (dir, CandidateSource::Path(p.clone()))
+                checkouts.push((dir, CandidateSource::Path(p.clone())));
             }
         }
+        DepSource::Git {
+            url,
+            rev: None,
+            tag: None,
+        } if dep.version.is_some() => {
+            collect_tagged_checkouts(url, cache, fetch, name, requirer, visited, &mut checkouts)?;
+        }
         DepSource::Git { url, rev, tag } => {
+            let source_id = format!(
+                "git:{url}:{}",
+                rev.clone().or(tag.clone()).unwrap_or_default()
+            );
+            if !visited.insert(source_id) {
+                return Ok(());
+            }
             let (dir, resolved) = materialize_git(cache, url, rev, tag, fetch, requirer)?;
-            (
+            checkouts.push((
                 dir,
                 CandidateSource::Git {
                     url: url.clone(),
                     rev: resolved,
                 },
-            )
+            ));
         }
     };
-    let pkg_manifest = read_pkg_manifest(&dir, name)?;
-    let version = super::semver::Version::parse(&pkg_manifest.version).expect("validated above");
-    let files_hash = hash_gzv_files(&dir)?;
-    candidates
-        .entry(name.to_string())
-        .or_default()
-        .push(Candidate {
-            version,
-            source: candsource,
-            dir: dir.clone(),
-            files_hash,
-        });
-    // Recurse into the package's own dependencies (sorted).
-    stack.push(name.to_string());
-    let mut nested: Vec<(String, DepReq)> = pkg_manifest
-        .dependencies
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    nested.sort_by(|a, b| a.0.cmp(&b.0));
-    let who = format!("{name} {version}");
-    for (sub, subdep) in nested {
-        visit_source(
-            root, root_name, cache, fetch, &sub, &subdep, &who, candidates, reqs, visited, stack,
-        )?;
+    for (dir, candsource) in checkouts {
+        let pkg_manifest = read_pkg_manifest(&dir, name)?;
+        let version =
+            super::semver::Version::parse(&pkg_manifest.version).expect("validated above");
+        let files_hash = hash_gzv_files(&dir)?;
+        candidates
+            .entry(name.to_string())
+            .or_default()
+            .push(Candidate {
+                version,
+                source: candsource,
+                dir: dir.clone(),
+                files_hash,
+            });
+        // Recurse into the package's own dependencies (sorted).
+        stack.push(name.to_string());
+        let mut nested: Vec<(String, DepReq)> = pkg_manifest
+            .dependencies
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        nested.sort_by(|a, b| a.0.cmp(&b.0));
+        let who = format!("{name} {version}");
+        for (sub, subdep) in nested {
+            visit_source(
+                root, root_name, cache, index, fetch, &sub, &subdep, &who, candidates, reqs,
+                visited, stack,
+            )?;
+        }
+        stack.pop();
     }
-    stack.pop();
     Ok(())
 }
 

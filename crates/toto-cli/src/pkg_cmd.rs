@@ -49,10 +49,10 @@ fn render_dep(dep: &DepReq) -> String {
         DepSource::Git { url, rev, tag } => {
             let pin = rev
                 .as_ref()
-                .map(|r| format!("rev = \"{r}\""))
-                .or_else(|| tag.as_ref().map(|t| format!("tag = \"{t}\"")))
+                .map(|r| format!(", rev = \"{r}\""))
+                .or_else(|| tag.as_ref().map(|t| format!(", tag = \"{t}\"")))
                 .unwrap_or_default();
-            format!("{{ git = \"{url}\", {pin}{ver} }}")
+            format!("{{ git = \"{url}\"{pin}{ver} }}")
         }
     }
 }
@@ -99,7 +99,8 @@ fn write_manifest(root: &Path, manifest: &Manifest) -> Result<(), PkgError> {
         .map_err(|e| PkgError::new("E0608", format!("cannot write `{}`: {e}", path.display())))
 }
 
-/// `toto add <name> (--path DIR | --git URL [--rev R | --tag T] | <file.gzv-pkg>) [--version REQ]`
+/// `toto add <name> [--version REQ] [--path DIR | --git URL [--rev R | --tag T] | <file.gzv-pkg>]`
+/// (bare names resolve through the package index)
 pub fn add(root: &Path, manifest: Manifest, cache: &Cache, args: &[String]) -> ExitCode {
     let mut name: Option<String> = None;
     let mut path_src: Option<String> = None;
@@ -193,11 +194,11 @@ pub fn add(root: &Path, manifest: Manifest, cache: &Cache, args: &[String]) -> E
             version: version_req,
         }
     } else if let Some(url) = git_src {
-        if rev.is_none() && tag.is_none() {
+        if rev.is_none() && tag.is_none() && version_req.is_none() {
             return fail(PkgError::new(
                 "E0605",
                 format!(
-                    "unpinned git source `{url}`: pin `--rev` or `--tag`; branches and HEAD are never resolved"
+                    "unpinned git source `{url}`: pin `--rev` or `--tag` (or give `--version` to select a tag); branches and HEAD are never resolved"
                 ),
             ));
         }
@@ -218,13 +219,22 @@ pub fn add(root: &Path, manifest: Manifest, cache: &Cache, args: &[String]) -> E
             source: DepSource::Path(name.clone()),
             version: version_req,
         }
-    } else {
+    } else if version_req.is_none() {
         return fail(PkgError::new(
             "E0606",
             format!(
-                "requirement `{name}` names no source: use `--path`, `--git`, or a `.gzv-pkg` file"
+                "requirement `{name}` names no source: add an index entry (`toto-index.toml`) or use `toto add <name> --version REQ | --path DIR | --git URL [--rev R | --tag T]`"
             ),
         ));
+    } else {
+        // Bare name with a version requirement: resolved through
+        // the package index (./toto-index.toml, then
+        // ~/.toto/index.toml). Unmapped names fail at resolve
+        // time with E0606 naming the index files.
+        DepReq {
+            source: DepSource::Bare,
+            version: version_req,
+        }
     };
     // For pkg files the dependency key is the packed name: unpack
     // the name from the manifest inside (validates the file now).

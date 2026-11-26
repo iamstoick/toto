@@ -23,10 +23,14 @@ single-project build, no resolution, no lockfile.
   (`^1.2.3`, `~1.2.0`, `=1.2.0`). No pre-releases, no build
   metadata. `0.x` is NOT special-cased: `^0.2.3` means
   `>=0.2.3, <0.3.0` like any other minor range.
-- A git source MUST pin `rev` to a tag or a commit hash.
-  A branch name, `HEAD`, or a missing `rev` is an add-time
-  error. A requirement with no source at all is an add-time
-  error too.
+- A git source MUST pin `rev` to a tag or a commit hash...
+  unless it carries a version requirement: unpinned
+  `git = "URL"` plus `version = REQ` enumerates the repo's
+  release tags and selects the highest satisfying one (same
+  as an index-mapped name, below). A branch name or `HEAD`
+  is always an error, pinned or not. A requirement with no
+  source at all is an add-time error too, unless an index
+  entry maps the name.
 
 ## Resolution
 
@@ -60,6 +64,19 @@ source of versions at build time.
 
 ## Sources
 
+- Bare names via a package index: `./toto-index.toml` in the
+  project root (checked in, wins), then
+  `~/.toto/index.toml` (personal). Each maps a name to a git
+  URL (`[packages]` table, `name = "url"` lines; `#`
+  comments and blank lines allowed). `toto add leftpad`
+  (optionally `--version REQ`) resolves through the index:
+  release tags are enumerated (`git ls-remote --tags`, or
+  the warm cache offline), non-version tags are skipped,
+  and the highest satisfying tag wins. Tags without a
+  package manifest are skipped (reported when nothing
+  usable remains). Unmapped names are E0606 naming both
+  index files; the index is consulted at add/update time
+  only — builds use the lockfile and never read it.
 - `path`: a directory containing `toto.toml` + `.gzv` files.
 - `git`: fetched at add/update time into the local package
   cache. At BUILD time a locked git dependency resolves from
@@ -82,8 +99,10 @@ Two packages exporting the same top-level name is an error.
 
 ## Commands
 
-- `toto add <spec>`: add a dependency (path dir, `git+URL@rev`,
-  or `.gzv-pkg` file), re-resolve, rewrite the lockfile.
+- `toto add <spec>`: add a dependency (bare indexed name
+  with optional `--version REQ`, path dir, `git+URL` with
+  `--rev`/`--tag` (or `--version` to select a tag), or
+  `.gzv-pkg` file), re-resolve, rewrite the lockfile.
 - `toto update`: re-resolve ALL requirements to the highest
   satisfying versions, rewrite the lockfile loudly (prints
   added/changed/removed, or "already up to date").

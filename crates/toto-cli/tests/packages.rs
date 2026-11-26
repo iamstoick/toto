@@ -571,3 +571,132 @@ fn update_subtree_pins_satisfiable_pins() {
     assert_eq!((code, run_out.trim()), (0, "112"));
     cleanup(&root);
 }
+
+/// Make a git repo with one tagged commit per version; returns the
+/// repo dir (usable as a git URL). Tags are plain `vX.Y.Z`.
+fn git_tagged_repo(root: &Path, name: &str, versions: &[&str]) -> PathBuf {
+    assert!(git_available(), "git must be on PATH for package tests");
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).expect("repo dir");
+    let git = |args: &[&str]| {
+        let st = Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(st.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q", "."]);
+    for v in versions {
+        let toml =
+            format!("[project]\nname = \"{name}\"\nversion = \"{v}\"\nentry = \"lib.gzv\"\n");
+        write(&dir.join("toto.toml"), &toml);
+        write(
+            &dir.join("lib.gzv"),
+            &format!("pub fn v() -> int {{ return {v}; }}\n").replace('.', ""),
+        );
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            v,
+        ]);
+        git(&["tag", &format!("v{v}")]);
+    }
+    dir
+}
+
+fn lock_version(app: &Path, name: &str) -> String {
+    let lock = std::fs::read_to_string(app.join("toto.lock")).expect("lock");
+    let block = lock
+        .split("[[package]]")
+        .find(|b| b.contains(&format!("name = \"{name}\"")))
+        .expect("package block");
+    for line in block.lines() {
+        if let Some(v) = line.strip_prefix("version = \"") {
+            return v.trim_end_matches('"').to_string();
+        }
+    }
+    panic!("no version in {block}");
+}
+
+#[test]
+fn index_bare_version_selects_max_satisfying() {
+    let root = scratch("index-basic");
+    let cache = root.join("cache");
+    let repo = git_tagged_repo(&root, "leftpad", &["1.0.0", "1.5.0", "2.0.0"]);
+    let app = mkapp(
+        &root,
+        "app",
+        "fn main() -> int {\n    println(7);\n    return 0;\n}\n",
+    );
+    write(
+        &app.join("toto-index.toml"),
+        &format!("[packages]\nleftpad = \"{}\"\n", repo.display()),
+    );
+    let (code, _, err) = run_toto(&app, &cache, &["add", "leftpad", "--version", "^1.0.0"]);
+    assert_eq!(code, 0, "add failed: {err}");
+    assert_eq!(lock_version(&app, "leftpad"), "1.5.0");
+    cleanup(&root);
+}
+
+#[test]
+fn index_bare_needs_known_name() {
+    let root = scratch("index-missing");
+    let cache = root.join("cache");
+    let app = mkapp(&root, "app", "fn main() -> int {\n    return 0;\n}\n");
+    let (code, _, err) = run_toto(&app, &cache, &["add", "nosuchpkg"]);
+    assert_eq!(code, 3, "unindexed add must fail: {err}");
+    assert!(err.contains("E0606"), "missing code: {err}");
+    assert!(
+        err.contains("toto-index.toml"),
+        "must name the index: {err}"
+    );
+    cleanup(&root);
+}
+
+#[test]
+fn index_unpinned_git_selects_version() {
+    let root = scratch("index-gitver");
+    let cache = root.join("cache");
+    let repo = git_tagged_repo(&root, "leftpad", &["1.0.0", "1.9.0", "2.0.0"]);
+    let app = mkapp(&root, "app", "fn main() -> int {\n    return 0;\n}\n");
+    let url = repo.to_string_lossy().to_string();
+    let (code, _, err) = run_toto(
+        &app,
+        &cache,
+        &["add", "leftpad", "--git", &url, "--version", "^1.0.0"],
+    );
+    assert_eq!(code, 0, "add failed: {err}");
+    assert_eq!(lock_version(&app, "leftpad"), "1.9.0");
+    cleanup(&root);
+}
+
+#[test]
+fn index_skips_nonversion_tags() {
+    let root = scratch("index-skip");
+    let cache = root.join("cache");
+    let dir = git_tagged_repo(&root, "leftpad", &["1.0.0"]);
+    // Non-version tag on the same history: must be ignored.
+    let st = Command::new("git")
+        .args(["tag", "nightly"])
+        .current_dir(&dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git runs");
+    assert!(st.status.success(), "tag failed");
+    let app = mkapp(&root, "app", "fn main() -> int {\n    return 0;\n}\n");
+    write(
+        &app.join("toto-index.toml"),
+        &format!("[packages]\nleftpad = \"{}\"\n", dir.display()),
+    );
+    let (code, _, err) = run_toto(&app, &cache, &["add", "leftpad", "--version", "^1.0.0"]);
+    assert_eq!(code, 0, "add failed: {err}");
+    assert_eq!(lock_version(&app, "leftpad"), "1.0.0");
+    cleanup(&root);
+}
