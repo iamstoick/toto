@@ -30,6 +30,7 @@ pub const MODULES: &[(&str, &str)] = &[
     std_module!("io"),
     std_module!("fs"),
     std_module!("strings"),
+    std_module!("bytes"),
     std_module!("collections"),
     std_module!("math"),
     std_module!("time"),
