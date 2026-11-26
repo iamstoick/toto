@@ -959,7 +959,9 @@ fn lsp_hover_shows_item_docs() {
     // Local documented declaration hover carries its prose.
     let hover = s.request(
         "textDocument/hover",
-        &format!("{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":9,\"character\":4}}}}"),
+        &format!(
+            "{{\"textDocument\":{{\"uri\":\"{uri}\"}},\"position\":{{\"line\":9,\"character\":4}}}}"
+        ),
     );
     assert!(hover.contains("Helper with docs."), "hover: {hover}");
 

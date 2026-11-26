@@ -80,3 +80,19 @@ Built on user go-ahead, exactly per the design above:
   pattern — hover a documented stdlib item in VS Code);
   CI green on the tip (this commit triggers it; outcome
   belongs in a future note).
+
+## CI failure round (2026-11-26; fixed same turn)
+
+Run 45766983164 on head 34960e5: check FAILED at
+`cargo fmt --check` on exactly ONE hunk — the line-9
+`&format!` in the new test (tests/lsp.rs:959), split
+byte-identical per the log. Correction recorded here: the
+"23 committed precedents" argument was wrong — whatever
+lets those 100+-char lines stand does not extend to this
+one, and mechanism-hunting stopped there. Refined operating
+rule (6/6 agreement between 1.87 advisory and CI): trust
+1.87's demands on lines this task touched, keep ignoring
+its demands on untouched baseline drift. Re-verified after
+the fix: 1.87 fully clean on both crates' trees plus every
+touched test file, 21/21 protocol tests green.
+Fixed in this commit; re-validation run pending.
