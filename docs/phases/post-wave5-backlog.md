@@ -95,3 +95,33 @@ probes green (Windows probe the known informational
 failure). This green covers the refusal-message pointer and
 confirms the tree state the spike was verified against. No
 open items remain on this note.
+
+## v2.5 scope check (2026-11-26; user-supplied file)
+
+Fetched `toto-implementation-roadmap-v2.pdf` (user URL) and
+checked it against the record: title page reads exactly
+"Toto (.gzv) Implementation Roadmap v2.5 and Phase 0 Decision
+Doc (D1-D8)" and `pdfinfo` reports 41 pages — both match the
+recorded v2.5. (Filename says v2; title block, page count,
+and section text identify it as v2.5.) Correction recorded
+here: the md5 in the Wave 4 brief
+(`819bece4eb63aa13cd964bad94f75`) is 29 hex chars — not a
+valid md5, so no file could ever reproduce that gate; title
++ pages + content verified instead. Measured md5 of the
+fetched file: `819bece4eb63aa13cd88f164bad94b75`.
+
+Verdict against that scope: everything v2.5 commits to is
+done — Phases 0–7 (verdicts on record), Enterprise Track
+Waves 0–5 (all closed), D1–D8 ratified and unchanged
+(verified: no spec/ADR touches across the wave). The ONLY
+open scope is what v2.5 itself leaves uncommitted: the
+Group C gated proposals (items 20–26 — raw sockets, packet
+crafting, capture, bytes story, WebSockets, HTTP/2+more
+protocols, security toolkit), which the document defines as
+"backlog / proposal only ... each one needs its own
+proposal, spike or proof, and exit criteria before any
+implementation." Neither the registry question nor
+concurrent coverage is a v2.5 item (Group C has no registry;
+toolkit item 26 is libraries, and the coverage refusal is a
+Stage 3 design position) — both stay deferred as recorded
+above, independent of v2.5.
