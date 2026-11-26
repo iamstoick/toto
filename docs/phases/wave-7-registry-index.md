@@ -114,7 +114,7 @@ Central hosting, accounts/billing, namespace governance,
 non-git transports, index signature verification (hashes
 in the lockfile already authenticate content).
 
-## Implementation record (2026-11-26; CI pending)
+## Implementation record (2026-11-26; closed same day — see below)
 
 Built as designed with two deviations recorded here:
 (1) version comes from each tag's manifest (not the tag
@@ -135,3 +135,14 @@ suite (only the 5 pre-existing env failures: AOT/network),
 fmt + clippy clean (real 1.100 oracle; only pre-existing
 netsys warnings). Phase B-equivalent follow-through (docs
 `package-manager.md` + HELP) included in this commit.
+
+## Wave 7 — CLOSED (CI green 2026-11-26, run 45842884118)
+
+Run 45842884118 on head 6e4851d concluded SUCCESS: check +
+release-gates + bench + macOS/Linux-ARM probes green (Windows
+the known informational failure). Bare-name resolution,
+unpinned-git-with-version selection, non-semver/manifestless
+tag skipping, E0606/E0605 paths, and the full pre-existing
+package suite all green on the final tree. Wave 7 meets its
+acceptance (index file, tag enumeration, selection semantics,
+offline build from lock+cache, docs) and is CLOSED.
