@@ -190,3 +190,14 @@ rather than refused.
 - Did NOT add a `--workers` flag to `toto coverage` (the
   design-turn sketch had one with a refusal; the build
   drops it — fewer shapes, same honesty).
+
+## CI record
+
+Run 45913621020 (head `57f74f1`, the Wave 8 commit)
+concluded SUCCESS: check + release-gates + bench +
+macOS/Linux-ARM probes green; Windows probe the known
+informational failure under continue-on-error. The
+tie-break golden (`BRDA:37,0,0,1` in
+`conc_select.gzv.lcov`) agreed byte-for-byte on Linux,
+confirming the seeded-winner determinism cross-platform.
+The final tree is now CI-confirmed green on this run.
