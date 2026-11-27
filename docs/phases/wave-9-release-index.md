@@ -100,6 +100,26 @@ the resolver, which already enumerates tags loudly).
   help text lines.
 - Full gate green + CI green (recorded below on push).
 
+## CI record
+
+- Run 45965393378 (head `64cceda`, the Wave 9 commit):
+  `check` FAILED — and only there. Every Rust test
+  passed (including the 9 new registry tests and the
+  coverage goldens); the failure was the new Wave 9
+  gate block itself: `toto release` creates an annotated
+  tag, which needs a committer identity, and CI runners
+  have no global git identity (my machine does, which
+  masked it locally). Diagnosis from the gate log, no
+  product-code change needed.
+- Commit `a21ab43` (gate-only fix: repo-local
+  `git config user.email/name` before the scratch-repo
+  release, the same hermetic pattern the registry
+  tests use; verified locally in an identity-stripped
+  environment), run 45972447313: SUCCESS — check +
+  release-gates + bench + macOS/Linux-ARM probes green,
+  Windows probe the known informational failure.
+  Final tree CI-confirmed green.
+
 ## Local verification record (this turn, macOS ARM)
 
 - `cargo fmt --all -- --check`: clean.
