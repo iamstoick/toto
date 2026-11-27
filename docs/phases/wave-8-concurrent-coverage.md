@@ -200,4 +200,14 @@ informational failure under continue-on-error. The
 tie-break golden (`BRDA:37,0,0,1` in
 `conc_select.gzv.lcov`) agreed byte-for-byte on Linux,
 confirming the seeded-winner determinism cross-platform.
-The final tree is now CI-confirmed green on this run.
+
+Run 45917231592 (head `f0a90d0`, the CI-record + Group C
+proposals commit): first attempt hung in the `check`
+gate step (~3h vs 36min for the byte-identical gate on
+the Wave 8 run; the delta to that run is docs-only, so
+the hang is infra/flake, not signal — the project's
+Wave 4 record already establishes this failure shape).
+Cancelled and rerun; the rerun concluded SUCCESS with
+the same shape (check + release-gates + bench +
+macOS/Linux-ARM green, Windows informational). The final
+tree is now CI-confirmed green on this run.
