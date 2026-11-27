@@ -42,6 +42,14 @@ impl Index {
         self.map.get(name).map(String::as_str)
     }
 
+    /// Sorted entries for curation commands (Wave 9).
+    pub(crate) fn entries(&self) -> Vec<(String, String)> {
+        self.map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     fn insert(
         &mut self,
         name: String,
@@ -147,7 +155,7 @@ fn split_entry(line: &str) -> Option<(String, String)> {
 
 /// `~/.toto/index.toml` (`$XDG_CONFIG_HOME` honored); `None`
 /// when no home is known (then there is simply no user index).
-fn user_index_path() -> Option<PathBuf> {
+pub(crate) fn user_index_path() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
         && !xdg.is_empty()
     {
@@ -194,11 +202,30 @@ impl Indexes {
     }
 }
 
+/// Load both index files, separately (Wave 9 curation needs
+/// the project file alone; resolution keeps using
+/// `Indexes::load`).
+pub(crate) fn load_pair(root: &Path) -> Result<(Index, Index), PkgError> {
+    load_index_pair(root)
+}
+
+/// Where the project index lives (created by `index add` when
+/// missing).
+pub(crate) fn project_index_path(root: &Path) -> PathBuf {
+    root.join("toto-index.toml")
+}
+
+/// Project index alone (Wave 9 curation reads only this file;
+/// a missing file is empty, a malformed one is loud).
+pub(crate) fn load_project(root: &Path) -> Result<Index, PkgError> {
+    load_file(&project_index_path(root))
+}
+
 /// Load both index files: `./toto-index.toml` under the project
 /// root, then the user file. Missing files are empty indexes
 /// (never an error); malformed files are loud errors.
 fn load_index_pair(root: &Path) -> Result<(Index, Index), PkgError> {
-    let project = load_file(&root.join("toto-index.toml"))?;
+    let project = load_file(&project_index_path(root))?;
     let user = match user_index_path() {
         Some(p) => load_file(&p)?,
         None => Index::default(),

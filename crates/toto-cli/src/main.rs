@@ -32,6 +32,8 @@ const HELP: &str = "toto — a new programming language (.gzv)\n\
                     \x20                                      add a dependency (writes toto.toml + toto.lock)\n\
                     \x20   toto update [pkg...]              re-resolve dependencies, rewrite toto.lock\n\
                     \x20   toto publish                      pack <name>-<version>.gzv-pkg (local only)\n\
+                    \x20   toto release [--push]             cut manifest version as git tag v<version>\n\
+                    \x20   toto index add|remove|list ...    curate ./toto-index.toml (bare-name registry)\n\
                     \x20   toto test                         run the project tests\n\
                     \x20   toto fmt [--check] <file.gzv>...   format files in place\n\
                     (--check: list files that would change, no writes)\n\
@@ -237,6 +239,40 @@ fn main() -> ExitCode {
                 Err(code) => return code,
             };
             pkg_cmd::publish(&root, manifest)
+        }
+        Some("release") => {
+            // `toto release [--push]`: tag the manifest version.
+            let mut push = false;
+            for a in args.iter().skip(2) {
+                if a == "--push" {
+                    push = true;
+                } else {
+                    eprintln!("toto: `release` takes only `--push`");
+                    return ExitCode::from(3);
+                }
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let (root, manifest) = match build_cmd::project_root_for(&cwd) {
+                Ok(ok) => ok,
+                Err(code) => return code,
+            };
+            pkg_cmd::release(&root, manifest, push)
+        }
+        Some("index") => {
+            // `toto index add|remove|list`: curate the project index.
+            let rest: Vec<String> = args.iter().skip(2).cloned().collect();
+            if rest.is_empty() {
+                eprintln!(
+                    "toto: `index` needs a subcommand: toto index add <name> <url> | remove <name> | list"
+                );
+                return ExitCode::from(3);
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let (root, _) = match build_cmd::project_root_for(&cwd) {
+                Ok(ok) => ok,
+                Err(code) => return code,
+            };
+            pkg_cmd::index_cmd(&root, &rest)
         }
         Some("fmt") => {
             let mut check = false;

@@ -229,7 +229,7 @@ struct Requirement {
     req: Option<Req>,
 }
 
-fn git_cmd() -> Result<Command, PkgError> {
+pub(crate) fn git_cmd() -> Result<Command, PkgError> {
     let probe = Command::new("git").arg("--version").output();
     match probe {
         Ok(out) if out.status.success() => Ok(Command::new("git")),

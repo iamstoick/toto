@@ -60,6 +60,27 @@ for conc in conc conc_select conc_branches; do
     ./target/debug/toto coverage "$fix" 2>/dev/null > /tmp/toto-cov-conc-b.lcov
     cmp /tmp/toto-cov-conc-a.lcov /tmp/toto-cov-conc-b.lcov
 done
+# Wave 9 registry gate: index curation round trip (offline, no
+# git) plus release cut + idempotent re-release + push of one
+# tag to a local bare remote (offline, hermetic). Needs git.
+TOTO_BIN="$PWD/target/debug/toto"
+rm -rf /tmp/toto-reg-gate && mkdir -p /tmp/toto-reg-gate
+"$TOTO_BIN" init /tmp/toto-reg-gate/calc >/dev/null
+(cd /tmp/toto-reg-gate/calc && "$TOTO_BIN" index add leftpad https://example.com/leftpad >/dev/null)
+grep -qxF 'leftpad = "https://example.com/leftpad"' /tmp/toto-reg-gate/calc/toto-index.toml
+(cd /tmp/toto-reg-gate/calc && "$TOTO_BIN" index list | grep -qxF 'leftpad = "https://example.com/leftpad"')
+(cd /tmp/toto-reg-gate/calc && "$TOTO_BIN" index remove leftpad >/dev/null)
+# Removed entries must be gone from list output (grep finds
+# nothing → the && does not fire; a leftover fails the gate).
+(cd /tmp/toto-reg-gate/calc && "$TOTO_BIN" index list | grep -q leftpad) && exit 1
+(cd /tmp/toto-reg-gate/calc && git init -q . && git add -A && git -c user.email=t@t -c user.name=t commit -qm init && "$TOTO_BIN" release > /tmp/toto-rel-1.txt)
+grep -q "released calc 0.1.0 (tag v0.1.0)" /tmp/toto-rel-1.txt
+test -f /tmp/toto-reg-gate/calc/calc-0.1.0.gzv-pkg
+(cd /tmp/toto-reg-gate/calc && "$TOTO_BIN" release > /tmp/toto-rel-2.txt)
+grep -q "already released calc 0.1.0" /tmp/toto-rel-2.txt
+(cd /tmp/toto-reg-gate/calc && git init -q --bare ../remote.git && git remote add origin ../remote.git && git push -q origin HEAD:main && git branch --set-upstream-to=origin/main -q && "$TOTO_BIN" release --push > /tmp/toto-rel-3.txt)
+grep -q "pushed v0.1.0 to origin" /tmp/toto-rel-3.txt
+git ls-remote /tmp/toto-reg-gate/remote.git | grep -q "refs/tags/v0.1.0"
 # Stage 4 doc gate (Wave 5): `toto doc` renders every stdlib module
 # (parse refusal would fail here), and every `pub` fn/struct has a
 # `###` signature heading in its module file (surface completeness,

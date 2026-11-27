@@ -1,4 +1,7 @@
-//! `toto add` / `toto update` / `toto publish` (Phase 7, Stage 3).
+//! `toto add` / `toto update` / `toto publish` (Phase 7, Stage 3)
+//! plus `toto release` / `toto index` (Wave 9: versioned
+//! publishing on git remotes the user owns — no central
+//! registry, no upload, no auth).
 //!
 //! - `add` binds a source (`--path`, `--git`, or a `.gzv-pkg`
 //!   file), edits `[dependencies]`, resolves with network, writes
@@ -9,6 +12,11 @@
 //!   disagreement (build/test/run never re-resolve silently).
 //! - `publish` packs the project into `<name>-<version>.gzv-pkg`
 //!   locally. No upload, no registry, no auth.
+//! - `release` cuts the manifest version as git tag `v<version>`
+//!   (E0610 family): author-side publishing — the tag IS the
+//!   release for git consumers, the pack serves file consumers.
+//! - `index` curates `./toto-index.toml` (E0611 family): the
+//!   user-owned name→URL registry the resolver consults.
 //!
 //! Manifest edits rewrite ONLY the `[dependencies]` table
 //! (sorted, regenerated); the `[project]` table is preserved
@@ -421,6 +429,47 @@ fn report_lock_diff(old: &[LockedPkg], new: &[LockedPkg]) {
     }
 }
 
+/// Run git in `root`, returning trimmed stdout. Git's own
+/// stderr becomes the error text (loud, exact); a missing git
+/// binary is a shape error like the resolver's (E0608 there —
+/// here E0610, the release family, since these helpers are
+/// release-only).
+fn git_out(root: &Path, args: &[&str]) -> Result<String, PkgError> {
+    let mut cmd = super::packages::git_cmd()
+        .map_err(|_| PkgError::new("E0610", "git not found on PATH (release tags a git repo)"))?;
+    let out = cmd
+        .args(args)
+        .current_dir(root)
+        .output()
+        .map_err(|e| PkgError::new("E0610", format!("cannot run git: {e}")))?;
+    if !out.status.success() {
+        return Err(PkgError::new(
+            "E0610",
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Hash a tag points at, or `None` when the tag does not exist
+/// (`-q` keeps a missing tag quiet; repo-ness is established
+/// before this is ever called).
+fn git_tag_hash(root: &Path, tag: &str) -> Result<Option<String>, PkgError> {
+    let mut cmd = super::packages::git_cmd()
+        .map_err(|_| PkgError::new("E0610", "git not found on PATH (release tags a git repo)"))?;
+    let out = cmd
+        .args(["rev-parse", "-q", "--verify", &format!("refs/tags/{tag}")])
+        .current_dir(root)
+        .output()
+        .map_err(|e| PkgError::new("E0610", format!("cannot run git: {e}")))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    ))
+}
+
 /// `toto publish`: pack the project into `<name>-<version>.gzv-pkg`
 /// in the project root. Local only: no upload, no registry, no auth.
 pub fn publish(root: &Path, manifest: Manifest) -> ExitCode {
@@ -441,5 +490,356 @@ pub fn publish(root: &Path, manifest: Manifest) -> ExitCode {
             }
         }
         Err(e) => fail(e),
+    }
+}
+
+/// `toto release [--push]`: cut the manifest version as git tag
+/// `v<version>` (Wave 9, errors E0610).
+///
+/// Author-side publishing for the decentralized registry: the
+/// tag IS the release (consumers resolve tags through the
+/// index), the pack serves file consumers (same artifact as
+/// `publish`). Order is validate-everything → tag → pack, so a
+/// failure never leaves a half-release. Nothing is pushed
+/// without `--push` (and then exactly one tag, never `--tags`).
+pub fn release(root: &Path, manifest: Manifest, push: bool) -> ExitCode {
+    let rel_fail = |msg: String| fail(PkgError::new("E0610", msg));
+    let version = match Version::parse(&manifest.version) {
+        Ok(v) => v,
+        Err(e) => {
+            return rel_fail(format!(
+                "cannot release `{}`: bad version: {e}",
+                manifest.name
+            ));
+        }
+    };
+    let tag = format!("v{version}");
+    // The release tags a repo: the project root must BE the repo
+    // root (a subdirectory release would tag the wrong tree).
+    let toplevel = match git_out(root, &["rev-parse", "--show-toplevel"]) {
+        Ok(t) => t,
+        Err(e) => {
+            return rel_fail(format!(
+                "cannot release: not a git repo ({}): {}",
+                root.display(),
+                e.message
+            ));
+        }
+    };
+    let same_root = std::fs::canonicalize(root)
+        .ok()
+        .zip(std::fs::canonicalize(toplevel.as_str()).ok())
+        .is_some_and(|(a, b)| a == b);
+    if !same_root {
+        return rel_fail(format!(
+            "cannot release: project root `{}` is not the git repo root (release tags the whole repo)",
+            root.display()
+        ));
+    }
+    // Clean tree: a release must match a commit, exactly. The
+    // release's own pack artifact (`<name>-<version>.gzv-pkg`,
+    // same spelling as `pack_pkg`) is exempt: it is derived
+    // output rewritten on every release, never source — without
+    // the exemption no release could ever be re-run.
+    // (Manifest names are charset-constrained and versions are
+    // strict numerics, so the artifact name needs no quoting
+    // and collides with nothing a user would commit.)
+    let own_artifact = format!("{}-{}.gzv-pkg", manifest.name, version);
+    let porcelain = match git_out(root, &["status", "--porcelain"]) {
+        Ok(p) => p,
+        Err(e) => return rel_fail(e.message),
+    };
+    let dirty: Vec<&str> = porcelain
+        .lines()
+        .filter(|line| {
+            let t = line.trim();
+            let rest = t.split_at_checked(3).map(|(_, p)| p).unwrap_or(t);
+            !rest.split(" -> ").any(|side| side.trim() == own_artifact)
+        })
+        .collect();
+    if !dirty.is_empty() {
+        let files: Vec<&&str> = dirty.iter().take(10).collect();
+        let n = dirty.len();
+        let more = if n > files.len() {
+            format!("\n... and {} more", n - files.len())
+        } else {
+            String::new()
+        };
+        let shown: Vec<&str> = files.into_iter().copied().collect();
+        return rel_fail(format!(
+            "cannot release: working tree not clean ({n} files); commit or stash first:\n{}{more}",
+            shown.join("\n")
+        ));
+    }
+    if git_out(root, &["rev-parse", "HEAD"]).is_err() {
+        return rel_fail("cannot release: no commits yet; commit first".to_string());
+    }
+    match git_tag_hash(root, &tag) {
+        Ok(Some(_)) => {
+            // The tag exists: released already iff the release
+            // content is unchanged since the tag. The pack
+            // artifact and the project index are exempt — the
+            // former is derived output, the latter maps OTHER
+            // packages (neither ships in the release). Any other
+            // drift means version `version` was already cut from
+            // different sources: bump the version or delete the
+            // tag by hand. Tags are never moved.
+            let diff = match git_out(root, &["diff", "--name-only", &tag, "HEAD"]) {
+                Ok(d) => d,
+                Err(e) => return rel_fail(e.message),
+            };
+            let index_name = "toto-index.toml";
+            let drifted: Vec<&str> = diff
+                .lines()
+                .map(str::trim)
+                .filter(|p| !p.is_empty() && *p != own_artifact && *p != index_name)
+                .collect();
+            if drifted.is_empty() {
+                println!(
+                    "toto: already released {} {version} (tag {tag})",
+                    manifest.name
+                );
+            } else {
+                let shown: Vec<&&str> = drifted.iter().take(10).collect();
+                let n = drifted.len();
+                let more = if n > shown.len() {
+                    format!("\n... and {} more", n - shown.len())
+                } else {
+                    String::new()
+                };
+                let listed: Vec<&str> = shown.into_iter().copied().collect();
+                return rel_fail(format!(
+                    "cannot release: tag `{tag}` already exists but {n} release file(s) changed since (bump the version or delete the tag by hand; tags are never moved):\n{}{more}",
+                    listed.join("\n")
+                ));
+            }
+        }
+        Ok(None) => {
+            if let Err(e) = git_out(
+                root,
+                &[
+                    "tag",
+                    "-a",
+                    &tag,
+                    "-m",
+                    &format!("toto release {} {version}", manifest.name),
+                ],
+            ) {
+                return rel_fail(e.message);
+            }
+            println!("toto: released {} {version} (tag {tag})", manifest.name);
+        }
+        Err(e) => return rel_fail(e.message),
+    }
+    // Pack for file consumers (same artifact as `publish`).
+    match pack_pkg(root) {
+        Ok((fname, bytes)) => {
+            let dest = root.join(&fname);
+            if let Err(e) = std::fs::write(&dest, &bytes) {
+                return rel_fail(format!("cannot write `{fname}`: {e}"));
+            }
+            println!("toto: packed {fname} ({} bytes)", bytes.len());
+        }
+        Err(e) => return fail(e),
+    }
+    // Publish step: push exactly the one tag (never `--tags`).
+    // The remote is the current branch's upstream; without one,
+    // print the command instead of guessing.
+    let upstream = git_out(
+        root,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .ok();
+    let remote = upstream
+        .as_deref()
+        .and_then(|u| u.split('/').next())
+        .filter(|r| !r.is_empty());
+    match (push, remote) {
+        (true, Some(r)) => match git_out(root, &["push", r, &tag]) {
+            Ok(_) => {
+                println!("toto: pushed {tag} to {r}");
+                ExitCode::from(0)
+            }
+            Err(e) => rel_fail(e.message),
+        },
+        (true, None) => rel_fail(
+            "cannot push: current branch has no upstream; set one (`git push -u <remote> <branch>`) or push the tag by hand"
+                .to_string(),
+        ),
+        (false, Some(r)) => {
+            println!("toto: to publish, run: git push {r} {tag}");
+            ExitCode::from(0)
+        }
+        (false, None) => {
+            println!("toto: to publish, run: git push <remote> {tag}");
+            ExitCode::from(0)
+        }
+    }
+}
+
+/// Name charset for index entries (Wave 9): exactly the
+/// `[packages]` table rule — alphanumerics, `-`, `_`.
+fn valid_index_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
+/// URL shape for index entries (Wave 9): non-empty, no
+/// whitespace, and shaped like a git remote (`scheme://`,
+/// scp-like `user@host:path`, or a local path). Reachability
+/// is NOT checked here (offline curation stays possible);
+/// the resolver proves the URL at add/update time, loudly.
+fn valid_index_url(url: &str) -> bool {
+    !url.is_empty()
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+        && (url.contains("://") || url.contains('@') || url.contains('/') || url.starts_with('.'))
+}
+
+/// `toto index add <name> <url> | remove <name> | list` (Wave 9,
+/// errors E0611). Curates the PROJECT index
+/// (`./toto-index.toml` — the checked-in, winning file) only;
+/// the user file stays hand-managed. No network in any of
+/// them.
+pub fn index_cmd(root: &Path, args: &[String]) -> ExitCode {
+    let idx_fail = |msg: String| fail(PkgError::new("E0611", msg));
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            if args.len() != 3 {
+                return idx_fail(
+                    "toto: `index add` needs a name and a URL: toto index add <name> <url>"
+                        .to_string(),
+                );
+            }
+            let (name, url) = (&args[1], &args[2]);
+            if !valid_index_name(name) {
+                return idx_fail(format!(
+                    "toto: bad index name `{name}` (want alphanumerics, `-`, `_`)"
+                ));
+            }
+            if !valid_index_url(url) {
+                return idx_fail(format!(
+                    "toto: bad index URL `{url}` (want a git remote: scheme://, user@host:path, or a local path)"
+                ));
+            }
+            let path = super::index::project_index_path(root);
+            let project = match super::index::load_project(root) {
+                Ok(p) => p,
+                Err(e) => return fail(e),
+            };
+            if let Some(existing) = project.lookup(name) {
+                if existing == url {
+                    println!("toto: already indexed {name} (./toto-index.toml)");
+                    return ExitCode::from(0);
+                }
+                return idx_fail(format!(
+                    "toto: index entry `{name}` already maps to `{existing}` (not `{url}`); remove it first — entries are never silently rebound"
+                ));
+            }
+            // Parseable files hold ONLY the `[packages]` section,
+            // so appending lands inside it by construction.
+            let mut text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return idx_fail(format!("cannot read `{}`: {e}", path.display())),
+            };
+            if text.is_empty() {
+                text.push_str("[packages]\n");
+            } else if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            // No section check: the strict reader above already
+            // rejected anything but `[packages]` (comments and
+            // blanks allowed anywhere), so appending at EOF lands
+            // inside `[packages]` by construction.
+            text.push_str(&format!("{name} = \"{url}\"\n"));
+            if let Err(e) = std::fs::write(&path, text) {
+                return idx_fail(format!("cannot write `{}`: {e}", path.display()));
+            }
+            println!("toto: indexed {name} (./toto-index.toml)");
+            ExitCode::from(0)
+        }
+        Some("remove") => {
+            if args.len() != 2 {
+                return idx_fail(
+                    "toto: `index remove` needs a name: toto index remove <name>".to_string(),
+                );
+            }
+            let name = &args[1];
+            let path = super::index::project_index_path(root);
+            let project = match super::index::load_project(root) {
+                Ok(p) => p,
+                Err(e) => return fail(e),
+            };
+            if project.lookup(name).is_none() {
+                return idx_fail(format!("toto: index entry `{name}` not found"));
+            }
+            // Line surgery: drop the entry line(s), keep
+            // comments, blanks, order, and bytes otherwise.
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => return idx_fail(format!("cannot read `{}`: {e}", path.display())),
+            };
+            let mut kept = Vec::new();
+            let mut dropped = 0;
+            for raw in text.lines() {
+                let t = raw.trim();
+                if !t.is_empty()
+                    && !t.starts_with('#')
+                    && !t.starts_with('[')
+                    && let Some((key, _)) = t.split_once('=')
+                    && key.trim() == name
+                {
+                    dropped += 1;
+                    continue;
+                }
+                kept.push(raw);
+            }
+            if dropped == 0 {
+                // Lookup said present but no line matched (only
+                // possible on pathological files); loud, no write.
+                return idx_fail(format!(
+                    "toto: index entry `{name}` not found as a line; refusing to rewrite"
+                ));
+            }
+            let mut next = kept.join("\n");
+            if !next.is_empty() {
+                next.push('\n');
+            }
+            if let Err(e) = std::fs::write(&path, next) {
+                return idx_fail(format!("cannot write `{}`: {e}", path.display()));
+            }
+            println!("toto: removed index entry {name}");
+            ExitCode::from(0)
+        }
+        Some("list") => {
+            if args.len() != 1 {
+                return idx_fail("toto: `index list` takes no arguments".to_string());
+            }
+            let (project, user) = match super::index::load_pair(root) {
+                Ok(p) => p,
+                Err(e) => return fail(e),
+            };
+            println!("# ./toto-index.toml");
+            for (n, u) in project.entries() {
+                println!("{n} = \"{u}\"");
+            }
+            if let Some(p) = super::index::user_index_path() {
+                // Missing user file is an empty index: omit the
+                // section so `list` stays stable and scriptable.
+                if p.is_file() {
+                    println!("# {}", p.display());
+                    for (n, u) in user.entries() {
+                        println!("{n} = \"{u}\"");
+                    }
+                }
+            }
+            ExitCode::from(0)
+        }
+        _ => idx_fail(
+            "toto: `index` needs a subcommand: toto index add <name> <url> | remove <name> | list"
+                .to_string(),
+        ),
     }
 }
