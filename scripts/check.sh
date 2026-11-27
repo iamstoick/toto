@@ -73,7 +73,7 @@ grep -qxF 'leftpad = "https://example.com/leftpad"' /tmp/toto-reg-gate/calc/toto
 # Removed entries must be gone from list output (grep finds
 # nothing → the && does not fire; a leftover fails the gate).
 (cd /tmp/toto-reg-gate/calc && "$TOTO_BIN" index list | grep -q leftpad) && exit 1
-(cd /tmp/toto-reg-gate/calc && git init -q . && git add -A && git -c user.email=t@t -c user.name=t commit -qm init && "$TOTO_BIN" release > /tmp/toto-rel-1.txt)
+(cd /tmp/toto-reg-gate/calc && git init -q . && git config user.email t@t && git config user.name t && git add -A && git commit -qm init && "$TOTO_BIN" release > /tmp/toto-rel-1.txt)
 grep -q "released calc 0.1.0 (tag v0.1.0)" /tmp/toto-rel-1.txt
 test -f /tmp/toto-reg-gate/calc/calc-0.1.0.gzv-pkg
 (cd /tmp/toto-reg-gate/calc && "$TOTO_BIN" release > /tmp/toto-rel-2.txt)
